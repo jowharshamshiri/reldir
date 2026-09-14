@@ -2420,10 +2420,10 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
                     format,
                     obj([
                         ("kind", Value::String("snapshot".into())),
-                        ("name", Value::String(name)),
+                        ("name", Value::String(name.clone())),
                         ("action", Value::String("create_planned".into())),
                     ]),
-                    "would create snapshot",
+                    &format!("would create snapshot {name}"),
                 )?;
                 return Ok(0);
             }
