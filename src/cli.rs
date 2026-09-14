@@ -3907,6 +3907,32 @@ fn event(format: Format, record: Map<String, Value>, human: &str) -> Result<()> 
     }
 }
 
+fn doctor_fix_matches(only: Option<&str>, fix: &str) -> bool {
+    let Some(only) = only else {
+        return true;
+    };
+    only == fix
+        || matches!(
+            (only, fix),
+            ("IDENTITY_MISMATCH", "FIX_RENAME_TO_IDENTITY")
+                | ("ROW_UNKNOWN_FIELD", "FIX_DROP_UNKNOWN_FIELD" | "FIX_RENAME_FIELD")
+                | ("TYPE_MISMATCH", "FIX_COERCE_VALUE")
+                | (
+                    "FOREIGN_KEY_VIOLATION",
+                    "FIX_ORPHAN_SET_NULL" | "FIX_ORPHAN_DELETE_ROW"
+                )
+                | ("LINT_SCHEMA_UNREVIEWED", "FIX_ACCEPT_INFERRED")
+                | ("LINT_NULLABLE_NEVER_NULL", "FIX_TIGHTEN_NULLABLE")
+                | ("LINT_WIDER_TYPE", "FIX_NARROW_TYPE")
+                | ("LINT_ENUM_CANDIDATE", "FIX_ADD_ENUM")
+                | ("LINT_UNIQUE_CANDIDATE", "FIX_ADD_UNIQUE")
+                | ("LINT_FK_CANDIDATE", "FIX_ADD_FK")
+                | ("LINT_CHECK_CANDIDATE", "FIX_ADD_CHECK")
+                | ("LINT_FK_NO_INDEX", "FIX_ADD_INDEX")
+                | ("LINT_NON_CANONICAL_FORMATTING", "FIX_CANONICALIZE")
+        )
+}
+
 fn serialized_record<T: serde::Serialize>(kind: &str, value: &T) -> Result<Map<String, Value>> {
     let mut object = serde_json::to_value(value)
         .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?
