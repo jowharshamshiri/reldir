@@ -1,0 +1,21 @@
+pub mod canonical;
+pub mod catalog;
+pub mod cli;
+pub mod config;
+pub mod db;
+pub mod diagnostic;
+pub mod doctor;
+pub mod index;
+pub mod infer;
+pub mod integrity;
+pub mod json;
+pub mod lint;
+pub mod metadata;
+pub mod output;
+pub mod schema;
+pub mod sql;
+pub mod transaction;
+pub mod value;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const FORMAT_VERSION: u32 = 1;

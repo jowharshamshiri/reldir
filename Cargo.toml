@@ -1,0 +1,59 @@
+[[bin]]
+name = "db"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap_complete = "4.5"
+csv = "1.3"
+fs2 = "0.4"
+globset = "0.4"
+hex = "0.4"
+rust_decimal = "1.36"
+rustyline = "17"
+sha2 = "0.10"
+sqlparser = "0.58"
+strsim = "0.11"
+tempfile = "3"
+thiserror = "2"
+ulid = "1"
+unicode-normalization = "0.1"
+
+[dependencies.chrono]
+features = ["serde"]
+version = "0.4"
+
+[dependencies.clap]
+features = ["derive", "env"]
+version = "4.5"
+
+[dependencies.indexmap]
+features = ["serde"]
+version = "2"
+
+[dependencies.rusqlite]
+features = ["bundled", "hooks", "collation", "column_decltype"]
+version = "0.37"
+
+[dependencies.serde]
+features = ["derive"]
+version = "1"
+
+[dependencies.serde_json]
+features = ["preserve_order"]
+version = "1"
+
+[dependencies.uuid]
+features = ["v4", "serde"]
+version = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[package]
+description = "A filesystem-native relational JSON database"
+edition = "2024"
+license = "MIT"
+name = "jdb"
+version = "0.2.4"
