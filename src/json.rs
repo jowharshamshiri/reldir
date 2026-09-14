@@ -10,6 +10,14 @@ pub fn parse(bytes: &[u8]) -> serde_json::Result<Value> {
     Ok(value)
 }
 
+pub fn parse_str(text: &str) -> serde_json::Result<Value> {
+    parse(text.as_bytes())
+}
+
+pub fn parse_as<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> serde_json::Result<T> {
+    serde_json::from_value(parse(bytes)?)
+}
+
 struct StrictValue(Value);
 
 impl<'de> Deserialize<'de> for StrictValue {

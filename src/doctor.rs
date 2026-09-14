@@ -348,7 +348,7 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
         if old != new {
             out.push(Change::Write {
                 path: PathBuf::from(format!("schema/{t}.json")),
-                bytes: canonical::pretty(&new),
+                bytes: canonical::pretty_with_indent(&new, db.config.indentation_width),
             })
         }
     }
@@ -361,7 +361,10 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
         for (table, rows) in &db.catalog.rows {
             let s = &db.catalog.schemas[table];
             for row in rows {
-                let bytes = canonical::pretty(&canonical::canonical_row(&row.value, s));
+                let bytes = canonical::pretty_with_indent(
+                    &canonical::canonical_row(&row.value, s),
+                    db.config.indentation_width,
+                );
                 if bytes != row.raw {
                     out.push(Change::Write {
                         path: row.relative.clone(),
@@ -417,7 +420,10 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
                     }
                     out.push(Change::Write {
                         path: path.clone(),
-                        bytes: canonical::pretty(&canonical::canonical_row(&value, s)),
+                        bytes: canonical::pretty_with_indent(
+                            &canonical::canonical_row(&value, s),
+                            db.config.indentation_width,
+                        ),
                     });
                 }
             }
@@ -442,7 +448,10 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
                         body.insert(field.clone(), value);
                         out.push(Change::Write {
                             path: path.clone(),
-                            bytes: canonical::pretty(&canonical::canonical_row(&body, s)),
+                            bytes: canonical::pretty_with_indent(
+                                &canonical::canonical_row(&body, s),
+                                db.config.indentation_width,
+                            ),
                         });
                     }
                 }
@@ -469,7 +478,10 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
                         }
                         out.push(Change::Write {
                             path: path.clone(),
-                            bytes: canonical::pretty(&canonical::canonical_row(&value, s)),
+                            bytes: canonical::pretty_with_indent(
+                                &canonical::canonical_row(&value, s),
+                                db.config.indentation_width,
+                            ),
                         });
                     }
                 }
@@ -549,9 +561,13 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
                     .flatten()
                     .find(|row| &row.relative == source);
                 let merged = match (dedup.get(&effective), original) {
-                    (Some(Change::Write { bytes: prior, .. }), Some(original)) => {
-                        merge_row_edits(prior, &bytes, &original.value, &db.catalog.schemas[&original.table])?
-                    }
+                    (Some(Change::Write { bytes: prior, .. }), Some(original)) => merge_row_edits(
+                        prior,
+                        &bytes,
+                        &original.value,
+                        &db.catalog.schemas[&original.table],
+                        db.config.indentation_width,
+                    )?,
                     _ => bytes,
                 };
                 dedup.insert(
@@ -571,6 +587,7 @@ fn merge_row_edits(
     next: &[u8],
     original: &serde_json::Map<String, serde_json::Value>,
     schema: &crate::schema::Schema,
+    indentation_width: usize,
 ) -> Result<Vec<u8>> {
     let mut merged = crate::json::parse(prior)
         .map_err(|error| {
@@ -620,7 +637,10 @@ fn merge_row_edits(
             }
         }
     }
-    Ok(canonical::pretty(&canonical::canonical_row(&merged, schema)))
+    Ok(canonical::pretty_with_indent(
+        &canonical::canonical_row(&merged, schema),
+        indentation_width,
+    ))
 }
 fn lossless_coerce(
     value: &serde_json::Value,

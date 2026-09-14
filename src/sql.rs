@@ -37,8 +37,44 @@ pub fn execute(catalog: &Catalog, text: &str, params: &[Value]) -> Result<SqlRes
     execute_params(catalog, text, &params)
 }
 
+pub fn execute_with_limits(
+    catalog: &Catalog,
+    text: &str,
+    params: &[Value],
+    timeout: Option<std::time::Duration>,
+    max_rows: usize,
+    max_memory: u64,
+    max_sort_memory: u64,
+    max_temporary_disk: u64,
+) -> Result<SqlResult> {
+    let params = params
+        .iter()
+        .cloned()
+        .map(|value| SqlParam { name: None, value })
+        .collect::<Vec<_>>();
+    execute_params_with_limits(
+        catalog,
+        text,
+        &params,
+        timeout,
+        max_rows,
+        max_memory,
+        max_sort_memory,
+        max_temporary_disk,
+    )
+}
+
 pub fn execute_params(catalog: &Catalog, text: &str, params: &[SqlParam]) -> Result<SqlResult> {
-    execute_params_with_limits(catalog, text, params, None, usize::MAX, u64::MAX)
+    execute_params_with_limits(
+        catalog,
+        text,
+        params,
+        None,
+        usize::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+    )
 }
 pub fn execute_params_timeout(
     catalog: &Catalog,
@@ -46,7 +82,16 @@ pub fn execute_params_timeout(
     params: &[SqlParam],
     timeout: Option<std::time::Duration>,
 ) -> Result<SqlResult> {
-    execute_params_with_limits(catalog, text, params, timeout, usize::MAX, u64::MAX)
+    execute_params_with_limits(
+        catalog,
+        text,
+        params,
+        timeout,
+        usize::MAX,
+        u64::MAX,
+        u64::MAX,
+        u64::MAX,
+    )
 }
 pub fn execute_params_with_limits(
     catalog: &Catalog,
@@ -55,8 +100,17 @@ pub fn execute_params_with_limits(
     timeout: Option<std::time::Duration>,
     max_rows: usize,
     max_memory: u64,
+    max_sort_memory: u64,
+    max_temporary_disk: u64,
 ) -> Result<SqlResult> {
     let token = statement_kind(text)?;
+    enforce_query_workspace(
+        catalog,
+        text,
+        max_memory,
+        max_sort_memory,
+        max_temporary_disk,
+    )?;
     let mut conn = load(catalog, true)?;
     if let Some(limit) = timeout {
         let start = std::time::Instant::now();
@@ -102,6 +156,8 @@ pub fn query_each_timeout<F>(
     timeout: Option<std::time::Duration>,
     max_rows: usize,
     max_memory: u64,
+    max_sort_memory: u64,
+    max_temporary_disk: u64,
     mut emit: F,
 ) -> Result<usize>
 where
@@ -114,6 +170,13 @@ where
             4,
         ));
     }
+    enforce_query_workspace(
+        catalog,
+        text,
+        max_memory,
+        max_sort_memory,
+        max_temporary_disk,
+    )?;
     let conn = load(catalog, true)?;
     if let Some(limit) = timeout {
         let start = std::time::Instant::now();
@@ -202,6 +265,57 @@ fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
     })
 }
 
+fn enforce_query_workspace(
+    catalog: &Catalog,
+    text: &str,
+    max_memory: u64,
+    max_sort_memory: u64,
+    max_temporary_disk: u64,
+) -> Result<()> {
+    if max_memory == 0 || max_sort_memory == 0 || max_temporary_disk == 0 {
+        return Err(DbError::new(
+            "RESOURCE_LIMIT",
+            "query resource limits must be greater than zero",
+            4,
+        ));
+    }
+    let workspace = catalog
+        .rows
+        .values()
+        .flatten()
+        .try_fold(0u64, |total, row| {
+            total
+                .checked_add(row.raw.len() as u64)
+                .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "query workspace size overflow", 4))
+        })?;
+    if workspace > max_memory {
+        return Err(DbError::new(
+            "RESOURCE_LIMIT",
+            format!(
+                "query requires {workspace} bytes of relational workspace, exceeding the configured {max_memory} byte query-memory limit"
+            ),
+            4,
+        ));
+    }
+    let normalized = normalized_statement(text)?.to_ascii_uppercase();
+    let may_sort = normalized.contains(" ORDER BY ")
+        || normalized.contains(" GROUP BY ")
+        || normalized.contains(" DISTINCT ")
+        || normalized.starts_with("SELECT DISTINCT ");
+    if may_sort && workspace > max_sort_memory {
+        return Err(DbError::new(
+            "RESOURCE_LIMIT",
+            format!(
+                "sort may require {workspace} bytes, exceeding the configured {max_sort_memory} byte sort-memory limit"
+            ),
+            4,
+        ));
+    }
+    // SQLite temporary storage is forced to memory for this ephemeral engine,
+    // so query execution consumes zero temporary-disk bytes.
+    Ok(())
+}
+
 fn load(c: &Catalog, enforce: bool) -> Result<Connection> {
     let conn = Connection::open_in_memory().map_err(query_err)?;
     conn.create_collation("JDB_DECIMAL", |left, right| {
@@ -217,8 +331,10 @@ fn load(c: &Catalog, enforce: bool) -> Result<Connection> {
         }
     })
     .map_err(query_err)?;
-    conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA case_sensitive_like=ON;")
-        .map_err(query_err)?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF; PRAGMA case_sensitive_like=ON; PRAGMA temp_store=MEMORY;",
+    )
+    .map_err(query_err)?;
     for (table, s) in &c.schemas {
         let mut defs: Vec<_> = s
             .columns
@@ -517,10 +633,7 @@ fn dump(
     }
     Ok(all)
 }
-fn diff(
-    c: &Catalog,
-    after: &BTreeMap<String, Vec<Map<String, Value>>>,
-) -> Result<Vec<Change>> {
+fn diff(c: &Catalog, after: &BTreeMap<String, Vec<Map<String, Value>>>) -> Result<Vec<Change>> {
     let mut out = vec![];
     for (table, s) in &c.schemas {
         let mut old: BTreeMap<String, (&Map<String, Value>, PathBuf)> = BTreeMap::new();
@@ -559,12 +672,18 @@ fn diff(
                     }
                     out.push(Change::Write {
                         path,
-                        bytes: canonical::pretty(&canonical::canonical_row(row, s)),
+                        bytes: canonical::pretty_with_indent(
+                            &canonical::canonical_row(row, s),
+                            c.indentation_width,
+                        ),
                     })
                 }
                 None => out.push(Change::Write {
                     path,
-                    bytes: canonical::pretty(&canonical::canonical_row(row, s)),
+                    bytes: canonical::pretty_with_indent(
+                        &canonical::canonical_row(row, s),
+                        c.indentation_width,
+                    ),
                 }),
             }
         }
@@ -880,7 +999,8 @@ pub fn validate_checks(c: &Catalog) -> Vec<Diagnostic> {
                                     if failed {
                                         break;
                                     }
-                                    if let Some(key) = crate::integrity::key(&key_row, &s.primary_key, s)
+                                    if let Some(key) =
+                                        crate::integrity::key(&key_row, &s.primary_key, s)
                                         && let Some(row) = by_key.get(&key)
                                     {
                                         let mut diagnostic = Diagnostic::error(

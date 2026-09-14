@@ -1,4 +1,5 @@
 use crate::{schema::Schema, value};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -56,7 +57,14 @@ pub fn compact(v: &Value) -> String {
     serde_json::to_string(&normalize(v)).expect("JSON values serialize")
 }
 pub fn pretty(v: &Value) -> Vec<u8> {
-    let mut b = serde_json::to_vec_pretty(v).expect("JSON values serialize");
+    pretty_with_indent(v, 2)
+}
+pub fn pretty_with_indent(v: &Value, indentation_width: usize) -> Vec<u8> {
+    let indent = vec![b' '; indentation_width];
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent);
+    let mut b = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut b, formatter);
+    v.serialize(&mut serializer).expect("JSON values serialize");
     b.push(b'\n');
     b
 }

@@ -245,7 +245,11 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
             );
         }
         if rows.iter().any(|r| {
-            r.raw != crate::canonical::pretty(&crate::canonical::canonical_row(&r.value, s))
+            r.raw
+                != crate::canonical::pretty_with_indent(
+                    &crate::canonical::canonical_row(&r.value, s),
+                    config.indentation_width,
+                )
         }) {
             out.push(
                 Diagnostic::info(

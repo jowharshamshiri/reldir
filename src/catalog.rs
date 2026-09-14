@@ -28,6 +28,7 @@ pub struct Catalog {
     pub rows: BTreeMap<String, Vec<Row>>,
     pub diagnostics: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
+    pub indentation_width: usize,
 }
 
 impl Catalog {
@@ -38,6 +39,7 @@ impl Catalog {
             rows: BTreeMap::new(),
             diagnostics: vec![],
             warnings: vec![],
+            indentation_width: config.indentation_width,
         };
         let schema_dir = root.join("schema");
         if !schema_dir.is_dir() {

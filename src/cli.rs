@@ -52,6 +52,20 @@ pub struct Cli {
     dry_run: bool,
     #[arg(long, global = true)]
     timeout: Option<u64>,
+    #[arg(long, global = true)]
+    max_json_file_size: Option<u64>,
+    #[arg(long, global = true)]
+    max_nesting_depth: Option<usize>,
+    #[arg(long, global = true)]
+    max_query_memory: Option<u64>,
+    #[arg(long, global = true)]
+    max_sort_memory: Option<u64>,
+    #[arg(long, global = true)]
+    max_temporary_disk: Option<u64>,
+    #[arg(long, global = true)]
+    max_result_rows: Option<usize>,
+    #[arg(long, global = true)]
+    max_transaction_size: Option<u64>,
     #[command(subcommand)]
     command: Command,
 }
@@ -199,7 +213,11 @@ enum Command {
         after_help = "Example: db explain 'SELECT * FROM users'"
     )]
     Explain { sql: String },
-    #[command(subcommand, about = "Manage schemas")]
+    #[command(
+        subcommand,
+        about = "Manage schemas",
+        after_help = "Example: db schema show users"
+    )]
     Schema(SchemaCommand),
     #[command(
         about = "Export a table",
@@ -229,7 +247,11 @@ enum Command {
     Log,
     #[command(about = "Show a revision", after_help = "Example: db show 1")]
     Show { revision: u64 },
-    #[command(subcommand, about = "Manage snapshots")]
+    #[command(
+        subcommand,
+        about = "Manage snapshots",
+        after_help = "Example: db snapshot list"
+    )]
     Snapshot(SnapshotCommand),
     #[command(
         about = "Recover interrupted transactions",
@@ -260,41 +282,59 @@ enum Command {
         after_help = "Example: db completions zsh"
     )]
     Completions { shell: String },
-    #[command(subcommand, about = "Apply schema migrations")]
+    #[command(
+        subcommand,
+        about = "Apply schema migrations",
+        after_help = "Example: db migrate apply migration.json"
+    )]
     Migrate(MigrateCommand),
 }
 #[derive(Subcommand, Clone)]
 enum SchemaCommand {
-    #[command(about = "Show a schema")]
+    #[command(about = "Show a schema", after_help = "Example: db schema show users")]
     Show { table: String },
-    #[command(about = "Create a minimal schema")]
+    #[command(
+        about = "Create a minimal schema",
+        after_help = "Example: db schema new users"
+    )]
     New { table: String },
-    #[command(about = "Accept an inferred schema")]
+    #[command(
+        about = "Accept an inferred schema",
+        after_help = "Example: db schema accept users"
+    )]
     Accept { table: String },
-    #[command(about = "Validate all schemas")]
+    #[command(
+        about = "Validate all schemas",
+        after_help = "Example: db schema validate"
+    )]
     Validate,
 }
 #[derive(Subcommand, Clone)]
 enum SnapshotCommand {
+    #[command(after_help = "Example: db snapshot create before-import")]
     Create { name: String },
+    #[command(after_help = "Example: db snapshot list")]
     List,
+    #[command(after_help = "Example: db snapshot restore before-import --yes")]
     Restore { name: String },
+    #[command(after_help = "Example: db snapshot delete before-import --yes")]
     Delete { name: String },
 }
 #[derive(Subcommand, Clone)]
 enum MigrateCommand {
+    #[command(after_help = "Example: db migrate add-table users --from users-schema.json")]
     AddTable {
         table: String,
         #[arg(long)]
         from: PathBuf,
     },
-    DropTable {
-        table: String,
-    },
-    RenameTable {
-        table: String,
-        new: String,
-    },
+    #[command(after_help = "Example: db migrate drop-table users --dry-run")]
+    DropTable { table: String },
+    #[command(after_help = "Example: db migrate rename-table users people")]
+    RenameTable { table: String, new: String },
+    #[command(
+        after_help = "Example: db migrate add-column users active --type bool --default true"
+    )]
     AddColumn {
         table: String,
         column: String,
@@ -305,15 +345,15 @@ enum MigrateCommand {
         #[arg(long)]
         default: Option<String>,
     },
-    DropColumn {
-        table: String,
-        column: String,
-    },
+    #[command(after_help = "Example: db migrate drop-column users legacy_name")]
+    DropColumn { table: String, column: String },
+    #[command(after_help = "Example: db migrate rename-column users name display_name")]
     RenameColumn {
         table: String,
         column: String,
         new: String,
     },
+    #[command(after_help = "Example: db migrate change-type users score float")]
     ChangeType {
         table: String,
         column: String,
@@ -321,27 +361,26 @@ enum MigrateCommand {
         #[arg(long)]
         using: Option<String>,
     },
-    AddConstraint {
-        table: String,
-        definition: String,
-    },
-    DropConstraint {
-        table: String,
-        name: String,
-    },
+    #[command(
+        after_help = "Example: db migrate add-constraint users '{\"kind\":\"unique\",\"columns\":[\"email\"]}'"
+    )]
+    AddConstraint { table: String, definition: String },
+    #[command(after_help = "Example: db migrate drop-constraint users unique_email")]
+    DropConstraint { table: String, name: String },
+    #[command(after_help = "Example: db migrate add-index users email")]
     AddIndex {
         table: String,
         #[arg(value_delimiter = ',')]
         columns: Vec<String>,
     },
+    #[command(after_help = "Example: db migrate drop-index users email")]
     DropIndex {
         table: String,
         #[arg(value_delimiter = ',')]
         columns: Vec<String>,
     },
-    Apply {
-        file: PathBuf,
-    },
+    #[command(after_help = "Example: db migrate apply migration.json")]
+    Apply { file: PathBuf },
 }
 
 #[derive(serde::Deserialize)]
@@ -426,6 +465,16 @@ enum MigrationOperation {
 
 pub fn run(cli: Cli) -> Result<i32> {
     let mut settings = cli.clone();
+    let resource_overrides = crate::config::ResourceOverrides {
+        max_json_file_size: cli.max_json_file_size,
+        max_nesting_depth: cli.max_nesting_depth,
+        max_query_memory: cli.max_query_memory,
+        max_sort_memory: cli.max_sort_memory,
+        max_temporary_disk: cli.max_temporary_disk,
+        max_result_rows: cli.max_result_rows,
+        max_transaction_size: cli.max_transaction_size,
+        timeout_seconds: cli.timeout,
+    };
     let requested_root = cli
         .db
         .clone()
@@ -450,6 +499,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             track_provenance,
             cli.dry_run,
             format,
+            &resource_overrides,
         ),
         Command::Inspect { path } => cmd_inspect(path.or(cli.db), format),
         Command::Completions { shell } => completions(&shell),
@@ -467,6 +517,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             &strictness,
             &pk,
             format,
+            &resource_overrides,
         ),
         command => {
             let root = Database::discover(cli.db.as_deref())?;
@@ -488,7 +539,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             } else {
                 ObserveMode::Record
             };
-            let mut db = Database::open(root, mode)?;
+            let mut db = Database::open_with_overrides(root, mode, &resource_overrides)?;
             if settings.readonly {
                 for warning in db.catalog.warnings.iter().filter(|warning| {
                     matches!(
@@ -635,7 +686,7 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
         }
         Command::Gc => {
             require_writable(cli)?;
-            gc(db, cli.dry_run, format)
+            gc(db, cli.dry_run, format, cli.yes)
         }
         Command::UpgradeFormat => {
             println!("format {} is current", crate::FORMAT_VERSION);
@@ -655,6 +706,7 @@ fn cmd_init(
     track: bool,
     dry: bool,
     format: Format,
+    resource_overrides: &crate::config::ResourceOverrides,
 ) -> Result<i32> {
     let root = path.unwrap_or(std::env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?);
     if root.join(".db").exists() {
@@ -681,14 +733,19 @@ fn cmd_init(
         .filter(|t| !existing.contains(*t))
         .cloned()
         .collect();
+    let mut inference_config = crate::config::Config::default();
+    inference_config.apply_overrides(resource_overrides);
+    inference_config
+        .validate()
+        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let schemas = infer::infer_all(
         &root,
         &missing,
         Strictness::Balanced,
-        &crate::config::Config::default(),
+        &inference_config,
         None,
     )?;
-    let preflight = adoption_preflight(&root, &schemas)?;
+    let preflight = adoption_preflight(&root, &schemas, &inference_config)?;
     let errors = crate::integrity::validate(&preflight);
     if !errors.is_empty() {
         output::diagnostics(&errors, format);
@@ -709,7 +766,7 @@ fn cmd_init(
     for s in schemas.values() {
         crate::db::write_schema(&root, s)?
     }
-    let c = crate::catalog::Catalog::observe(&root, &crate::config::Config::default())?;
+    let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash.clone(), entries, "import", None)?;
     println!(
@@ -781,6 +838,7 @@ fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<Strin
 fn adoption_preflight(
     root: &Path,
     inferred: &std::collections::BTreeMap<String, Schema>,
+    config: &crate::config::Config,
 ) -> Result<crate::catalog::Catalog> {
     let temp = tempfile::tempdir().map_err(|e| DbError::io(Path::new("/tmp"), e))?;
     let shadow = temp.path();
@@ -857,7 +915,7 @@ fn adoption_preflight(
             }
         }
     }
-    crate::catalog::Catalog::observe(shadow, &crate::config::Config::default())
+    crate::catalog::Catalog::observe(shadow, config)
 }
 
 #[cfg(unix)]
@@ -878,6 +936,7 @@ fn infer_standalone(
     strictness: &str,
     pk: &[String],
     _format: Format,
+    resource_overrides: &crate::config::ResourceOverrides,
 ) -> Result<i32> {
     let strict = match strictness {
         "strict" => Strictness::Strict,
@@ -894,11 +953,16 @@ fn infer_standalone(
     } else {
         infer::discover_tables(root)?
     };
+    let mut inference_config = crate::config::Config::default();
+    inference_config.apply_overrides(resource_overrides);
+    inference_config
+        .validate()
+        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let schemas = infer::infer_all(
         root,
         &tables,
         strict,
-        &crate::config::Config::default(),
+        &inference_config,
         if pk.is_empty() { None } else { Some(pk) },
     )?;
     if write {
@@ -1195,20 +1259,6 @@ fn doctor(
         "repair",
         cli.dry_run,
     )?;
-    if cli.dry_run && origin == "migration" && format == Format::Table {
-        let row_files = paths
-            .iter()
-            .filter(|path| {
-                path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                    && !path.starts_with("schema")
-                    && !path.starts_with(".db")
-            })
-            .count();
-        let schema_files = paths.iter().filter(|path| path.starts_with("schema")).count();
-        println!(
-            "migration plan: {row_files} row file(s), {schema_files} schema file(s)"
-        );
-    }
     print_mutation(
         &paths,
         db.manifest.as_ref().map_or(0, |m| m.revision + 1),
@@ -1276,7 +1326,10 @@ fn infer_cmd(
         }
         changes.push(Change::Write {
             path: name.into(),
-            bytes: canonical::pretty(&serde_json::to_value(s).unwrap()),
+            bytes: canonical::pretty_with_indent(
+                &serde_json::to_value(s).unwrap(),
+                db.config.indentation_width,
+            ),
         })
     }
     let paths = transaction::commit(
@@ -1342,6 +1395,8 @@ fn list(
         timeout,
         db.config.max_result_rows,
         db.config.max_query_memory,
+        db.config.max_sort_memory,
+        db.config.max_temporary_disk,
     )?;
     if r.rows.len() > db.config.max_result_rows {
         return Err(DbError::new(
@@ -1380,8 +1435,8 @@ fn insert(
     } else {
         json_value.ok_or_else(|| DbError::usage("insert requires JSON or --from"))?
     };
-    let v: Value =
-        serde_json::from_str(&text).map_err(|e| DbError::usage(format!("invalid JSON: {e}")))?;
+    let v =
+        crate::json::parse_str(&text).map_err(|e| DbError::usage(format!("invalid JSON: {e}")))?;
     let rows = match v {
         Value::Array(a) => a,
         x => vec![x],
@@ -1410,7 +1465,10 @@ fn insert(
         }
         changes.push(Change::Write {
             path,
-            bytes: canonical::pretty(&canonical::canonical_row(&row, s)),
+            bytes: canonical::pretty_with_indent(
+                &canonical::canonical_row(&row, s),
+                db.config.indentation_width,
+            ),
         })
     }
     commit_changes(db, changes, "internal", format, cli)
@@ -1428,7 +1486,7 @@ fn update(
     // Resolve the row first so a missing key is reported distinctly instead of
     // turning into a successful zero-row SQL update.
     find_row(db, table, key)?;
-    let p: Value = serde_json::from_str(patch)
+    let p = crate::json::parse_str(patch)
         .map_err(|e| DbError::usage(format!("invalid patch JSON: {e}")))?;
     let p = p
         .as_object()
@@ -1464,7 +1522,18 @@ fn update(
         "UPDATE {} SET {assignments} WHERE {predicate}",
         quote(table)
     );
-    let result = crate::sql::execute(&db.catalog, &statement, &params)?;
+    let result = crate::sql::execute_with_limits(
+        &db.catalog,
+        &statement,
+        &params,
+        cli.timeout
+            .or(db.config.timeout_seconds)
+            .map(std::time::Duration::from_secs),
+        db.config.max_result_rows,
+        db.config.max_query_memory,
+        db.config.max_sort_memory,
+        db.config.max_temporary_disk,
+    )?;
     commit_changes(db, result.changes, "internal", format, cli)
 }
 fn delete(db: &Database, table: &str, key: &str, format: Format, cli: &Cli) -> Result<i32> {
@@ -1478,7 +1547,18 @@ fn delete(db: &Database, table: &str, key: &str, format: Format, cli: &Cli) -> R
         .collect::<Vec<_>>()
         .join(" AND ");
     let sql = format!("DELETE FROM {} WHERE {where_sql}", quote(table));
-    let r = crate::sql::execute(&db.catalog, &sql, &values)?;
+    let r = crate::sql::execute_with_limits(
+        &db.catalog,
+        &sql,
+        &values,
+        cli.timeout
+            .or(db.config.timeout_seconds)
+            .map(std::time::Duration::from_secs),
+        db.config.max_result_rows,
+        db.config.max_query_memory,
+        db.config.max_sort_memory,
+        db.config.max_temporary_disk,
+    )?;
     commit_changes(db, r.changes, "internal", format, cli)
 }
 fn sql(db: &Database, text: &str, param_text: &[String], format: Format, cli: &Cli) -> Result<i32> {
@@ -1489,7 +1569,7 @@ fn sql(db: &Database, text: &str, param_text: &[String], format: Format, cli: &C
             let (name, text) = p
                 .split_once('=')
                 .map_or((None, p.as_str()), |(n, v)| (Some(n.to_string()), v));
-            serde_json::from_str(text)
+            crate::json::parse_str(text)
                 .map(|value| crate::sql::SqlParam { name, value })
                 .map_err(|e| DbError::usage(format!("invalid parameter {p:?}: {e}")))
         })
@@ -1515,6 +1595,8 @@ fn sql(db: &Database, text: &str, param_text: &[String], format: Format, cli: &C
             .map(std::time::Duration::from_secs),
         db.config.max_result_rows,
         db.config.max_query_memory,
+        db.config.max_sort_memory,
+        db.config.max_temporary_disk,
     )?;
     if r.rows.len() > db.config.max_result_rows {
         return Err(DbError::new(
@@ -1560,6 +1642,8 @@ fn explain_sql(
             .map(std::time::Duration::from_secs),
         db.config.max_result_rows,
         db.config.max_query_memory,
+        db.config.max_sort_memory,
+        db.config.max_temporary_disk,
     )?
     .rows;
     let details = physical
@@ -1628,6 +1712,8 @@ fn explain_sql(
                 .map(std::time::Duration::from_secs),
             db.config.max_result_rows,
             db.config.max_query_memory,
+            db.config.max_sort_memory,
+            db.config.max_temporary_disk,
         )?;
         record.insert("actual_rows".into(), Value::from(result.rows.len()));
         record.insert(
@@ -1648,7 +1734,7 @@ fn parse_sql_params(param_text: &[String]) -> Result<Vec<crate::sql::SqlParam>> 
                 .map_or((None, parameter.as_str()), |(name, value)| {
                     (Some(name.to_string()), value)
                 });
-            serde_json::from_str(text)
+            crate::json::parse_str(text)
                 .map(|value| crate::sql::SqlParam { name, value })
                 .map_err(|error| {
                     DbError::usage(format!("invalid parameter {parameter:?}: {error}"))
@@ -1677,6 +1763,8 @@ fn stream_query_if_supported(
                 timeout,
                 db.config.max_result_rows,
                 db.config.max_query_memory,
+                db.config.max_sort_memory,
+                db.config.max_temporary_disk,
                 output::jsonl_record,
             )?;
         }
@@ -1690,6 +1778,8 @@ fn stream_query_if_supported(
                 timeout,
                 db.config.max_result_rows,
                 db.config.max_query_memory,
+                db.config.max_sort_memory,
+                db.config.max_temporary_disk,
                 |row| {
                     if headers.is_none() {
                         let row_headers = row.keys().cloned().collect::<Vec<_>>();
@@ -1785,7 +1875,10 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 db,
                 vec![Change::Write {
                     path: format!("schema/{table}.json").into(),
-                    bytes: canonical::pretty(&serde_json::to_value(s).unwrap()),
+                    bytes: canonical::pretty_with_indent(
+                        &serde_json::to_value(s).unwrap(),
+                        db.config.indentation_width,
+                    ),
                 }],
                 "internal",
                 format,
@@ -1802,7 +1895,10 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 db,
                 vec![Change::Write {
                     path: format!("schema/{table}.json").into(),
-                    bytes: canonical::pretty(&serde_json::to_value(s).unwrap()),
+                    bytes: canonical::pretty_with_indent(
+                        &serde_json::to_value(s).unwrap(),
+                        db.config.indentation_width,
+                    ),
                 }],
                 "internal",
                 format,
@@ -1918,12 +2014,12 @@ fn import(db: &Database, table: &str, path: &Path, format: Format, cli: &Cli) ->
             text.lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| {
-                    serde_json::from_str(l)
+                    crate::json::parse_str(l)
                         .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            match serde_json::from_str::<Value>(&text)
+            match crate::json::parse_str(&text)
                 .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))?
             {
                 Value::Array(a) => a,
@@ -1959,7 +2055,10 @@ fn import(db: &Database, table: &str, path: &Path, format: Format, cli: &Cli) ->
         }
         changes.push(Change::Write {
             path,
-            bytes: canonical::pretty(&canonical::canonical_row(&r, s)),
+            bytes: canonical::pretty_with_indent(
+                &canonical::canonical_row(&r, s),
+                db.config.indentation_width,
+            ),
         })
     }
     commit_changes(db, changes, "import", format, cli)
@@ -2270,29 +2369,113 @@ fn analyze(db: &Database, _format: Format) -> Result<i32> {
     println!("rebuilt statistics");
     Ok(0)
 }
-fn gc(db: &Database, dry: bool, _format: Format) -> Result<i32> {
-    let dir = db.root.join(".db/transactions");
-    let mut targets = vec![];
-    for e in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
-        let p = e.map_err(|e| DbError::io(&dir, e))?.path();
-        if p.is_dir() && !p.join("COMMITTING").exists() {
-            targets.push(p)
+fn gc(db: &Database, dry: bool, format: Format, yes: bool) -> Result<i32> {
+    db.require_valid()?;
+    let mut retained = std::collections::BTreeSet::new();
+    if let Some(manifest) = &db.manifest {
+        retained.extend(manifest.entries.values().map(|entry| entry.hash.clone()));
+    }
+    let provenance = db.root.join(".db/provenance");
+    for entry in fs::read_dir(&provenance).map_err(|error| DbError::io(&provenance, error))? {
+        let path = entry
+            .map_err(|error| DbError::io(&provenance, error))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|error| DbError::io(&path, error))?;
+        let revision: metadata::Provenance = crate::json::parse_as(&bytes).map_err(|error| {
+            DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!("invalid provenance {}: {error}", path.display()),
+                6,
+            )
+        })?;
+        retained.extend(revision.entries.values().map(|entry| entry.hash.clone()));
+    }
+
+    let mut targets = Vec::<(PathBuf, u64, &'static str)>::new();
+    let objects = db.root.join(".db/objects");
+    if objects.exists() {
+        for entry in fs::read_dir(&objects).map_err(|error| DbError::io(&objects, error))? {
+            let path = entry.map_err(|error| DbError::io(&objects, error))?.path();
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+            let hash = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".json"));
+            if hash.is_none_or(|hash| !retained.contains(hash)) {
+                targets.push((path, metadata.len(), "object"));
+            }
         }
     }
-    for p in &targets {
+    let transactions = db.root.join(".db/transactions");
+    for entry in fs::read_dir(&transactions).map_err(|error| DbError::io(&transactions, error))? {
+        let path = entry
+            .map_err(|error| DbError::io(&transactions, error))?
+            .path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+        if metadata.file_type().is_dir()
+            && (!path.join("COMMITTING").exists() || path.join("COMPLETE").exists())
+        {
+            targets.push((path, 0, "transaction"));
+        }
+    }
+    targets.sort_by(|left, right| left.0.cmp(&right.0));
+    let records = targets
+        .iter()
+        .map(|(path, bytes, target_kind)| {
+            obj([
+                ("kind", Value::String("gc_candidate".into())),
+                ("target_kind", Value::String((*target_kind).into())),
+                (
+                    "path",
+                    Value::String(
+                        path.strip_prefix(&db.root)
+                            .unwrap_or(path)
+                            .display()
+                            .to_string(),
+                    ),
+                ),
+                ("bytes", Value::from(*bytes)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if format == Format::Table {
+        for record in &records {
+            println!(
+                "{} {} ({} bytes)",
+                if dry { "would reclaim" } else { "reclaim" },
+                record["path"].as_str().unwrap_or(""),
+                record["bytes"]
+            );
+        }
         println!(
-            "{} {}",
-            if dry { "would remove" } else { "remove" },
-            p.display()
+            "{} item(s), {} byte(s) reclaimable",
+            targets.len(),
+            targets.iter().map(|target| target.1).sum::<u64>()
         );
-        if !dry {
-            fs::remove_dir_all(p).map_err(|e| DbError::io(p, e))?
+    } else {
+        output::records(&records, format)?;
+    }
+    if !dry && !targets.is_empty() && !yes {
+        return Err(DbError::new(
+            "CONFIRMATION_REQUIRED",
+            "garbage collection requires --yes after reviewing the reclaim plan",
+            9,
+        ));
+    }
+    if !dry {
+        for (path, _, _) in &targets {
+            let metadata = fs::symlink_metadata(path).map_err(|error| DbError::io(path, error))?;
+            if metadata.file_type().is_dir() {
+                fs::remove_dir_all(path).map_err(|error| DbError::io(path, error))?;
+            } else {
+                fs::remove_file(path).map_err(|error| DbError::io(path, error))?;
+            }
         }
     }
-    println!(
-        "{} transaction staging directories reclaimable",
-        targets.len()
-    );
     Ok(0)
 }
 
@@ -2478,7 +2661,10 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                 db,
                 vec![Change::Write {
                     path: format!("schema/{table}.json").into(),
-                    bytes: canonical::pretty(&serde_json::to_value(&mut s).unwrap()),
+                    bytes: canonical::pretty_with_indent(
+                        &serde_json::to_value(&mut s).unwrap(),
+                        db.config.indentation_width,
+                    ),
                 }],
                 "migration",
                 format,
@@ -2530,7 +2716,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                 if old.as_ref() != Some(&value) {
                     changes.push(Change::Write {
                         path: format!("schema/{name}.json").into(),
-                        bytes: canonical::pretty(&value),
+                        bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
                     });
                 }
             }
@@ -2563,7 +2749,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
             let kind = parse_type(&kind)?;
             let default = default
                 .map(|x| {
-                    serde_json::from_str(&x)
+                    crate::json::parse_str(&x)
                         .map_err(|e| DbError::usage(format!("invalid default: {e}")))
                 })
                 .transpose()?;
@@ -2697,7 +2883,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
                     changes.push(Change::Write {
                         path: format!("schema/{name}.json").into(),
-                        bytes: canonical::pretty(&value),
+                        bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
                     });
                 }
             }
@@ -2762,9 +2948,12 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     db,
                     vec![Change::Write {
                         path: format!("schema/{table}.json").into(),
-                        bytes: canonical::pretty(&serde_json::to_value(&s).map_err(|e| {
-                            DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6)
-                        })?),
+                        bytes: canonical::pretty_with_indent(
+                            &serde_json::to_value(&s).map_err(|e| {
+                                DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6)
+                            })?,
+                            db.config.indentation_width,
+                        ),
                     }],
                     "migration",
                     format,
@@ -2774,8 +2963,11 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
         }
         MigrateCommand::AddConstraint { table, definition } => {
             let mut s = schema_for(db, &table)?.clone();
-            let def: ConstraintDefinition = serde_json::from_str(&definition)
-                .map_err(|e| DbError::usage(format!("invalid constraint definition: {e}")))?;
+            let def: ConstraintDefinition = serde_json::from_value(
+                crate::json::parse_str(&definition)
+                    .map_err(|e| DbError::usage(format!("invalid constraint definition: {e}")))?,
+            )
+            .map_err(|e| DbError::usage(format!("invalid constraint definition: {e}")))?;
             match def {
                 ConstraintDefinition::Unique { columns } => {
                     if s.unique.contains(&columns) {
@@ -2830,9 +3022,12 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
             commit_schema(db, s, format, cli)
         }
         MigrateCommand::Apply { file } => {
-            let document: MigrationDocument =
-                serde_json::from_slice(&fs::read(&file).map_err(|e| DbError::io(&file, e))?)
-                    .map_err(|e| DbError::usage(format!("invalid migration JSON: {e}")))?;
+            let bytes = fs::read(&file).map_err(|e| DbError::io(&file, e))?;
+            let document: MigrationDocument = serde_json::from_value(
+                crate::json::parse(&bytes)
+                    .map_err(|e| DbError::usage(format!("invalid migration JSON: {e}")))?,
+            )
+            .map_err(|e| DbError::usage(format!("invalid migration JSON: {e}")))?;
             let changes = declarative_migration_changes(db, document)?;
             commit_changes(db, changes, "migration", format, cli)
         }
@@ -2846,7 +3041,7 @@ fn commit_schema(db: &Database, s: Schema, format: Format, cli: &Cli) -> Result<
         db,
         vec![Change::Write {
             path: format!("schema/{table}.json").into(),
-            bytes: canonical::pretty(&value),
+            bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
         }],
         "migration",
         format,
@@ -3211,7 +3406,7 @@ fn authoritative_diff(
         {
             changes.push(Change::Write {
                 path: format!("schema/{t}.json").into(),
-                bytes: canonical::pretty(&value),
+                bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
             })
         }
     }
@@ -3252,7 +3447,10 @@ fn authoritative_diff(
                 .to_string();
             changes.push(Change::Write {
                 path: p,
-                bytes: canonical::pretty(&canonical::canonical_row(&row, &schemas[&t])),
+                bytes: canonical::pretty_with_indent(
+                    &canonical::canonical_row(&row, &schemas[&t]),
+                    db.config.indentation_width,
+                ),
             })
         }
     }
@@ -3276,9 +3474,10 @@ fn schema_row_changes<F: Fn(&mut Map<String, Value>) -> Result<()>>(
     let table = s.table.clone();
     let mut changes = vec![Change::Write {
         path: format!("schema/{table}.json").into(),
-        bytes: canonical::pretty(
+        bytes: canonical::pretty_with_indent(
             &serde_json::to_value(s)
                 .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?,
+            db.config.indentation_width,
         ),
     }];
     for row in &db.catalog.rows[&table] {
@@ -3298,7 +3497,10 @@ fn schema_row_changes<F: Fn(&mut Map<String, Value>) -> Result<()>>(
         }
         changes.push(Change::Write {
             path: new,
-            bytes: canonical::pretty(&canonical::canonical_row(&r, &s)),
+            bytes: canonical::pretty_with_indent(
+                &canonical::canonical_row(&r, &s),
+                db.config.indentation_width,
+            ),
         })
     }
     Ok(changes)
@@ -3324,6 +3526,21 @@ fn commit_changes(
         origin,
         cli.dry_run,
     )?;
+    if cli.dry_run && origin == "migration" && format == Format::Table {
+        let row_files = paths
+            .iter()
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                    && !path.starts_with("schema")
+                    && !path.starts_with(".db")
+            })
+            .count();
+        let schema_files = paths
+            .iter()
+            .filter(|path| path.starts_with("schema"))
+            .count();
+        println!("migration plan: {row_files} row file(s), {schema_files} schema file(s)");
+    }
     print_mutation(
         &paths,
         db.manifest.as_ref().map_or(1, |m| m.revision + 1),
@@ -3397,10 +3614,10 @@ fn find_row<'a>(db: &'a Database, table: &str, key: &str) -> Result<&'a crate::c
 fn key_values(text: &str, count: usize) -> Result<Vec<Value>> {
     if count == 1 {
         return Ok(vec![
-            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.into())),
+            crate::json::parse_str(text).unwrap_or_else(|_| Value::String(text.into())),
         ]);
     }
-    let v: Value = serde_json::from_str(text)
+    let v = crate::json::parse_str(text)
         .map_err(|_| DbError::usage("composite primary keys must be a JSON array"))?;
     let a = v
         .as_array()
@@ -3480,9 +3697,8 @@ fn parse_csv(v: &str, c: &Column) -> Result<Value> {
             v.parse::<f64>()
                 .map_err(|_| DbError::new("TYPE_MISMATCH", format!("{v:?} is not float"), 2))?,
         ),
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => {
-            serde_json::from_str(v).map_err(|e| DbError::new("TYPE_MISMATCH", e.to_string(), 2))?
-        }
+        ColumnType::Array | ColumnType::Object | ColumnType::Json => crate::json::parse_str(v)
+            .map_err(|e| DbError::new("TYPE_MISMATCH", e.to_string(), 2))?,
         _ => Value::String(v.into()),
     };
     Ok(parsed)

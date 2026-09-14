@@ -1,7 +1,7 @@
 use crate::{
     FORMAT_VERSION,
     catalog::Catalog,
-    config::Config,
+    config::{Config, ResourceOverrides},
     diagnostic::{DbError, Diagnostic, Result},
     integrity,
     metadata::{self, Manifest},
@@ -28,6 +28,7 @@ pub struct Database {
     pub external_changes: Vec<String>,
     pub validation_elapsed: std::time::Duration,
     pub manifest_needs_rebuild: bool,
+    resource_overrides: ResourceOverrides,
 }
 
 impl Database {
@@ -59,6 +60,14 @@ impl Database {
         ))
     }
     pub fn open(root: PathBuf, mode: ObserveMode) -> Result<Self> {
+        Self::open_with_overrides(root, mode, &ResourceOverrides::default())
+    }
+
+    pub fn open_with_overrides(
+        root: PathBuf,
+        mode: ObserveMode,
+        overrides: &ResourceOverrides,
+    ) -> Result<Self> {
         let validation_started = std::time::Instant::now();
         validate_format(&root)?;
         let writer_lock = if mode == ObserveMode::Record {
@@ -93,7 +102,15 @@ impl Database {
         if recovered {
             metadata::reconcile_after_recovery(&root)?;
         }
-        let config = load_config(&root)?;
+        let mut config = load_config(&root)?;
+        config.apply_overrides(overrides);
+        config.validate().map_err(|message| {
+            DbError::new(
+                "RESOURCE_LIMIT",
+                format!("invalid command-line resource limit: {message}"),
+                1,
+            )
+        })?;
         let mut catalog = Catalog::observe(&root, &config)?;
         let mut diagnostics = integrity::validate(&catalog);
         if pending && !recovered {
@@ -184,6 +201,7 @@ impl Database {
             external_changes,
             validation_elapsed: validation_started.elapsed(),
             manifest_needs_rebuild,
+            resource_overrides: overrides.clone(),
         };
         drop(writer_lock);
         Ok(database)
@@ -202,7 +220,7 @@ impl Database {
         Ok(())
     }
     pub fn refresh(&mut self, mode: ObserveMode) -> Result<()> {
-        *self = Self::open(self.root.clone(), mode)?;
+        *self = Self::open_with_overrides(self.root.clone(), mode, &self.resource_overrides)?;
         Ok(())
     }
 }
@@ -258,13 +276,21 @@ pub fn load_config(root: &Path) -> Result<Config> {
             6,
         )
     })?;
-    serde_json::from_value(value).map_err(|e| {
+    let config: Config = serde_json::from_value(value).map_err(|e| {
         DbError::new(
             "INTERNAL_METADATA_CORRUPT",
             format!("invalid .db/config: {e}"),
             6,
         )
-    })
+    })?;
+    config.validate().map_err(|message| {
+        DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("invalid .db/config: {message}"),
+            6,
+        )
+    })?;
+    Ok(config)
 }
 pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
     if root.join(".db").exists() {

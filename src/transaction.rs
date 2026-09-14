@@ -366,14 +366,14 @@ pub fn recover(root: &Path) -> Result<bool> {
             fs::remove_dir_all(&dir).map_err(|e| DbError::io(&dir, e))?;
             continue;
         }
-        let j: Journal = serde_json::from_slice(&fs::read(&jp).map_err(|e| DbError::io(&jp, e))?)
+        let j: Journal = crate::json::parse_as(&fs::read(&jp).map_err(|e| DbError::io(&jp, e))?)
             .map_err(|e| {
-            DbError::new(
-                "TRANSACTION_INCOMPLETE",
-                format!("corrupt transaction journal {}: {e}", jp.display()),
-                5,
-            )
-        })?;
+                DbError::new(
+                    "TRANSACTION_INCOMPLETE",
+                    format!("corrupt transaction journal {}: {e}", jp.display()),
+                    5,
+                )
+            })?;
         if dir.join("COMMITTING").exists() {
             if !dir.join("RECOVERED").exists() {
                 apply_journal(root, &dir, &j)?;

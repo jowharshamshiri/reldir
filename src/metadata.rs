@@ -67,7 +67,7 @@ pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
     let config_path = c.root.join(".db/config");
     if config_path.exists() {
         let bytes = fs::read(&config_path).map_err(|e| DbError::io(&config_path, e))?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(internal)?;
+        let value = crate::json::parse(&bytes).map_err(internal)?;
         let canonical = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
         let hash = canonical::hash_bytes(&canonical);
         root.update(b".db/config\0");
@@ -126,7 +126,7 @@ pub fn load_manifest(root: &Path) -> Result<Option<Manifest>> {
         return Ok(None);
     }
     let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
-    serde_json::from_slice(&b).map(Some).map_err(|e| {
+    crate::json::parse_as(&b).map(Some).map_err(|e| {
         DbError::new(
             "INTERNAL_METADATA_CORRUPT",
             format!("{}: {e}", p.display()),
@@ -149,7 +149,7 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
     paths.sort();
     let mut prior: Option<Provenance> = None;
     for path in paths {
-        let value: Provenance = serde_json::from_slice(
+        let value: Provenance = crate::json::parse_as(
             &fs::read(&path).map_err(|e| DbError::io(&path, e))?,
         )
         .map_err(|e| {
@@ -211,7 +211,7 @@ pub fn provenance_head(root: &Path) -> Result<Option<Manifest>> {
     let Some(path) = paths.last() else {
         return Ok(None);
     };
-    let p: Provenance = serde_json::from_slice(&fs::read(path).map_err(|e| DbError::io(path, e))?)
+    let p: Provenance = crate::json::parse_as(&fs::read(path).map_err(|e| DbError::io(path, e))?)
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
     Ok(Some(Manifest {
         format_version: p.format_version,
@@ -264,7 +264,7 @@ pub fn reconcile_after_recovery(root: &Path) -> Result<()> {
 }
 fn load_provenance(root: &Path, revision: u64) -> Result<Provenance> {
     let path = root.join(format!(".db/provenance/{revision:020}.json"));
-    serde_json::from_slice(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
+    crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
 }
 pub fn record(
@@ -333,7 +333,7 @@ fn store_objects(c: &Catalog, entries: &BTreeMap<String, ManifestEntry>) -> Resu
         values.insert(
             ".db/config".into(),
             canonical::normalize(
-                &serde_json::from_slice(&fs::read(&config).map_err(|e| DbError::io(&config, e))?)
+                &crate::json::parse(&fs::read(&config).map_err(|e| DbError::io(&config, e))?)
                     .map_err(internal)?,
             ),
         );
