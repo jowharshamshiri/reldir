@@ -794,6 +794,13 @@ fn cmd_init(
     inference_config
         .validate()
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
+    let ignore_set = inference_config
+        .ignore_set()
+        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
+    let tables = tables
+        .into_iter()
+        .filter(|table| !ignore_set.is_match(table))
+        .collect::<Vec<_>>();
     let reference_catalog = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let schemas = infer::infer_all_with_references(
         &root,
@@ -1053,6 +1060,13 @@ fn infer_standalone(
     inference_config
         .validate()
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
+    let ignore_set = inference_config
+        .ignore_set()
+        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
+    let tables = tables
+        .into_iter()
+        .filter(|table| !ignore_set.is_match(table))
+        .collect::<Vec<_>>();
     let reference_catalog = crate::catalog::Catalog::observe(root, &inference_config)?;
     let schemas = infer::infer_all_with_references(
         root,
@@ -1457,8 +1471,13 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
     } else {
         infer::discover_tables(&db.root)?
     };
+    let ignore_set = db
+        .config
+        .ignore_set()
+        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
     let wanted: Vec<_> = tables
         .into_iter()
+        .filter(|table| !ignore_set.is_match(table))
         .filter(|t| all || !db.catalog.schemas.contains_key(t))
         .collect();
     let schemas = infer::infer_all_with_references(

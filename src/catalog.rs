@@ -3,7 +3,6 @@ use crate::{
     diagnostic::{DbError, Diagnostic, Result},
     schema::{self, Schema},
 };
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -147,7 +146,9 @@ impl Catalog {
             }
         }
         validate_cross(&c.schemas, &mut c.diagnostics);
-        let ignores = compile_ignores(&config.ignore)?;
+        let ignores = config.ignore_set().map_err(|error| {
+            DbError::new("INTERNAL_METADATA_CORRUPT", error, 6)
+        })?;
         for (table, s) in &c.schemas {
             let dir = root.join(table);
             c.rows.insert(table.clone(), vec![]);
@@ -348,21 +349,6 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<PathBuf>> {
     v.sort();
     Ok(v)
 }
-fn compile_ignores(items: &[String]) -> Result<GlobSet> {
-    let mut b = GlobSetBuilder::new();
-    for x in items {
-        b.add(Glob::new(x).map_err(|e| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("invalid ignore glob {x:?}: {e}"),
-                6,
-            )
-        })?);
-    }
-    b.build()
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
-}
-
 fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>) {
     for (table, s) in schemas {
         for fk in &s.foreign_keys {

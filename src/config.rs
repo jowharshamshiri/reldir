@@ -96,6 +96,17 @@ pub struct ResourceOverrides {
 }
 
 impl Config {
+    pub fn ignore_set(&self) -> std::result::Result<globset::GlobSet, String> {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in &self.ignore {
+            builder.add(
+                globset::Glob::new(pattern)
+                    .map_err(|error| format!("invalid ignore glob {pattern:?}: {error}"))?,
+            );
+        }
+        builder.build().map_err(|error| error.to_string())
+    }
+
     pub fn apply_overrides(&mut self, overrides: &ResourceOverrides) {
         if let Some(value) = overrides.max_json_file_size {
             self.max_json_file_size = value;
@@ -136,7 +147,7 @@ impl Config {
         if invalid {
             Err("indentation and resource limits must be greater than zero".into())
         } else {
-            Ok(())
+            self.ignore_set().map(|_| ())
         }
     }
 }

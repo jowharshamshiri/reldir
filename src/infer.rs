@@ -212,19 +212,9 @@ fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>
     }
     paths.sort();
     let mut rows = vec![];
-    let mut ignore_builder = globset::GlobSetBuilder::new();
-    for pattern in &config.ignore {
-        ignore_builder.add(globset::Glob::new(pattern).map_err(|error| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("invalid ignore glob {pattern:?}: {error}"),
-                6,
-            )
-        })?);
-    }
-    let ignores = ignore_builder
-        .build()
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
+    let ignores = config
+        .ignore_set()
+        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error, 6))?;
     for p in paths {
         let rel = p.strip_prefix(root).unwrap().to_path_buf();
         if ignores.is_match(&rel)
