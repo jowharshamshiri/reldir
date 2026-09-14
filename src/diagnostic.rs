@@ -164,6 +164,9 @@ impl DbError {
         if let Some(v) = &d.observed {
             eprintln!("   = observed: {v}");
         }
+        if !d.fixes.is_empty() {
+            eprintln!("   = fixes: {}", d.fixes.join(", "));
+        }
         if let Some(h) = &d.help {
             eprintln!("   = help: {h}");
         }

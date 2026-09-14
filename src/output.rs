@@ -65,6 +65,12 @@ pub fn diagnostics(items: &[Diagnostic], format: Format) {
                 if let Some(o) = &d.observed {
                     eprintln!("   = observed: {o}")
                 }
+                if let Some(constraint) = &d.constraint {
+                    eprintln!("   = constraint: {constraint}")
+                }
+                if !d.fixes.is_empty() {
+                    eprintln!("   = fixes: {}", d.fixes.join(", "))
+                }
                 if let Some(h) = &d.help {
                     eprintln!("   = help: {h}")
                 }

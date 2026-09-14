@@ -37,6 +37,7 @@ pub fn commit(
     changes: &[Change],
     origin: &str,
     dry_run: bool,
+    resource_overrides: &crate::config::ResourceOverrides,
 ) -> Result<Vec<PathBuf>> {
     if changes.is_empty() {
         return Ok(vec![]);
@@ -81,7 +82,7 @@ pub fn commit(
             Change::Write { path, .. } | Change::Delete { path } => path,
         })?
     }
-    validate_prospective(root, changes)?;
+    validate_prospective(root, changes, resource_overrides)?;
     if dry_run {
         return Ok(changes
             .iter()
@@ -198,7 +199,11 @@ pub fn commit(
         .collect())
 }
 
-fn validate_prospective(root: &Path, changes: &[Change]) -> Result<()> {
+fn validate_prospective(
+    root: &Path,
+    changes: &[Change],
+    resource_overrides: &crate::config::ResourceOverrides,
+) -> Result<()> {
     // Prospective validation must be observational from the database's point of
     // view, including for --dry-run. Keeping the shadow outside the database
     // also prevents an interrupted validator from being mistaken for a pending
@@ -288,7 +293,11 @@ fn validate_prospective(root: &Path, changes: &[Change]) -> Result<()> {
         }
     }
     crate::db::validate_format(shadow)?;
-    let future_config = crate::db::load_config(shadow)?;
+    let mut future_config = crate::db::load_config(shadow)?;
+    future_config.apply_overrides(resource_overrides);
+    future_config
+        .validate()
+        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let future = Catalog::observe(shadow, &future_config)?;
     let errors = integrity::validate(&future);
     if let Some(d) = errors.into_iter().next() {

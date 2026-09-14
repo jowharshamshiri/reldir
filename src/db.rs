@@ -223,6 +223,9 @@ impl Database {
         *self = Self::open_with_overrides(self.root.clone(), mode, &self.resource_overrides)?;
         Ok(())
     }
+    pub fn resource_overrides(&self) -> &ResourceOverrides {
+        &self.resource_overrides
+    }
 }
 
 pub fn validate_format(root: &Path) -> Result<()> {

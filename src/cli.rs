@@ -618,7 +618,11 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
             let s = db.catalog.schemas.get(&table).ok_or_else(|| {
                 DbError::new("UNKNOWN_TABLE", format!("unknown table {table:?}"), 4)
             })?;
-            println!("{}", serde_json::to_string_pretty(s).unwrap());
+            if format == Format::Table {
+                println!("{}", serde_json::to_string_pretty(s).unwrap());
+            } else {
+                output::records(&[serialized_record("schema", s)?], format)?;
+            }
             Ok(0)
         }
         Command::Get { table, key } => get(db, &table, &key, format),
@@ -666,14 +670,18 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
         Command::Recover => {
             require_writable(cli)?;
             let changed = crate::db::recover(&db.root)?;
-            println!(
-                "{}",
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("recovery".into())),
+                    ("changed", Value::Bool(changed)),
+                ]),
                 if changed {
                     "recovery complete"
                 } else {
                     "no pending transactions"
-                }
-            );
+                },
+            )?;
             Ok(0)
         }
         Command::Reindex => {
@@ -689,7 +697,15 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
             gc(db, cli.dry_run, format, cli.yes)
         }
         Command::UpgradeFormat => {
-            println!("format {} is current", crate::FORMAT_VERSION);
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("format_status".into())),
+                    ("format_version", Value::from(crate::FORMAT_VERSION)),
+                    ("current", Value::Bool(true)),
+                ]),
+                &format!("format {} is current", crate::FORMAT_VERSION),
+            )?;
             Ok(0)
         }
         Command::Shell => shell(db, format, cli),
@@ -718,11 +734,27 @@ fn cmd_init(
     }
     if !adopt {
         if dry {
-            println!("would initialize {}", root.display());
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("initialization_plan".into())),
+                    ("path", Value::String(root.display().to_string())),
+                    ("adopt", Value::Bool(false)),
+                ]),
+                &format!("would initialize {}", root.display()),
+            )?;
             return Ok(0);
         }
         crate::db::init_empty(&root, track)?;
-        println!("initialized {} (revision 1)", root.display());
+        event(
+            format,
+            obj([
+                ("kind", Value::String("initialization".into())),
+                ("path", Value::String(root.display().to_string())),
+                ("revision", Value::from(1)),
+            ]),
+            &format!("initialized {} (revision 1)", root.display()),
+        )?;
         return Ok(0);
     }
     let tables = infer::discover_tables(&root)?;
@@ -752,13 +784,29 @@ fn cmd_init(
         return Ok(2);
     }
     if dry {
-        println!(
-            "would adopt {} tables and infer {} schemas",
-            tables.len(),
-            schemas.len()
-        );
-        for (name, reason) in &skipped {
-            println!("skipped {name}: {reason}");
+        if format == Format::Table {
+            println!(
+                "would adopt {} tables and infer {} schemas",
+                tables.len(),
+                schemas.len()
+            );
+            for (name, reason) in &skipped {
+                println!("skipped {name}: {reason}");
+            }
+        } else {
+            let mut records = vec![obj([
+                ("kind", Value::String("adoption_plan".into())),
+                ("tables", Value::from(tables.len())),
+                ("inferred_schemas", Value::from(schemas.len())),
+            ])];
+            records.extend(skipped.iter().map(|(name, reason)| {
+                obj([
+                    ("kind", Value::String("skipped_directory".into())),
+                    ("path", Value::String(name.clone())),
+                    ("reason", Value::String(reason.clone())),
+                ])
+            }));
+            output::records(&records, format)?;
         }
         return Ok(0);
     }
@@ -769,14 +817,32 @@ fn cmd_init(
     let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash.clone(), entries, "import", None)?;
-    println!(
-        "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",
-        tables.len(),
-        c.row_count(),
-        &hash[..8]
-    );
-    for (name, reason) in &skipped {
-        println!("Skipped {name}: {reason}");
+    if format == Format::Table {
+        println!(
+            "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",
+            tables.len(),
+            c.row_count(),
+            &hash[..8]
+        );
+        for (name, reason) in &skipped {
+            println!("Skipped {name}: {reason}");
+        }
+    } else {
+        let mut records = vec![obj([
+            ("kind", Value::String("initialization".into())),
+            ("tables", Value::from(tables.len())),
+            ("rows", Value::from(c.row_count())),
+            ("revision", Value::from(1)),
+            ("root", Value::String(hash)),
+        ])];
+        records.extend(skipped.iter().map(|(name, reason)| {
+            obj([
+                ("kind", Value::String("skipped_directory".into())),
+                ("path", Value::String(name.clone())),
+                ("reason", Value::String(reason.clone())),
+            ])
+        }));
+        output::records(&records, format)?;
     }
     Ok(0)
 }
@@ -935,7 +1001,7 @@ fn infer_standalone(
     _all: bool,
     strictness: &str,
     pk: &[String],
-    _format: Format,
+    format: Format,
     resource_overrides: &crate::config::ResourceOverrides,
 ) -> Result<i32> {
     let strict = match strictness {
@@ -979,9 +1045,7 @@ fn infer_standalone(
             metadata::write_json_atomic(&p, s)?
         }
     } else {
-        for s in schemas.values() {
-            println!("{}", serde_json::to_string_pretty(s).unwrap())
-        }
+        output_schemas(schemas.values(), format)?;
     }
     Ok(0)
 }
@@ -1172,17 +1236,21 @@ fn doctor(
     let plan = crate::doctor::plan(db);
     if let Some(id) = explain {
         if let Some(f) = plan.iter().find(|f| f.id == id) {
-            println!(
-                "{} [{}]: {}\npaths: {}",
-                f.id,
-                f.class,
-                f.description,
-                f.paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            if format == Format::Table {
+                println!(
+                    "{} [{}]: {}\npaths: {}",
+                    f.id,
+                    f.class,
+                    f.description,
+                    f.paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else {
+                output::records(&[serialized_record("doctor_fix", f)?], format)?;
+            }
             return Ok(0);
         }
         return Err(DbError::usage(format!(
@@ -1194,7 +1262,7 @@ fn doctor(
         for class in ["derived", "schema", "layout", "data", "manual"] {
             let items: Vec<_> = plan
                 .iter()
-                .filter(|f| f.class == class && only.is_none_or(|o| o == f.id))
+                .filter(|f| f.class == class && doctor_fix_matches(only, &f.id))
                 .collect();
             if !items.is_empty() {
                 println!("  {class} ({}):", items.len());
@@ -1204,7 +1272,12 @@ fn doctor(
             }
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(&plan).unwrap())
+        let records = plan
+            .iter()
+            .filter(|fix| doctor_fix_matches(only, &fix.id))
+            .map(|fix| serialized_record("doctor_fix", fix))
+            .collect::<Result<Vec<_>>>()?;
+        output::records(&records, format)?;
     }
     if !fix {
         return Ok(if db.diagnostics.is_empty() { 0 } else { 2 });
@@ -1226,7 +1299,17 @@ fn doctor(
     }
     let changes = crate::doctor::repair_changes(db, only, allow_data)?;
     if changes.is_empty() {
-        println!("no applicable automatic fixes");
+        event(
+            format,
+            obj([
+                ("kind", Value::String("no_change".into())),
+                (
+                    "message",
+                    Value::String("no applicable automatic fixes".into()),
+                ),
+            ]),
+            "no applicable automatic fixes",
+        )?;
         return Ok(if db.diagnostics.is_empty() { 0 } else { 2 });
     }
     let touches_rows = changes.iter().any(|c| match c {
@@ -1248,7 +1331,17 @@ fn doctor(
             ));
         }
         create_snapshot(db, &name)?;
-        println!("created snapshot {name}; restore with `db snapshot restore {name} --yes`");
+        event(
+            format,
+            obj([
+                ("kind", Value::String("snapshot".into())),
+                ("name", Value::String(name.clone())),
+                ("action", Value::String("created".into())),
+            ]),
+            &format!(
+                "created snapshot {name}; restore with `db snapshot restore {name} --yes`"
+            ),
+        )?;
     }
     let start = current_root(db)?;
     let paths = transaction::commit(
@@ -1258,6 +1351,7 @@ fn doctor(
         &changes,
         "repair",
         cli.dry_run,
+        db.resource_overrides(),
     )?;
     print_mutation(
         &paths,
@@ -1305,9 +1399,7 @@ fn infer_cmd(
         if pk.is_empty() { None } else { Some(pk) },
     )?;
     if !write {
-        for s in schemas.values() {
-            println!("{}", serde_json::to_string_pretty(s).unwrap())
-        }
+        output_schemas(schemas.values(), format)?;
         return Ok(0);
     }
     let mut changes = vec![];
@@ -1339,6 +1431,7 @@ fn infer_cmd(
         &changes,
         "internal",
         cli.dry_run,
+        db.resource_overrides(),
     )?;
     print_mutation(
         &paths,
@@ -1821,7 +1914,11 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
     match cmd {
         SchemaCommand::Show { table } => {
             let s = schema_for(db, &table)?;
-            println!("{}", serde_json::to_string_pretty(s).unwrap());
+            if format == Format::Table {
+                println!("{}", serde_json::to_string_pretty(s).unwrap());
+            } else {
+                output::records(&[serialized_record("schema", s)?], format)?;
+            }
             Ok(0)
         }
         SchemaCommand::Validate => check(db, format, false),
@@ -3525,6 +3622,7 @@ fn commit_changes(
         &changes,
         origin,
         cli.dry_run,
+        db.resource_overrides(),
     )?;
     if cli.dry_run && origin == "migration" && format == Format::Table {
         let row_files = paths
@@ -3800,6 +3898,44 @@ fn rename_expression_identifier(expr: &str, old: &str, new: &str) -> Result<Stri
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
+fn event(format: Format, record: Map<String, Value>, human: &str) -> Result<()> {
+    if format == Format::Table {
+        println!("{human}");
+        Ok(())
+    } else {
+        output::records(&[record], format)
+    }
+}
+
+fn serialized_record<T: serde::Serialize>(kind: &str, value: &T) -> Result<Map<String, Value>> {
+    let mut object = serde_json::to_value(value)
+        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| {
+            DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                "serialized command record is not an object",
+                6,
+            )
+        })?;
+    object.insert("kind".into(), Value::String(kind.into()));
+    Ok(object)
+}
+
+fn output_schemas<'a>(schemas: impl Iterator<Item = &'a Schema>, format: Format) -> Result<()> {
+    if format == Format::Table {
+        for schema in schemas {
+            println!("{}", serde_json::to_string_pretty(schema).unwrap());
+        }
+        return Ok(());
+    }
+    let records = schemas
+        .map(|schema| serialized_record("schema", schema))
+        .collect::<Result<Vec<_>>>()?;
+    output::records(&records, format)
+}
+
 fn obj<const N: usize>(items: [(&str, Value); N]) -> Map<String, Value> {
     items.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }
