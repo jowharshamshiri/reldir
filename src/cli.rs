@@ -801,6 +801,10 @@ fn cmd_init(
         .into_iter()
         .filter(|table| !ignore_set.is_match(table))
         .collect::<Vec<_>>();
+    let missing = missing
+        .into_iter()
+        .filter(|table| !ignore_set.is_match(table))
+        .collect::<Vec<_>>();
     let reference_catalog = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let schemas = infer::infer_all_with_references(
         &root,

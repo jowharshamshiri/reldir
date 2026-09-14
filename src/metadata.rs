@@ -433,7 +433,10 @@ fn load_provenance(root: &Path, revision: u64) -> Result<Provenance> {
     if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("provenance {} is not a private regular file", path.display()),
+            format!(
+                "provenance {} is not a private regular file",
+                path.display()
+            ),
             6,
         ));
     }

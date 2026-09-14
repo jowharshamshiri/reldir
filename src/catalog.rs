@@ -146,9 +146,9 @@ impl Catalog {
             }
         }
         validate_cross(&c.schemas, &mut c.diagnostics);
-        let ignores = config.ignore_set().map_err(|error| {
-            DbError::new("INTERNAL_METADATA_CORRUPT", error, 6)
-        })?;
+        let ignores = config
+            .ignore_set()
+            .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error, 6))?;
         for (table, s) in &c.schemas {
             let dir = root.join(table);
             c.rows.insert(table.clone(), vec![]);
