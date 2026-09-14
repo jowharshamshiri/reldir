@@ -1078,6 +1078,19 @@ fn action(a: Action) -> &'static str {
 }
 fn query_err(e: rusqlite::Error) -> DbError {
     let msg = e.to_string();
+    if let rusqlite::Error::SqliteFailure(error, _) = &e {
+        let code = match error.extended_code {
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => Some("PRIMARY_KEY_VIOLATION"),
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => Some("UNIQUE_VIOLATION"),
+            rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL => Some("NOT_NULL_VIOLATION"),
+            rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => Some("FOREIGN_KEY_VIOLATION"),
+            rusqlite::ffi::SQLITE_CONSTRAINT_CHECK => Some("CHECK_VIOLATION"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return DbError::new(code, msg, 2);
+        }
+    }
     let interrupted = matches!(
         &e,
         rusqlite::Error::SqliteFailure(error, _)
@@ -1085,6 +1098,8 @@ fn query_err(e: rusqlite::Error) -> DbError {
     );
     let code = if interrupted {
         "RESOURCE_LIMIT"
+    } else if msg.contains("syntax error") {
+        "QUERY_UNSUPPORTED"
     } else if msg.contains("no such table") {
         "UNKNOWN_TABLE"
     } else if msg.contains("no such column") {

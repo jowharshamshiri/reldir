@@ -287,6 +287,17 @@ fn sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
         "--format",
         "table",
         "sql",
+        "INSERT INTO items (id, count, active) VALUES ('a', 2, false)",
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("PRIMARY_KEY_VIOLATION"));
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "sql",
         "UPDATE items SET count = ? WHERE id = 'a'",
         "--param",
         "\"2\"",

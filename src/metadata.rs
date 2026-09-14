@@ -352,15 +352,24 @@ fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()>
 }
 pub fn provenance_head(root: &Path) -> Result<Option<Manifest>> {
     let dir = root.join(".db/provenance");
-    if !dir.exists() {
+    if !ensure_real_directory(&dir, false, "provenance")? {
         return Ok(None);
     }
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
-        if path.extension().and_then(|x| x.to_str()) == Some("json") {
-            paths.push(path);
+        let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+        if !metadata.file_type().is_file()
+            || has_multiple_links(&metadata)
+            || path.extension().and_then(|x| x.to_str()) != Some("json")
+        {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!("unexpected provenance entry {}", path.display()),
+                6,
+            ));
         }
+        paths.push(path);
     }
     paths.sort();
     let Some(path) = paths.last() else {
@@ -420,6 +429,14 @@ pub fn reconcile_after_recovery(root: &Path) -> Result<()> {
 }
 fn load_provenance(root: &Path, revision: u64) -> Result<Provenance> {
     let path = root.join(format!(".db/provenance/{revision:020}.json"));
+    let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("provenance {} is not a private regular file", path.display()),
+            6,
+        ));
+    }
     crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
 }

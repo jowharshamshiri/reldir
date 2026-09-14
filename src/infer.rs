@@ -40,7 +40,23 @@ pub fn discover_tables(root: &Path) -> Result<Vec<String>> {
     for e in fs::read_dir(root).map_err(|e| DbError::io(root, e))? {
         let p = e.map_err(|e| DbError::io(root, e))?.path();
         let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if matches!(n, "schema" | ".db" | ".git") || n.starts_with('.') || !p.is_dir() {
+        if matches!(n, "schema" | ".db" | ".git") || n.starts_with('.') {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&p).map_err(|error| DbError::io(&p, error))?;
+        if metadata.file_type().is_symlink()
+            || (!metadata.file_type().is_dir() && !metadata.file_type().is_file())
+        {
+            return Err(DbError::from_diag(
+                Diagnostic::error(
+                    "NON_REGULAR_FILE",
+                    "top-level candidate is a symlink or special file",
+                )
+                .at(PathBuf::from(n)),
+                8,
+            ));
+        }
+        if !metadata.file_type().is_dir() {
             continue;
         }
         let mut contains_json = false;
@@ -211,9 +227,10 @@ fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>
         .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
     for p in paths {
         let rel = p.strip_prefix(root).unwrap().to_path_buf();
-        if p.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| ignores.is_match(name))
+        if ignores.is_match(&rel)
+            || p.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| ignores.is_match(name))
         {
             continue;
         }

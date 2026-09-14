@@ -166,7 +166,7 @@ impl Catalog {
             for path in read_dir_sorted(&dir)? {
                 let rel = path.strip_prefix(root).unwrap().to_path_buf();
                 let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                if ignores.is_match(name) {
+                if ignores.is_match(&rel) || ignores.is_match(name) {
                     continue;
                 }
                 let norm: String = name.nfc().flat_map(char::to_lowercase).collect();
