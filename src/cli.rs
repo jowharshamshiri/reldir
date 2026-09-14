@@ -817,7 +817,7 @@ fn cmd_init(
     let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash.clone(), entries, "import", None)?;
-    if format == Format::Table {
+    if matches!(format, Format::Table | Format::Sqlite) {
         println!(
             "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",
             tables.len(),
@@ -1585,7 +1585,14 @@ fn update(
         .as_object()
         .ok_or_else(|| DbError::usage("patch must be a JSON object"))?;
     if p.is_empty() {
-        println!("no change: patch is empty");
+        event(
+            format,
+            obj([
+                ("kind", Value::String("no_change".into())),
+                ("message", Value::String("patch is empty".into())),
+            ]),
+            "no change: patch is empty",
+        )?;
         return Ok(0);
     }
     for name in p.keys() {
@@ -1985,7 +1992,18 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
         SchemaCommand::Accept { table } => {
             let mut s = schema_for(db, &table)?.clone();
             if s.inferred.take().is_none() {
-                println!("no change: schema {table} is already accepted");
+                event(
+                    format,
+                    obj([
+                        ("kind", Value::String("no_change".into())),
+                        ("table", Value::String(table.clone())),
+                        (
+                            "message",
+                            Value::String("schema is already accepted".into()),
+                        ),
+                    ]),
+                    &format!("no change: schema {table} is already accepted"),
+                )?;
                 return Ok(0);
             }
             commit_changes(
@@ -2011,7 +2029,16 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
     if format == Format::Sqlite {
         let path = out.ok_or_else(|| DbError::usage("sqlite export requires --out"))?;
         crate::sql::export_sqlite(&db.catalog, table, path)?;
-        println!("exported database to {}", path.display());
+        event(
+            format,
+            obj([
+                ("kind", Value::String("export".into())),
+                ("table", Value::String(table.into())),
+                ("path", Value::String(path.display().to_string())),
+                ("format", Value::String("sqlite".into())),
+            ]),
+            &format!("exported database to {}", path.display()),
+        )?;
         return Ok(0);
     }
     let rows: Vec<_> = db.catalog.rows[table]
@@ -2059,7 +2086,16 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
             }
         };
         fs::write(path, bytes).map_err(|e| DbError::io(path, e))?;
-        println!("exported {} rows to {}", rows.len(), path.display())
+        event(
+            format,
+            obj([
+                ("kind", Value::String("export".into())),
+                ("table", Value::String(table.into())),
+                ("path", Value::String(path.display().to_string())),
+                ("rows", Value::from(rows.len())),
+            ]),
+            &format!("exported {} rows to {}", rows.len(), path.display()),
+        )?
     } else {
         output::records(&rows, format)?
     }
