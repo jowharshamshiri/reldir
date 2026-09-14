@@ -338,13 +338,13 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: array requires items"),
         ));
     }
-    if let Some(default) = &c.default {
-        if !crate::value::matches_column(default, c) {
-            out.push(Diagnostic::error(
-                "SCHEMA_DEFAULT_TYPE_MISMATCH",
-                format!("default for {table}.{name} does not match its type"),
-            ));
-        }
+    if let Some(default) = &c.default
+        && !crate::value::matches_column(default, c)
+    {
+        out.push(Diagnostic::error(
+            "SCHEMA_DEFAULT_TYPE_MISMATCH",
+            format!("default for {table}.{name} does not match its type"),
+        ));
     }
     if let Some(items) = &c.items {
         validate_column(table, &format!("{name}[]"), items, out);

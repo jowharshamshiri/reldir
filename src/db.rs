@@ -34,10 +34,10 @@ pub struct Database {
 impl Database {
     pub fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
         if let Some(p) = explicit {
-            return Ok(abs(p)?);
+            return abs(p);
         }
         if let Ok(p) = env::var("DB_DIR") {
-            return Ok(abs(Path::new(&p))?);
+            return abs(Path::new(&p));
         }
         let mut cur = env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?;
         let mut tried = vec![];

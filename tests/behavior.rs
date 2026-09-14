@@ -492,3 +492,190 @@ fn schema_errors_have_specific_codes_and_locations() {
             .and(predicate::str::contains("schema/bad.json:4")),
     );
 }
+
+#[test]
+fn duplicate_keys_are_rejected_before_any_mutation_is_planned() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+    let before = fs::read_to_string(dir.path().join(".db/manifest.json")).unwrap();
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "table",
+        "insert",
+        "users",
+        r#"{"id":"u3","id":"u4","name":"Carol"}"#,
+    ])
+    .assert()
+    .code(1)
+    .stderr(predicate::str::contains("duplicate object key \"id\""));
+    assert!(!dir.path().join("users/u3.json").exists());
+    assert!(!dir.path().join("users/u4.json").exists());
+    assert_eq!(
+        before,
+        fs::read_to_string(dir.path().join(".db/manifest.json")).unwrap()
+    );
+}
+
+#[test]
+fn defaults_participate_in_identity_and_uniqueness_as_logical_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("items")).unwrap();
+    fs::write(
+        root.join("schema/items.json"),
+        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string","default":"fixed"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("items/fixed.json"), "{}\n").unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    fs::write(
+        root.join("schema/items.json"),
+        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"unique":[["tag"]]}"#,
+    )
+    .unwrap();
+    fs::write(root.join("items/a.json"), "{\"id\":\"a\"}\n").unwrap();
+    fs::write(root.join("items/b.json"), "{\"id\":\"b\"}\n").unwrap();
+    fs::remove_file(root.join("items/fixed.json")).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("UNIQUE_VIOLATION"));
+}
+
+#[test]
+fn check_schema_typechecking_rejects_unknown_identifiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::write(
+        root.join("schema/items.json"),
+        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"count":{"type":"int"}},"check":[{"name":"positive","expr":"typo > 0"}]}"#,
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("SCHEMA_CHECK_INVALID"));
+}
+
+#[test]
+fn configured_indentation_and_command_line_resource_overrides_are_enforced() {
+    let dir = adopted();
+    let root = dir.path();
+    let config_path = root.join(".db/config");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["indentation_width"] = serde_json::Value::from(4);
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "update",
+        "users",
+        "u1",
+        r#"{"name":"Updated"}"#,
+    ])
+    .assert()
+    .success();
+    let row = fs::read_to_string(root.join("users/u1.json")).unwrap();
+    assert!(row.contains("    \"id\": \"u1\""));
+
+    config["max_json_file_size"] = serde_json::Value::from(1);
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("RESOURCE_LIMIT"));
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--max-json-file-size",
+        "100000",
+        "--format",
+        "table",
+        "check",
+    ])
+    .assert()
+    .success();
+}
+
+#[test]
+fn decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("numbers")).unwrap();
+    fs::write(
+        root.join("schema/numbers.json"),
+        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"amount":{"type":"decimal"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("numbers/a.json"),
+        r#"{"id":"a","amount":"1000000000000000000000000000000000000000000"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("numbers/b.json"),
+        r#"{"id":"b","amount":"999999999999999999999999999999999999999999"}"#,
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT id FROM numbers ORDER BY amount",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::starts_with("{\"id\":\"b\""));
+
+    let fake_hash = "f".repeat(64);
+    let fake = root.join(format!(".db/objects/{fake_hash}.json"));
+    fs::write(&fake, "{}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "gc",
+        "--dry-run",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(&fake_hash));
+    assert!(fake.exists());
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "gc"])
+        .assert()
+        .code(9)
+        .stderr(predicate::str::contains("CONFIRMATION_REQUIRED"));
+    assert!(fake.exists());
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "gc",
+        "--yes",
+    ])
+    .assert()
+    .success();
+    assert!(!fake.exists());
+    assert!(fs::read_dir(root.join(".db/objects")).unwrap().count() > 0);
+}

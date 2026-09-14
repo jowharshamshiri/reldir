@@ -43,43 +43,43 @@ pub fn validate(c: &Catalog) -> Vec<Diagnostic> {
                 .filter_map(|r| key(&r.value, &fk.references.columns, target_schema))
                 .collect();
             for row in &c.rows[table] {
-                if let Some(k) = key(&row.value, &fk.columns, s) {
-                    if !targets.contains(&k) {
-                        let constraint = format!(
-                            "{}.{} -> {}.{}",
+                if let Some(k) = key(&row.value, &fk.columns, s)
+                    && !targets.contains(&k)
+                {
+                    let constraint = format!(
+                        "{}.{} -> {}.{}",
+                        table,
+                        fk.columns.join(","),
+                        fk.references.table,
+                        fk.references.columns.join(",")
+                    );
+                    let mut d = Diagnostic::error(
+                        "FOREIGN_KEY_VIOLATION",
+                        format!(
+                            "{}.{} references a row that does not exist",
                             table,
-                            fk.columns.join(","),
-                            fk.references.table,
-                            fk.references.columns.join(",")
-                        );
-                        let mut d = Diagnostic::error(
-                            "FOREIGN_KEY_VIOLATION",
-                            format!(
-                                "{}.{} references a row that does not exist",
-                                table,
-                                fk.columns.join(",")
-                            ),
-                        )
-                        .at(row.relative.clone())
-                        .table(table)
-                        .field(fk.columns.join(","))
-                        .expected(format!(
-                            "existing {}.{}",
-                            fk.references.table,
-                            fk.references.columns.join(",")
-                        ))
-                        .observed(k)
-                        .fix("FIX_ORPHAN_DELETE_ROW");
-                        d.constraint = Some(constraint);
-                        if fk
-                            .columns
-                            .iter()
-                            .all(|x| s.columns.get(x).is_some_and(|c| c.nullable))
-                        {
-                            d.fixes.insert(0, "FIX_ORPHAN_SET_NULL".into())
-                        }
-                        out.push(d)
+                            fk.columns.join(",")
+                        ),
+                    )
+                    .at(row.relative.clone())
+                    .table(table)
+                    .field(fk.columns.join(","))
+                    .expected(format!(
+                        "existing {}.{}",
+                        fk.references.table,
+                        fk.references.columns.join(",")
+                    ))
+                    .observed(k)
+                    .fix("FIX_ORPHAN_DELETE_ROW");
+                    d.constraint = Some(constraint);
+                    if fk
+                        .columns
+                        .iter()
+                        .all(|x| s.columns.get(x).is_some_and(|c| c.nullable))
+                    {
+                        d.fixes.insert(0, "FIX_ORPHAN_SET_NULL".into())
                     }
+                    out.push(d)
                 }
             }
         }

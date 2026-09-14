@@ -28,6 +28,27 @@ pub struct SqlParam {
     pub value: Value,
 }
 
+#[derive(Clone, Copy)]
+pub struct QueryLimits {
+    pub timeout: Option<std::time::Duration>,
+    pub max_rows: usize,
+    pub max_memory: u64,
+    pub max_sort_memory: u64,
+    pub max_temporary_disk: u64,
+}
+
+impl QueryLimits {
+    fn unbounded(timeout: Option<std::time::Duration>) -> Self {
+        Self {
+            timeout,
+            max_rows: usize::MAX,
+            max_memory: u64::MAX,
+            max_sort_memory: u64::MAX,
+            max_temporary_disk: u64::MAX,
+        }
+    }
+}
+
 pub fn execute(catalog: &Catalog, text: &str, params: &[Value]) -> Result<SqlResult> {
     let params: Vec<_> = params
         .iter()
@@ -41,40 +62,18 @@ pub fn execute_with_limits(
     catalog: &Catalog,
     text: &str,
     params: &[Value],
-    timeout: Option<std::time::Duration>,
-    max_rows: usize,
-    max_memory: u64,
-    max_sort_memory: u64,
-    max_temporary_disk: u64,
+    limits: QueryLimits,
 ) -> Result<SqlResult> {
     let params = params
         .iter()
         .cloned()
         .map(|value| SqlParam { name: None, value })
         .collect::<Vec<_>>();
-    execute_params_with_limits(
-        catalog,
-        text,
-        &params,
-        timeout,
-        max_rows,
-        max_memory,
-        max_sort_memory,
-        max_temporary_disk,
-    )
+    execute_params_with_limits(catalog, text, &params, limits)
 }
 
 pub fn execute_params(catalog: &Catalog, text: &str, params: &[SqlParam]) -> Result<SqlResult> {
-    execute_params_with_limits(
-        catalog,
-        text,
-        params,
-        None,
-        usize::MAX,
-        u64::MAX,
-        u64::MAX,
-        u64::MAX,
-    )
+    execute_params_with_limits(catalog, text, params, QueryLimits::unbounded(None))
 }
 pub fn execute_params_timeout(
     catalog: &Catalog,
@@ -82,42 +81,23 @@ pub fn execute_params_timeout(
     params: &[SqlParam],
     timeout: Option<std::time::Duration>,
 ) -> Result<SqlResult> {
-    execute_params_with_limits(
-        catalog,
-        text,
-        params,
-        timeout,
-        usize::MAX,
-        u64::MAX,
-        u64::MAX,
-        u64::MAX,
-    )
+    execute_params_with_limits(catalog, text, params, QueryLimits::unbounded(timeout))
 }
 pub fn execute_params_with_limits(
     catalog: &Catalog,
     text: &str,
     params: &[SqlParam],
-    timeout: Option<std::time::Duration>,
-    max_rows: usize,
-    max_memory: u64,
-    max_sort_memory: u64,
-    max_temporary_disk: u64,
+    limits: QueryLimits,
 ) -> Result<SqlResult> {
     let token = statement_kind(text)?;
-    enforce_query_workspace(
-        catalog,
-        text,
-        max_memory,
-        max_sort_memory,
-        max_temporary_disk,
-    )?;
+    enforce_query_workspace(catalog, text, &limits)?;
     let mut conn = load(catalog, true)?;
-    if let Some(limit) = timeout {
+    if let Some(limit) = limits.timeout {
         let start = std::time::Instant::now();
         conn.progress_handler(1000, Some(move || start.elapsed() >= limit));
     }
     if matches!(token.as_str(), "SELECT" | "WITH" | "EXPLAIN") {
-        let rows = query(&conn, text, params, max_rows, max_memory)?;
+        let rows = query(&conn, text, params, limits.max_rows, limits.max_memory)?;
         return Ok(SqlResult {
             rows,
             changes: vec![],
@@ -153,11 +133,7 @@ pub fn query_each_timeout<F>(
     catalog: &Catalog,
     text: &str,
     params: &[SqlParam],
-    timeout: Option<std::time::Duration>,
-    max_rows: usize,
-    max_memory: u64,
-    max_sort_memory: u64,
-    max_temporary_disk: u64,
+    limits: QueryLimits,
     mut emit: F,
 ) -> Result<usize>
 where
@@ -170,15 +146,9 @@ where
             4,
         ));
     }
-    enforce_query_workspace(
-        catalog,
-        text,
-        max_memory,
-        max_sort_memory,
-        max_temporary_disk,
-    )?;
+    enforce_query_workspace(catalog, text, &limits)?;
     let conn = load(catalog, true)?;
-    if let Some(limit) = timeout {
+    if let Some(limit) = limits.timeout {
         let start = std::time::Instant::now();
         conn.progress_handler(1000, Some(move || start.elapsed() >= limit));
     }
@@ -196,10 +166,13 @@ where
     let mut cursor = statement.raw_query();
     let mut emitted = 0usize;
     while let Some(row) = cursor.next().map_err(query_err)? {
-        if emitted == max_rows {
+        if emitted == limits.max_rows {
             return Err(DbError::new(
                 "RESOURCE_LIMIT",
-                format!("query exceeds the configured limit of {max_rows} result rows"),
+                format!(
+                    "query exceeds the configured limit of {} result rows",
+                    limits.max_rows
+                ),
                 4,
             ));
         }
@@ -208,17 +181,18 @@ where
             let value = from_ref(row.get_ref(index).map_err(query_err)?);
             object.insert(
                 name.clone(),
-                decode_declared(value, declared[index].as_deref()),
+                decode_declared(value, declared[index].as_deref())?,
             );
         }
         let row_size = serde_json::to_vec(&object)
             .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))?
             .len() as u64;
-        if row_size > max_memory {
+        if row_size > limits.max_memory {
             return Err(DbError::new(
                 "RESOURCE_LIMIT",
                 format!(
-                    "one result row exceeds the configured {max_memory} byte query-memory limit"
+                    "one result row exceeds the configured {} byte query-memory limit",
+                    limits.max_memory
                 ),
                 4,
             ));
@@ -265,14 +239,8 @@ fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
     })
 }
 
-fn enforce_query_workspace(
-    catalog: &Catalog,
-    text: &str,
-    max_memory: u64,
-    max_sort_memory: u64,
-    max_temporary_disk: u64,
-) -> Result<()> {
-    if max_memory == 0 || max_sort_memory == 0 || max_temporary_disk == 0 {
+fn enforce_query_workspace(catalog: &Catalog, text: &str, limits: &QueryLimits) -> Result<()> {
+    if limits.max_memory == 0 || limits.max_sort_memory == 0 || limits.max_temporary_disk == 0 {
         return Err(DbError::new(
             "RESOURCE_LIMIT",
             "query resource limits must be greater than zero",
@@ -288,11 +256,12 @@ fn enforce_query_workspace(
                 .checked_add(row.raw.len() as u64)
                 .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "query workspace size overflow", 4))
         })?;
-    if workspace > max_memory {
+    if workspace > limits.max_memory {
         return Err(DbError::new(
             "RESOURCE_LIMIT",
             format!(
-                "query requires {workspace} bytes of relational workspace, exceeding the configured {max_memory} byte query-memory limit"
+                "query requires {workspace} bytes of relational workspace, exceeding the configured {} byte query-memory limit",
+                limits.max_memory
             ),
             4,
         ));
@@ -302,11 +271,12 @@ fn enforce_query_workspace(
         || normalized.contains(" GROUP BY ")
         || normalized.contains(" DISTINCT ")
         || normalized.starts_with("SELECT DISTINCT ");
-    if may_sort && workspace > max_sort_memory {
+    if may_sort && workspace > limits.max_sort_memory {
         return Err(DbError::new(
             "RESOURCE_LIMIT",
             format!(
-                "sort may require {workspace} bytes, exceeding the configured {max_sort_memory} byte sort-memory limit"
+                "sort may require {workspace} bytes, exceeding the configured {} byte sort-memory limit",
+                limits.max_sort_memory
             ),
             4,
         ));
@@ -477,7 +447,7 @@ fn query(
         let mut obj = Map::new();
         for (i, n) in names.iter().enumerate() {
             let value = from_ref(row.get_ref(i).map_err(query_err)?);
-            obj.insert(n.clone(), decode_declared(value, declared[i].as_deref()));
+            obj.insert(n.clone(), decode_declared(value, declared[i].as_deref())?);
         }
         memory = memory
             .checked_add(
@@ -619,7 +589,7 @@ fn dump(
                         }
                     }
                 } else {
-                    v = decode(v, col);
+                    v = decode(v, col)?;
                 }
                 obj.insert(n.clone(), v);
             }
@@ -746,24 +716,95 @@ fn from_ref(v: ValueRef<'_>) -> Value {
         )),
     }
 }
-fn decode(v: Value, c: &crate::schema::Column) -> Value {
-    match c.kind {
-        ColumnType::Bool => Value::Bool(v.as_i64() == Some(1)),
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => v
-            .as_str()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(v),
+fn decode(v: Value, c: &crate::schema::Column) -> Result<Value> {
+    if v.is_null() {
+        return Ok(v);
+    }
+    let decoded = match c.kind {
+        ColumnType::Bool => match v.as_i64() {
+            Some(0) => Value::Bool(false),
+            Some(1) => Value::Bool(true),
+            _ => {
+                return Err(DbError::new(
+                    "TYPE_MISMATCH",
+                    "SQLite returned a non-boolean value for a bool column",
+                    2,
+                ));
+            }
+        },
+        ColumnType::Array | ColumnType::Object | ColumnType::Json => {
+            let text = v.as_str().ok_or_else(|| {
+                DbError::new(
+                    "TYPE_MISMATCH",
+                    "SQLite returned non-text encoded structured JSON",
+                    2,
+                )
+            })?;
+            crate::json::parse_str(text).map_err(|error| {
+                DbError::new(
+                    "TYPE_MISMATCH",
+                    format!("SQLite returned invalid encoded JSON: {error}"),
+                    2,
+                )
+            })?
+        }
         _ => v,
+    };
+    if crate::value::matches_column(&decoded, c) {
+        Ok(decoded)
+    } else {
+        Err(DbError::new(
+            "TYPE_MISMATCH",
+            "SQLite returned a value incompatible with its declared column type",
+            2,
+        ))
     }
 }
-fn decode_declared(v: Value, declared: Option<&str>) -> Value {
+fn decode_declared(v: Value, declared: Option<&str>) -> Result<Value> {
+    if v.is_null() {
+        return Ok(v);
+    }
     match declared {
-        Some("JDB_BLOB_BOOL") => Value::Bool(v.as_i64() == Some(1)),
-        Some("JDB_BLOB_ARRAY" | "JDB_BLOB_OBJECT" | "JDB_BLOB_JSON") => v
-            .as_str()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or(v),
-        _ => v,
+        Some("JDB_BLOB_BOOL") => match v.as_i64() {
+            Some(0) => Ok(Value::Bool(false)),
+            Some(1) => Ok(Value::Bool(true)),
+            _ => Err(DbError::new(
+                "QUERY_TYPE_ERROR",
+                "SQLite returned a non-boolean value for a bool result column",
+                4,
+            )),
+        },
+        Some(kind @ ("JDB_BLOB_ARRAY" | "JDB_BLOB_OBJECT" | "JDB_BLOB_JSON")) => {
+            let text = v.as_str().ok_or_else(|| {
+                DbError::new(
+                    "QUERY_TYPE_ERROR",
+                    format!("SQLite returned non-text encoded data for {kind}"),
+                    4,
+                )
+            })?;
+            let decoded = crate::json::parse_str(text).map_err(|error| {
+                DbError::new(
+                    "QUERY_TYPE_ERROR",
+                    format!("SQLite returned invalid encoded JSON: {error}"),
+                    4,
+                )
+            })?;
+            let correct_shape = match kind {
+                "JDB_BLOB_ARRAY" => decoded.is_array(),
+                "JDB_BLOB_OBJECT" => decoded.is_object(),
+                _ => true,
+            };
+            if correct_shape {
+                Ok(decoded)
+            } else {
+                Err(DbError::new(
+                    "QUERY_TYPE_ERROR",
+                    format!("SQLite returned the wrong JSON shape for {kind}"),
+                    4,
+                ))
+            }
+        }
+        _ => Ok(v),
     }
 }
 fn sqlite_type(kind: &ColumnType) -> &'static str {
@@ -1038,7 +1079,7 @@ pub fn validate_checks(c: &Catalog) -> Vec<Diagnostic> {
     }
     let conn = match load(c, false) {
         Ok(connection) => connection,
-        Err(error) => return vec![error.diagnostic],
+        Err(error) => return vec![*error.diagnostic],
     };
     let mut out = vec![];
     for (table, s) in &c.schemas {
@@ -1086,10 +1127,22 @@ pub fn validate_checks(c: &Catalog) -> Vec<Diagnostic> {
                                     for (index, column) in s.primary_key.iter().enumerate() {
                                         match result.get_ref(index) {
                                             Ok(value) => {
-                                                key_row.insert(
-                                                    column.clone(),
-                                                    decode(from_ref(value), &s.columns[column]),
-                                                );
+                                                match decode(from_ref(value), &s.columns[column]) {
+                                                    Ok(value) => {
+                                                        key_row.insert(column.clone(), value);
+                                                    }
+                                                    Err(error) => {
+                                                        out.push(
+                                                            Diagnostic::error(
+                                                                "SCHEMA_CHECK_INVALID",
+                                                                error.to_string(),
+                                                            )
+                                                            .table(table),
+                                                        );
+                                                        failed = true;
+                                                        break;
+                                                    }
+                                                }
                                             }
                                             Err(error) => {
                                                 out.push(

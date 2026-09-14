@@ -143,7 +143,7 @@ impl Catalog {
                         );
                     }
                 }
-                Err(e) => c.diagnostics.push(e.diagnostic),
+                Err(e) => c.diagnostics.push(*e.diagnostic),
             }
         }
         validate_cross(&c.schemas, &mut c.diagnostics);
@@ -426,19 +426,19 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                 );
             }
             for (a, b) in fk.columns.iter().zip(&fk.references.columns) {
-                if let (Some(x), Some(y)) = (s.columns.get(a), target.columns.get(b)) {
-                    if x.kind != y.kind {
-                        out.push(
-                            Diagnostic::error(
-                                "SCHEMA_FK_TYPE_MISMATCH",
-                                format!(
-                                    "{table}.{a} and {}.{b} have different types",
-                                    fk.references.table
-                                ),
-                            )
-                            .table(table),
-                        );
-                    }
+                if let (Some(x), Some(y)) = (s.columns.get(a), target.columns.get(b))
+                    && x.kind != y.kind
+                {
+                    out.push(
+                        Diagnostic::error(
+                            "SCHEMA_FK_TYPE_MISMATCH",
+                            format!(
+                                "{table}.{a} and {}.{b} have different types",
+                                fk.references.table
+                            ),
+                        )
+                        .table(table),
+                    );
                 }
             }
             if [fk.delete_action(), fk.update_action()].contains(&crate::schema::Action::SetNull)

@@ -47,6 +47,85 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
     }
 }
 
+/// Convert a value only when the target representation preserves its logical
+/// value. This is shared by doctor and migrations so the database has one
+/// definition of a safe implicit conversion.
+pub fn lossless_convert(value: &Value, target: &Column) -> Option<Value> {
+    if matches_column(value, target) {
+        return Some(value.clone());
+    }
+    if value.is_null() {
+        return None;
+    }
+
+    let converted = match target.kind {
+        ColumnType::Bool => match value.as_str()? {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => return None,
+        },
+        ColumnType::Int => {
+            if let Some(text) = value.as_str() {
+                let number = text.parse::<i64>().ok()?;
+                if number.to_string() != text {
+                    return None;
+                }
+                Value::Number(number.into())
+            } else {
+                let number = value.as_f64()?;
+                if !number.is_finite()
+                    || number.fract() != 0.0
+                    || number < i64::MIN as f64
+                    || number > i64::MAX as f64
+                {
+                    return None;
+                }
+                let integer = number as i64;
+                if integer as f64 != number {
+                    return None;
+                }
+                Value::Number(integer.into())
+            }
+        }
+        ColumnType::Float => {
+            let number = value.as_str()?.parse::<f64>().ok()?;
+            if !number.is_finite() {
+                return None;
+            }
+            Value::Number(serde_json::Number::from_f64(number)?)
+        }
+        ColumnType::Decimal => {
+            if let Some(integer) = value.as_i64() {
+                Value::String(integer.to_string())
+            } else {
+                return None;
+            }
+        }
+        ColumnType::String => match value {
+            Value::Bool(boolean) => Value::String(boolean.to_string()),
+            Value::Number(number) => Value::String(number.to_string()),
+            _ => return None,
+        },
+        ColumnType::Timestamp => {
+            let timestamp = DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+            Value::String(
+                timestamp
+                    .with_timezone(&chrono::Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+            )
+        }
+        ColumnType::Json => value.clone(),
+        ColumnType::Bytes
+        | ColumnType::Date
+        | ColumnType::Uuid
+        | ColumnType::Ulid
+        | ColumnType::Enum
+        | ColumnType::Array
+        | ColumnType::Object => return None,
+    };
+    matches_column(&converted, target).then_some(converted)
+}
+
 pub fn canonical_decimal(text: &str) -> bool {
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     if unsigned.is_empty() || text.starts_with('+') || text == "-0" {

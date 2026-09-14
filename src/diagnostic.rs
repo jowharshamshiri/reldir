@@ -111,19 +111,22 @@ impl Diagnostic {
 #[derive(Debug, thiserror::Error)]
 #[error("{diagnostic:?}")]
 pub struct DbError {
-    pub diagnostic: Diagnostic,
+    pub diagnostic: Box<Diagnostic>,
     pub exit: i32,
 }
 
 impl DbError {
     pub fn new(code: &str, message: impl Into<String>, exit: i32) -> Self {
         Self {
-            diagnostic: Diagnostic::error(code, message),
+            diagnostic: Box::new(Diagnostic::error(code, message)),
             exit,
         }
     }
     pub fn from_diag(diagnostic: Diagnostic, exit: i32) -> Self {
-        Self { diagnostic, exit }
+        Self {
+            diagnostic: Box::new(diagnostic),
+            exit,
+        }
     }
     pub fn usage(message: impl Into<String>) -> Self {
         Self::new("USAGE", message, 1)

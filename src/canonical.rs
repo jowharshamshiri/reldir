@@ -33,10 +33,10 @@ pub fn canonical_row(row: &Map<String, Value>, schema: &Schema) -> Value {
             .cloned()
             .or_else(|| col.default.clone())
             .unwrap_or(Value::Null);
-        if col.kind == crate::schema::ColumnType::Timestamp {
-            if let Some(s) = value::textual(&v, col) {
-                v = Value::String(s);
-            }
+        if col.kind == crate::schema::ColumnType::Timestamp
+            && let Some(s) = value::textual(&v, col)
+        {
+            v = Value::String(s);
         }
         out.insert(name.nfc().collect(), normalize(&v));
     }

@@ -18,6 +18,7 @@ pub enum Change {
     Delete { path: PathBuf },
 }
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Journal {
     id: String,
     start_root: String,
@@ -25,6 +26,7 @@ struct Journal {
     changes: Vec<JournalChange>,
 }
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JournalChange {
     path: PathBuf,
     stage: Option<String>,
@@ -42,14 +44,12 @@ pub fn commit(
     if changes.is_empty() {
         return Ok(vec![]);
     }
-    let mut writes = std::collections::BTreeSet::new();
-    let mut deletes = std::collections::BTreeSet::new();
+    let mut mutation_paths = std::collections::BTreeSet::new();
     for change in changes {
-        let (path, seen) = match change {
-            Change::Write { path, .. } => (path, &mut writes),
-            Change::Delete { path } => (path, &mut deletes),
+        let path = match change {
+            Change::Write { path, .. } | Change::Delete { path } => path,
         };
-        if !seen.insert(path.clone()) {
+        if !mutation_paths.insert(path.clone()) {
             return Err(DbError::new(
                 "MUTATION_CONFLICT",
                 format!(
@@ -107,12 +107,15 @@ pub fn commit(
         )
     })?;
     let current = Catalog::observe(root, config)?;
-    let (current_hash, _) = metadata::state(&current)?;
+    let (current_hash, current_entries) = metadata::state(&current)?;
     if current_hash != start_root {
+        let changed = conflict_paths(root, start_root, &current_entries)?;
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "CONCURRENT_MODIFICATION",
-                "authoritative files changed while the mutation was being planned",
+                format!(
+                    "authoritative files changed while the mutation was being planned: {changed}"
+                ),
             )
             .expected(start_root)
             .observed(current_hash),
@@ -151,13 +154,14 @@ pub fn commit(
     };
     metadata::write_json_atomic(&dir.join("journal.json"), &journal)?;
     let rechecked = Catalog::observe(root, config)?;
-    let (rechecked_root, _) = metadata::state(&rechecked)?;
+    let (rechecked_root, rechecked_entries) = metadata::state(&rechecked)?;
     if rechecked_root != start_root {
         fs::remove_dir_all(&dir).map_err(|e| DbError::io(&dir, e))?;
+        let changed = conflict_paths(root, start_root, &rechecked_entries)?;
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "CONCURRENT_MODIFICATION",
-                "authoritative files changed while the transaction was staged",
+                format!("authoritative files changed while the transaction was staged: {changed}"),
             )
             .expected(start_root)
             .observed(rechecked_root),
@@ -197,6 +201,23 @@ pub fn commit(
             Change::Write { path, .. } | Change::Delete { path } => path.clone(),
         })
         .collect())
+}
+
+fn conflict_paths(
+    root: &Path,
+    start_root: &str,
+    current: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
+) -> Result<String> {
+    let manifest = metadata::load_manifest(root)?;
+    let paths = manifest
+        .filter(|manifest| manifest.root_hash == start_root)
+        .map(|manifest| metadata::diff_entries(Some(&manifest.entries), current))
+        .unwrap_or_default();
+    Ok(if paths.is_empty() {
+        "paths could not be localized from the recorded start state".into()
+    } else {
+        paths.join(", ")
+    })
 }
 
 fn validate_prospective(
@@ -282,12 +303,21 @@ fn validate_prospective(
                 if let Some(p) = target.parent() {
                     fs::create_dir_all(p).map_err(|e| DbError::io(p, e))?
                 }
+                if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir())
+                {
+                    fs::remove_dir_all(&target).map_err(|e| DbError::io(&target, e))?;
+                }
                 fs::write(&target, bytes).map_err(|e| DbError::io(&target, e))?
             }
             Change::Delete { path } => {
                 let target = shadow.join(path);
-                if target.exists() {
-                    fs::remove_file(&target).map_err(|e| DbError::io(&target, e))?
+                match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {
+                        fs::remove_dir_all(&target).map_err(|e| DbError::io(&target, e))?
+                    }
+                    Ok(_) => fs::remove_file(&target).map_err(|e| DbError::io(&target, e))?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(DbError::io(&target, error)),
                 }
             }
         }
@@ -300,8 +330,22 @@ fn validate_prospective(
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let future = Catalog::observe(shadow, &future_config)?;
     let errors = integrity::validate(&future);
-    if let Some(d) = errors.into_iter().next() {
-        return Err(DbError::from_diag(d, 2));
+    if let Some(mut diagnostic) = errors.first().cloned() {
+        let residual = errors
+            .iter()
+            .map(|error| {
+                error.path.as_ref().map_or_else(
+                    || error.code.clone(),
+                    |path| format!("{} at {}", error.code, path.display()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        diagnostic.help = Some(format!(
+            "the prospective transaction was rejected with {} residual violation(s): {residual}",
+            errors.len()
+        ));
+        return Err(DbError::from_diag(diagnostic, 2));
     }
     Ok(())
 }
@@ -318,14 +362,29 @@ fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
 }
 
 fn apply_journal(root: &Path, dir: &Path, j: &Journal) -> Result<()> {
+    validate_journal(dir, j)?;
     for c in &j.changes {
         let target = root.join(&c.path);
+        validate_target_parent(root, &c.path)?;
         if let Some(stage) = &c.stage {
             let source = dir.join("staged").join(stage);
-            if !source.exists() {
+            let source_metadata = fs::symlink_metadata(&source).map_err(|error| {
+                DbError::new(
+                    "TRANSACTION_INCOMPLETE",
+                    format!(
+                        "transaction {} is missing or cannot inspect staged object {stage}: {error}",
+                        j.id
+                    ),
+                    5,
+                )
+            })?;
+            if !source_metadata.file_type().is_file() || has_multiple_links(&source_metadata) {
                 return Err(DbError::new(
                     "TRANSACTION_INCOMPLETE",
-                    format!("transaction {} is missing staged object {stage}", j.id),
+                    format!(
+                        "transaction {} staged object {stage} is not a private regular file",
+                        j.id
+                    ),
                     5,
                 ));
             }
@@ -337,11 +396,119 @@ fn apply_journal(root: &Path, dir: &Path, j: &Journal) -> Result<()> {
             fs::File::open(&temp)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| DbError::io(&temp, e))?;
+            if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+                fs::remove_dir_all(&target).map_err(|e| DbError::io(&target, e))?;
+            }
             fs::rename(&temp, &target).map_err(|e| DbError::io(&target, e))?;
             metadata::sync_parent(&target)?
-        } else if target.exists() {
-            fs::remove_file(&target).map_err(|e| DbError::io(&target, e))?;
-            metadata::sync_parent(&target)?
+        } else {
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    fs::remove_dir_all(&target).map_err(|e| DbError::io(&target, e))?;
+                    metadata::sync_parent(&target)?
+                }
+                Ok(_) => {
+                    fs::remove_file(&target).map_err(|e| DbError::io(&target, e))?;
+                    metadata::sync_parent(&target)?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(DbError::io(&target, error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_journal(dir: &Path, journal: &Journal) -> Result<()> {
+    let directory_id = dir.file_name().and_then(|name| name.to_str());
+    if uuid::Uuid::parse_str(&journal.id).is_err() || directory_id != Some(journal.id.as_str()) {
+        return Err(DbError::new(
+            "TRANSACTION_INCOMPLETE",
+            "transaction journal id does not match its directory",
+            5,
+        ));
+    }
+    if !matches!(
+        journal.origin.as_str(),
+        "internal" | "recovery" | "repair" | "migration" | "import" | "snapshot_restore"
+    ) {
+        return Err(DbError::new(
+            "TRANSACTION_INCOMPLETE",
+            format!("transaction has invalid origin {:?}", journal.origin),
+            5,
+        ));
+    }
+    if journal.changes.is_empty() {
+        return Err(DbError::new(
+            "TRANSACTION_INCOMPLETE",
+            "transaction journal contains no changes",
+            5,
+        ));
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut stages = std::collections::BTreeSet::new();
+    for change in &journal.changes {
+        safe_relative(&change.path).map_err(|error| {
+            DbError::new(
+                "TRANSACTION_INCOMPLETE",
+                format!(
+                    "unsafe path in transaction journal: {}",
+                    error.diagnostic.message
+                ),
+                5,
+            )
+        })?;
+        if !paths.insert(change.path.clone()) {
+            return Err(DbError::new(
+                "TRANSACTION_INCOMPLETE",
+                format!("transaction repeats path {}", change.path.display()),
+                5,
+            ));
+        }
+        if let Some(stage) = &change.stage {
+            let stage_path = Path::new(stage);
+            if stage_path.components().count() != 1
+                || !matches!(stage_path.components().next(), Some(Component::Normal(_)))
+                || !stages.insert(stage)
+            {
+                return Err(DbError::new(
+                    "TRANSACTION_INCOMPLETE",
+                    format!("transaction has unsafe or duplicate staged object {stage:?}"),
+                    5,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_target_parent(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let Component::Normal(component) = component else {
+                return Err(DbError::new(
+                    "PATH_VIOLATION",
+                    format!("unsafe transaction path {}", relative.display()),
+                    5,
+                ));
+            };
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if !metadata.file_type().is_dir() => {
+                    return Err(DbError::new(
+                        "CONCURRENT_MODIFICATION",
+                        format!(
+                            "transaction target parent {} is no longer a real directory",
+                            current.display()
+                        ),
+                        3,
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(DbError::io(&current, error)),
+            }
         }
     }
     Ok(())
@@ -367,8 +534,16 @@ pub fn recover(root: &Path) -> Result<bool> {
     let mut recovered = false;
     for e in fs::read_dir(&tx).map_err(|e| DbError::io(&tx, e))? {
         let dir = e.map_err(|e| DbError::io(&tx, e))?.path();
-        if !dir.is_dir() {
-            continue;
+        let metadata = fs::symlink_metadata(&dir).map_err(|error| DbError::io(&dir, error))?;
+        if !metadata.file_type().is_dir() {
+            return Err(DbError::new(
+                "TRANSACTION_INCOMPLETE",
+                format!(
+                    "transaction entry {} is not a real directory",
+                    dir.display()
+                ),
+                5,
+            ));
         }
         let jp = dir.join("journal.json");
         if !jp.exists() {

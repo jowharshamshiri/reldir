@@ -8,19 +8,22 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub format_version: u32,
     pub revision: u64,
     pub root_hash: String,
     pub entries: BTreeMap<String, ManifestEntry>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub kind: String,
     pub hash: String,
     pub size: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     pub revision: u64,
     pub timestamp: String,
@@ -142,9 +145,17 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
-        if path.extension().and_then(|x| x.to_str()) == Some("json") {
-            paths.push(path);
+        let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+        if !metadata.file_type().is_file()
+            || path.extension().and_then(|x| x.to_str()) != Some("json")
+        {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!("unexpected provenance entry {}", path.display()),
+                6,
+            ));
         }
+        paths.push(path);
     }
     paths.sort();
     let mut prior: Option<Provenance> = None;
@@ -170,10 +181,48 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
                 6,
             ));
         }
-        if let Some(p) = &prior {
-            if value.revision != p.revision + 1
-                || value.previous_revision != Some(p.revision)
-                || value.previous_root_hash.as_deref() != Some(&p.new_root_hash)
+        let expected_name = format!("{:020}.json", value.revision);
+        if path.file_name().and_then(|name| name.to_str()) != Some(&expected_name) {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!(
+                    "provenance filename does not match revision {}",
+                    value.revision
+                ),
+                6,
+            ));
+        }
+        if !matches!(
+            value.origin.as_str(),
+            "internal"
+                | "external"
+                | "recovery"
+                | "repair"
+                | "migration"
+                | "import"
+                | "snapshot_restore"
+        ) {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!("unknown provenance origin {:?}", value.origin),
+                6,
+            ));
+        }
+        match &prior {
+            None if value.revision != 1
+                || value.previous_revision.is_some()
+                || value.previous_root_hash.is_some() =>
+            {
+                return Err(DbError::new(
+                    "INTERNAL_METADATA_CORRUPT",
+                    "provenance history must begin at revision 1 without a predecessor",
+                    6,
+                ));
+            }
+            Some(p)
+                if value.revision != p.revision + 1
+                    || value.previous_revision != Some(p.revision)
+                    || value.previous_root_hash.as_deref() != Some(&p.new_root_hash) =>
             {
                 return Err(DbError::new(
                     "INTERNAL_METADATA_CORRUPT",
@@ -181,17 +230,110 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
                     6,
                 ));
             }
+            _ => {}
+        }
+        for (object_path, entry) in &value.entries {
+            validate_object(root, object_path, entry)?;
         }
         prior = Some(value);
     }
-    if let (Some(last), Some(m)) = (prior, manifest) {
-        if last.revision != m.revision || last.new_root_hash != m.root_hash {
-            return Err(DbError::new(
+    if let (Some(last), Some(m)) = (prior, manifest)
+        && (last.revision != m.revision
+            || last.new_root_hash != m.root_hash
+            || last.entries != m.entries)
+    {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            "manifest does not match the latest provenance record",
+            6,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()> {
+    if entry.hash.len() != 64
+        || !entry
+            .hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("invalid object hash {:?} for {path}", entry.hash),
+            6,
+        ));
+    }
+    let expected_kind = if path == ".db/format" {
+        "format"
+    } else if path == ".db/config" {
+        "config"
+    } else if path.starts_with("schema/") && path.ends_with(".json") {
+        "schema"
+    } else {
+        "row"
+    };
+    if entry.kind != expected_kind {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!(
+                "object {path} has kind {:?}, expected {expected_kind:?}",
+                entry.kind
+            ),
+            6,
+        ));
+    }
+    let object = root.join(format!(".db/objects/{}.json", entry.hash));
+    let metadata = fs::symlink_metadata(&object).map_err(|error| {
+        DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("missing revision object {}: {error}", object.display()),
+            6,
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("revision object {} is not a regular file", object.display()),
+            6,
+        ));
+    }
+    let bytes = fs::read(&object).map_err(|error| DbError::io(&object, error))?;
+    let value = crate::json::parse(&bytes).map_err(|error| {
+        DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("invalid revision object {}: {error}", object.display()),
+            6,
+        )
+    })?;
+    let canonical = if entry.kind == "format" {
+        let text = value.as_str().ok_or_else(|| {
+            DbError::new(
                 "INTERNAL_METADATA_CORRUPT",
-                "manifest does not match the latest provenance record",
+                format!(
+                    "format revision object {} is not a string",
+                    object.display()
+                ),
                 6,
-            ));
-        }
+            )
+        })?;
+        format!("{}\n", text.trim()).into_bytes()
+    } else if entry.kind == "row" {
+        // Row object order is semantic canonical order: schema columns first,
+        // then permitted extras. The object store preserves that order.
+        serde_json::to_vec(&value).map_err(internal)?
+    } else {
+        serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?
+    };
+    if canonical::hash_bytes(&canonical) != entry.hash {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!(
+                "revision object {} does not match its hash",
+                object.display()
+            ),
+            6,
+        ));
     }
     Ok(())
 }

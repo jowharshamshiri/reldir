@@ -53,33 +53,26 @@ pub fn plan(db: &Database) -> Vec<Fix> {
                 }
             }
             "TYPE_MISMATCH" => {
-                if let (Some(path), Some(field)) = (&d.path, &d.field) {
-                    if let Some(row) = db
+                if let (Some(path), Some(field)) = (&d.path, &d.field)
+                    && let Some(row) = db
                         .catalog
                         .rows
                         .values()
                         .flatten()
                         .find(|r| &r.relative == path)
-                    {
-                        if lossless_coerce(
-                            row.value.get(field).unwrap_or(&serde_json::Value::Null),
-                            &db.catalog.schemas[&row.table].columns[field],
-                        )
-                        .is_some()
-                        {
-                            out.push(Fix {
-                                id: "FIX_COERCE_VALUE".into(),
-                                class: "data".into(),
-                                description: format!(
-                                    "losslessly coerce {} in {}",
-                                    field,
-                                    path.display()
-                                ),
-                                paths: vec![path.clone()],
-                            });
-                            continue;
-                        }
-                    }
+                    && lossless_coerce(
+                        row.value.get(field).unwrap_or(&serde_json::Value::Null),
+                        &db.catalog.schemas[&row.table].columns[field],
+                    )
+                    .is_some()
+                {
+                    out.push(Fix {
+                        id: "FIX_COERCE_VALUE".into(),
+                        class: "data".into(),
+                        description: format!("losslessly coerce {} in {}", field, path.display()),
+                        paths: vec![path.clone()],
+                    });
+                    continue;
                 }
                 if let Some(path) = &d.path {
                     out.push(Fix {
@@ -377,19 +370,17 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
     for d in &db.diagnostics {
         if d.code == "IDENTITY_MISMATCH"
             && only.is_none_or(|x| x == "IDENTITY_MISMATCH" || x == "FIX_RENAME_TO_IDENTITY")
+            && let (Some(old), Some(expected)) = (&d.path, &d.expected)
+            && !expected.contains('/')
         {
-            if let (Some(old), Some(expected)) = (&d.path, &d.expected) {
-                if !expected.contains('/') {
-                    let new = old
-                        .parent()
-                        .unwrap_or(std::path::Path::new(""))
-                        .join(expected);
-                    let bytes = std::fs::read(db.root.join(old))
-                        .map_err(|e| crate::diagnostic::DbError::io(&db.root.join(old), e))?;
-                    out.push(Change::Delete { path: old.clone() });
-                    out.push(Change::Write { path: new, bytes });
-                }
-            }
+            let new = old
+                .parent()
+                .unwrap_or(std::path::Path::new(""))
+                .join(expected);
+            let bytes = std::fs::read(db.root.join(old))
+                .map_err(|e| crate::diagnostic::DbError::io(&db.root.join(old), e))?;
+            out.push(Change::Delete { path: old.clone() });
+            out.push(Change::Write { path: new, bytes });
         }
         if !allow_data {
             continue;
@@ -402,122 +393,114 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
             if only == Some("FIX_RENAME_FIELD") && near_field(db, d).is_none() {
                 continue;
             }
-            if let (Some(path), Some(field)) = (&d.path, &d.field) {
-                if let Some(row) = db
+            if let (Some(path), Some(field)) = (&d.path, &d.field)
+                && let Some(row) = db
                     .catalog
                     .rows
                     .values()
                     .flatten()
                     .find(|r| &r.relative == path)
+            {
+                let s = &db.catalog.schemas[&row.table];
+                let mut value = row.value.clone();
+                let old = value.remove(field).unwrap_or(serde_json::Value::Null);
+                if only != Some("FIX_DROP_UNKNOWN_FIELD")
+                    && let Some(to) = near_field(db, d)
                 {
-                    let s = &db.catalog.schemas[&row.table];
-                    let mut value = row.value.clone();
-                    let old = value.remove(field).unwrap_or(serde_json::Value::Null);
-                    if only != Some("FIX_DROP_UNKNOWN_FIELD") {
-                        if let Some(to) = near_field(db, d) {
-                            value.insert(to, old);
-                        }
-                    }
-                    out.push(Change::Write {
-                        path: path.clone(),
-                        bytes: canonical::pretty_with_indent(
-                            &canonical::canonical_row(&value, s),
-                            db.config.indentation_width,
-                        ),
-                    });
+                    value.insert(to, old);
                 }
+                out.push(Change::Write {
+                    path: path.clone(),
+                    bytes: canonical::pretty_with_indent(
+                        &canonical::canonical_row(&value, s),
+                        db.config.indentation_width,
+                    ),
+                });
             }
         }
         if d.code == "TYPE_MISMATCH"
             && only.is_none_or(|x| x == "TYPE_MISMATCH" || x == "FIX_COERCE_VALUE")
+            && let (Some(path), Some(field)) = (&d.path, &d.field)
+            && let Some(row) = db
+                .catalog
+                .rows
+                .values()
+                .flatten()
+                .find(|r| &r.relative == path)
         {
-            if let (Some(path), Some(field)) = (&d.path, &d.field) {
-                if let Some(row) = db
-                    .catalog
-                    .rows
-                    .values()
-                    .flatten()
-                    .find(|r| &r.relative == path)
-                {
-                    let s = &db.catalog.schemas[&row.table];
-                    if let Some(value) = lossless_coerce(
-                        row.value.get(field).unwrap_or(&serde_json::Value::Null),
-                        &s.columns[field],
-                    ) {
-                        let mut body = row.value.clone();
-                        body.insert(field.clone(), value);
-                        out.push(Change::Write {
-                            path: path.clone(),
-                            bytes: canonical::pretty_with_indent(
-                                &canonical::canonical_row(&body, s),
-                                db.config.indentation_width,
-                            ),
-                        });
-                    }
-                }
+            let s = &db.catalog.schemas[&row.table];
+            if let Some(value) = lossless_coerce(
+                row.value.get(field).unwrap_or(&serde_json::Value::Null),
+                &s.columns[field],
+            ) {
+                let mut body = row.value.clone();
+                body.insert(field.clone(), value);
+                out.push(Change::Write {
+                    path: path.clone(),
+                    bytes: canonical::pretty_with_indent(
+                        &canonical::canonical_row(&body, s),
+                        db.config.indentation_width,
+                    ),
+                });
             }
         }
-        if d.code == "FOREIGN_KEY_VIOLATION" && only.is_none_or(|x| x == "FIX_ORPHAN_SET_NULL") {
-            if let (Some(path), Some(fields)) = (&d.path, &d.field) {
-                if let Some(row) = db
-                    .catalog
-                    .rows
-                    .values()
-                    .flatten()
-                    .find(|r| &r.relative == path)
-                {
-                    let s = &db.catalog.schemas[&row.table];
-                    let names: Vec<_> = fields.split(',').collect();
-                    if names
-                        .iter()
-                        .all(|f| s.columns.get(*f).is_some_and(|c| c.nullable))
-                    {
-                        let mut value = row.value.clone();
-                        for f in names {
-                            value.insert(f.into(), serde_json::Value::Null);
-                        }
-                        out.push(Change::Write {
-                            path: path.clone(),
-                            bytes: canonical::pretty_with_indent(
-                                &canonical::canonical_row(&value, s),
-                                db.config.indentation_width,
-                            ),
-                        });
-                    }
+        if d.code == "FOREIGN_KEY_VIOLATION"
+            && only.is_none_or(|x| x == "FIX_ORPHAN_SET_NULL")
+            && let (Some(path), Some(fields)) = (&d.path, &d.field)
+            && let Some(row) = db
+                .catalog
+                .rows
+                .values()
+                .flatten()
+                .find(|r| &r.relative == path)
+        {
+            let s = &db.catalog.schemas[&row.table];
+            let names: Vec<_> = fields.split(',').collect();
+            if names
+                .iter()
+                .all(|f| s.columns.get(*f).is_some_and(|c| c.nullable))
+            {
+                let mut value = row.value.clone();
+                for f in names {
+                    value.insert(f.into(), serde_json::Value::Null);
                 }
+                out.push(Change::Write {
+                    path: path.clone(),
+                    bytes: canonical::pretty_with_indent(
+                        &canonical::canonical_row(&value, s),
+                        db.config.indentation_width,
+                    ),
+                });
             }
         }
         if d.code == "FOREIGN_KEY_VIOLATION"
             && (only.is_some_and(|x| x == "FOREIGN_KEY_VIOLATION" || x == "FIX_ORPHAN_DELETE_ROW")
                 || (only.is_none() && !d.fixes.iter().any(|x| x == "FIX_ORPHAN_SET_NULL")))
+            && let Some(path) = &d.path
+            && let Some(row) = db
+                .catalog
+                .rows
+                .values()
+                .flatten()
+                .find(|r| &r.relative == path)
         {
-            if let Some(path) = &d.path {
-                if let Some(row) = db
-                    .catalog
-                    .rows
-                    .values()
-                    .flatten()
-                    .find(|r| &r.relative == path)
-                {
-                    let s = &db.catalog.schemas[&row.table];
-                    let where_sql = s
-                        .primary_key
-                        .iter()
-                        .map(|c| format!("\"{}\" = ?", c.replace('"', "\"\"")))
-                        .collect::<Vec<_>>()
-                        .join(" AND ");
-                    let query = format!(
-                        "DELETE FROM \"{}\" WHERE {where_sql}",
-                        row.table.replace('"', "\"\"")
-                    );
-                    let params: Vec<_> = s
-                        .primary_key
-                        .iter()
-                        .map(|c| row.value.get(c).cloned().unwrap_or(serde_json::Value::Null))
-                        .collect();
-                    out.extend(crate::sql::execute(&db.catalog, &query, &params)?.changes);
-                }
-            }
+            let s = &db.catalog.schemas[&row.table];
+            let where_sql = s
+                .primary_key
+                .iter()
+                .map(|c| format!("\"{}\" = ?", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let query = format!(
+                "DELETE FROM \"{}\" WHERE {where_sql}",
+                row.table.replace('"', "\"\"")
+            );
+            let params: Vec<_> = s
+                .primary_key
+                .iter()
+                .map(|c| row.value.get(c).cloned().unwrap_or(serde_json::Value::Null))
+                .collect();
+            out.extend(crate::sql::execute(&db.catalog, &query, &params)?.changes);
         }
     }
     let mut moves = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
@@ -529,15 +512,15 @@ pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Re
         {
             continue;
         }
-        if let (Some(old), Some(expected)) = (&diagnostic.path, &diagnostic.expected) {
-            if !expected.contains('/') {
-                moves.insert(
-                    old.clone(),
-                    old.parent()
-                        .unwrap_or(std::path::Path::new(""))
-                        .join(expected),
-                );
-            }
+        if let (Some(old), Some(expected)) = (&diagnostic.path, &diagnostic.expected)
+            && !expected.contains('/')
+        {
+            moves.insert(
+                old.clone(),
+                old.parent()
+                    .unwrap_or(std::path::Path::new(""))
+                    .join(expected),
+            );
         }
     }
     // Merge independent, lossless edits to the same row relative to the
@@ -646,38 +629,7 @@ fn lossless_coerce(
     value: &serde_json::Value,
     column: &crate::schema::Column,
 ) -> Option<serde_json::Value> {
-    let s = value.as_str()?;
-    match column.kind {
-        ColumnType::Bool => match s {
-            "true" => Some(serde_json::Value::Bool(true)),
-            "false" => Some(serde_json::Value::Bool(false)),
-            _ => None,
-        },
-        ColumnType::Int => {
-            let n = s.parse::<i64>().ok()?;
-            if n.to_string() == s {
-                Some(n.into())
-            } else {
-                None
-            }
-        }
-        ColumnType::Float => {
-            let n = s.parse::<f64>().ok()?;
-            if n.is_finite() {
-                serde_json::Number::from_f64(n).map(serde_json::Value::Number)
-            } else {
-                None
-            }
-        }
-        ColumnType::Timestamp => {
-            let t = chrono::DateTime::parse_from_rfc3339(s).ok()?;
-            Some(serde_json::Value::String(
-                t.with_timezone(&chrono::Utc)
-                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            ))
-        }
-        _ => None,
-    }
+    crate::value::lossless_convert(value, column)
 }
 fn near_field(db: &Database, d: &crate::diagnostic::Diagnostic) -> Option<String> {
     let table = d.table.as_ref()?;
@@ -697,7 +649,7 @@ fn near_field(db: &Database, d: &crate::diagnostic::Diagnostic) -> Option<String
     candidates.sort();
     if candidates.len() == 1
         || candidates
-            .get(0)
+            .first()
             .zip(candidates.get(1))
             .is_some_and(|(a, b)| a.0 < b.0)
     {
