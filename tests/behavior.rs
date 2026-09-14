@@ -1134,3 +1134,60 @@ fn test0026_internal_symlinks_are_rejected_without_following_them() {
     .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
     assert_eq!(fs::read_dir(&external_snapshot).unwrap().count(), 0);
 }
+
+#[test]
+fn test0027_documented_flag_names_match_the_specified_cli_contract() {
+    // Section 29 specifies `db list users [--where <expr>] [--order <col>]
+    // [--limit n]`, and Section 39 specifies `db migrate add-column <t> <c>
+    // --type <type>`. These long flags are part of the CLI contract, so a
+    // derive attribute that silently renames one is a defect even though the
+    // underlying operation still works under the wrong name.
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "jsonl",
+        "list",
+        "users",
+        "--where",
+        "name = 'Bob'",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Bob").and(predicate::str::contains("Alice").not()));
+
+    db().args([
+        "--db", root, "--format", "jsonl", "list", "users", "--order", "name", "--limit", "1",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Alice").and(predicate::str::contains("Bob").not()));
+
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "table",
+        "migrate",
+        "add-column",
+        "users",
+        "active",
+        "--type",
+        "bool",
+        "--default",
+        "true",
+    ])
+    .assert()
+    .success();
+
+    let row: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("users/u1.json")).unwrap()).unwrap();
+    assert_eq!(row["active"], true);
+
+    db().args(["--db", root, "--format", "table", "check"])
+        .assert()
+        .success();
+}

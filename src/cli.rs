@@ -167,7 +167,7 @@ enum Command {
     )]
     List {
         table: String,
-        #[arg(long, name = "where")]
+        #[arg(long = "where", value_name = "EXPR")]
         where_expr: Option<String>,
         #[arg(long)]
         order: Option<String>,
@@ -338,7 +338,7 @@ enum MigrateCommand {
     AddColumn {
         table: String,
         column: String,
-        #[arg(long, name = "type")]
+        #[arg(long = "type", value_name = "TYPE")]
         kind: String,
         #[arg(long)]
         nullable: bool,
@@ -956,8 +956,7 @@ fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<Strin
                 2,
             ));
         }
-        if p
-            .file_name()
+        if p.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with(".inferred.json"))
         {
