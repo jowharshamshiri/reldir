@@ -102,7 +102,9 @@ fn windows_reserved_component(value: &str) -> bool {
 fn percent_encode(bytes: &[u8]) -> String {
     let mut s = String::new();
     for (i, b) in bytes.iter().enumerate() {
-        let allowed = b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'_' | b'-');
+        let allowed = b.is_ascii_alphanumeric()
+            || matches!(*b, b'_' | b'-')
+            || (*b == b'.' && i + 1 < bytes.len());
         if allowed && !(i == 0 && *b == b'.') {
             s.push(*b as char)
         } else {

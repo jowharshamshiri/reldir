@@ -208,6 +208,11 @@ fn statement_kind(text: &str) -> Result<String> {
         let message = error.to_string();
         let mut diagnostic = Diagnostic::error("QUERY_UNSUPPORTED", &message);
         diagnostic.location = sql_error_location(&message);
+        diagnostic.source_line = diagnostic
+            .location
+            .as_ref()
+            .and_then(|location| text.lines().nth(location.line.saturating_sub(1)))
+            .map(String::from);
         DbError::from_diag(diagnostic, 4)
     })?;
     if ast.len() != 1 {
@@ -217,12 +222,24 @@ fn statement_kind(text: &str) -> Result<String> {
             4,
         ));
     }
-    Ok(ast[0]
-        .to_string()
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase())
+    Ok(match &ast[0] {
+        Statement::Query(query) => match query.body.as_ref() {
+            SetExpr::Insert(_) => "INSERT".into(),
+            SetExpr::Update(_) => "UPDATE".into(),
+            SetExpr::Delete(_) => "DELETE".into(),
+            _ => "SELECT".into(),
+        },
+        Statement::Insert(_) => "INSERT".into(),
+        Statement::Update { .. } => "UPDATE".into(),
+        Statement::Delete(_) => "DELETE".into(),
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN".into(),
+        statement => statement
+            .to_string()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase(),
+    })
 }
 
 fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
@@ -728,7 +745,7 @@ fn decode(v: Value, c: &crate::schema::Column) -> Result<Value> {
                 return Err(DbError::new(
                     "TYPE_MISMATCH",
                     "SQLite returned a non-boolean value for a bool column",
-                    2,
+                    4,
                 ));
             }
         },
@@ -737,14 +754,14 @@ fn decode(v: Value, c: &crate::schema::Column) -> Result<Value> {
                 DbError::new(
                     "TYPE_MISMATCH",
                     "SQLite returned non-text encoded structured JSON",
-                    2,
+                    4,
                 )
             })?;
             crate::json::parse_str(text).map_err(|error| {
                 DbError::new(
                     "TYPE_MISMATCH",
                     format!("SQLite returned invalid encoded JSON: {error}"),
-                    2,
+                    4,
                 )
             })?
         }
@@ -756,7 +773,7 @@ fn decode(v: Value, c: &crate::schema::Column) -> Result<Value> {
         Err(DbError::new(
             "TYPE_MISMATCH",
             "SQLite returned a value incompatible with its declared column type",
-            2,
+            4,
         ))
     }
 }
@@ -1061,7 +1078,12 @@ fn action(a: Action) -> &'static str {
 }
 fn query_err(e: rusqlite::Error) -> DbError {
     let msg = e.to_string();
-    let code = if msg.contains("interrupted") {
+    let interrupted = matches!(
+        &e,
+        rusqlite::Error::SqliteFailure(error, _)
+            if error.code == rusqlite::ffi::ErrorCode::OperationInterrupted
+    );
+    let code = if interrupted {
         "RESOURCE_LIMIT"
     } else if msg.contains("no such table") {
         "UNKNOWN_TABLE"

@@ -25,10 +25,14 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
             );
         }
         for (name, col) in &s.columns {
-            let vals: Vec<_> = rows.iter().map(|r| r.value.get(name)).collect();
+            let physical_values: Vec<_> = rows.iter().map(|r| r.value.get(name)).collect();
+            let values: Vec<_> = rows
+                .iter()
+                .map(|row| row.value.get(name).or(col.default.as_ref()))
+                .collect();
             if !rows.is_empty()
                 && col.nullable
-                && vals.iter().all(|v| v.is_some_and(|v| !v.is_null()))
+                && values.iter().all(|v| v.is_some_and(|v| !v.is_null()))
             {
                 out.push(
                     Diagnostic::warning(
@@ -40,7 +44,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .fix("FIX_TIGHTEN_NULLABLE"),
                 );
             }
-            if !rows.is_empty() && vals.iter().all(|v| v.is_none_or(|v| v.is_null())) {
+            if !rows.is_empty() && values.iter().all(|v| v.is_none_or(|v| v.is_null())) {
                 out.push(
                     Diagnostic::warning(
                         "LINT_COLUMN_NEVER_POPULATED",
@@ -50,7 +54,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .field(name),
                 );
             }
-            let present = vals.iter().filter(|v| v.is_some()).count();
+            let present = physical_values.iter().filter(|v| v.is_some()).count();
             if present > 0 && present < rows.len() {
                 out.push(
                     Diagnostic::warning(
@@ -62,16 +66,23 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 );
             }
             if col.kind == ColumnType::String {
-                let strings: Vec<_> = vals
+                let strings: Vec<_> = values
                     .iter()
                     .filter_map(|v| v.and_then(|v| v.as_str()))
                     .collect();
                 let narrower = if !strings.is_empty()
-                    && strings.iter().all(|s| uuid::Uuid::parse_str(s).is_ok())
-                {
+                    && strings.iter().all(|s| {
+                        uuid::Uuid::parse_str(s).is_ok()
+                            && s.len() == 36
+                            && **s == s.to_ascii_lowercase()
+                    }) {
                     Some("uuid")
                 } else if !strings.is_empty()
-                    && strings.iter().all(|s| ulid::Ulid::from_string(s).is_ok())
+                    && strings.iter().all(|s| {
+                        ulid::Ulid::from_string(s).is_ok()
+                            && s.len() == 26
+                            && **s == s.to_ascii_uppercase()
+                    })
                 {
                     Some("ulid")
                 } else if !strings.is_empty()
@@ -113,32 +124,29 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     );
                 }
             }
-            if col.kind == ColumnType::Float {
-                let numeric: Vec<_> = vals
+            if col.kind == ColumnType::Float
+                && values
                     .iter()
-                    .filter_map(|v| v.and_then(|v| v.as_f64()))
-                    .collect();
-                if !numeric.is_empty()
-                    && numeric
-                        .iter()
-                        .all(|v| v.fract() == 0.0 && *v >= i64::MIN as f64 && *v <= i64::MAX as f64)
-                {
-                    out.push(
-                        Diagnostic::warning(
-                            "LINT_WIDER_TYPE",
-                            format!("{table}.{name} can be narrowed from float to int"),
-                        )
-                        .table(table)
-                        .field(name)
-                        .fix("FIX_NARROW_TYPE"),
-                    );
-                }
+                    .any(|value| value.is_some_and(|value| !value.is_null()))
+                && values.iter().all(|value| {
+                    value.is_none_or(|value| value.is_null() || value.as_i64().is_some())
+                })
+            {
+                out.push(
+                    Diagnostic::warning(
+                        "LINT_WIDER_TYPE",
+                        format!("{table}.{name} can be narrowed from float to int"),
+                    )
+                    .table(table)
+                    .field(name)
+                    .fix("FIX_NARROW_TYPE"),
+                );
             }
-            let nonnull: Vec<_> = vals
+            let nonnull: Vec<_> = values
                 .iter()
                 .filter_map(|v| v.filter(|v| !v.is_null()))
                 .collect();
-            if rows.len() >= config.unique_min_rows
+            if !rows.is_empty()
                 && !s.primary_key.contains(name)
                 && !s.unique.iter().any(|u| u == &vec![name.clone()])
                 && nonnull.len() == rows.len()
@@ -162,6 +170,9 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
             if rows.len() >= config.unique_min_rows && !nonnull.is_empty() {
                 if col.kind == ColumnType::Int
                     && nonnull.iter().all(|v| v.as_i64().is_some_and(|x| x >= 0))
+                    && !s.check.iter().any(|check| {
+                        check.expr == format!("\"{}\" >= 0", name.replace('"', "\"\""))
+                    })
                 {
                     out.push(
                         Diagnostic::suggestion(
@@ -177,6 +188,9 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     && nonnull
                         .iter()
                         .all(|v| v.as_str().is_some_and(|x| !x.is_empty()))
+                    && !s.check.iter().any(|check| {
+                        check.expr == format!("\"{}\" <> ''", name.replace('"', "\"\""))
+                    })
                 {
                     out.push(
                         Diagnostic::suggestion(

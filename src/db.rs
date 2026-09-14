@@ -72,6 +72,7 @@ impl Database {
         validate_format(&root)?;
         let writer_lock = if mode == ObserveMode::Record {
             let path = root.join(".db/lock");
+            validate_optional_private_file(&path, "lock")?;
             let file = fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -210,11 +211,7 @@ impl Database {
         if let Some(d) = self.diagnostics.first() {
             return Err(DbError::from_diag(
                 d.clone(),
-                if d.code == "TRANSACTION_INCOMPLETE" {
-                    5
-                } else {
-                    2
-                },
+                crate::diagnostic::exit_code_for_diagnostics(&self.diagnostics),
             ));
         }
         Ok(())
@@ -230,21 +227,33 @@ impl Database {
 
 pub fn validate_format(root: &Path) -> Result<()> {
     let meta = root.join(".db");
-    if !meta.is_dir() {
-        return Err(DbError::from_diag(
-            Diagnostic::error(
-                "UNINITIALIZED",
-                format!("{} has no .db metadata", root.display()),
-            )
-            .help(format!(
-                "run `db init {}` or `db init {} --adopt`",
-                root.display(),
-                root.display()
-            )),
-            10,
-        ));
+    match fs::symlink_metadata(&meta) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DbError::from_diag(
+                Diagnostic::error(
+                    "UNINITIALIZED",
+                    format!("{} has no .db metadata", root.display()),
+                )
+                .help(format!(
+                    "run `db init {}` or `db init {} --adopt`",
+                    root.display(),
+                    root.display()
+                )),
+                10,
+            ));
+        }
+        Err(error) => return Err(DbError::io(&meta, error)),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                ".db must be a real directory, not a symlink or special file",
+                6,
+            ));
+        }
+        Ok(_) => {}
     }
     let p = meta.join("format");
+    require_private_regular_file(&p, "format marker")?;
     let text = fs::read_to_string(&p).map_err(|e| DbError::io(&p, e))?;
     let found = text
         .lines()
@@ -271,6 +280,7 @@ pub fn load_config(root: &Path) -> Result<Config> {
     if !p.exists() {
         return Ok(Config::default());
     }
+    require_private_regular_file(&p, "configuration")?;
     let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
     let value = crate::json::parse(&b).map_err(|e| {
         DbError::new(
@@ -294,6 +304,43 @@ pub fn load_config(root: &Path) -> Result<Config> {
         )
     })?;
     Ok(config)
+}
+
+fn require_private_regular_file(path: &Path, description: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("cannot inspect {description} {}: {error}", path.display()),
+            6,
+        )
+    })?;
+    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("{description} {} must be a private regular file", path.display()),
+            6,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_private_file(path: &Path, description: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => require_private_regular_file(path, description),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::io(path, error)),
+    }
+}
+
+#[cfg(unix)]
+fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
+    false
 }
 pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
     if root.join(".db").exists() {

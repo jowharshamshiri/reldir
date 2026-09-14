@@ -1,5 +1,6 @@
 use crate::{
     canonical,
+    catalog::Catalog,
     config::Config,
     diagnostic::{DbError, Diagnostic, Result},
     schema::{AdditionalFields, Column, ColumnType, ForeignKey, Inferred, Reference, Schema},
@@ -62,6 +63,17 @@ pub fn infer_all(
     config: &Config,
     pk_override: Option<&[String]>,
 ) -> Result<BTreeMap<String, Schema>> {
+    infer_all_with_references(root, tables, strictness, config, pk_override, None)
+}
+
+pub fn infer_all_with_references(
+    root: &Path,
+    tables: &[String],
+    strictness: Strictness,
+    config: &Config,
+    pk_override: Option<&[String]>,
+    references: Option<&Catalog>,
+) -> Result<BTreeMap<String, Schema>> {
     let mut schemas = BTreeMap::new();
     let mut samples = BTreeMap::new();
     for t in tables {
@@ -70,7 +82,10 @@ pub fn infer_all(
         samples.insert(t.clone(), ss);
         schemas.insert(t.clone(), s);
     }
-    let snapshot = schemas.clone();
+    let mut snapshot = references
+        .map(|catalog| catalog.schemas.clone())
+        .unwrap_or_default();
+    snapshot.extend(schemas.clone());
     for (table, s) in &mut schemas {
         let rows = &samples[table];
         for (name, col) in s.columns.clone() {
@@ -89,10 +104,30 @@ pub fn infer_all(
                 if !names.contains(&name) || ts.columns[&ts.primary_key[0]].kind != col.kind {
                     continue;
                 }
-                let target_values: HashSet<_> = samples[target]
-                    .iter()
-                    .filter_map(|x| x.obj.get(&ts.primary_key[0]).map(canonical::compact))
-                    .collect();
+                let target_values: HashSet<_> = if let Some(target_samples) = samples.get(target) {
+                    target_samples
+                        .iter()
+                        .filter_map(|sample| {
+                            sample
+                                .obj
+                                .get(&ts.primary_key[0])
+                                .or(ts.columns[&ts.primary_key[0]].default.as_ref())
+                                .map(canonical::compact)
+                        })
+                        .collect()
+                } else {
+                    references
+                        .and_then(|catalog| catalog.rows.get(target))
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|row| {
+                            row.value
+                                .get(&ts.primary_key[0])
+                                .or(ts.columns[&ts.primary_key[0]].default.as_ref())
+                                .map(canonical::compact)
+                        })
+                        .collect()
+                };
                 let values = rows.iter().filter_map(|row| row.obj.get(&name));
                 let has_value = values.clone().any(|value| !value.is_null());
                 if has_value
@@ -100,6 +135,8 @@ pub fn infer_all(
                         value.is_null() || target_values.contains(&canonical::compact(value))
                     })
                 {
+                    let matched = values.filter(|value| !value.is_null()).count();
+                    let foreign_key_index = s.foreign_keys.len();
                     s.foreign_keys.push(ForeignKey {
                         columns: vec![name.clone()],
                         references: Reference {
@@ -110,6 +147,17 @@ pub fn infer_all(
                         on_update: Some(crate::schema::Action::Restrict),
                     });
                     s.indexes.push(vec![name.clone()]);
+                    if let Some(inferred) = &mut s.inferred {
+                        inferred.evidence.insert(
+                            format!("foreign_keys[{foreign_key_index}]"),
+                            format!(
+                                "{matched}/{} non-null values present in {}.{}",
+                                rows.len(),
+                                target,
+                                ts.primary_key[0]
+                            ),
+                        );
+                    }
                     break;
                 }
             }
@@ -311,6 +359,7 @@ fn infer_table(
         columns.insert(name, col);
     }
     let pk = if let Some(p) = pk_override {
+        validate_pk_override(table, rows, &columns, p)?;
         p.to_vec()
     } else {
         infer_pk(table, rows, &columns)?
@@ -405,6 +454,65 @@ fn infer_table(
         }
     }
     Ok(schema)
+}
+
+fn validate_pk_override(
+    table: &str,
+    rows: &[Sample],
+    columns: &IndexMap<String, Column>,
+    requested: &[String],
+) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for name in requested {
+        if !names.insert(name) {
+            return Err(DbError::new(
+                "INFER_NO_PRIMARY_KEY",
+                format!("--pk repeats column {name:?} for table {table}"),
+                8,
+            ));
+        }
+        let column = columns.get(name).ok_or_else(|| {
+            DbError::new(
+                "INFER_NO_PRIMARY_KEY",
+                format!("--pk names unknown column {name:?} for table {table}"),
+                8,
+            )
+        })?;
+        if column.nullable {
+            let path = rows
+                .iter()
+                .find(|row| row.obj.get(name).is_none_or(Value::is_null))
+                .map(|row| row.path.display().to_string())
+                .unwrap_or_else(|| "an observed row".into());
+            return Err(DbError::new(
+                "INFER_NO_PRIMARY_KEY",
+                format!("--pk column {name:?} is null or absent in {path}"),
+                8,
+            ));
+        }
+    }
+    let mut seen = BTreeMap::<String, &Sample>::new();
+    for row in rows {
+        let key = Value::Array(
+            requested
+                .iter()
+                .map(|name| row.obj.get(name).cloned().unwrap_or(Value::Null))
+                .collect(),
+        );
+        let key = canonical::compact(&key);
+        if let Some(previous) = seen.insert(key.clone(), row) {
+            return Err(DbError::new(
+                "INFER_NO_PRIMARY_KEY",
+                format!(
+                    "--pk is not unique: duplicate value {key} in {} and {}",
+                    previous.path.display(),
+                    row.path.display()
+                ),
+                8,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn infer_column(

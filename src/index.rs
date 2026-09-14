@@ -58,14 +58,18 @@ fn expected(c: &Catalog) -> BTreeMap<PathBuf, IndexFile> {
 }
 pub fn valid(root: &Path, c: &Catalog) -> Result<bool> {
     let dir = root.join(".db/indexes");
-    if !dir.is_dir() {
-        return Ok(false);
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(DbError::io(&dir, error)),
     }
     let expected = expected(c);
     let mut actual = BTreeSet::new();
     for e in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = e.map_err(|e| DbError::io(&dir, e))?.path();
-        if !path.is_file() {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+        if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
             return Ok(false);
         }
         let rel = PathBuf::from(path.file_name().ok_or_else(|| {
@@ -98,16 +102,39 @@ pub fn rebuild(root: &Path, c: &Catalog) -> Result<()> {
     }
     let dir = root.join(".db/indexes");
     let old = root.join(".db/indexes.old");
-    if old.exists() {
-        fs::remove_dir_all(&old).map_err(|e| DbError::io(&old, e))?
-    }
-    if dir.exists() {
-        fs::rename(&dir, &old).map_err(|e| DbError::io(&dir, e))?
+    remove_internal_path(&old)?;
+    match fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::rename(&dir, &old).map_err(|e| DbError::io(&dir, e))?
+        }
+        Ok(_) => remove_internal_path(&dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DbError::io(&dir, error)),
     }
     fs::rename(temp.keep(), &dir).map_err(|e| DbError::io(&dir, e))?;
     metadata::sync_parent(&dir)?;
-    if old.exists() {
-        fs::remove_dir_all(&old).map_err(|e| DbError::io(&old, e))?
-    }
+    remove_internal_path(&old)?;
     Ok(())
+}
+
+fn remove_internal_path(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::remove_dir_all(path).map_err(|error| DbError::io(path, error))
+        }
+        Ok(_) => fs::remove_file(path).map_err(|error| DbError::io(path, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::io(path, error)),
+    }
+}
+
+#[cfg(unix)]
+fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
+    false
 }

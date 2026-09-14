@@ -276,7 +276,7 @@ fn sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
         "\"2\"",
     ])
     .assert()
-    .code(2)
+    .code(4)
     .stderr(predicate::str::contains("TYPE_MISMATCH"));
     db().args([
         "--db",
@@ -289,6 +289,19 @@ fn sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
     .assert()
     .success()
     .stdout(predicate::str::contains("\"active\":true"));
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "sql",
+        "WITH chosen(id) AS (VALUES ('a')) UPDATE items SET count = 3 WHERE id IN (SELECT id FROM chosen)",
+    ])
+    .assert()
+    .success();
+    let row: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("items/a.json")).unwrap()).unwrap();
+    assert_eq!(row["count"], 3);
 }
 
 #[test]
@@ -297,6 +310,33 @@ fn doctor_repairs_layout_without_changing_row_body() {
     let root = dir.path();
     let original = fs::read(root.join("users/u1.json")).unwrap();
     fs::rename(root.join("users/u1.json"), root.join("users/moved.json")).unwrap();
+    let preview = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "json",
+            "--dry-run",
+            "doctor",
+            "--fix",
+            "--only",
+            "FIX_RENAME_TO_IDENTITY",
+        ])
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let records = preview.as_array().unwrap();
+    assert!(records.iter().any(|record| {
+        record["kind"] == "doctor_fix"
+            && record["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "users/moved.json")
+    }));
+    assert!(records.iter().any(|record| record["kind"] == "doctor_diff"));
+    assert!(root.join("users/moved.json").exists());
     db().args([
         "--db",
         root.to_str().unwrap(),
@@ -678,4 +718,314 @@ fn decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
     .success();
     assert!(!fake.exists());
     assert!(fs::read_dir(root.join(".db/objects")).unwrap().count() > 0);
+}
+
+#[test]
+fn change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("numbers")).unwrap();
+    fs::write(
+        root.join("schema/numbers.json"),
+        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string","default":"10"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("numbers/a.json"), "{\"id\":\"a\"}\n").unwrap();
+    fs::write(
+        root.join("numbers/b.json"),
+        "{\"id\":\"b\",\"score\":\"20\"}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "change-type",
+        "numbers",
+        "score",
+        "int",
+    ])
+    .assert()
+    .success();
+    let schema: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("schema/numbers.json")).unwrap()).unwrap();
+    let omitted: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("numbers/a.json")).unwrap()).unwrap();
+    let explicit: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("numbers/b.json")).unwrap()).unwrap();
+    assert_eq!(schema["columns"]["score"]["type"], "int");
+    assert_eq!(schema["columns"]["score"]["default"], 10);
+    assert!(omitted.get("score").is_none());
+    assert_eq!(explicit["score"], 20);
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    let failed = tempfile::tempdir().unwrap();
+    let failed_root = failed.path();
+    db().args(["--format", "table", "init", failed_root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(failed_root.join("numbers")).unwrap();
+    fs::write(
+        failed_root.join("schema/numbers.json"),
+        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        failed_root.join("numbers/a.json"),
+        "{\"id\":\"a\",\"score\":\"01\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        failed_root.join("numbers/b.json"),
+        "{\"id\":\"b\",\"score\":\"not-a-number\"}\n",
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        failed_root.to_str().unwrap(),
+        "--format",
+        "table",
+        "check",
+    ])
+    .assert()
+    .success();
+    let manifest_before = fs::read(failed_root.join(".db/manifest.json")).unwrap();
+    let schema_before = fs::read(failed_root.join("schema/numbers.json")).unwrap();
+    db().args([
+        "--db",
+        failed_root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "change-type",
+        "numbers",
+        "score",
+        "int",
+    ])
+    .assert()
+    .code(2)
+    .stderr(
+        predicate::str::contains("numbers/a.json").and(predicate::str::contains("numbers/b.json")),
+    );
+    assert_eq!(
+        manifest_before,
+        fs::read(failed_root.join(".db/manifest.json")).unwrap()
+    );
+    assert_eq!(
+        schema_before,
+        fs::read(failed_root.join("schema/numbers.json")).unwrap()
+    );
+}
+
+#[test]
+fn snapshot_restore_removes_malformed_extra_authoritative_files() {
+    let dir = adopted();
+    let root = dir.path();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "snapshot",
+        "create",
+        "clean",
+    ])
+    .assert()
+    .success();
+    let stray = root.join("users/stray.json");
+    fs::write(&stray, "not json\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "snapshot",
+        "restore",
+        "clean",
+        "--yes",
+    ])
+    .assert()
+    .success();
+    assert!(!stray.exists());
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn provenance_objects_are_verified_and_corruption_is_exit_six() {
+    let dir = adopted();
+    let root = dir.path();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".db/manifest.json")).unwrap()).unwrap();
+    let hash = manifest["entries"][".db/config"]["hash"].as_str().unwrap();
+    fs::write(root.join(format!(".db/objects/{hash}.json")), "{}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .code(6)
+    .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
+}
+
+#[test]
+fn schema_type_specific_members_are_strict_and_format_errors_are_exit_six() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("bad")).unwrap();
+    fs::write(
+        root.join("schema/bad.json"),
+        r#"{"table":"bad","primary_key":["id"],"columns":{"id":{"type":"string","values":["x"]}}}"#,
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains(
+        "values is only valid for enum columns",
+    ));
+
+    fs::write(
+        root.join("schema/bad.json"),
+        r#"{"table":"bad","schema_format":999,"primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(6)
+        .stderr(predicate::str::contains("FORMAT_UNSUPPORTED"));
+}
+
+#[test]
+fn inference_records_foreign_key_evidence_and_rejects_invalid_pk_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::create_dir(root.join("posts")).unwrap();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/users.json"),
+        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+    fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
+    fs::write(
+        root.join("posts/p1.json"),
+        "{\"id\":\"p1\",\"user_id\":\"u1\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("posts/p2.json"),
+        "{\"id\":\"p2\",\"user_id\":\"u2\"}\n",
+    )
+    .unwrap();
+    db().args([
+        "--format",
+        "table",
+        "init",
+        root.to_str().unwrap(),
+        "--adopt",
+    ])
+    .assert()
+    .success();
+    let posts: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("schema/posts.json")).unwrap()).unwrap();
+    assert_eq!(posts["foreign_keys"][0]["columns"][0], "user_id");
+    assert_eq!(posts["foreign_keys"][0]["references"]["table"], "users");
+    assert_eq!(posts["indexes"][0][0], "user_id");
+    assert!(
+        posts["inferred"]["evidence"]["foreign_keys[0]"]
+            .as_str()
+            .unwrap()
+            .contains("users.id")
+    );
+
+    let invalid = tempfile::tempdir().unwrap();
+    fs::create_dir(invalid.path().join("things")).unwrap();
+    fs::write(invalid.path().join("things/a.json"), "{\"id\":\"a\"}\n").unwrap();
+    db().args(["--format", "table", "infer", "things", "--pk", "missing"])
+        .current_dir(invalid.path())
+        .assert()
+        .code(8)
+        .stderr(
+            predicate::str::contains("INFER_NO_PRIMARY_KEY")
+                .and(predicate::str::contains("unknown column \"missing\"")),
+        );
+}
+
+#[test]
+fn inferred_comparison_files_are_non_authoritative_and_replaceable() {
+    let dir = adopted();
+    let root = dir.path();
+    let manifest_before = fs::read(root.join(".db/manifest.json")).unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "--all",
+        "--write",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("revision 1"));
+    let proposal = root.join("schema/users.inferred.json");
+    assert!(proposal.exists());
+    assert_eq!(
+        manifest_before,
+        fs::read(root.join(".db/manifest.json")).unwrap()
+    );
+
+    fs::write(&proposal, "not json\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "--all",
+        "--write",
+    ])
+    .assert()
+    .success();
+    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(&proposal).unwrap()).is_ok());
+    assert_eq!(
+        manifest_before,
+        fs::read(root.join(".db/manifest.json")).unwrap()
+    );
 }

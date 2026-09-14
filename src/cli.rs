@@ -548,7 +548,6 @@ pub fn run(cli: Cli) -> Result<i32> {
                     command,
                     Command::Check { no_write: true, .. }
                         | Command::Lint { .. }
-                        | Command::Doctor { fix: false, .. }
                         | Command::Diff { .. }
                 );
             let mode = if settings.readonly {
@@ -793,12 +792,14 @@ fn cmd_init(
     inference_config
         .validate()
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-    let schemas = infer::infer_all(
+    let reference_catalog = crate::catalog::Catalog::observe(&root, &inference_config)?;
+    let schemas = infer::infer_all_with_references(
         &root,
         &missing,
         Strictness::Balanced,
         &inference_config,
         None,
+        Some(&reference_catalog),
     )?;
     let preflight = adoption_preflight(&root, &schemas, &inference_config)?;
     let errors = crate::integrity::validate(&preflight);
@@ -1050,12 +1051,14 @@ fn infer_standalone(
     inference_config
         .validate()
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-    let schemas = infer::infer_all(
+    let reference_catalog = crate::catalog::Catalog::observe(root, &inference_config)?;
+    let schemas = infer::infer_all_with_references(
         root,
         &tables,
         strict,
         &inference_config,
         if pk.is_empty() { None } else { Some(pk) },
+        Some(&reference_catalog),
     )?;
     if write {
         fs::create_dir_all(root.join("schema"))
@@ -1125,17 +1128,9 @@ fn status(db: &Database, format: Format) -> Result<i32> {
             &db.diagnostics
         };
         output::check_result(diagnostics, summary, format)?;
-        return Ok(if db.diagnostics.is_empty() {
-            0
-        } else if db
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "TRANSACTION_INCOMPLETE")
-        {
-            5
-        } else {
-            2
-        });
+        return Ok(crate::diagnostic::exit_code_for_diagnostics(
+            &db.diagnostics,
+        ));
     }
     if !db.diagnostics.is_empty() {
         output::diagnostics(&db.diagnostics, format);
@@ -1145,17 +1140,9 @@ fn status(db: &Database, format: Format) -> Result<i32> {
             db.external_changes.len(),
             db.diagnostics.len()
         );
-        return Ok(
-            if db
-                .diagnostics
-                .iter()
-                .any(|d| d.code == "TRANSACTION_INCOMPLETE")
-            {
-                5
-            } else {
-                2
-            },
-        );
+        return Ok(crate::diagnostic::exit_code_for_diagnostics(
+            &db.diagnostics,
+        ));
     }
     if !db.catalog.warnings.is_empty() {
         output::diagnostics(&db.catalog.warnings, format);
@@ -1225,17 +1212,9 @@ fn check(db: &Database, format: Format, strict: bool) -> Result<i32> {
         }
         output::check_result(&reported, summary, format)?;
         if !db.diagnostics.is_empty() {
-            return Ok(
-                if db
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.code == "TRANSACTION_INCOMPLETE")
-                {
-                    5
-                } else {
-                    2
-                },
-            );
+            return Ok(crate::diagnostic::exit_code_for_diagnostics(
+                &db.diagnostics,
+            ));
         }
         if strict && (!lint.is_empty() || !db.catalog.warnings.is_empty()) {
             return Ok(7);
@@ -1254,17 +1233,9 @@ fn check(db: &Database, format: Format, strict: bool) -> Result<i32> {
             lint_counts,
             db.validation_elapsed.as_millis(),
         );
-        return Ok(
-            if db
-                .diagnostics
-                .iter()
-                .any(|d| d.code == "TRANSACTION_INCOMPLETE")
-            {
-                5
-            } else {
-                2
-            },
-        );
+        return Ok(crate::diagnostic::exit_code_for_diagnostics(
+            &db.diagnostics,
+        ));
     }
     if strict && (!lint.is_empty() || !db.catalog.warnings.is_empty()) {
         let mut findings = db.catalog.warnings.clone();
@@ -1329,6 +1300,7 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
             "unknown or inapplicable fix {id:?}"
         )));
     }
+    let mut machine_records = Vec::new();
     if format == Format::Table {
         println!("Doctor plan:");
         for class in ["derived", "schema", "layout", "data", "manual"] {
@@ -1339,54 +1311,73 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
             if !items.is_empty() {
                 println!("  {class} ({}):", items.len());
                 for f in items {
-                    println!("    {}  {}", f.id, f.description)
+                    println!("    {}  {}", f.id, f.description);
+                    for path in &f.paths {
+                        println!("      -> {}", path.display());
+                    }
                 }
             }
         }
     } else {
-        let records = plan
+        machine_records = plan
             .iter()
             .filter(|fix| doctor_fix_matches(only, &fix.id))
             .map(|fix| serialized_record("doctor_fix", fix))
             .collect::<Result<Vec<_>>>()?;
-        output::records(&records, format)?;
     }
     if !fix {
-        return Ok(if db.diagnostics.is_empty() { 0 } else { 2 });
+        if format != Format::Table {
+            output::records(&machine_records, format)?;
+        }
+        return Ok(crate::diagnostic::exit_code_for_diagnostics(
+            &db.diagnostics,
+        ));
     }
     require_writable(cli)?;
-    if !cli.dry_run && format != Format::Table && !cli.yes {
-        return Err(DbError::new(
-            "CONFIRMATION_REQUIRED",
-            "--yes is required to apply doctor fixes with machine-readable output",
-            9,
-        ));
-    }
-    if !cli.dry_run && !cli.yes {
-        return Err(DbError::new(
-            "CONFIRMATION_REQUIRED",
-            "doctor fixes require --yes",
-            9,
-        ));
-    }
     let changes = crate::doctor::repair_changes(db, only, allow_data)?;
     if changes.is_empty() {
-        event(
-            format,
-            obj([
-                ("kind", Value::String("no_change".into())),
-                (
-                    "message",
-                    Value::String("no applicable automatic fixes".into()),
-                ),
-            ]),
-            "no applicable automatic fixes",
-        )?;
-        return Ok(if db.diagnostics.is_empty() { 0 } else { 2 });
+        let no_change = obj([
+            ("kind", Value::String("no_change".into())),
+            (
+                "message",
+                Value::String("no applicable automatic fixes".into()),
+            ),
+        ]);
+        if format == Format::Table {
+            event(format, no_change, "no applicable automatic fixes")?;
+        } else {
+            machine_records.push(no_change);
+            output::records(&machine_records, format)?;
+        }
+        return Ok(crate::diagnostic::exit_code_for_diagnostics(
+            &db.diagnostics,
+        ));
     }
     let touches_rows = changes.iter().any(|c| match c {
         Change::Write { path, .. } | Change::Delete { path } => !path.starts_with("schema"),
     });
+    if cli.dry_run || touches_rows {
+        let diffs = doctor_diff_records(&db.root, &changes)?;
+        if format == Format::Table {
+            print_doctor_diffs(&diffs);
+        } else {
+            machine_records.extend(diffs);
+        }
+    }
+    if !cli.dry_run && !cli.yes {
+        if format != Format::Table {
+            output::records(&machine_records, format)?;
+        }
+        return Err(DbError::new(
+            "CONFIRMATION_REQUIRED",
+            if format == Format::Table {
+                "doctor fixes require --yes"
+            } else {
+                "--yes is required to apply doctor fixes with machine-readable output"
+            },
+            9,
+        ));
+    }
     if touches_rows && !no_snapshot && !cli.dry_run {
         let name = format!(
             "pre-doctor-{}",
@@ -1403,15 +1394,22 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
             ));
         }
         create_snapshot(db, &name)?;
-        event(
-            format,
-            obj([
-                ("kind", Value::String("snapshot".into())),
-                ("name", Value::String(name.clone())),
-                ("action", Value::String("created".into())),
-            ]),
-            &format!("created snapshot {name}; restore with `db snapshot restore {name} --yes`"),
-        )?;
+        let snapshot = obj([
+            ("kind", Value::String("snapshot".into())),
+            ("name", Value::String(name.clone())),
+            ("action", Value::String("created".into())),
+        ]);
+        if format == Format::Table {
+            event(
+                format,
+                snapshot,
+                &format!(
+                    "created snapshot {name}; restore with `db snapshot restore {name} --yes`"
+                ),
+            )?;
+        } else {
+            machine_records.push(snapshot);
+        }
     }
     let start = current_root(db)?;
     let paths = transaction::commit(
@@ -1423,12 +1421,13 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
         cli.dry_run,
         db.resource_overrides(),
     )?;
-    print_mutation(
-        &paths,
-        db.manifest.as_ref().map_or(0, |m| m.revision + 1),
-        cli.dry_run,
-        format,
-    )?;
+    let revision = resulting_revision(db, cli.dry_run)?;
+    if format == Format::Table {
+        print_mutation(&paths, revision, cli.dry_run, format)?;
+    } else {
+        machine_records.extend(mutation_records(&paths, revision, cli.dry_run));
+        output::records(&machine_records, format)?;
+    }
     Ok(0)
 }
 
@@ -1460,12 +1459,13 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
         .into_iter()
         .filter(|t| all || !db.catalog.schemas.contains_key(t))
         .collect();
-    let schemas = infer::infer_all(
+    let schemas = infer::infer_all_with_references(
         &db.root,
         &wanted,
         strict,
         &db.config,
         if pk.is_empty() { None } else { Some(pk) },
+        Some(&db.catalog),
     )?;
     if !write {
         output_schemas(schemas.values(), format)?;
@@ -1478,20 +1478,27 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
         } else {
             format!("schema/{t}.json")
         };
-        if db.root.join(&name).exists() {
+        if !name.ends_with(".inferred.json") && db.root.join(&name).exists() {
             return Err(DbError::new(
                 "SCHEMA_MISSING_REQUIRED",
                 format!("refusing to overwrite {name}"),
                 1,
             ));
         }
-        changes.push(Change::Write {
-            path: name.into(),
-            bytes: canonical::pretty_with_indent(
-                &serde_json::to_value(s).unwrap(),
-                db.config.indentation_width,
-            ),
-        })
+        let bytes = canonical::pretty_with_indent(
+            &serde_json::to_value(s)
+                .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?,
+            db.config.indentation_width,
+        );
+        if fs::read(db.root.join(&name)).ok().as_deref() != Some(bytes.as_slice()) {
+            changes.push(Change::Write {
+                path: name.into(),
+                bytes,
+            });
+        }
+    }
+    if changes.is_empty() {
+        return commit_changes(db, changes, "internal", format, cli);
     }
     let paths = transaction::commit(
         &db.root,
@@ -1504,7 +1511,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
     )?;
     print_mutation(
         &paths,
-        db.manifest.as_ref().map_or(1, |m| m.revision + 1),
+        resulting_revision(db, cli.dry_run)?,
         cli.dry_run,
         format,
     )?;
@@ -2440,6 +2447,7 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
             require_writable(cli)?;
             db.require_valid()?;
             valid_snapshot(&name)?;
+            ensure_snapshot_base(&base, true)?;
             let dest = base.join(&name);
             if dest.exists() {
                 return Err(DbError::usage("snapshot already exists"));
@@ -2470,17 +2478,28 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
         }
         SnapshotCommand::List => {
             let mut rows = vec![];
+            if !ensure_snapshot_base(&base, false)? {
+                output::records(&rows, format)?;
+                return Ok(0);
+            }
             for e in fs::read_dir(&base).map_err(|e| DbError::io(&base, e))? {
                 let e = e.map_err(|e| DbError::io(&base, e))?;
-                if e.path().is_dir() {
-                    rows.push(obj([
-                        ("kind", Value::String("snapshot".into())),
-                        (
-                            "name",
-                            Value::String(e.file_name().to_string_lossy().into()),
-                        ),
-                    ]))
+                let path = e.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+                if !metadata.file_type().is_dir() {
+                    return Err(DbError::new(
+                        "INTERNAL_METADATA_CORRUPT",
+                        format!("snapshot entry {} is not a real directory", path.display()),
+                        6,
+                    ));
                 }
+                rows.push(obj([
+                    ("kind", Value::String("snapshot".into())),
+                    (
+                        "name",
+                        Value::String(e.file_name().to_string_lossy().into()),
+                    ),
+                ]))
             }
             output::records(&rows, format)?;
             Ok(0)
@@ -2496,7 +2515,7 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
                 ));
             }
             let src = base.join(&name);
-            if !src.is_dir() {
+            if !ensure_snapshot_base(&base, false)? || !snapshot_exists(&src)? {
                 return Err(DbError::usage("snapshot does not exist"));
             }
             let changes = changes_from_snapshot(db, &src)?;
@@ -2513,7 +2532,8 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
                 ));
             }
             let p = base.join(name);
-            if !cli.dry_run && p.exists() {
+            let exists = ensure_snapshot_base(&base, false)? && snapshot_exists(&p)?;
+            if !cli.dry_run && exists {
                 fs::remove_dir_all(&p).map_err(|e| DbError::io(&p, e))?
             }
             let display_name = p
@@ -3116,98 +3136,19 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
             kind,
             using,
         } => {
-            let mut s = schema_for(db, &table)?.clone();
             let target = parse_type(&kind)?;
-            let column_definition = s.columns.get_mut(&column).ok_or_else(|| {
-                DbError::new("UNKNOWN_COLUMN", format!("unknown column {column}"), 4)
-            })?;
-            retarget_column(column_definition, target.clone())?;
-            if let Some(expr) = using {
-                let old = schema_for(db, &table)?;
-                let where_sql = old
-                    .primary_key
-                    .iter()
-                    .map(|c| format!("{} = ?", quote(c)))
-                    .collect::<Vec<_>>()
-                    .join(" AND ");
-                rewrite_schema_rows(
-                    db,
-                    s,
-                    |row| {
-                        let params: Vec<_> = old
-                            .primary_key
-                            .iter()
-                            .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let query = format!(
-                            "SELECT ({expr}) AS value FROM {} WHERE {where_sql}",
-                            quote(&table)
-                        );
-                        let result = crate::sql::execute(&db.catalog, &query, &params)?;
-                        let value = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.get("value"))
-                            .cloned()
-                            .ok_or_else(|| {
-                                DbError::new(
-                                    "QUERY_TYPE_ERROR",
-                                    "conversion expression produced no value",
-                                    4,
-                                )
-                            })?;
-                        row.insert(column.clone(), convert_query_value(value, &target)?);
-                        Ok(())
-                    },
-                    format,
-                    cli,
-                )
-            } else {
-                let target_column = s.columns[&column].clone();
-                let offenders = db.catalog.rows[&table]
-                    .iter()
-                    .filter(|row| {
-                        row.value
-                            .get(&column)
-                            .and_then(|value| crate::value::lossless_convert(value, &target_column))
-                            .is_none()
-                    })
-                    .map(|row| row.relative.display().to_string())
-                    .collect::<Vec<_>>();
-                if !offenders.is_empty() {
-                    return Err(DbError::new(
-                        "TYPE_MISMATCH",
-                        format!(
-                            "change-type cannot losslessly convert {table}.{column} in: {}; supply --using with an explicit conversion expression",
-                            offenders.join(", ")
-                        ),
-                        2,
-                    ));
-                }
-                rewrite_schema_rows(
-                    db,
-                    s,
-                    move |row| {
-                        if let Some(value) = row.get(&column).cloned() {
-                            row.insert(
-                                column.clone(),
-                                crate::value::lossless_convert(&value, &target_column).ok_or_else(
-                                    || {
-                                        DbError::new(
-                                            "TYPE_MISMATCH",
-                                            "row changed after lossless conversion preflight",
-                                            2,
-                                        )
-                                    },
-                                )?,
-                            );
-                        }
-                        Ok(())
-                    },
-                    format,
-                    cli,
-                )
-            }
+            let changes = declarative_migration_changes(
+                db,
+                MigrationDocument {
+                    operations: vec![MigrationOperation::ChangeType {
+                        table,
+                        column,
+                        kind: target,
+                        using,
+                    }],
+                },
+            )?;
+            commit_changes(db, changes, "migration", format, cli)
         }
         MigrateCommand::AddConstraint { table, definition } => {
             let mut s = schema_for(db, &table)?.clone();
@@ -3519,16 +3460,19 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
                     })?;
                     for (index, row) in table_rows.iter_mut().enumerate() {
-                        let converted = row.get(&column).and_then(|value| {
-                            crate::value::lossless_convert(value, &target_column)
-                        });
-                        if let Some(converted) = converted {
-                            row.insert(column.clone(), converted);
-                        } else {
-                            let path = canonical::filename(&old_schema, row)
-                                .map(|name| PathBuf::from(&table).join(name).display().to_string())
-                                .unwrap_or_else(|| format!("{table}/<row {}>", index + 1));
-                            offenders.push(path);
+                        if let Some(value) = row.get(&column) {
+                            if let Some(converted) =
+                                crate::value::lossless_convert(value, &target_column)
+                            {
+                                row.insert(column.clone(), converted);
+                            } else {
+                                let path = canonical::filename(&old_schema, row)
+                                    .map(|name| {
+                                        PathBuf::from(&table).join(name).display().to_string()
+                                    })
+                                    .unwrap_or_else(|| format!("{table}/<row {}>", index + 1));
+                                offenders.push(path);
+                            }
                         }
                     }
                     if !offenders.is_empty() {
@@ -3849,11 +3793,20 @@ fn commit_changes(
     }
     print_mutation(
         &paths,
-        db.manifest.as_ref().map_or(1, |m| m.revision + 1),
+        resulting_revision(db, cli.dry_run)?,
         cli.dry_run,
         format,
     )?;
     Ok(0)
+}
+fn resulting_revision(db: &Database, dry_run: bool) -> Result<u64> {
+    if dry_run {
+        return Ok(db
+            .manifest
+            .as_ref()
+            .map_or(1, |manifest| manifest.revision + 1));
+    }
+    Ok(metadata::load_manifest(&db.root)?.map_or(0, |manifest| manifest.revision))
 }
 fn require_writable(cli: &Cli) -> Result<()> {
     if cli.readonly && !cli.dry_run {
@@ -3866,19 +3819,7 @@ fn require_writable(cli: &Cli) -> Result<()> {
     Ok(())
 }
 fn print_mutation(paths: &[PathBuf], revision: u64, dry: bool, format: Format) -> Result<()> {
-    let rows = paths
-        .iter()
-        .map(|p| {
-            obj([
-                (
-                    "kind",
-                    Value::String(if dry { "planned_change" } else { "change" }.into()),
-                ),
-                ("path", Value::String(p.display().to_string())),
-                ("revision", Value::from(revision)),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let rows = mutation_records(paths, revision, dry);
     if format == Format::Table {
         let suffix = if dry {
             String::new()
@@ -3898,6 +3839,77 @@ fn print_mutation(paths: &[PathBuf], revision: u64, dry: bool, format: Format) -
         output::records(&rows, format)?
     }
     Ok(())
+}
+fn mutation_records(paths: &[PathBuf], revision: u64, dry: bool) -> Vec<Map<String, Value>> {
+    paths
+        .iter()
+        .map(|path| {
+            obj([
+                (
+                    "kind",
+                    Value::String(if dry { "planned_change" } else { "change" }.into()),
+                ),
+                ("path", Value::String(path.display().to_string())),
+                ("revision", Value::from(revision)),
+            ])
+        })
+        .collect()
+}
+
+fn doctor_diff_records(root: &Path, changes: &[Change]) -> Result<Vec<Map<String, Value>>> {
+    changes
+        .iter()
+        .map(|change| {
+            let (path, after) = match change {
+                Change::Write { path, bytes } => (path, Some(bytes.as_slice())),
+                Change::Delete { path } => (path, None),
+            };
+            let before = match fs::read(root.join(path)) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(DbError::io(&root.join(path), error)),
+            };
+            Ok(obj([
+                ("kind", Value::String("doctor_diff".into())),
+                ("path", Value::String(path.display().to_string())),
+                (
+                    "before",
+                    before.as_deref().map(bytes_value).unwrap_or(Value::Null),
+                ),
+                ("after", after.map(bytes_value).unwrap_or(Value::Null)),
+            ]))
+        })
+        .collect()
+}
+
+fn bytes_value(bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Value::String(text.into()),
+        Err(_) => Value::Array(bytes.iter().copied().map(Value::from).collect()),
+    }
+}
+
+fn print_doctor_diffs(records: &[Map<String, Value>]) {
+    for record in records {
+        let path = record["path"].as_str().unwrap_or("<unknown>");
+        println!("--- {path}");
+        println!("+++ {path}");
+        print_prefixed_content('-', &record["before"]);
+        print_prefixed_content('+', &record["after"]);
+    }
+}
+
+fn print_prefixed_content(prefix: char, value: &Value) {
+    match value {
+        Value::Null => println!("{prefix}<absent>"),
+        Value::String(text) => {
+            for line in text.lines() {
+                println!("{prefix}{line}");
+            }
+        }
+        Value::Array(bytes) => println!("{prefix}<binary bytes: {}>", bytes.len()),
+        _ => unreachable!("doctor diff content has a fixed shape"),
+    }
 }
 fn current_root(db: &Database) -> Result<String> {
     Ok(metadata::state(&db.catalog)?.0)
@@ -4260,8 +4272,70 @@ fn obj<const N: usize>(items: [(&str, Value); N]) -> Map<String, Value> {
     items.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }
 fn valid_snapshot(s: &str) -> Result<()> {
-    if s.is_empty() || s.contains('/') || s.contains('\\') || s == "." || s == ".." {
+    let lower = s.to_ascii_lowercase();
+    let base = lower.split('.').next().unwrap_or(&lower);
+    let windows_reserved = matches!(base, "con" | "prn" | "aux" | "nul")
+        || base
+            .strip_prefix("com")
+            .or_else(|| base.strip_prefix("lpt"))
+            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'));
+    if s.is_empty()
+        || s.contains(['/', '\\', '\0'])
+        || s == "."
+        || s == ".."
+        || s.ends_with(['.', ' '])
+        || windows_reserved
+    {
         return Err(DbError::new("PATH_VIOLATION", "invalid snapshot name", 2));
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_base(base: &Path, create: bool) -> Result<bool> {
+    match fs::symlink_metadata(base) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("snapshot path {} is not a real directory", base.display()),
+            6,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            fs::create_dir(base).map_err(|error| DbError::io(base, error))?;
+            metadata::sync_parent(base)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DbError::io(base, error)),
+    }
+}
+
+fn snapshot_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("snapshot {} is not a real directory", path.display()),
+            6,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DbError::io(path, error)),
+    }
+}
+
+fn reject_snapshot_collision(base: &Path, candidate: &str) -> Result<()> {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = candidate.nfc().flat_map(char::to_lowercase).collect();
+    for entry in fs::read_dir(base).map_err(|error| DbError::io(base, error))? {
+        let entry = entry.map_err(|error| DbError::io(base, error))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let existing: String = name.nfc().flat_map(char::to_lowercase).collect();
+        if existing == normalized {
+            return Err(DbError::new(
+                "PATH_COLLISION",
+                format!("snapshot name {candidate:?} collides with existing {name:?}"),
+                2,
+            ));
+        }
     }
     Ok(())
 }
@@ -4292,7 +4366,9 @@ fn copy_file_synced(source: &Path, destination: &Path) -> Result<()> {
 }
 fn create_snapshot(db: &Database, name: &str) -> Result<()> {
     let base = db.root.join(".db/snapshots");
-    fs::create_dir_all(&base).map_err(|error| DbError::io(&base, error))?;
+    valid_snapshot(name)?;
+    ensure_snapshot_base(&base, true)?;
+    reject_snapshot_collision(&base, name)?;
     let destination = base.join(name);
     if destination.exists() {
         return Err(DbError::new(

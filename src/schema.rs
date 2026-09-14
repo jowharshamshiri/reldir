@@ -323,6 +323,12 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: enum requires non-empty values"),
         ));
     }
+    if c.kind != ColumnType::Enum && c.values.is_some() {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: values is only valid for enum columns"),
+        ));
+    }
     if let Some(values) = &c.values {
         let set: BTreeSet<_> = values.iter().collect();
         if set.len() != values.len() {
@@ -336,6 +342,18 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
         out.push(Diagnostic::error(
             "SCHEMA_MISSING_REQUIRED",
             format!("{table}.{name}: array requires items"),
+        ));
+    }
+    if c.kind != ColumnType::Array && c.items.is_some() {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: items is only valid for array columns"),
+        ));
+    }
+    if c.kind != ColumnType::Object && c.properties.is_some() {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: properties is only valid for object columns"),
         ));
     }
     if let Some(default) = &c.default
@@ -353,6 +371,12 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
         let mut normalized = BTreeSet::new();
         for (n, p) in props {
             use unicode_normalization::UnicodeNormalization;
+            if !valid_column_name(n) {
+                out.push(Diagnostic::error(
+                    "SCHEMA_COLUMN_UNKNOWN",
+                    format!("invalid nested column name {n:?} in {table}.{name}"),
+                ));
+            }
             if !normalized.insert(n.nfc().collect::<String>()) {
                 out.push(Diagnostic::error(
                     "SCHEMA_COLUMN_UNKNOWN",

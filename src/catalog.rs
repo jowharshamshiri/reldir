@@ -76,6 +76,13 @@ impl Catalog {
                 );
                 continue;
             }
+            if path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.ends_with(".inferred.json"))
+            {
+                continue;
+            }
             if meta.len() > config.max_json_file_size {
                 c.diagnostics.push(
                     Diagnostic::error(
@@ -110,13 +117,6 @@ impl Catalog {
                     )
                     .at(rel),
                 );
-                continue;
-            }
-            if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".inferred.json"))
-            {
                 continue;
             }
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

@@ -92,6 +92,7 @@ pub fn commit(
             .collect());
     }
     let lock_path = root.join(".db/lock");
+    validate_lock_path(&lock_path)?;
     let lock = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -123,7 +124,9 @@ pub fn commit(
         ));
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let dir = root.join(".db/transactions").join(&id);
+    let transactions = root.join(".db/transactions");
+    metadata::ensure_real_directory(&transactions, true, "transaction store")?;
+    let dir = transactions.join(&id);
     let staged = dir.join("staged");
     fs::create_dir_all(&staged).map_err(|e| DbError::io(&staged, e))?;
     let mut jc = vec![];
@@ -185,7 +188,12 @@ pub fn commit(
     crate::index::rebuild(root, &c)?;
     let (hash, entries) = metadata::state(&c)?;
     let old = metadata::load_manifest(root)?;
-    metadata::record(&c, old.as_ref(), hash, entries, origin, Some(&id))?;
+    if old
+        .as_ref()
+        .is_none_or(|manifest| manifest.root_hash != hash)
+    {
+        metadata::record(&c, old.as_ref(), hash, entries, origin, Some(&id))?;
+    }
     fs::write(dir.join("COMPLETE"), b"complete\n")
         .map_err(|e| DbError::io(&dir.join("COMPLETE"), e))?;
     if let Err(error) = fs::remove_dir_all(&dir) {
@@ -516,19 +524,26 @@ fn validate_target_parent(root: &Path, relative: &Path) -> Result<()> {
 
 pub fn has_pending(root: &Path) -> Result<bool> {
     let tx = root.join(".db/transactions");
-    if !tx.exists() {
+    if !metadata::ensure_real_directory(&tx, false, "transaction store")? {
         return Ok(false);
     }
     for entry in fs::read_dir(&tx).map_err(|e| DbError::io(&tx, e))? {
-        if entry.map_err(|e| DbError::io(&tx, e))?.path().is_dir() {
-            return Ok(true);
+        let path = entry.map_err(|e| DbError::io(&tx, e))?.path();
+        let entry_metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+        if !entry_metadata.file_type().is_dir() {
+            return Err(DbError::new(
+                "TRANSACTION_INCOMPLETE",
+                format!("transaction entry {} is not a real directory", path.display()),
+                5,
+            ));
         }
+        return Ok(true);
     }
     Ok(false)
 }
 pub fn recover(root: &Path) -> Result<bool> {
     let tx = root.join(".db/transactions");
-    if !tx.exists() {
+    if !metadata::ensure_real_directory(&tx, false, "transaction store")? {
         return Ok(false);
     }
     let mut recovered = false;
@@ -603,4 +618,17 @@ fn safe_relative(path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_lock_path(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !has_multiple_links(&metadata) => Ok(()),
+        Ok(_) => Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("lock {} is not a private regular file", path.display()),
+            6,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DbError::io(path, error)),
+    }
 }

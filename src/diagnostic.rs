@@ -108,6 +108,26 @@ impl Diagnostic {
     }
 }
 
+pub fn exit_code_for_diagnostics(diagnostics: &[Diagnostic]) -> i32 {
+    if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code.as_str(),
+            "FORMAT_UNSUPPORTED" | "INTERNAL_METADATA_CORRUPT"
+        )
+    }) {
+        6
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "TRANSACTION_INCOMPLETE")
+    {
+        5
+    } else if diagnostics.is_empty() {
+        0
+    } else {
+        2
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{diagnostic:?}")]
 pub struct DbError {

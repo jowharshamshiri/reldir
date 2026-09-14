@@ -128,6 +128,14 @@ pub fn load_manifest(root: &Path) -> Result<Option<Manifest>> {
     if !p.exists() {
         return Ok(None);
     }
+    let metadata = fs::symlink_metadata(&p).map_err(|e| DbError::io(&p, e))?;
+    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("manifest {} is not a private regular file", p.display()),
+            6,
+        ));
+    }
     let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
     crate::json::parse_as(&b).map(Some).map_err(|e| {
         DbError::new(
@@ -142,11 +150,21 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
     if !dir.exists() {
         return Ok(());
     }
+    let metadata = fs::symlink_metadata(&dir).map_err(|e| DbError::io(&dir, e))?;
+    if !metadata.file_type().is_dir() {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("provenance path {} is not a real directory", dir.display()),
+            6,
+        ));
+    }
+    ensure_real_directory(&root.join(".db/objects"), false, "object store")?;
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
         let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
         if !metadata.file_type().is_file()
+            || has_multiple_links(&metadata)
             || path.extension().and_then(|x| x.to_str()) != Some("json")
         {
             return Err(DbError::new(
@@ -291,10 +309,10 @@ fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()>
             6,
         )
     })?;
-    if !metadata.file_type().is_file() {
+    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("revision object {} is not a regular file", object.display()),
+            format!("revision object {} is not a private regular file", object.display()),
             6,
         ));
     }
@@ -366,6 +384,7 @@ pub fn write_manifest(root: &Path, m: &Manifest) -> Result<()> {
     write_json_atomic(&root.join(".db/manifest.json"), m)
 }
 pub fn write_provenance(root: &Path, p: &Provenance) -> Result<()> {
+    ensure_real_directory(&root.join(".db/provenance"), true, "provenance")?;
     let path = root.join(format!(".db/provenance/{:020}.json", p.revision));
     if path.exists() {
         return Err(DbError::new(
@@ -456,7 +475,7 @@ pub fn record(
 }
 fn store_objects(c: &Catalog, entries: &BTreeMap<String, ManifestEntry>) -> Result<()> {
     let dir = c.root.join(".db/objects");
-    fs::create_dir_all(&dir).map_err(|e| DbError::io(&dir, e))?;
+    ensure_real_directory(&dir, true, "object store")?;
     let mut values = BTreeMap::<String, serde_json::Value>::new();
     for (t, s) in &c.schemas {
         values.insert(
@@ -494,15 +513,20 @@ fn store_objects(c: &Catalog, entries: &BTreeMap<String, ManifestEntry>) -> Resu
     }
     for (path, entry) in entries {
         let target = dir.join(format!("{}.json", entry.hash));
-        if !target.exists() {
-            let value = values.get(path).ok_or_else(|| {
-                DbError::new(
-                    "INTERNAL_METADATA_CORRUPT",
-                    format!("cannot capture revision object {path}"),
-                    6,
-                )
-            })?;
-            write_json_atomic(&target, value)?;
+        match fs::symlink_metadata(&target) {
+            Ok(_) => validate_object(&c.root, path, entry)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let value = values.get(path).ok_or_else(|| {
+                    DbError::new(
+                        "INTERNAL_METADATA_CORRUPT",
+                        format!("cannot capture revision object {path}"),
+                        6,
+                    )
+                })?;
+                write_json_atomic(&target, value)?;
+                validate_object(&c.root, path, entry)?;
+            }
+            Err(error) => return Err(DbError::io(&target, error)),
         }
     }
     Ok(())
@@ -549,6 +573,34 @@ pub fn sync_parent(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+pub fn ensure_real_directory(path: &Path, create: bool, description: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!("{description} {} is not a real directory", path.display()),
+            6,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
+            sync_parent(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(DbError::io(path, error)),
+    }
+}
 fn internal(e: serde_json::Error) -> DbError {
     DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6)
+}
+
+#[cfg(unix)]
+fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
+    false
 }

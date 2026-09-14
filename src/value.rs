@@ -95,11 +95,8 @@ pub fn lossless_convert(value: &Value, target: &Column) -> Option<Value> {
             Value::Number(serde_json::Number::from_f64(number)?)
         }
         ColumnType::Decimal => {
-            if let Some(integer) = value.as_i64() {
-                Value::String(integer.to_string())
-            } else {
-                return None;
-            }
+            let integer = value.as_i64()?;
+            Value::String(integer.to_string())
         }
         ColumnType::String => match value {
             Value::Bool(boolean) => Value::String(boolean.to_string()),
