@@ -76,7 +76,8 @@ pub fn filename(schema: &Schema, row: &Map<String, Value>) -> Option<String> {
     let mut parts = vec![];
     for n in schema.filename_columns() {
         let c = schema.columns.get(n)?;
-        let t = value::textual(row.get(n)?, c)?;
+        let logical = row.get(n).or(c.default.as_ref())?;
+        let t = value::textual(logical, c)?;
         let mut encoded = percent_encode(t.as_bytes());
         if schema.filename_columns().len() == 1 && windows_reserved_component(&t) {
             let first = t.as_bytes().first()?;

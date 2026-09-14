@@ -96,6 +96,22 @@ impl Catalog {
                 );
                 continue;
             }
+            let schema_bytes = fs::read(&path).map_err(|error| DbError::io(&path, error))?;
+            if let Ok(schema_value) = crate::json::parse(&schema_bytes)
+                && json_depth(&schema_value) > config.max_nesting_depth
+            {
+                c.diagnostics.push(
+                    Diagnostic::error(
+                        "RESOURCE_LIMIT",
+                        format!(
+                            "schema JSON nesting exceeds depth limit {}",
+                            config.max_nesting_depth
+                        ),
+                    )
+                    .at(rel),
+                );
+                continue;
+            }
             if path
                 .file_name()
                 .and_then(|s| s.to_str())

@@ -43,14 +43,6 @@ pub fn validate(c: &Catalog) -> Vec<Diagnostic> {
                 .filter_map(|r| key(&r.value, &fk.references.columns, target_schema))
                 .collect();
             for row in &c.rows[table] {
-                let vals: Vec<_> = fk
-                    .columns
-                    .iter()
-                    .map(|x| row.value.get(x).unwrap_or(&Value::Null))
-                    .collect();
-                if vals.iter().any(|v| v.is_null()) {
-                    continue;
-                }
                 if let Some(k) = key(&row.value, &fk.columns, s) {
                     if !targets.contains(&k) {
                         let constraint = format!(
@@ -220,10 +212,19 @@ fn validate_unique(s: &Schema, rows: &[crate::catalog::Row], out: &mut Vec<Diagn
     }
 }
 
-pub fn key(row: &Map<String, Value>, cols: &[String], _s: &Schema) -> Option<String> {
+pub fn key(row: &Map<String, Value>, cols: &[String], s: &Schema) -> Option<String> {
     let values: Vec<_> = cols
         .iter()
-        .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
+        .map(|name| {
+            row.get(name)
+                .cloned()
+                .or_else(|| {
+                    s.columns
+                        .get(name)
+                        .and_then(|column| column.default.clone())
+                })
+                .unwrap_or(Value::Null)
+        })
         .collect();
     if values.iter().any(Value::is_null) {
         return None;

@@ -319,15 +319,11 @@ fn enforce_query_workspace(
 fn load(c: &Catalog, enforce: bool) -> Result<Connection> {
     let conn = Connection::open_in_memory().map_err(query_err)?;
     conn.create_collation("JDB_DECIMAL", |left, right| {
-        use std::str::FromStr;
-        match (
-            rust_decimal::Decimal::from_str(left),
-            rust_decimal::Decimal::from_str(right),
-        ) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
+        match crate::value::compare_decimal(left, right) {
+            Some(ordering) => ordering,
             // Invalid decimal text cannot occur in a valid catalog. Retaining a
             // total order here keeps SQLite's collation callback infallible.
-            _ => left.cmp(right),
+            None => left.cmp(right),
         }
     })
     .map_err(query_err)?;
@@ -849,57 +845,169 @@ pub fn check_expression_is_boolean(schema: &crate::schema::Schema, expression: &
 }
 
 fn boolean_expression(schema: &crate::schema::Schema, expression: &Expr) -> bool {
+    expression_kind(schema, expression) == Some(ExpressionKind::Bool)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpressionKind {
+    Bool,
+    Numeric,
+    Text,
+    Json,
+    Null,
+}
+
+fn expression_kind(schema: &crate::schema::Schema, expression: &Expr) -> Option<ExpressionKind> {
     match expression {
         Expr::Identifier(identifier) => schema
             .columns
             .get(&identifier.value)
-            .is_some_and(|column| column.kind == ColumnType::Bool),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .and_then(|identifier| schema.columns.get(&identifier.value))
-            .is_some_and(|column| column.kind == ColumnType::Bool),
-        Expr::Value(value) => matches!(value.value, sqlparser::ast::Value::Boolean(_)),
-        Expr::Nested(expression) => boolean_expression(schema, expression),
-        Expr::UnaryOp {
-            op: UnaryOperator::Not | UnaryOperator::BangNot,
-            expr,
-        } => boolean_expression(schema, expr),
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Xor => {
-                boolean_expression(schema, left) && boolean_expression(schema, right)
+            .map(|column| column_expression_kind(&column.kind)),
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() == 2 && parts[0].value != schema.table {
+                return None;
             }
-            BinaryOperator::Eq
-            | BinaryOperator::NotEq
-            | BinaryOperator::Gt
-            | BinaryOperator::GtEq
-            | BinaryOperator::Lt
-            | BinaryOperator::LtEq
-            | BinaryOperator::Spaceship => true,
-            _ => false,
+            parts
+                .last()
+                .and_then(|identifier| schema.columns.get(&identifier.value))
+                .map(|column| column_expression_kind(&column.kind))
+        }
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Boolean(_) => Some(ExpressionKind::Bool),
+            sqlparser::ast::Value::Number(_, _) => Some(ExpressionKind::Numeric),
+            sqlparser::ast::Value::Null => Some(ExpressionKind::Null),
+            sqlparser::ast::Value::SingleQuotedString(_)
+            | sqlparser::ast::Value::DoubleQuotedString(_)
+            | sqlparser::ast::Value::TripleSingleQuotedString(_)
+            | sqlparser::ast::Value::TripleDoubleQuotedString(_)
+            | sqlparser::ast::Value::EscapedStringLiteral(_)
+            | sqlparser::ast::Value::NationalStringLiteral(_)
+            | sqlparser::ast::Value::HexStringLiteral(_)
+            | sqlparser::ast::Value::SingleQuotedByteStringLiteral(_)
+            | sqlparser::ast::Value::DoubleQuotedByteStringLiteral(_)
+            | sqlparser::ast::Value::TripleSingleQuotedByteStringLiteral(_)
+            | sqlparser::ast::Value::TripleDoubleQuotedByteStringLiteral(_) => {
+                Some(ExpressionKind::Text)
+            }
+            _ => None,
         },
-        Expr::IsFalse(_)
-        | Expr::IsNotFalse(_)
-        | Expr::IsTrue(_)
-        | Expr::IsNotTrue(_)
-        | Expr::IsNull(_)
-        | Expr::IsNotNull(_)
-        | Expr::IsUnknown(_)
-        | Expr::IsNotUnknown(_)
-        | Expr::IsDistinctFrom(_, _)
-        | Expr::IsNotDistinctFrom(_, _)
-        | Expr::InList { .. }
-        | Expr::InSubquery { .. }
-        | Expr::InUnnest { .. }
-        | Expr::Between { .. }
-        | Expr::Like { .. }
-        | Expr::ILike { .. }
-        | Expr::SimilarTo { .. }
-        | Expr::RLike { .. }
-        | Expr::AnyOp { .. }
-        | Expr::AllOp { .. }
-        | Expr::Exists { .. } => true,
-        _ => false,
+        Expr::Nested(expression) => expression_kind(schema, expression),
+        Expr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Not | UnaryOperator::BangNot
+                if expression_kind(schema, expr) == Some(ExpressionKind::Bool) =>
+            {
+                Some(ExpressionKind::Bool)
+            }
+            UnaryOperator::Plus | UnaryOperator::Minus
+                if expression_kind(schema, expr) == Some(ExpressionKind::Numeric) =>
+            {
+                Some(ExpressionKind::Numeric)
+            }
+            _ => None,
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let left = expression_kind(schema, left)?;
+            let right = expression_kind(schema, right)?;
+            match op {
+                BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Xor
+                    if left == ExpressionKind::Bool && right == ExpressionKind::Bool =>
+                {
+                    Some(ExpressionKind::Bool)
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Spaceship
+                    if comparable_kinds(left, right) =>
+                {
+                    Some(ExpressionKind::Bool)
+                }
+                BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Modulo
+                    if left == ExpressionKind::Numeric && right == ExpressionKind::Numeric =>
+                {
+                    Some(ExpressionKind::Numeric)
+                }
+                BinaryOperator::StringConcat
+                    if left == ExpressionKind::Text && right == ExpressionKind::Text =>
+                {
+                    Some(ExpressionKind::Text)
+                }
+                _ => None,
+            }
+        }
+        Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner)
+            if expression_kind(schema, inner) == Some(ExpressionKind::Bool) =>
+        {
+            Some(ExpressionKind::Bool)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expression_kind(schema, inner).map(|_| ExpressionKind::Bool)
+        }
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            let left = expression_kind(schema, left)?;
+            let right = expression_kind(schema, right)?;
+            comparable_kinds(left, right).then_some(ExpressionKind::Bool)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            let value = expression_kind(schema, expr)?;
+            let low = expression_kind(schema, low)?;
+            let high = expression_kind(schema, high)?;
+            (comparable_kinds(value, low) && comparable_kinds(value, high))
+                .then_some(ExpressionKind::Bool)
+        }
+        Expr::InList { expr, list, .. } => {
+            let value = expression_kind(schema, expr)?;
+            list.iter()
+                .map(|item| expression_kind(schema, item))
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .all(|item| comparable_kinds(value, item))
+                .then_some(ExpressionKind::Bool)
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. }
+            if expression_kind(schema, expr) == Some(ExpressionKind::Text)
+                && expression_kind(schema, pattern) == Some(ExpressionKind::Text) =>
+        {
+            Some(ExpressionKind::Bool)
+        }
+        _ => None,
     }
+}
+
+fn column_expression_kind(kind: &ColumnType) -> ExpressionKind {
+    match kind {
+        ColumnType::Bool => ExpressionKind::Bool,
+        ColumnType::Int | ColumnType::Float | ColumnType::Decimal => ExpressionKind::Numeric,
+        ColumnType::String
+        | ColumnType::Bytes
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Uuid
+        | ColumnType::Ulid
+        | ColumnType::Enum => ExpressionKind::Text,
+        ColumnType::Array | ColumnType::Object | ColumnType::Json => ExpressionKind::Json,
+    }
+}
+
+fn comparable_kinds(left: ExpressionKind, right: ExpressionKind) -> bool {
+    left == ExpressionKind::Null || right == ExpressionKind::Null || left == right
 }
 fn action(a: Action) -> &'static str {
     match a {

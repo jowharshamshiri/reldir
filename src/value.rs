@@ -1,9 +1,8 @@
 use crate::schema::{Column, ColumnType};
 use base64::Engine;
 use chrono::{DateTime, NaiveDate};
-use rust_decimal::Decimal;
 use serde_json::Value;
-use std::str::FromStr;
+use std::cmp::Ordering;
 
 pub fn matches_column(v: &Value, c: &Column) -> bool {
     if v.is_null() {
@@ -13,9 +12,7 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
         ColumnType::Bool => v.is_boolean(),
         ColumnType::Int => v.as_i64().is_some() && v.as_f64().is_none_or(|n| n.fract() == 0.0),
         ColumnType::Float => v.as_f64().is_some_and(|x| x.is_finite()),
-        ColumnType::Decimal => v
-            .as_str()
-            .is_some_and(|s| Decimal::from_str(s).is_ok() && canonical_decimal(s)),
+        ColumnType::Decimal => v.as_str().is_some_and(canonical_decimal),
         ColumnType::String => v.is_string(),
         ColumnType::Bytes => v
             .as_str()
@@ -50,17 +47,82 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
     }
 }
 
-fn canonical_decimal(s: &str) -> bool {
-    if s.starts_with('+')
-        || s.contains('e')
-        || s.contains('E')
-        || (s.starts_with('0') && s.len() > 1 && !s.starts_with("0."))
-        || s.ends_with('.')
-        || (s.contains('.') && s.ends_with('0'))
+pub fn canonical_decimal(text: &str) -> bool {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    if unsigned.is_empty() || text.starts_with('+') || text == "-0" {
+        return false;
+    }
+    let mut parts = unsigned.split('.');
+    let whole = parts.next().unwrap_or("");
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || (whole.len() > 1 && whole.starts_with('0'))
     {
         return false;
     }
-    Decimal::from_str(s).is_ok()
+    match fraction {
+        None => true,
+        Some(fraction) => {
+            !fraction.is_empty()
+                && fraction.bytes().all(|byte| byte.is_ascii_digit())
+                && !fraction.ends_with('0')
+        }
+    }
+}
+
+pub fn compare_decimal(left: &str, right: &str) -> Option<Ordering> {
+    let left_parts = decimal_parts(left)?;
+    let right_parts = decimal_parts(right)?;
+    if left_parts.0 != right_parts.0 {
+        return Some(left_parts.0.cmp(&right_parts.0));
+    }
+    if left_parts.0 == 0 {
+        return Some(Ordering::Equal);
+    }
+    let magnitude = left_parts
+        .1
+        .len()
+        .cmp(&right_parts.1.len())
+        .then_with(|| left_parts.1.cmp(right_parts.1))
+        .then_with(|| compare_fraction(left_parts.2, right_parts.2));
+    Some(if left_parts.0 < 0 {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
+fn decimal_parts(text: &str) -> Option<(i8, &str, &str)> {
+    if !canonical_decimal(text) {
+        return None;
+    }
+    let negative = text.starts_with('-');
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let sign = if whole == "0" && fraction.bytes().all(|byte| byte == b'0') {
+        0
+    } else if negative {
+        -1
+    } else {
+        1
+    };
+    Some((sign, whole, fraction))
+}
+
+fn compare_fraction(left: &str, right: &str) -> Ordering {
+    let length = left.len().max(right.len());
+    (0..length)
+        .map(|index| {
+            left.as_bytes()
+                .get(index)
+                .copied()
+                .unwrap_or(b'0')
+                .cmp(&right.as_bytes().get(index).copied().unwrap_or(b'0'))
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
 }
 
 pub fn textual(v: &Value, c: &Column) -> Option<String> {
