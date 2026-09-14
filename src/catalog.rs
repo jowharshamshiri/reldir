@@ -376,6 +376,19 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                 );
                 continue;
             }
+            if fk.columns.iter().collect::<BTreeSet<_>>().len() != fk.columns.len()
+                || fk.references.columns.iter().collect::<BTreeSet<_>>().len()
+                    != fk.references.columns.len()
+            {
+                out.push(
+                    Diagnostic::error(
+                        "SCHEMA_FK_ACTION_INVALID",
+                        "foreign key column lists must not repeat columns",
+                    )
+                    .table(table),
+                );
+                continue;
+            }
             for c in &fk.columns {
                 if !s.columns.contains_key(c) {
                     out.push(
@@ -427,7 +440,7 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
             }
             for (a, b) in fk.columns.iter().zip(&fk.references.columns) {
                 if let (Some(x), Some(y)) = (s.columns.get(a), target.columns.get(b))
-                    && x.kind != y.kind
+                    && !same_column_type(x, y, false)
                 {
                     out.push(
                         Diagnostic::error(
@@ -476,6 +489,7 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
         s: &'a BTreeMap<String, Schema>,
         vis: &mut BTreeSet<&'a str>,
         stack: &mut BTreeSet<&'a str>,
+        update: bool,
     ) -> bool {
         if stack.contains(n) {
             return true;
@@ -487,20 +501,59 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
         let cycle = s.get(n).is_some_and(|x| {
             x.foreign_keys
                 .iter()
-                .filter(|f| f.delete_action() == crate::schema::Action::Cascade)
-                .any(|f| visit(&f.references.table, s, vis, stack))
+                .filter(|f| {
+                    (if update {
+                        f.update_action()
+                    } else {
+                        f.delete_action()
+                    }) == crate::schema::Action::Cascade
+                })
+                .any(|f| visit(&f.references.table, s, vis, stack, update))
         });
         stack.remove(n);
         cycle
     }
-    let mut vis = BTreeSet::new();
-    for n in schemas.keys() {
-        if visit(n, schemas, &mut vis, &mut BTreeSet::new()) {
-            out.push(Diagnostic::error(
-                "SCHEMA_FK_CYCLE",
-                "foreign keys form an all-cascade cycle",
-            ));
-            break;
+    for (update, action) in [(false, "delete"), (true, "update")] {
+        let mut vis = BTreeSet::new();
+        for n in schemas.keys() {
+            if visit(n, schemas, &mut vis, &mut BTreeSet::new(), update) {
+                out.push(Diagnostic::error(
+                    "SCHEMA_FK_CYCLE",
+                    format!("foreign keys form an all-cascade {action} cycle"),
+                ));
+                break;
+            }
         }
+    }
+}
+
+fn same_column_type(
+    left: &crate::schema::Column,
+    right: &crate::schema::Column,
+    compare_nullable: bool,
+) -> bool {
+    if left.kind != right.kind || (compare_nullable && left.nullable != right.nullable) {
+        return false;
+    }
+    match left.kind {
+        crate::schema::ColumnType::Enum => left.values == right.values,
+        crate::schema::ColumnType::Array => match (&left.items, &right.items) {
+            (Some(left), Some(right)) => same_column_type(left, right, true),
+            (None, None) => true,
+            _ => false,
+        },
+        crate::schema::ColumnType::Object => match (&left.properties, &right.properties) {
+            (Some(left), Some(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|(name, left)| {
+                        right
+                            .get(name)
+                            .is_some_and(|right| same_column_type(left, right, true))
+                    })
+            }
+            (None, None) => true,
+            _ => false,
+        },
+        _ => true,
     }
 }

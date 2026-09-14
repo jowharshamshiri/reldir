@@ -548,6 +548,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                     command,
                     Command::Check { no_write: true, .. }
                         | Command::Lint { .. }
+                        | Command::Doctor { fix: false, .. }
+                        | Command::Infer { write: false, .. }
                         | Command::Diff { .. }
                 );
             let mode = if settings.readonly {
@@ -2268,6 +2270,57 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
             added.insert(new[&path].hash.clone(), path);
         }
     }
+    let mut key_changes = std::collections::BTreeMap::<String, (String, Value, Value)>::new();
+    let mut key_change_targets = std::collections::BTreeSet::new();
+    let removed_paths = changes
+        .iter()
+        .filter_map(|change| change.strip_prefix("D "))
+        .collect::<Vec<_>>();
+    let added_paths = changes
+        .iter()
+        .filter_map(|change| change.strip_prefix("A "))
+        .collect::<Vec<_>>();
+    for old_path in removed_paths {
+        if added.contains_key(&old[old_path].hash) {
+            continue;
+        }
+        let Some(table) = authoritative_table(old_path) else {
+            continue;
+        };
+        let Some(schema) = diff_schema(db, &new, table, working)? else {
+            continue;
+        };
+        let old_value = load_object(db, &old[old_path].hash)?;
+        let old_payload = without_fields(&old_value, &schema.primary_key);
+        let candidates = added_paths
+            .iter()
+            .filter(|new_path| {
+                authoritative_table(new_path) == Some(table)
+                    && !removed.contains_key(&new[**new_path].hash)
+                    && !key_change_targets.contains(**new_path)
+            })
+            .filter_map(|new_path| {
+                let value = if working {
+                    current_object(db, new_path)
+                } else {
+                    load_object(db, &new[*new_path].hash)
+                };
+                match value {
+                    Ok(value) if without_fields(&value, &schema.primary_key) == old_payload => {
+                        Some(Ok(((*new_path).to_string(), value)))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let [candidate] = candidates.as_slice() {
+            let old_key = row_key_value(&old_value, &schema);
+            let new_key = row_key_value(&candidate.1, &schema);
+            key_change_targets.insert(candidate.0.clone());
+            key_changes.insert(old_path.into(), (candidate.0.clone(), old_key, new_key));
+        }
+    }
     for x in changes {
         let path = x[2..].to_string();
         if schema_only && !path.starts_with("schema/") {
@@ -2280,6 +2333,16 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
             continue;
         }
         if x.starts_with("D ") {
+            if let Some((to, old_key, new_key)) = key_changes.get(&path) {
+                rows.push(obj([
+                    ("kind", Value::String("key_change".into())),
+                    ("from", Value::String(path)),
+                    ("to", Value::String(to.clone())),
+                    ("old", old_key.clone()),
+                    ("new", new_key.clone()),
+                ]));
+                continue;
+            }
             let hash = &old[&path].hash;
             if let Some(to) = added.get(hash) {
                 rows.push(obj([
@@ -2294,7 +2357,7 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
                 ("path", Value::String(path)),
             ]));
         } else if x.starts_with("A ") {
-            if removed.contains_key(&new[&path].hash) {
+            if removed.contains_key(&new[&path].hash) || key_change_targets.contains(&path) {
                 continue;
             }
             rows.push(obj([
@@ -2314,22 +2377,70 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
     output::records(&rows, format)?;
     Ok(0)
 }
+fn authoritative_table(path: &str) -> Option<&str> {
+    let (table, _) = path.split_once('/')?;
+    (!matches!(table, ".db" | "schema")).then_some(table)
+}
+
+fn diff_schema(
+    db: &Database,
+    entries: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
+    table: &str,
+    working: bool,
+) -> Result<Option<Schema>> {
+    if working {
+        return Ok(db.catalog.schemas.get(table).cloned());
+    }
+    let Some(entry) = entries.get(&format!("schema/{table}.json")) else {
+        return Ok(None);
+    };
+    let value = load_object(db, &entry.hash)?;
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))
+}
+
+fn without_fields(value: &Value, fields: &[String]) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        for field in fields {
+            object.remove(field);
+        }
+    }
+    value
+}
+
+fn row_key_value(value: &Value, schema: &Schema) -> Value {
+    Value::Array(
+        schema
+            .primary_key
+            .iter()
+            .map(|name| {
+                value
+                    .get(name)
+                    .cloned()
+                    .or_else(|| schema.columns[name].default.clone())
+                    .unwrap_or(Value::Null)
+            })
+            .collect(),
+    )
+}
 fn load_revision(db: &Database, revision: u64) -> Result<metadata::Provenance> {
     let p = db.root.join(format!(".db/provenance/{revision:020}.json"));
     if !p.exists() {
         return Err(DbError::usage(format!("unknown revision {revision}")));
     }
-    serde_json::from_slice(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
+    crate::json::parse_as(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
 }
 fn load_object(db: &Database, hash: &str) -> Result<Value> {
     let p = db.root.join(format!(".db/objects/{hash}.json"));
-    serde_json::from_slice(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
+    crate::json::parse(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
 }
 fn current_object(db: &Database, path: &str) -> Result<Value> {
     if path == ".db/config" {
-        return serde_json::from_slice(
+        return crate::json::parse(
             &fs::read(db.root.join(path)).map_err(|e| DbError::io(&db.root.join(path), e))?,
         )
         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6));

@@ -206,6 +206,12 @@ impl Schema {
                 "primary_key must be a non-empty array",
             ));
         }
+        if self.primary_key.iter().collect::<BTreeSet<_>>().len() != self.primary_key.len() {
+            out.push(Diagnostic::error(
+                "SCHEMA_PK_COLUMN_UNKNOWN",
+                "primary_key must not repeat a column",
+            ));
+        }
         if self.columns.is_empty() {
             out.push(Diagnostic::error(
                 "SCHEMA_MISSING_REQUIRED",
@@ -254,6 +260,12 @@ impl Schema {
                 out.push(Diagnostic::error(
                     "SCHEMA_COLUMN_UNKNOWN",
                     "constraint column list cannot be empty",
+                ));
+            }
+            if cols.iter().collect::<BTreeSet<_>>().len() != cols.len() {
+                out.push(Diagnostic::error(
+                    "SCHEMA_COLUMN_UNKNOWN",
+                    "constraint column list must not repeat a column",
                 ));
             }
             for c in cols {

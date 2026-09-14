@@ -236,6 +236,22 @@ fn direct_primary_key_update_uses_declared_cascade() {
             .unwrap()
             .contains("\"user_id\": \"u2\"")
     );
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "json",
+        "diff",
+        "2",
+        "3",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("\"kind\": \"key_change\"")
+            .and(predicate::str::contains("users/u1.json"))
+            .and(predicate::str::contains("users/u2.json")),
+    );
 }
 
 #[test]

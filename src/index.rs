@@ -12,6 +12,7 @@ use std::{
 };
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct IndexFile {
     table: String,
     columns: Vec<String>,
@@ -82,7 +83,7 @@ pub fn valid(root: &Path, c: &Catalog) -> Result<bool> {
         let Ok(bytes) = fs::read(&path) else {
             return Ok(false);
         };
-        let Ok(got) = serde_json::from_slice::<IndexFile>(&bytes) else {
+        let Ok(got) = crate::json::parse_as::<IndexFile>(&bytes) else {
             return Ok(false);
         };
         if &got != want {
