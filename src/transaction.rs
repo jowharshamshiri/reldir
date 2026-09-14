@@ -527,19 +527,23 @@ pub fn has_pending(root: &Path) -> Result<bool> {
     if !metadata::ensure_real_directory(&tx, false, "transaction store")? {
         return Ok(false);
     }
+    let mut pending = false;
     for entry in fs::read_dir(&tx).map_err(|e| DbError::io(&tx, e))? {
         let path = entry.map_err(|e| DbError::io(&tx, e))?.path();
         let entry_metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
         if !entry_metadata.file_type().is_dir() {
             return Err(DbError::new(
                 "TRANSACTION_INCOMPLETE",
-                format!("transaction entry {} is not a real directory", path.display()),
+                format!(
+                    "transaction entry {} is not a real directory",
+                    path.display()
+                ),
                 5,
             ));
         }
-        return Ok(true);
+        pending = true;
     }
-    Ok(false)
+    Ok(pending)
 }
 pub fn recover(root: &Path) -> Result<bool> {
     let tx = root.join(".db/transactions");

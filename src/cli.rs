@@ -2485,7 +2485,8 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
             for e in fs::read_dir(&base).map_err(|e| DbError::io(&base, e))? {
                 let e = e.map_err(|e| DbError::io(&base, e))?;
                 let path = e.path();
-                let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+                let metadata =
+                    fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
                 if !metadata.file_type().is_dir() {
                     return Err(DbError::new(
                         "INTERNAL_METADATA_CORRUPT",
@@ -2592,7 +2593,9 @@ fn analyze(db: &Database, format: Format) -> Result<i32> {
         .iter()
         .map(|(t, r)| (t.clone(), obj([("rows", Value::from(r.len()))])))
         .collect();
-    metadata::write_json_atomic(&db.root.join(".db/statistics/catalog.json"), &stats)?;
+    let statistics = db.root.join(".db/statistics");
+    ensure_rebuildable_directory(&statistics)?;
+    metadata::write_json_atomic(&statistics.join("catalog.json"), &stats)?;
     event(
         format,
         obj([
@@ -2602,6 +2605,21 @@ fn analyze(db: &Database, format: Format) -> Result<i32> {
         "rebuilt statistics",
     )?;
     Ok(0)
+}
+fn ensure_rebuildable_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(file_metadata) if file_metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => {
+            fs::remove_file(path).map_err(|error| DbError::io(path, error))?;
+            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
+            metadata::sync_parent(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
+            metadata::sync_parent(path)
+        }
+        Err(error) => Err(DbError::io(path, error)),
+    }
 }
 fn gc(db: &Database, dry: bool, format: Format, yes: bool) -> Result<i32> {
     db.require_valid()?;

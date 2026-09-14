@@ -1029,3 +1029,49 @@ fn inferred_comparison_files_are_non_authoritative_and_replaceable() {
         fs::read(root.join(".db/manifest.json")).unwrap()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn internal_symlinks_are_rejected_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let dir = adopted();
+    let root = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+    let external_config = outside.path().join("config");
+    let original = fs::read(root.join(".db/config")).unwrap();
+    fs::write(&external_config, &original).unwrap();
+    fs::remove_file(root.join(".db/config")).unwrap();
+    symlink(&external_config, root.join(".db/config")).unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .code(6)
+    .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
+    assert_eq!(original, fs::read(&external_config).unwrap());
+
+    fs::remove_file(root.join(".db/config")).unwrap();
+    fs::write(root.join(".db/config"), original).unwrap();
+    let external_snapshot = outside.path().join("snapshot");
+    fs::create_dir(&external_snapshot).unwrap();
+    symlink(&external_snapshot, root.join(".db/snapshots/redirected")).unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "snapshot",
+        "restore",
+        "redirected",
+        "--yes",
+    ])
+    .assert()
+    .code(6)
+    .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
+    assert_eq!(fs::read_dir(&external_snapshot).unwrap().count(), 0);
+}

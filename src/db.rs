@@ -317,7 +317,10 @@ fn require_private_regular_file(path: &Path, description: &str) -> Result<()> {
     if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("{description} {} must be a private regular file", path.display()),
+            format!(
+                "{description} {} must be a private regular file",
+                path.display()
+            ),
             6,
         ));
     }

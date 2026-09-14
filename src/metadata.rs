@@ -147,18 +147,10 @@ pub fn load_manifest(root: &Path) -> Result<Option<Manifest>> {
 }
 pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<()> {
     let dir = root.join(".db/provenance");
-    if !dir.exists() {
+    ensure_real_directory(&root.join(".db/objects"), false, "object store")?;
+    if !ensure_real_directory(&dir, false, "provenance")? {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(&dir).map_err(|e| DbError::io(&dir, e))?;
-    if !metadata.file_type().is_dir() {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("provenance path {} is not a real directory", dir.display()),
-            6,
-        ));
-    }
-    ensure_real_directory(&root.join(".db/objects"), false, "object store")?;
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
@@ -312,7 +304,10 @@ fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()>
     if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("revision object {} is not a private regular file", object.display()),
+            format!(
+                "revision object {} is not a private regular file",
+                object.display()
+            ),
             6,
         ));
     }
