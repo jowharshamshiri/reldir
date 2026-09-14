@@ -254,6 +254,16 @@ pub fn validate_format(root: &Path) -> Result<()> {
     }
     let p = meta.join("format");
     require_private_regular_file(&p, "format marker")?;
+    let format_size = fs::symlink_metadata(&p)
+        .map_err(|error| DbError::io(&p, error))?
+        .len();
+    if format_size > 4096 {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            ".db/format exceeds the 4096-byte format marker limit",
+            6,
+        ));
+    }
     let text = fs::read_to_string(&p).map_err(|e| DbError::io(&p, e))?;
     let found = text
         .lines()
@@ -281,6 +291,19 @@ pub fn load_config(root: &Path) -> Result<Config> {
         return Ok(Config::default());
     }
     require_private_regular_file(&p, "configuration")?;
+    let config_size = fs::symlink_metadata(&p)
+        .map_err(|error| DbError::io(&p, error))?
+        .len();
+    if config_size > crate::config::BOOTSTRAP_MAX_CONFIG_SIZE {
+        return Err(DbError::new(
+            "INTERNAL_METADATA_CORRUPT",
+            format!(
+                ".db/config exceeds the {} byte bootstrap limit",
+                crate::config::BOOTSTRAP_MAX_CONFIG_SIZE
+            ),
+            6,
+        ));
+    }
     let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
     let value = crate::json::parse(&b).map_err(|e| {
         DbError::new(

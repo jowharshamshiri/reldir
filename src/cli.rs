@@ -891,7 +891,11 @@ fn skipped_adoption_directories(root: &Path) -> Result<Vec<(String, String)>> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if matches!(name, "schema" | ".db" | ".git") || name.starts_with('.') || !path.is_dir() {
+        if matches!(name, "schema" | ".db" | ".git") || name.starts_with('.') {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
+        if !metadata.file_type().is_dir() {
             continue;
         }
         let mut contains_json = false;
@@ -928,8 +932,37 @@ fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<Strin
     if !dir.exists() {
         return Ok(out);
     }
+    let metadata = fs::symlink_metadata(&dir).map_err(|error| DbError::io(&dir, error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(DbError::from_diag(
+            crate::diagnostic::Diagnostic::error(
+                "NON_REGULAR_FILE",
+                "schema/ must be a real directory",
+            )
+            .at("schema"),
+            2,
+        ));
+    }
     for e in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let p = e.map_err(|e| DbError::io(&dir, e))?.path();
+        let metadata = fs::symlink_metadata(&p).map_err(|error| DbError::io(&p, error))?;
+        if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
+            return Err(DbError::from_diag(
+                crate::diagnostic::Diagnostic::error(
+                    "NON_REGULAR_FILE",
+                    "schema entries must be private regular files",
+                )
+                .at(p.strip_prefix(root).unwrap_or(&p)),
+                2,
+            ));
+        }
+        if p
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".inferred.json"))
+        {
+            continue;
+        }
         if p.extension().and_then(|x| x.to_str()) == Some("json")
             && let Some(s) = p.file_stem().and_then(|x| x.to_str())
         {

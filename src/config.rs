@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const BOOTSTRAP_MAX_CONFIG_SIZE: u64 = 64 * 1024 * 1024;
+
 fn default_enum_max() -> usize {
     10
 }
@@ -7,7 +9,7 @@ fn default_unique_min() -> usize {
     20
 }
 fn default_file_size() -> u64 {
-    64 * 1024 * 1024
+    BOOTSTRAP_MAX_CONFIG_SIZE
 }
 fn default_depth() -> usize {
     128
