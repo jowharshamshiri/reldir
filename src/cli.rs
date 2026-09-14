@@ -2416,11 +2416,27 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
                 return Err(DbError::usage("snapshot already exists"));
             }
             if cli.dry_run {
-                println!("would create snapshot {name}");
+                event(
+                    format,
+                    obj([
+                        ("kind", Value::String("snapshot".into())),
+                        ("name", Value::String(name)),
+                        ("action", Value::String("create_planned".into())),
+                    ]),
+                    "would create snapshot",
+                )?;
                 return Ok(0);
             }
             create_snapshot(db, &name)?;
-            println!("created snapshot {name}");
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("snapshot".into())),
+                    ("name", Value::String(name.clone())),
+                    ("action", Value::String("created".into())),
+                ]),
+                &format!("created snapshot {name}"),
+            )?;
             Ok(0)
         }
         SnapshotCommand::List => {
@@ -2471,26 +2487,55 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
             if !cli.dry_run && p.exists() {
                 fs::remove_dir_all(&p).map_err(|e| DbError::io(&p, e))?
             }
-            println!(
-                "{} snapshot {}",
-                if cli.dry_run {
-                    "would delete"
-                } else {
-                    "deleted"
-                },
-                p.file_name().unwrap().to_string_lossy()
-            );
+            let display_name = p
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| DbError::new("PATH_VIOLATION", "invalid snapshot path", 1))?;
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("snapshot".into())),
+                    ("name", Value::String(display_name.into())),
+                    (
+                        "action",
+                        Value::String(
+                            if cli.dry_run {
+                                "delete_planned"
+                            } else {
+                                "deleted"
+                            }
+                            .into(),
+                        ),
+                    ),
+                ]),
+                &format!(
+                    "{} snapshot {}",
+                    if cli.dry_run {
+                        "would delete"
+                    } else {
+                        "deleted"
+                    },
+                    display_name
+                ),
+            )?;
             Ok(0)
         }
     }
 }
-fn reindex(db: &Database, _format: Format) -> Result<i32> {
+fn reindex(db: &Database, format: Format) -> Result<i32> {
     db.require_valid()?;
     crate::index::rebuild(&db.root, &db.catalog)?;
-    println!("rebuilt indexes");
+    event(
+        format,
+        obj([
+            ("kind", Value::String("maintenance".into())),
+            ("operation", Value::String("reindex".into())),
+        ]),
+        "rebuilt indexes",
+    )?;
     Ok(0)
 }
-fn analyze(db: &Database, _format: Format) -> Result<i32> {
+fn analyze(db: &Database, format: Format) -> Result<i32> {
     db.require_valid()?;
     let stats: std::collections::BTreeMap<_, _> = db
         .catalog
@@ -2499,7 +2544,14 @@ fn analyze(db: &Database, _format: Format) -> Result<i32> {
         .map(|(t, r)| (t.clone(), obj([("rows", Value::from(r.len()))])))
         .collect();
     metadata::write_json_atomic(&db.root.join(".db/statistics/catalog.json"), &stats)?;
-    println!("rebuilt statistics");
+    event(
+        format,
+        obj([
+            ("kind", Value::String("maintenance".into())),
+            ("operation", Value::String("analyze".into())),
+        ]),
+        "rebuilt statistics",
+    )?;
     Ok(0)
 }
 fn gc(db: &Database, dry: bool, format: Format, yes: bool) -> Result<i32> {
