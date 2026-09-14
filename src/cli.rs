@@ -1283,14 +1283,14 @@ fn doctor(
         return Ok(if db.diagnostics.is_empty() { 0 } else { 2 });
     }
     require_writable(cli)?;
-    if format != Format::Table && !cli.yes {
+    if !cli.dry_run && format != Format::Table && !cli.yes {
         return Err(DbError::new(
             "CONFIRMATION_REQUIRED",
             "--yes is required to apply doctor fixes with machine-readable output",
             9,
         ));
     }
-    if !cli.yes {
+    if !cli.dry_run && !cli.yes {
         return Err(DbError::new(
             "CONFIRMATION_REQUIRED",
             "doctor fixes require --yes",
@@ -2385,22 +2385,36 @@ fn log(db: &Database, format: Format) -> Result<i32> {
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let v: Value = serde_json::from_slice(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
+        let bytes = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
+        let revision: metadata::Provenance = crate::json::parse_as(&bytes)
             .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
-        rows.push(v.as_object().unwrap().clone())
+        rows.push(serialized_record("provenance", &revision)?)
     }
     output::records(&rows, format)?;
     Ok(0)
 }
-fn show(db: &Database, revision: u64, _format: Format) -> Result<i32> {
+fn show(db: &Database, revision: u64, format: Format) -> Result<i32> {
     let p = db.root.join(format!(".db/provenance/{revision:020}.json"));
     if !p.exists() {
         return Err(DbError::usage(format!("unknown revision {revision}")));
     }
-    print!(
-        "{}",
-        fs::read_to_string(&p).map_err(|e| DbError::io(&p, e))?
-    );
+    let bytes = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
+    if format == Format::Table {
+        print!(
+            "{}",
+            String::from_utf8(bytes).map_err(|error| {
+                DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
+            })?
+        );
+    } else {
+        let provenance: metadata::Provenance = crate::json::parse_as(&bytes).map_err(|error| {
+            DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
+        })?;
+        output::records(
+            &[serialized_record("provenance", &provenance)?],
+            format,
+        )?;
+    }
     Ok(0)
 }
 
@@ -2459,7 +2473,7 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
         SnapshotCommand::Restore { name } => {
             require_writable(cli)?;
             valid_snapshot(&name)?;
-            if !cli.yes {
+            if !cli.dry_run && !cli.yes {
                 return Err(DbError::new(
                     "CONFIRMATION_REQUIRED",
                     "snapshot restore requires --yes",
@@ -2476,7 +2490,7 @@ fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> R
         SnapshotCommand::Delete { name } => {
             require_writable(cli)?;
             valid_snapshot(&name)?;
-            if !cli.yes {
+            if !cli.dry_run && !cli.yes {
                 return Err(DbError::new(
                     "CONFIRMATION_REQUIRED",
                     "snapshot delete requires --yes",
