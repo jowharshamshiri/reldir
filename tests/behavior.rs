@@ -32,7 +32,7 @@ fn adopted() -> tempfile::TempDir {
 }
 
 #[test]
-fn adoption_query_crud_and_external_revision_are_real() {
+fn test0001_adoption_query_crud_and_external_revision_are_real() {
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     db().args([
@@ -73,7 +73,7 @@ fn adoption_query_crud_and_external_revision_are_real() {
 }
 
 #[test]
-fn invalid_external_state_is_rejected_without_advancing_revision() {
+fn test0002_invalid_external_state_is_rejected_without_advancing_revision() {
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     fs::write(
@@ -102,7 +102,7 @@ fn invalid_external_state_is_rejected_without_advancing_revision() {
 }
 
 #[test]
-fn failed_adoption_writes_nothing() {
+fn test0003_failed_adoption_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("things")).unwrap();
     fs::write(dir.path().join("things/a.json"), "[1,2]\n").unwrap();
@@ -115,7 +115,7 @@ fn failed_adoption_writes_nothing() {
 }
 
 #[test]
-fn dry_run_does_not_mutate() {
+fn test0004_dry_run_does_not_mutate() {
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     let before = fs::read(dir.path().join("users/u1.json")).unwrap();
@@ -137,7 +137,7 @@ fn dry_run_does_not_mutate() {
 }
 
 #[test]
-fn sql_delete_executes_declared_cascade_in_one_revision() {
+fn test0005_sql_delete_executes_declared_cascade_in_one_revision() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -185,7 +185,7 @@ fn sql_delete_executes_declared_cascade_in_one_revision() {
 }
 
 #[test]
-fn direct_primary_key_update_uses_declared_cascade() {
+fn test0006_direct_primary_key_update_uses_declared_cascade() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -255,7 +255,7 @@ fn direct_primary_key_update_uses_declared_cascade() {
 }
 
 #[test]
-fn sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
+fn test0007_sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -332,7 +332,7 @@ fn sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_output() {
 }
 
 #[test]
-fn doctor_repairs_layout_without_changing_row_body() {
+fn test0008_doctor_repairs_layout_without_changing_row_body() {
     let dir = adopted();
     let root = dir.path();
     let original = fs::read(root.join("users/u1.json")).unwrap();
@@ -386,7 +386,7 @@ fn doctor_repairs_layout_without_changing_row_body() {
 }
 
 #[test]
-fn logical_hash_ignores_formatting_only_edits() {
+fn test0009_logical_hash_ignores_formatting_only_edits() {
     let dir = adopted();
     let root = dir.path();
     fs::write(
@@ -410,7 +410,7 @@ fn logical_hash_ignores_formatting_only_edits() {
 }
 
 #[test]
-fn named_parameters_are_bound_as_values_and_revision_diff_is_semantic() {
+fn test0010_named_parameters_are_bound_as_values_and_revision_diff_is_semantic() {
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     db().args([
@@ -453,7 +453,7 @@ fn named_parameters_are_bound_as_values_and_revision_diff_is_semantic() {
 }
 
 #[test]
-fn snapshot_restores_authoritative_config_and_rows() {
+fn test0011_snapshot_restores_authoritative_config_and_rows() {
     let dir = adopted();
     let root = dir.path();
     let original_config = fs::read(root.join(".db/config")).unwrap();
@@ -508,7 +508,7 @@ fn snapshot_restores_authoritative_config_and_rows() {
 }
 
 #[test]
-fn declarative_migration_is_atomic_across_schema_and_rows() {
+fn test0012_declarative_migration_is_atomic_across_schema_and_rows() {
     let dir = adopted();
     let root = dir.path();
     let migration = root.join("migration.json");
@@ -535,7 +535,7 @@ fn declarative_migration_is_atomic_across_schema_and_rows() {
 }
 
 #[test]
-fn schema_errors_have_specific_codes_and_locations() {
+fn test0013_schema_errors_have_specific_codes_and_locations() {
     let dir = tempfile::tempdir().unwrap();
     db().args(["init", dir.path().to_str().unwrap()])
         .assert()
@@ -561,7 +561,7 @@ fn schema_errors_have_specific_codes_and_locations() {
 }
 
 #[test]
-fn duplicate_keys_are_rejected_before_any_mutation_is_planned() {
+fn test0014_duplicate_keys_are_rejected_before_any_mutation_is_planned() {
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     let before = fs::read_to_string(dir.path().join(".db/manifest.json")).unwrap();
@@ -586,7 +586,7 @@ fn duplicate_keys_are_rejected_before_any_mutation_is_planned() {
 }
 
 #[test]
-fn defaults_participate_in_identity_and_uniqueness_as_logical_values() {
+fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -618,7 +618,7 @@ fn defaults_participate_in_identity_and_uniqueness_as_logical_values() {
 }
 
 #[test]
-fn check_schema_typechecking_rejects_unknown_identifiers() {
+fn test0016_check_schema_typechecking_rejects_unknown_identifiers() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["init", root.to_str().unwrap()])
@@ -636,7 +636,7 @@ fn check_schema_typechecking_rejects_unknown_identifiers() {
 }
 
 #[test]
-fn configured_indentation_and_command_line_resource_overrides_are_enforced() {
+fn test0017_configured_indentation_and_command_line_resource_overrides_are_enforced() {
     let dir = adopted();
     let root = dir.path();
     let config_path = root.join(".db/config");
@@ -679,7 +679,7 @@ fn configured_indentation_and_command_line_resource_overrides_are_enforced() {
 }
 
 #[test]
-fn decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
+fn test0018_decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -748,7 +748,7 @@ fn decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
 }
 
 #[test]
-fn change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
+fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -856,7 +856,7 @@ fn change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
 }
 
 #[test]
-fn snapshot_restore_removes_malformed_extra_authoritative_files() {
+fn test0020_snapshot_restore_removes_malformed_extra_authoritative_files() {
     let dir = adopted();
     let root = dir.path();
     db().args([
@@ -891,7 +891,7 @@ fn snapshot_restore_removes_malformed_extra_authoritative_files() {
 }
 
 #[test]
-fn provenance_objects_are_verified_and_corruption_is_exit_six() {
+fn test0021_provenance_objects_are_verified_and_corruption_is_exit_six() {
     let dir = adopted();
     let root = dir.path();
     let manifest: serde_json::Value =
@@ -911,7 +911,7 @@ fn provenance_objects_are_verified_and_corruption_is_exit_six() {
 }
 
 #[test]
-fn schema_type_specific_members_are_strict_and_format_errors_are_exit_six() {
+fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_six() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -948,7 +948,39 @@ fn schema_type_specific_members_are_strict_and_format_errors_are_exit_six() {
 }
 
 #[test]
-fn inference_records_foreign_key_evidence_and_rejects_invalid_pk_overrides() {
+fn test0023_primary_key_arguments_are_decoded_against_the_declared_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("things")).unwrap();
+    fs::write(
+        root.join("schema/things.json"),
+        r#"{"table":"things","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("things/123.json"),
+        "{\"id\":\"123\",\"name\":\"numeric text\"}\n",
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "get",
+        "things",
+        "123",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("numeric text"));
+}
+
+#[test]
+fn test0024_inference_records_foreign_key_evidence_and_rejects_invalid_pk_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir(root.join("users")).unwrap();
@@ -1006,7 +1038,7 @@ fn inference_records_foreign_key_evidence_and_rejects_invalid_pk_overrides() {
 }
 
 #[test]
-fn inferred_comparison_files_are_non_authoritative_and_replaceable() {
+fn test0025_inferred_comparison_files_are_non_authoritative_and_replaceable() {
     let dir = adopted();
     let root = dir.path();
     let manifest_before = fs::read(root.join(".db/manifest.json")).unwrap();
@@ -1059,7 +1091,7 @@ fn inferred_comparison_files_are_non_authoritative_and_replaceable() {
 
 #[cfg(unix)]
 #[test]
-fn internal_symlinks_are_rejected_without_following_them() {
+fn test0026_internal_symlinks_are_rejected_without_following_them() {
     use std::os::unix::fs::symlink;
 
     let dir = adopted();

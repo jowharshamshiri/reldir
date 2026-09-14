@@ -1579,7 +1579,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
 fn get(db: &Database, table: &str, key: &str, format: Format) -> Result<i32> {
     db.require_valid()?;
     let s = schema_for(db, table)?;
-    let values = key_values(key, s.primary_key.len())?;
+    let values = key_values(key, s)?;
     let k = canonical::compact(&Value::Array(values));
     let row = crate::integrity::rows_by_key(&db.catalog, table)
         .get(&k)
@@ -1734,7 +1734,7 @@ fn update(
             ));
         }
     }
-    let key_values = key_values(key, s.primary_key.len())?;
+    let key_values = key_values(key, s)?;
     let mut params = p.values().cloned().collect::<Vec<_>>();
     params.extend(key_values);
     let assignments = p
@@ -1759,7 +1759,7 @@ fn update(
 fn delete(db: &Database, table: &str, key: &str, format: Format, cli: &Cli) -> Result<i32> {
     db.require_valid()?;
     let s = schema_for(db, table)?;
-    let values = key_values(key, s.primary_key.len())?;
+    let values = key_values(key, s)?;
     let where_sql = s
         .primary_key
         .iter()
@@ -2124,11 +2124,29 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
         )?;
         return Ok(0);
     }
-    let rows: Vec<_> = db.catalog.rows[table]
+    let schema = &db.catalog.schemas[table];
+    let rows = db.catalog.rows[table]
         .iter()
-        .map(|r| r.value.clone())
-        .collect();
+        .map(|row| {
+            canonical::canonical_row(&row.value, schema)
+                .as_object()
+                .cloned()
+                .ok_or_else(|| {
+                    DbError::new(
+                        "INTERNAL_METADATA_CORRUPT",
+                        "canonical row serialization did not produce an object",
+                        6,
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     if let Some(path) = out {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(DbError::usage(format!(
+                "refusing to overwrite {}",
+                path.display()
+            )));
+        }
         let bytes = match format {
             Format::Json => {
                 let mut b = serde_json::to_vec_pretty(&rows).unwrap();
@@ -2149,14 +2167,11 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
                 w.write_record(&heads)
                     .map_err(|e| DbError::new("IO_ERROR", e.to_string(), 6))?;
                 for r in &rows {
-                    w.write_record(heads.iter().map(|h| {
-                        r.get(h)
-                            .map(|v| match v {
-                                Value::String(s) => s.clone(),
-                                _ => canonical::compact(v),
-                            })
-                            .unwrap_or_default()
-                    }))
+                    w.write_record(
+                        heads
+                            .iter()
+                            .map(|header| output_cell(r.get(header).unwrap_or(&Value::Null))),
+                    )
                     .map_err(|e| DbError::new("IO_ERROR", e.to_string(), 6))?
                 }
                 w.into_inner()
@@ -2168,7 +2183,14 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
                 ));
             }
         };
-        fs::write(path, bytes).map_err(|e| DbError::io(path, e))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| DbError::io(path, error))?;
+        file.write_all(&bytes)
+            .map_err(|error| DbError::io(path, error))?;
+        file.sync_all().map_err(|error| DbError::io(path, error))?;
         event(
             format,
             obj([
@@ -4107,18 +4129,29 @@ fn schema_for<'a>(db: &'a Database, table: &str) -> Result<&'a Schema> {
 }
 fn find_row<'a>(db: &'a Database, table: &str, key: &str) -> Result<&'a crate::catalog::Row> {
     let s = schema_for(db, table)?;
-    let vals = key_values(key, s.primary_key.len())?;
+    let vals = key_values(key, s)?;
     let k = canonical::compact(&Value::Array(vals));
     crate::integrity::rows_by_key(&db.catalog, table)
         .get(&k)
         .copied()
         .ok_or_else(|| DbError::new("UNKNOWN_ROW", format!("no row with key {key}"), 4))
 }
-fn key_values(text: &str, count: usize) -> Result<Vec<Value>> {
-    if count == 1 {
-        return Ok(vec![
-            crate::json::parse_str(text).unwrap_or_else(|_| Value::String(text.into())),
-        ]);
+fn key_values(text: &str, schema: &Schema) -> Result<Vec<Value>> {
+    if schema.primary_key.len() == 1 {
+        let column = &schema.columns[&schema.primary_key[0]];
+        let parsed = crate::json::parse_str(text).unwrap_or_else(|_| Value::String(text.into()));
+        if crate::value::matches_column(&parsed, column) {
+            return Ok(vec![parsed]);
+        }
+        let textual = Value::String(text.into());
+        if crate::value::matches_column(&textual, column) {
+            return Ok(vec![textual]);
+        }
+        return Err(DbError::new(
+            "TYPE_MISMATCH",
+            format!("primary key does not match type {:?}", column.kind),
+            4,
+        ));
     }
     let v = crate::json::parse_str(text)
         .map_err(|_| DbError::usage("composite primary keys must be a JSON array"))?;
@@ -4126,10 +4159,20 @@ fn key_values(text: &str, count: usize) -> Result<Vec<Value>> {
         .as_array()
         .cloned()
         .ok_or_else(|| DbError::usage("composite primary keys must be a JSON array"))?;
-    if a.len() != count {
+    if a.len() != schema.primary_key.len() {
         return Err(DbError::usage(format!(
-            "primary key requires {count} values"
+            "primary key requires {} values",
+            schema.primary_key.len()
         )));
+    }
+    for (value, name) in a.iter().zip(&schema.primary_key) {
+        if !crate::value::matches_column(value, &schema.columns[name]) {
+            return Err(DbError::new(
+                "TYPE_MISMATCH",
+                format!("primary-key component {name:?} does not match its declared type"),
+                4,
+            ));
+        }
     }
     Ok(a)
 }
