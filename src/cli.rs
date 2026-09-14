@@ -3935,7 +3935,7 @@ fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 fn event(format: Format, record: Map<String, Value>, human: &str) -> Result<()> {
-    if format == Format::Table {
+    if matches!(format, Format::Table | Format::Sqlite) {
         println!("{human}");
         Ok(())
     } else {
