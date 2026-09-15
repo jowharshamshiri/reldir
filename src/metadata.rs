@@ -778,4 +778,398 @@ mod tests {
         assert_eq!(names, sorted, "zero padding must preserve revision order");
         assert_eq!(names[0], "00000000000000000001.json");
     }
+
+    // ---------------------------------------------------------------------
+    // Golden schema hashes.
+    //
+    // The schema file format is being replaced by a JSON Schema dialect. That
+    // is a change to how a schema is *written*, not to what it *is*, so every
+    // hash below must survive it unchanged: a revision's identity is its
+    // logical content, never its serialization.
+    //
+    // These are frozen literals rather than values recomputed on both sides of
+    // an assertion. A test that hashes the same input twice and compares the
+    // results passes no matter what the encoding does, which would make it
+    // worthless for exactly the change it exists to guard.
+    // ---------------------------------------------------------------------
+
+    use crate::schema::{
+        AdditionalFields, Action, Check, Column, ColumnType, ForeignKey, Generated, GeneratedKind,
+        Reference, Schema, Storage,
+    };
+    use indexmap::IndexMap;
+    use serde_json::json;
+
+    fn col(kind: ColumnType) -> Column {
+        Column {
+            kind,
+            nullable: false,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn table(name: &str, columns: Vec<(&str, Column)>, primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (column_name, column) in columns {
+            map.insert(column_name.to_string(), column);
+        }
+        Schema {
+            table: name.into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+        }
+    }
+
+    /// Every fixture the golden hashes cover, built once so the hash test and
+    /// any future encoder test describe the same schemas.
+    fn golden_fixtures() -> Vec<(&'static str, Schema)> {
+        let mut out = vec![];
+
+        // One fixture per column type, so a change to any type's encoding shows
+        // up as exactly one failing row.
+        for (label, kind) in [
+            ("bool", ColumnType::Bool),
+            ("int", ColumnType::Int),
+            ("float", ColumnType::Float),
+            ("decimal", ColumnType::Decimal),
+            ("string", ColumnType::String),
+            ("bytes", ColumnType::Bytes),
+            ("date", ColumnType::Date),
+            ("timestamp", ColumnType::Timestamp),
+            ("uuid", ColumnType::Uuid),
+            ("ulid", ColumnType::Ulid),
+            ("json", ColumnType::Json),
+        ] {
+            out.push((
+                label,
+                table("t", vec![("id", col(ColumnType::String)), ("v", col(kind))], &["id"]),
+            ));
+        }
+
+        // enum carries its values; array and object carry nested shape.
+        let mut enumerated = col(ColumnType::Enum);
+        enumerated.values = Some(vec!["a".into(), "b".into()]);
+        out.push((
+            "enum",
+            table("t", vec![("id", col(ColumnType::String)), ("v", enumerated)], &["id"]),
+        ));
+
+        let mut nested_array = col(ColumnType::Array);
+        nested_array.items = Some(Box::new(col(ColumnType::Decimal)));
+        out.push((
+            "array_of_decimal",
+            table("t", vec![("id", col(ColumnType::String)), ("v", nested_array)], &["id"]),
+        ));
+
+        let mut properties = IndexMap::new();
+        properties.insert("inner".to_string(), col(ColumnType::Ulid));
+        let mut nested_object = col(ColumnType::Object);
+        nested_object.properties = Some(properties);
+        out.push((
+            "object_with_ulid_property",
+            table("t", vec![("id", col(ColumnType::String)), ("v", nested_object)], &["id"]),
+        ));
+
+        // nullable x default x generated, the axes that decide `required`.
+        let mut nullable = col(ColumnType::String);
+        nullable.nullable = true;
+        out.push((
+            "nullable",
+            table("t", vec![("id", col(ColumnType::String)), ("v", nullable)], &["id"]),
+        ));
+
+        let mut defaulted = col(ColumnType::String);
+        defaulted.default = Some(json!("fixed"));
+        out.push((
+            "default_not_null",
+            table("t", vec![("id", col(ColumnType::String)), ("v", defaulted)], &["id"]),
+        ));
+
+        let mut nullable_defaulted = col(ColumnType::String);
+        nullable_defaulted.nullable = true;
+        nullable_defaulted.default = Some(json!("fixed"));
+        out.push((
+            "nullable_and_default",
+            table("t", vec![("id", col(ColumnType::String)), ("v", nullable_defaulted)], &["id"]),
+        ));
+
+        for (label, kind, generated) in [
+            ("generated_uuid", ColumnType::Uuid, GeneratedKind::Uuid),
+            ("generated_ulid", ColumnType::Ulid, GeneratedKind::Ulid),
+            ("generated_now", ColumnType::Timestamp, GeneratedKind::Now),
+            ("generated_sequence", ColumnType::Int, GeneratedKind::Sequence),
+        ] {
+            let mut column = col(kind);
+            column.generated = Some(Generated { kind: generated });
+            out.push((
+                label,
+                table("t", vec![("id", col(ColumnType::String)), ("v", column)], &["id"]),
+            ));
+        }
+
+        let mut described = col(ColumnType::String);
+        described.description = Some("what it holds".into());
+        let mut with_description =
+            table("t", vec![("id", col(ColumnType::String)), ("v", described)], &["id"]);
+        with_description.description = Some("the table".into());
+        out.push(("descriptions", with_description));
+
+        // Relational facts: each one alone, so a failure names the culprit.
+        let mut unique = table(
+            "t",
+            vec![("id", col(ColumnType::String)), ("v", col(ColumnType::String))],
+            &["id"],
+        );
+        unique.unique = vec![vec!["v".into()]];
+        out.push(("unique", unique));
+
+        let mut indexes = table(
+            "t",
+            vec![("id", col(ColumnType::String)), ("v", col(ColumnType::String))],
+            &["id"],
+        );
+        indexes.indexes = vec![vec!["v".into()]];
+        out.push(("indexes", indexes));
+
+        let mut checked = table(
+            "t",
+            vec![("id", col(ColumnType::String)), ("n", col(ColumnType::Int))],
+            &["id"],
+        );
+        checked.check = vec![Check {
+            name: "positive".into(),
+            expr: "n > 0".into(),
+        }];
+        out.push(("check", checked));
+
+        let mut stored = table(
+            "t",
+            vec![("id", col(ColumnType::String)), ("slug", col(ColumnType::String))],
+            &["id"],
+        );
+        stored.unique = vec![vec!["slug".into()]];
+        stored.storage = Some(Storage {
+            filename: vec!["slug".into()],
+        });
+        out.push(("storage_filename", stored));
+
+        let mut permissive = table("t", vec![("id", col(ColumnType::String))], &["id"]);
+        permissive.additional_fields = AdditionalFields::Allow;
+        out.push(("additional_fields_allow", permissive));
+
+        let mut composite = table(
+            "t",
+            vec![("a", col(ColumnType::String)), ("b", col(ColumnType::String))],
+            &["a", "b"],
+        );
+        composite.unique = vec![vec!["a".into(), "b".into()]];
+        out.push(("composite_primary_key", composite));
+
+        let mut versioned = table("t", vec![("id", col(ColumnType::String))], &["id"]);
+        versioned.schema_version = 7;
+        versioned.schema_format = Some(crate::FORMAT_VERSION);
+        out.push(("schema_version_and_format", versioned));
+
+        // Every referential action, including the unset pair that defaults to
+        // restrict without being written.
+        for (label, on_delete, on_update) in [
+            ("fk_unset_actions", None, None),
+            ("fk_restrict", Some(Action::Restrict), Some(Action::Restrict)),
+            ("fk_cascade", Some(Action::Cascade), Some(Action::Cascade)),
+            ("fk_set_null", Some(Action::SetNull), Some(Action::Restrict)),
+            ("fk_set_default", Some(Action::SetDefault), Some(Action::Restrict)),
+            ("fk_no_action", Some(Action::NoAction), Some(Action::NoAction)),
+        ] {
+            let mut referencing = col(ColumnType::String);
+            referencing.nullable = true;
+            referencing.default = Some(json!("x"));
+            let mut child = table(
+                "child",
+                vec![("id", col(ColumnType::String)), ("parent_id", referencing)],
+                &["id"],
+            );
+            child.foreign_keys = vec![ForeignKey {
+                columns: vec!["parent_id".into()],
+                references: Reference {
+                    table: "parent".into(),
+                    columns: vec!["id".into()],
+                },
+                on_delete,
+                on_update,
+            }];
+            out.push((label, child));
+        }
+
+        // Column order is part of the logical schema: canonical rows are
+        // written in it, so two schemas differing only by order are different.
+        out.push((
+            "column_order_ab",
+            table(
+                "t",
+                vec![
+                    ("id", col(ColumnType::String)),
+                    ("a", col(ColumnType::String)),
+                    ("b", col(ColumnType::String)),
+                ],
+                &["id"],
+            ),
+        ));
+        out.push((
+            "column_order_ba",
+            table(
+                "t",
+                vec![
+                    ("id", col(ColumnType::String)),
+                    ("b", col(ColumnType::String)),
+                    ("a", col(ColumnType::String)),
+                ],
+                &["id"],
+            ),
+        ));
+
+        out
+    }
+
+    /// The logical identity of a schema, frozen.
+    ///
+    /// A schema's hash is what a revision is recorded against, so it must not
+    /// move when the file format changes. If one of these fails after the JSON
+    /// Schema migration, the serialization has leaked into semantic identity.
+    #[test]
+    fn test1125_schema_hashes_are_independent_of_the_file_format() {
+        const GOLDEN: &[(&str, &str)] = &[
+            ("bool", "cc3953444fc6da20609a4a30d25115e73a5866554961248fe23c318fa0cd1f0a"),
+            ("int", "08c3094a50f73ba9cf8e5244416d8babb38eb3a43729b354d28e83d406c0da87"),
+            ("float", "ec66e6dbf1629a9e6669ca44d0fe86ea59d15a9bd226e5e1c798009f844de5c1"),
+            ("decimal", "4848feb2023da36cd6d27afd76905000e0404afb4c3fd5219c44ee0cae88eb13"),
+            ("string", "e8416591e847834d7c91f27f8500594abad6262c8f816e65ebd92f83617d0527"),
+            ("bytes", "7db5e0ac9294507a3f6568ad0687ae15bf979462e860bebf3bc9bdc664be22ec"),
+            ("date", "e3ea1f666dc3eb3ea26643c16f846c54f13d0d19a3907491ab7fe740ad2b0931"),
+            ("timestamp", "d75a856dae24cce543a51686427b022b6bbe8a15104c189f5548eca46afb2f7d"),
+            ("uuid", "0b3367c750b570d54d65f6970c44cba95830040b9bc3d7a4af98ba480bc949fe"),
+            ("ulid", "ed4660a70664675a52a4613c831b0c8fe32a5f843e4b3a4cd3e2577ebb654c41"),
+            ("json", "4346a285dcc9de59acc942633704bf9fd5f853eb18093f7d19754900fcb2f603"),
+            ("enum", "d95845eb9f1492f31e374e63e58d41f0e49e223cd2f1a1c55079c0cf53f9b309"),
+            ("array_of_decimal", "d5db9d0771ca5f66b3343aa7b73ff8db47941f223e6002671d75b377764933a3"),
+            ("object_with_ulid_property", "82021f39b401975101ba870166e321ccfd32c6fb34593785f2d67f4b4d4dd57d"),
+            ("nullable", "9ec092431fa4a2a5150055348efbcd670a6abdfbebd63e0610236a07728d1d56"),
+            ("default_not_null", "85e8818b1fcd57257b5863f2a6728788113f98b5b325849d46f04a301bea0d46"),
+            ("nullable_and_default", "885b01784138c4eac5c12d75966e79a9db2ee2009eed29d3f868eef8b8909184"),
+            ("generated_uuid", "f970fda239e15e262204e31c815673f87e8c998dcc3eb73a3c1ac4f083fa5690"),
+            ("generated_ulid", "d98250519a93175fdaffd6c05cadc6ee82c390233bad1a5e83f55a13afd85777"),
+            ("generated_now", "f2696cb37eb8d276bf962a4c5522305ff6429b5a75434bcf16efdef52ec3bcc4"),
+            ("generated_sequence", "68134ae7a4a3c9a682848ce1e8eb227152c7366d4ea7fa43d15cf7de89aa1c90"),
+            ("descriptions", "52f4ffcd23393555ec3b8ff18d5c0447c59207e47d9b98932e36ec74c866ffd5"),
+            ("unique", "fea5c1583ede49db44985352d7981a33de376eb51582dc5767e9c06365e78c0a"),
+            ("indexes", "ee774fcd15e3d7fe2343936e6de0be69c5e43b9c68746dc272a0f6c8342e0fca"),
+            ("check", "19068ac92176fd9673867316d8768d1d9dedb573af940c812fbd95365268f64f"),
+            ("storage_filename", "bad6237a75fb4e4e26a4c93cfd40af2a7b9fb37a1aa058b3725bec48264edf67"),
+            ("additional_fields_allow", "2604644dbc1c9a16f02a370de4ab3da907ebbdf32743672634396a9f77eaeb34"),
+            ("composite_primary_key", "79e999568848b32c57ba1825e70dcc53d5dbc3799dc135b52b8623b59db0a097"),
+            ("schema_version_and_format", "fbf32922ab5d62ae411637b146871690d85f31fe142124d50936357825589256"),
+            ("fk_unset_actions", "299d51c8d8c1e9f11887d89327bff06e5e0c3b0adf6274dc64962169e23bc114"),
+            ("fk_restrict", "71267855e073a03f1c3cc1bddb3fdd2a9ea35e1f087dc69257e129fc4aeeb594"),
+            ("fk_cascade", "0f4b51c2b783e90522efe5e72958ba4cbe62f352506b14a7791db49f373e7f60"),
+            ("fk_set_null", "875bb050dbdd0ce1edc0e807361ca76401dfbe5faa361431e0132ba1db71214e"),
+            ("fk_set_default", "b636cfb176e3e12a2322c76f9de7e65d5ab8b9062819136689647d9b56168d5d"),
+            ("fk_no_action", "3a1fcf4ec5835795dd8d16ea1e37886617f7e9577d9026cd2b47c549a4c2a264"),
+            ("column_order_ab", "243c440a0b370685c5d3fae90b79dbd6034b6d4c1497477eaf157eb916a68832"),
+            ("column_order_ba", "243c440a0b370685c5d3fae90b79dbd6034b6d4c1497477eaf157eb916a68832"),
+        ];
+
+        let fixtures = golden_fixtures();
+        let computed: Vec<(String, String)> = fixtures
+            .iter()
+            .map(|(label, schema)| {
+                (
+                    (*label).to_string(),
+                    schema_hash(schema).expect("a schema hashes"),
+                )
+            })
+            .collect();
+
+        if GOLDEN.is_empty() {
+            let rendered = computed
+                .iter()
+                .map(|(label, hash)| format!("        (\"{label}\", \"{hash}\"),"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!("golden hashes are unrecorded; freeze these:\n{rendered}");
+        }
+
+        assert_eq!(
+            GOLDEN.len(),
+            computed.len(),
+            "every fixture must be pinned: the golden table has drifted from the fixtures"
+        );
+        for ((label, expected), (computed_label, actual)) in GOLDEN.iter().zip(&computed) {
+            assert_eq!(label, computed_label, "fixture order must be stable");
+            assert_eq!(
+                expected, actual,
+                "{label}: schema hash moved, so serialization has changed logical identity"
+            );
+        }
+    }
+
+    /// Column order is logical state, and today's hash loses it.
+    ///
+    /// `canonical_row` writes a row's keys in schema column order, so two
+    /// schemas differing only in that order write different bytes for the same
+    /// logical row -- `test1003` pins exactly that. But `schema_hash` runs the
+    /// schema through `canonical::normalize`, which sorts object keys, so the
+    /// `columns` ordering is erased before the digest. Two schemas that produce
+    /// different files therefore share one identity, and the state root cannot
+    /// tell them apart.
+    ///
+    /// This predates the JSON Schema work and is recorded here because the
+    /// golden table above freezes today's hashes: without this test that table
+    /// would silently ratify the collision as intended behaviour. The fix
+    /// belongs in the semantic encoding, which must carry column order
+    /// explicitly rather than inheriting `normalize`'s key sorting.
+    #[test]
+    #[should_panic(expected = "column order must change a schema's identity")]
+    fn test1126_column_order_is_lost_from_schema_identity() {
+        let fixtures = golden_fixtures();
+        let find = |name: &str| {
+            fixtures
+                .iter()
+                .find(|(label, _)| *label == name)
+                .map(|(_, schema)| schema.clone())
+                .expect("fixture exists")
+        };
+        let ab = find("column_order_ab");
+        let ba = find("column_order_ba");
+
+        // The two schemas genuinely differ: they serialize the same row to
+        // different bytes, which is what makes sharing one hash a defect.
+        let mut row = serde_json::Map::new();
+        row.insert("id".into(), json!("r"));
+        row.insert("a".into(), json!("A"));
+        row.insert("b".into(), json!("B"));
+        assert_ne!(
+            serde_json::to_vec(&canonical::canonical_row(&row, &ab)).unwrap(),
+            serde_json::to_vec(&canonical::canonical_row(&row, &ba)).unwrap(),
+            "the fixtures must write different rows, or they are not a witness"
+        );
+
+        assert_ne!(
+            schema_hash(&ab).unwrap(),
+            schema_hash(&ba).unwrap(),
+            "column order must change a schema's identity"
+        );
+    }
 }
