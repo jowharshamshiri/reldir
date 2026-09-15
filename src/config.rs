@@ -2,6 +2,14 @@ use serde::{Deserialize, Serialize};
 
 pub const BOOTSTRAP_MAX_CONFIG_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Nesting depth allowed before `.db/config` has been read.
+///
+/// `load_config` must parse the very file that carries `max_nesting_depth`, so
+/// the parser needs a bound before the configured one is known. This is that
+/// bound: generous enough for any real metadata document, finite so that a
+/// hostile file cannot exhaust the stack during bootstrap (Section 57).
+pub const BOOTSTRAP_MAX_NESTING_DEPTH: usize = 1024;
+
 fn default_enum_max() -> usize {
     10
 }

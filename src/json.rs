@@ -3,22 +3,69 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 use std::fmt;
 
-/// Parse one JSON document, rejecting duplicate object keys and trailing
-/// content.
+/// The marker carried by the error a document exceeding the depth limit
+/// produces. Callers match on it to report `RESOURCE_LIMIT` rather than
+/// `INVALID_JSON`: the document is well formed, it is merely too deep.
+pub const DEPTH_LIMIT_MESSAGE: &str = "JSON nesting exceeds the configured depth limit";
+
+thread_local! {
+    /// Depth bound applied by the parser on this thread. Deserialization
+    /// recurses through `StrictValue`, which serde reconstructs at every level
+    /// with no state of its own, so the limit cannot travel as a parameter.
+    static DEPTH_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(crate::config::BOOTSTRAP_MAX_NESTING_DEPTH) };
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bound the nesting depth this thread's parser accepts, for the duration of
+/// `body`.
 ///
-/// Nesting depth is bounded by the `max_nesting_depth` configuration
-/// (Sections 57 and 61), which callers enforce against the parsed value. The
-/// parser's own recursion limit is therefore disabled: leaving it in place
-/// would impose a hidden ceiling of its own that no configuration could raise,
-/// so a database whose limit is set above it could never be read even though
-/// the limit says it is allowed. Depth remains bounded -- by the documented,
-/// configurable limit rather than by an undocumented constant.
+/// Section 61 makes maximum nesting depth a configured limit and Section 57
+/// requires parsers to enforce it. Enforcing it *during* deserialization is
+/// what makes it real: a check applied to the parsed value cannot protect the
+/// parse itself, which recurses before any caller sees a value.
+pub fn with_depth_limit<T>(limit: usize, body: impl FnOnce() -> T) -> T {
+    let previous = DEPTH_LIMIT.with(|cell| cell.replace(limit));
+    let result = body();
+    DEPTH_LIMIT.with(|cell| cell.set(previous));
+    result
+}
+
+fn enter<E: de::Error>() -> std::result::Result<usize, E> {
+    let limit = DEPTH_LIMIT.with(|cell| cell.get());
+    let depth = DEPTH.with(|cell| cell.get()) + 1;
+    if depth > limit {
+        return Err(E::custom(format!("{DEPTH_LIMIT_MESSAGE} of {limit}")));
+    }
+    DEPTH.with(|cell| cell.set(depth));
+    Ok(depth)
+}
+
+fn leave() {
+    DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+}
+
+/// Parse one JSON document, rejecting duplicate object keys, non-finite
+/// numbers, trailing content, and nesting beyond the configured depth limit.
+///
+/// The parser's own recursion limit is disabled because it is an undocumented
+/// constant that no configuration could raise; the limit enforced here is the
+/// documented, configurable one instead. Depth is therefore still bounded, and
+/// bounded during the recursion rather than after it.
 pub fn parse(bytes: &[u8]) -> serde_json::Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     deserializer.disable_recursion_limit();
-    let value = StrictValue::deserialize(&mut deserializer)?.0;
+    DEPTH.with(|cell| cell.set(0));
+    let parsed = StrictValue::deserialize(&mut deserializer).map(|value| value.0);
+    DEPTH.with(|cell| cell.set(0));
+    let value = parsed?;
     deserializer.end()?;
     Ok(value)
+}
+
+/// Whether an error reports that the depth limit was exceeded.
+pub fn is_depth_limit(error: &serde_json::Error) -> bool {
+    error.to_string().contains(DEPTH_LIMIT_MESSAGE)
 }
 
 pub fn parse_str(text: &str) -> serde_json::Result<Value> {
@@ -90,10 +137,19 @@ impl<'de> Visitor<'de> for StrictVisitor {
     where
         A: SeqAccess<'de>,
     {
+        enter::<A::Error>()?;
         let mut array = Vec::new();
-        while let Some(value) = values.next_element::<StrictValue>()? {
-            array.push(value.0);
+        loop {
+            match values.next_element::<StrictValue>() {
+                Ok(Some(value)) => array.push(value.0),
+                Ok(None) => break,
+                Err(error) => {
+                    leave();
+                    return Err(error);
+                }
+            }
         }
+        leave();
         Ok(StrictValue(Value::Array(array)))
     }
 
@@ -101,14 +157,33 @@ impl<'de> Visitor<'de> for StrictVisitor {
     where
         A: MapAccess<'de>,
     {
+        enter::<A::Error>()?;
         let mut object = Map::new();
-        while let Some(key) = values.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(de::Error::custom(format!("duplicate object key {key:?}")));
+        loop {
+            match values.next_key::<String>() {
+                Ok(Some(key)) => {
+                    if object.contains_key(&key) {
+                        leave();
+                        return Err(de::Error::custom(format!("duplicate object key {key:?}")));
+                    }
+                    match values.next_value::<StrictValue>() {
+                        Ok(value) => {
+                            object.insert(key, value.0);
+                        }
+                        Err(error) => {
+                            leave();
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    leave();
+                    return Err(error);
+                }
             }
-            let value = values.next_value::<StrictValue>()?;
-            object.insert(key, value.0);
         }
+        leave();
         Ok(StrictValue(Value::Object(object)))
     }
 }
