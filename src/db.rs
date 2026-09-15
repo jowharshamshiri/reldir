@@ -40,14 +40,16 @@ impl ObserveMode {
         record_provenance: true,
     };
 
-    /// Diagnosis: accept valid external changes, but leave derived state
-    /// exactly as found so the report describes the folder as it was.
-    pub const DIAGNOSE: Self = Self {
-        repair_derived: false,
-        record_provenance: true,
-    };
-
-    /// Read-only: persist nothing at all.
+    /// Read-only: persist nothing, and take no lock.
+    ///
+    /// `--readonly` guards the user's data, not `.db/` -- every *writing*
+    /// command refreshes derived state without asking, because it is
+    /// reconstructible. A pure reader is different: correctness never depends
+    /// on an index (queries read rows; `indexes` in a schema is a declaration,
+    /// not a cache), so repairing one here would buy nothing and cost
+    /// everything, because the writer lock is exclusive and readers would then
+    /// exclude each other. A reader that finds derived state stale reports it
+    /// and answers from the rows.
     pub const READ_ONLY: Self = Self {
         repair_derived: false,
         record_provenance: false,

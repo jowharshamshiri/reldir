@@ -115,11 +115,9 @@ enum Command {
     Inspect { path: Option<PathBuf> },
     #[command(
         about = "Fully validate the database",
-        after_help = "Example: db check --no-write"
+        after_help = "Example: db --readonly check"
     )]
     Check {
-        #[arg(long)]
-        no_write: bool,
         #[arg(long)]
         strict: bool,
     },
@@ -599,19 +597,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             // authoritative work, not derived repair: a status that observed a
             // change without accepting it would leave the database permanently
             // behind its own files.
-            let diagnostic_only = matches!(
-                command,
-                Command::Check { .. }
-                    | Command::Lint { .. }
-                    | Command::Doctor { fix: false, .. }
-                    | Command::Infer { write: false, .. }
-                    | Command::Diff { .. }
-            );
             if !observation.writable {
                 settings.readonly = true;
             }
 
-            let requirements = command_requirements(&command, &settings, diagnostic_only);
+            let requirements = command_requirements(&command, &settings);
             // A dry run plans what a real run would do, under the same
             // requirements. It must not plan work the invocation would refuse:
             // `--no-auto` establishes nothing, so it has nothing to promise, and
@@ -641,8 +631,6 @@ pub fn run(cli: Cli) -> Result<i32> {
             // exactly as it found them.
             let mode = if settings.readonly {
                 ObserveMode::READ_ONLY
-            } else if diagnostic_only {
-                ObserveMode::DIAGNOSE
             } else {
                 ObserveMode::RECORD
             };
@@ -658,8 +646,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             // through and surface UNINITIALIZED.
             let cannot_write = settings.readonly || cli.dry_run;
             let establishes_on_demand = matches!(command, Command::Shell);
-            let answers_ephemerally =
-                !cli.no_auto && (cannot_write || establishes_on_demand) && !diagnostic_only;
+            let answers_ephemerally = !cli.no_auto && (cannot_write || establishes_on_demand);
             let mut db = if observation.format == crate::state::FormatState::Absent
                 && answers_ephemerally
             {
@@ -687,11 +674,7 @@ pub fn run(cli: Cli) -> Result<i32> {
 ///
 /// Declared per command rather than inferred, so a new command has to answer
 /// the question instead of inheriting the most permissive behavior.
-fn command_requirements(
-    command: &Command,
-    cli: &Cli,
-    diagnostic_only: bool,
-) -> crate::state::Requirements {
+fn command_requirements(command: &Command, cli: &Cli) -> crate::state::Requirements {
     // `--no-auto` is the "do not change my prerequisites" posture, and
     // `--readonly` cannot write at all: both establish nothing, so they require
     // nothing.
@@ -710,7 +693,6 @@ fn command_requirements(
         Command::Recover | Command::UpgradeFormat | Command::Shell => {
             crate::state::Requirements::structural()
         }
-        _ if diagnostic_only => crate::state::Requirements::diagnostic(),
         _ => crate::state::Requirements::functional(),
     }
 }
@@ -2213,11 +2195,15 @@ fn stream_query_if_supported(
                         let row_headers = row.keys().cloned().collect::<Vec<_>>();
                         writer
                             .write_record(&row_headers)
-                            .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+                            .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))?;
                         headers = Some(row_headers);
                     }
                     let row_headers = headers.as_ref().ok_or_else(|| {
-                        DbError::new("IO_ERROR", "CSV header state was not initialized", 6)
+                        DbError::new(
+                            "INTERNAL_METADATA_CORRUPT",
+                            "CSV header state was not initialized",
+                            6,
+                        )
                     })?;
                     writer
                         .write_record(
@@ -2225,7 +2211,7 @@ fn stream_query_if_supported(
                                 .iter()
                                 .map(|name| output_cell(row.get(name).unwrap_or(&Value::Null))),
                         )
-                        .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))
+                        .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))
                 },
             )?;
             writer
@@ -2453,17 +2439,17 @@ fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Res
                 let mut w = csv::Writer::from_writer(vec![]);
                 let heads: Vec<_> = db.catalog.schemas[table].columns.keys().cloned().collect();
                 w.write_record(&heads)
-                    .map_err(|e| DbError::new("IO_ERROR", e.to_string(), 6))?;
+                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?;
                 for r in &rows {
                     w.write_record(
                         heads
                             .iter()
                             .map(|header| output_cell(r.get(header).unwrap_or(&Value::Null))),
                     )
-                    .map_err(|e| DbError::new("IO_ERROR", e.to_string(), 6))?
+                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?
                 }
                 w.into_inner()
-                    .map_err(|e| DbError::new("IO_ERROR", e.to_string(), 6))?
+                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?
             }
             Format::Table | Format::Sqlite => {
                 return Err(DbError::usage(
@@ -3302,7 +3288,7 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
     candidates.sort();
     candidates.dedup();
     let mut editor = Editor::<ShellHelper, DefaultHistory>::new()
-        .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
     editor.set_helper(Some(ShellHelper { candidates }));
     // Input history persists per database, so recall survives the session:
     // `.db/.gitignore` already excludes everything but `format` and `config`,
@@ -3311,7 +3297,7 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
     if history.exists() {
         editor
             .load_history(&history)
-            .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+            .map_err(|error| DbError::io(&history, std::io::Error::other(error)))?;
     }
     loop {
         match editor.readline("db> ") {
@@ -3326,7 +3312,9 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
                 if !matches!(query, ".quit" | ".exit") {
                     editor
                         .add_history_entry(query)
-                        .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+                        .map_err(|error| {
+                            DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
+                        })?;
                 }
                 if !shell_line(db, query, format, cli)? {
                     break;
@@ -3336,13 +3324,16 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
             Err(error) => return Err(DbError::new("IO_ERROR", error.to_string(), 6)),
         }
     }
-    if !cli.readonly {
+    // History is per-database state, so it needs a database. A shell over a
+    // folder that has none answers from an in-memory model and leaves no trace,
+    // which is the whole point of that mode -- writing a history file would be
+    // the one thing it did create.
+    if !cli.readonly && crate::schema_store::working_dir(&db.root).exists() {
         // rustyline rewrites the history file in place and does not create it,
         // so the first session on a database must put it there. Without this
         // the initial save fails with ENOENT and nothing is ever persisted.
         if !history.exists() {
-            fs::write(&history, "")
-                .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+            fs::write(&history, "").map_err(|error| DbError::io(&history, error))?;
         }
         // A session that answered every question has succeeded. Failing it here
         // would discard that work over a convenience file, so the inability to

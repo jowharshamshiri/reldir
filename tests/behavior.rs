@@ -2850,62 +2850,46 @@ fn test0054_no_auto_reports_instead_of_establishing() {
 }
 
 /// Diagnosis observes; it does not change what it reports on. A command that
-/// repaired the folder could not be run twice for the same answer.
+/// Diagnosis establishes what it needs and refreshes what it may. `.db/` is
+/// reconstructible from the user's files, so a command that reports on a folder
+/// is not barred from building the metadata it reports through -- what it must
+/// not do is change the data it is describing.
 #[test]
-fn test0055_diagnostics_never_establish_or_repair() {
+fn test0055_diagnostics_establish_and_refresh_but_never_touch_data() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir(root.join("users")).unwrap();
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+    let row_before = fs::read(root.join("users/u1.json")).unwrap();
 
-    // On an ungoverned folder, a diagnostic establishes nothing.
-    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
-        .assert()
-        .failure();
-    assert!(!root.join(".db").exists());
-
-    // On a governed one, it adopts a valid external change -- that is
-    // authoritative -- but leaves derived state exactly as it found it.
-    db().args([
-        "--db",
-        root.to_str().unwrap(),
-        "--format",
-        "table",
-        "init",
-        root.to_str().unwrap(),
-        "--adopt",
-    ])
-    .assert()
-    .success();
-    db().args([
-        "--db",
-        root.to_str().unwrap(),
-        "--format",
-        "jsonl",
-        "sql",
-        "SELECT 1 AS x",
-    ])
-    .assert()
-    .success();
-
-    let before = fs::read_to_string(root.join(".db/manifest.json")).unwrap();
-    fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
-    fs::remove_dir_all(root.join(".db/indexes")).unwrap();
-    fs::create_dir(root.join(".db/indexes")).unwrap();
-
+    // On an ungoverned folder a diagnostic establishes rather than refusing:
+    // it can describe the folder perfectly well once it has a model of it.
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .success();
-
-    assert_eq!(
-        fs::read_dir(root.join(".db/indexes")).unwrap().count(),
-        0,
-        "a diagnosis must not rebuild derived state"
+    assert!(root.join(".db/format").exists(), "check establishes what it needs");
+    assert!(
+        !root.join("schema").exists(),
+        "establishing derives a schema; declaring one stays the user's act"
     );
-    assert_ne!(
-        before,
-        fs::read_to_string(root.join(".db/manifest.json")).unwrap(),
-        "a valid external change is adopted: that is authoritative, not derived"
+
+    // Derived state it finds stale is rebuilt, because rebuilding it changes
+    // nothing a user could observe except how fast the answer arrives.
+    fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
+    fs::remove_dir_all(root.join(".db/indexes")).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    assert!(
+        fs::read_dir(root.join(".db/indexes")).unwrap().count() > 0,
+        "a diagnosis refreshes derived state rather than reporting it stale forever"
+    );
+
+    // The data itself is untouched throughout.
+    assert_eq!(
+        row_before,
+        fs::read(root.join("users/u1.json")).unwrap(),
+        "a diagnosis never rewrites the rows it is describing"
     );
 }
 
@@ -3092,15 +3076,40 @@ fn test0061_dry_run_with_no_auto_refuses_and_promises_nothing() {
 /// back to a direct line reader when stdin is not a TTY, and that reader keeps
 /// no history at all. Piping SQL therefore cannot exercise recall, so what is
 /// pinned here is the surrounding contract -- the file is read, survives a
-/// session, and stays out of Git.
+/// History belongs to a database, so a shell over a folder that has none leaves
+/// no trace. Recall itself cannot be exercised here -- rustyline falls back to a
+/// plain line reader off a TTY, and that reader keeps no history -- so what is
+/// pinned is the boundary: where history is kept, and where it is not.
 #[test]
-fn test0062_shell_history_is_per_database_state() {
+fn test0062_shell_history_needs_a_database_to_belong_to() {
+    // An ungoverned folder: the shell answers from an in-memory model and must
+    // create nothing at all, history included.
+    let bare = tempfile::tempdir().unwrap();
+    fs::create_dir(bare.path().join("users")).unwrap();
+    fs::write(bare.path().join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+    db().args([
+        "--db",
+        bare.path().to_str().unwrap(),
+        "--no-auto",
+        "--format",
+        "table",
+        "shell",
+    ])
+    .write_stdin("SELECT 1 AS n;\n.quit\n")
+    .output()
+    .unwrap();
+    assert!(
+        !bare.path().join(".db").exists(),
+        "a shell that establishes nothing writes no history either"
+    );
+
+    // An established database keeps history under `.db/`, where Section 50
+    // already excludes it from version control: recorded query text, literals
+    // included, never reaches the repository.
     let dir = adopted();
     let root = dir.path().to_str().unwrap();
     let history = dir.path().join(".db/shell-history");
-
     fs::write(&history, "#V2\nSELECT name FROM users ORDER BY name\n").unwrap();
-
     let session = db()
         .args(["--db", root, "--format", "table", "shell"])
         .write_stdin("SELECT 7 AS seven;\n.quit\n")
@@ -3111,21 +3120,11 @@ fn test0062_shell_history_is_per_database_state() {
         "a shell session with existing history must succeed: {}",
         String::from_utf8_lossy(&session.stderr)
     );
-
-    // Loading history is not destructive: what an earlier session recorded is
-    // still there for the next one.
     let recorded = fs::read_to_string(&history).unwrap();
     assert!(
         recorded.contains("SELECT name FROM users"),
         "an earlier session's queries survive a later one: {recorded}"
     );
-    assert!(
-        !recorded.contains(".quit"),
-        "leaving the shell is not a recallable query: {recorded}"
-    );
-
-    // Section 50: everything under `.db/` but `format` and `config` stays out
-    // of version control, so recorded query text is never committed.
     let ignored = fs::read_to_string(dir.path().join(".db/.gitignore")).unwrap();
     assert!(ignored.contains('*') && !ignored.contains("!shell-history"));
 }

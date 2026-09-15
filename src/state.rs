@@ -127,16 +127,6 @@ impl Requirements {
         }
     }
 
-    /// Diagnostics: they need to see whatever is there, and must never change
-    /// it. A command that reports what is wrong cannot alter what it reports
-    /// on, or it could not be run twice for the same answer.
-    pub const fn diagnostic() -> Self {
-        Self {
-            relational_model: true,
-            may_establish: false,
-        }
-    }
-
     /// Commands that operate on the folder itself rather than on relations.
     pub const fn structural() -> Self {
         Self {
@@ -756,19 +746,21 @@ mod tests {
         assert!(holds_recognizable_schema(real.path()).unwrap());
     }
 
-    /// Diagnostic commands observe without establishing. A command that reports
-    /// what is wrong must not change what it reports on.
+    /// `--no-auto` is the only posture that establishes nothing while still
+    /// needing a relational model: a diagnosis no longer refuses to bootstrap,
+    /// because `.db/` is reconstructible and refusing left `lint` unable to
+    /// answer about a folder it could describe perfectly well.
     #[test]
-    fn test1096_diagnostic_requirements_establish_nothing() {
+    fn test1096_structural_requirements_establish_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
 
         let observed = observe(root).unwrap();
         let transitions =
-            establish(&observed, Requirements::diagnostic(), &Default::default()).unwrap();
+            establish(&observed, Requirements::structural(), &Default::default()).unwrap();
         assert!(transitions.is_empty());
-        assert!(!root.join(".db").exists(), "diagnosis must not bootstrap");
+        assert!(!root.join(".db").exists(), "structural work bootstraps nothing");
         assert!(!root.join("schema").exists());
     }
 
