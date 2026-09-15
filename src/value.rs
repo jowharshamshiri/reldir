@@ -386,9 +386,9 @@ mod tests {
     /// rendering, so the same instant written in any offset has one identity.
     #[test]
     fn test9999_timestamp_text_is_normalised_to_utc() {
-        let column = column(ColumnType::Timestamp);
-        let offset = textual(&json!("2026-09-14T12:00:00+02:00"), &column).unwrap();
-        let utc = textual(&json!("2026-09-14T10:00:00Z"), &column).unwrap();
+        let timestamp = column(ColumnType::Timestamp);
+        let offset = textual(&json!("2026-09-14T12:00:00+02:00"), &timestamp).unwrap();
+        let utc = textual(&json!("2026-09-14T10:00:00Z"), &timestamp).unwrap();
         assert_eq!(offset, utc, "the same instant must render identically");
     }
 }

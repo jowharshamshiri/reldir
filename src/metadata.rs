@@ -704,7 +704,12 @@ mod tests {
         assert_eq!(parsed.entries, manifest.entries);
 
         // Unknown keys are refused: the manifest is a closed representation.
-        let extended = text.replace('{', "{\"surprise\":1,", 1);
+        // The key is injected once, immediately inside the top-level object, so
+        // the refusal is about that object and not about some nested value.
+        let extended = format!(
+            "{{\"surprise\":1,{}",
+            text.strip_prefix('{').expect("an object was serialized")
+        );
         assert!(crate::json::parse_as::<Manifest>(extended.as_bytes()).is_err());
     }
 
@@ -732,7 +737,10 @@ mod tests {
         assert_eq!(parsed.origin, "import");
         assert!(parsed.previous_revision.is_none());
 
-        let extended = text.replace('{', "{\"surprise\":1,", 1);
+        let extended = format!(
+            "{{\"surprise\":1,{}",
+            text.strip_prefix('{').expect("an object was serialized")
+        );
         assert!(crate::json::parse_as::<Provenance>(extended.as_bytes()).is_err());
     }
 

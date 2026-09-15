@@ -400,7 +400,7 @@ mod tests {
         }
     }
 
-    fn catalog(schema: Schema, rows: &[Value]) -> Catalog {
+    fn catalog_with(schema: Schema, rows: &[Value]) -> Catalog {
         let table = schema.table.clone();
         let rows: Vec<Row> = rows
             .iter()
@@ -450,14 +450,14 @@ mod tests {
             strictness: "balanced".into(),
             evidence: BTreeMap::new(),
         });
-        let catalog = catalog(broken, &[json!({"id": "a"})]);
+        let catalog = catalog_with(broken, &[json!({"id": "a"})]);
         // Would otherwise report LINT_SCHEMA_UNREVIEWED; contributes nothing
         // instead, and above all does not panic.
         assert!(codes(&catalog, false).is_empty());
 
         // An empty primary key is equally unanalysable.
         let empty = schema(&[("id", ColumnType::String, false)], &[]);
-        let catalog = catalog(empty, &[json!({"id": "a"})]);
+        let catalog = catalog_with(empty, &[json!({"id": "a"})]);
         assert!(codes(&catalog, false).is_empty());
     }
 
@@ -471,14 +471,14 @@ mod tests {
             ],
             &["id"],
         );
-        let populated = catalog(
+        let populated = catalog_with(
             s.clone(),
             &[json!({"id": "a", "maybe": "x"}), json!({"id": "b", "maybe": "y"})],
         );
         assert!(codes(&populated, false).contains(&"LINT_NULLABLE_NEVER_NULL".to_string()));
 
         // With a null actually present, the column is correctly nullable.
-        let with_null = catalog(
+        let with_null = catalog_with(
             s,
             &[json!({"id": "a", "maybe": Value::Null}), json!({"id": "b", "maybe": "y"})],
         );
@@ -496,7 +496,7 @@ mod tests {
             ],
             &["id"],
         );
-        let catalog = catalog(
+        let catalog = catalog_with(
             s,
             &[
                 json!({"id": "a", "at": "2026-09-14T10:00:00Z"}),
@@ -512,10 +512,10 @@ mod tests {
             ],
             &["id"],
         );
-        let integral = catalog(s.clone(), &[json!({"id": "a", "n": 1}), json!({"id": "b", "n": 2})]);
+        let integral = catalog_with(s.clone(), &[json!({"id": "a", "n": 1}), json!({"id": "b", "n": 2})]);
         assert!(codes(&integral, false).contains(&"LINT_WIDER_TYPE".to_string()));
 
-        let fractional = catalog(s, &[json!({"id": "a", "n": 1.5})]);
+        let fractional = catalog_with(s, &[json!({"id": "a", "n": 1.5})]);
         assert!(!codes(&fractional, false).contains(&"LINT_WIDER_TYPE".to_string()));
     }
 
@@ -530,10 +530,10 @@ mod tests {
             ],
             &["id"],
         );
-        let never = catalog(s.clone(), &[json!({"id": "a"}), json!({"id": "b"})]);
+        let never = catalog_with(s.clone(), &[json!({"id": "a"}), json!({"id": "b"})]);
         assert!(codes(&never, false).contains(&"LINT_COLUMN_NEVER_POPULATED".to_string()));
 
-        let sometimes = catalog(s, &[json!({"id": "a", "ghost": "x"}), json!({"id": "b"})]);
+        let sometimes = catalog_with(s, &[json!({"id": "a", "ghost": "x"}), json!({"id": "b"})]);
         assert!(codes(&sometimes, false).contains(&"LINT_INCONSISTENT_PRESENCE".to_string()));
     }
 
@@ -549,7 +549,7 @@ mod tests {
             evidence: BTreeMap::new(),
         });
         s.additional_fields = AdditionalFields::Allow;
-        let catalog = catalog(s, &[json!({"id": "a"})]);
+        let catalog = catalog_with(s, &[json!({"id": "a"})]);
         let found = codes(&catalog, false);
         assert!(found.contains(&"LINT_SCHEMA_UNREVIEWED".to_string()));
         assert!(found.contains(&"LINT_ADDITIONAL_FIELDS_ALLOWED".to_string()));
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn test9999_description_findings_are_opt_in() {
         let s = schema(&[("id", ColumnType::String, false)], &["id"]);
-        let catalog = catalog(s, &[json!({"id": "a"})]);
+        let catalog = catalog_with(s, &[json!({"id": "a"})]);
         assert!(!codes(&catalog, false).contains(&"LINT_NO_DESCRIPTION".to_string()));
         assert!(codes(&catalog, true).contains(&"LINT_NO_DESCRIPTION".to_string()));
     }
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn test9999_an_ungenerated_identifier_primary_key_is_reported() {
         let s = schema(&[("id", ColumnType::Uuid, false)], &["id"]);
-        let catalog = catalog(
+        let catalog = catalog_with(
             s,
             &[json!({"id": "0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"})],
         );
@@ -578,7 +578,7 @@ mod tests {
 
         // A plain string key carries no such expectation.
         let s = schema(&[("id", ColumnType::String, false)], &["id"]);
-        let catalog = catalog(s, &[json!({"id": "a"})]);
+        let catalog = catalog_with(s, &[json!({"id": "a"})]);
         assert!(!codes(&catalog, false).contains(&"LINT_PK_NOT_GENERATED".to_string()));
     }
 }

@@ -1745,9 +1745,9 @@ fn update(
             ));
         }
     }
-    let key_values = key_values(key, s)?;
+    let key_params = key_values(key, s)?;
     let mut params = p.values().cloned().collect::<Vec<_>>();
-    params.extend(key_values);
+    params.extend(key_params);
     let assignments = p
         .keys()
         .map(|name| format!("{} = ?", quote(name)))

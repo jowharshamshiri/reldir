@@ -65,7 +65,7 @@ pub fn valid(root: &Path, c: &Catalog) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(DbError::io(&dir, error)),
     }
-    let expected = expected(c);
+    let expected_indexes = expected(c);
     let mut actual = BTreeSet::new();
     for e in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = e.map_err(|e| DbError::io(&dir, e))?.path();
@@ -77,7 +77,7 @@ pub fn valid(root: &Path, c: &Catalog) -> Result<bool> {
             DbError::new("INTERNAL_METADATA_CORRUPT", "index has no filename", 6)
         })?);
         actual.insert(rel.clone());
-        let Some(want) = expected.get(&rel) else {
+        let Some(want) = expected_indexes.get(&rel) else {
             return Ok(false);
         };
         let Ok(bytes) = fs::read(&path) else {
@@ -90,7 +90,7 @@ pub fn valid(root: &Path, c: &Catalog) -> Result<bool> {
             return Ok(false);
         }
     }
-    Ok(actual == expected.keys().cloned().collect())
+    Ok(actual == expected_indexes.keys().cloned().collect())
 }
 pub fn rebuild(root: &Path, c: &Catalog) -> Result<()> {
     let parent = root.join(".db");
