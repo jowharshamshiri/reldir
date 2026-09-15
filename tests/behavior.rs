@@ -3003,3 +3003,73 @@ fn test0059_established_databases_do_not_adopt_new_directories() {
         "an unrelated directory must not silently become a table"
     );
 }
+
+/// A dry run answers the question and reports what a real run would have
+/// changed, without changing it. The plan is not decoration: it names the same
+/// transitions the unprefixed invocation would perform.
+#[test]
+fn test0060_dry_run_plans_establishment_without_performing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--dry-run",
+        "--format",
+        "table",
+        "tables",
+    ])
+    .assert()
+    .success()
+    // The plan is a notice, and Section 48 keeps notices on stderr so stdout
+    // stays free for results: a dry run remains pipeable.
+    .stderr(
+        predicate::str::contains("would initialize metadata")
+            .and(predicate::str::contains("would infer schema/users.json")),
+    )
+    .stdout(predicate::str::contains("users"));
+
+    assert!(!root.join(".db").exists(), "--dry-run establishes nothing");
+    assert!(!root.join("schema").exists());
+}
+
+/// `--dry-run` promises what a real run would do; `--no-auto` refuses to do
+/// anything. Together the refusal wins, so there is no plan to print: promising
+/// work the invocation would never perform is worse than saying nothing.
+#[test]
+fn test0061_dry_run_with_no_auto_refuses_and_promises_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+
+    let out = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--dry-run",
+            "--no-auto",
+            "--format",
+            "table",
+            "tables",
+        ])
+        .assert()
+        .code(10)
+        .stderr(predicate::str::contains("UNINITIALIZED"))
+        .get_output()
+        .clone();
+
+    // A plan would surface on stderr alongside the refusal, so that is where
+    // its absence has to be checked.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("would"),
+        "a refused invocation plans nothing: {stderr}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    assert!(!root.join(".db").exists());
+    assert!(!root.join("schema").exists());
+}

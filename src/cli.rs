@@ -602,9 +602,17 @@ pub fn run(cli: Cli) -> Result<i32> {
             }
 
             let requirements = command_requirements(&command, &settings, diagnostic_only);
-            let transitions =
-                crate::state::establish(&observation, requirements, &resource_overrides)?;
-            report_transitions(&transitions, format)?;
+            // A dry run plans what a real run would do, under the same
+            // requirements. It must not plan work the invocation would refuse:
+            // `--no-auto` establishes nothing, so it has nothing to promise, and
+            // printing a plan before refusing would describe work that was never
+            // going to happen.
+            let transitions = if cli.dry_run {
+                crate::state::plan(&observation, requirements, &resource_overrides)?
+            } else {
+                crate::state::establish(&observation, requirements, &resource_overrides)?
+            };
+            report_transitions(&transitions, format, cli.dry_run)?;
 
             // A folder holding nothing at all has nothing to govern, and saying
             // so is the answer rather than a prerequisite to satisfy first.
@@ -638,7 +646,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             // report the folder's state -- answering from an invented model
             // would conceal the very thing they were run to reveal. Both fall
             // through and surface UNINITIALIZED.
-            let cannot_write = settings.readonly;
+            let cannot_write = settings.readonly || cli.dry_run;
             let establishes_on_demand = matches!(command, Command::Shell);
             let answers_ephemerally =
                 !cli.no_auto && (cannot_write || establishes_on_demand) && !diagnostic_only;
@@ -674,9 +682,15 @@ fn command_requirements(
     cli: &Cli,
     diagnostic_only: bool,
 ) -> crate::state::Requirements {
-    // `--no-auto` is the "do not change my prerequisites" posture: it disables
-    // implicit establishment without disabling the command itself.
-    if cli.no_auto || cli.readonly || cli.dry_run {
+    // `--no-auto` is the "do not change my prerequisites" posture, and
+    // `--readonly` cannot write at all: both establish nothing, so they require
+    // nothing.
+    //
+    // `--dry-run` is not in that set. It reports what a real run would do, which
+    // it can only compute by asking what that run would require. Planning is not
+    // establishing -- `plan` writes nothing -- so a dry run keeps the command's
+    // ordinary requirements and simply stops short of performing them.
+    if cli.no_auto || cli.readonly {
         return crate::state::Requirements::structural();
     }
     match command {
@@ -693,20 +707,34 @@ fn command_requirements(
 
 /// Report automatic establishment once, after it succeeded and before the
 /// command's own output.
-fn report_transitions(transitions: &[crate::state::Transition], format: Format) -> Result<()> {
+fn report_transitions(
+    transitions: &[crate::state::Transition],
+    format: Format,
+    planned: bool,
+) -> Result<()> {
     if transitions.is_empty() {
         return Ok(());
     }
     if matches!(format, Format::Json | Format::Jsonl) {
         // Establishment is part of the machine-readable contract, so it is
         // emitted as data rather than as prose a consumer would have to parse.
+        // `planned` distinguishes what happened from what would happen, which a
+        // consumer cannot infer from the wording.
         let records = transitions
             .iter()
             .map(|transition| {
                 obj([
                     ("kind", Value::String("state_transition".into())),
                     ("transition", Value::String(transition.kind().into())),
-                    ("detail", Value::String(transition.describe())),
+                    ("planned", Value::Bool(planned)),
+                    (
+                        "detail",
+                        Value::String(if planned {
+                            transition.describe_planned()
+                        } else {
+                            transition.describe()
+                        }),
+                    ),
                 ])
             })
             .collect::<Vec<_>>();
@@ -715,7 +743,13 @@ fn report_transitions(transitions: &[crate::state::Transition], format: Format) 
     }
     let summary = transitions
         .iter()
-        .map(crate::state::Transition::describe)
+        .map(|transition| {
+            if planned {
+                transition.describe_planned()
+            } else {
+                transition.describe()
+            }
+        })
         .collect::<Vec<_>>()
         .join("; ");
     output::notice_stderr(&summary);

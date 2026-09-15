@@ -165,6 +165,22 @@ impl Transition {
         }
     }
 
+    /// The same transition stated as something that has not happened yet.
+    ///
+    /// A plan that reads like a report would be worse than no plan at all: the
+    /// user must be able to tell what `--dry-run` did from what it merely
+    /// intends.
+    pub fn describe_planned(&self) -> String {
+        match self {
+            Self::Bootstrapped => "would initialize metadata and record initial provenance".into(),
+            Self::InferredSchemas(tables) => tables
+                .iter()
+                .map(|table| format!("would infer schema/{table}.json"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+
     /// The machine-readable name, part of the structured output contract.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -425,6 +441,15 @@ pub fn establish(
     requirements: Requirements,
     overrides: &crate::config::ResourceOverrides,
 ) -> Result<Vec<Transition>> {
+    establish_inner(observation, requirements, overrides, true)
+}
+
+fn establish_inner(
+    observation: &Observation,
+    requirements: Requirements,
+    overrides: &crate::config::ResourceOverrides,
+    execute: bool,
+) -> Result<Vec<Transition>> {
     if !requirements.relational_model || !requirements.may_establish {
         return Ok(vec![]);
     }
@@ -488,7 +513,6 @@ pub fn establish(
         ));
     }
 
-    let mut transitions = vec![];
     let mut config = Config::default();
     config.apply_overrides(overrides);
     config
@@ -523,18 +547,28 @@ pub fn establish(
         )?
     };
 
+    let mut transitions = vec![];
     if bootstrapping {
-        crate::db::init_layout(&observation.root, false)?;
         transitions.push(Transition::Bootstrapped);
     }
-
     if !inferred.is_empty() {
-        for schema in inferred.values() {
-            crate::db::write_schema(&observation.root, schema)?;
-        }
         transitions.push(Transition::InferredSchemas(
             inferred.keys().cloned().collect(),
         ));
+    }
+
+    if !execute {
+        // Inference already ran, so the plan reflects what would actually
+        // happen rather than what is merely intended. Nothing is written.
+        return Ok(transitions);
+    }
+
+    if bootstrapping {
+        crate::db::init_layout(&observation.root, false)?;
+    }
+
+    for schema in inferred.values() {
+        crate::db::write_schema(&observation.root, schema)?;
     }
 
     if bootstrapping {
@@ -546,6 +580,19 @@ pub fn establish(
     }
 
     Ok(transitions)
+}
+
+/// The transitions establishment would perform, without performing any of them.
+///
+/// Inference still runs, so a folder that cannot be interpreted reports that
+/// failure here exactly as it would when establishing: a plan that ignored the
+/// reason establishment is impossible would be a false promise.
+pub fn plan(
+    observation: &Observation,
+    requirements: Requirements,
+    overrides: &crate::config::ResourceOverrides,
+) -> Result<Vec<Transition>> {
+    establish_inner(observation, requirements, overrides, false)
 }
 
 /// Schemas a read needs but that must not be persisted.
