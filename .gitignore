@@ -2,3 +2,4 @@
 /.wsb/
 .DS_Store
 *.log
+.scrap/
