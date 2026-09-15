@@ -360,6 +360,116 @@ mod tests {
         );
     }
 
+    /// The two validators must not disagree.
+    ///
+    /// `decode` and the bundled meta-schema are independent judgements of the
+    /// same question, and a document the dialect accepts but the codec refuses
+    /// -- or the reverse -- means one of them is lying about what a jdb schema
+    /// is. The meta-schema may legitimately be more permissive, because
+    /// cross-schema facts cannot be expressed in one document; it must never be
+    /// more *restrictive* than the codec.
+    #[test]
+    fn test1141_the_dialect_never_refuses_what_the_codec_accepts() {
+        let validator = validator().expect("the dialect compiles");
+        for (label, document) in [
+            ("minimal", users()),
+            ("no optional members", json!({
+                "$schema": DIALECT_URI,
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false,
+                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
+            })),
+            ("nested array of decimal", json!({
+                "$schema": DIALECT_URI,
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "v": { "type": "array", "items": {
+                        "type": "array", "items": {
+                            "type": "string", "x-jdb-type": "decimal" } } },
+                },
+                "required": ["id", "v"],
+                "additionalProperties": false,
+                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id", "v"] },
+            })),
+            ("annotations at depth", json!({
+                "$schema": DIALECT_URI,
+                "type": "object",
+                "$comment": "top",
+                "properties": {
+                    "id": { "type": "string", "$comment": "the key", "deprecated": false },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
+            })),
+        ] {
+            let decoded = crate::schema::json_schema::decode(&document);
+            let dialect_errors: Vec<String> = validator
+                .iter_errors(&document)
+                .map(|error| format!("{error} at {}", error.instance_path()))
+                .collect();
+            assert!(
+                decoded.is_ok(),
+                "{label}: the codec must accept this document"
+            );
+            assert!(
+                dialect_errors.is_empty(),
+                "{label}: the codec accepted a document the dialect refuses: {dialect_errors:?}"
+            );
+        }
+    }
+
+    /// Neither validator may be the permissive one.
+    ///
+    /// `test1141` fixes one direction: the dialect never refuses what the codec
+    /// accepts. This fixes the other, which is the dangerous one -- a document
+    /// the dialect rejects but the codec reads would mean the file says one
+    /// thing and the database believes another.
+    #[test]
+    fn test1143_the_codec_never_accepts_what_the_dialect_refuses() {
+        let validator = validator().expect("the dialect compiles");
+        let refused = [
+            ("no x-jdb", {
+                let mut d = users();
+                d.as_object_mut().unwrap().remove("x-jdb");
+                d
+            }),
+            ("no columnOrder", {
+                let mut d = users();
+                d["x-jdb"].as_object_mut().unwrap().remove("columnOrder");
+                d
+            }),
+            ("unknown x-jdb key", {
+                let mut d = users();
+                d["x-jdb"]["cascadeEverything"] = json!(true);
+                d
+            }),
+            ("undefined referential action", {
+                let mut d = users();
+                d["x-jdb"]["foreignKeys"][0]["onDelete"] = json!("explode");
+                d
+            }),
+            ("root is not an object", {
+                let mut d = users();
+                d["type"] = json!("array");
+                d
+            }),
+        ];
+        for (label, document) in refused {
+            assert!(
+                !validator.is_valid(&document),
+                "{label}: the fixture must actually be refused by the dialect"
+            );
+            assert!(
+                crate::schema::json_schema::decode(&document).is_err(),
+                "{label}: the codec accepted a document the dialect refuses"
+            );
+        }
+    }
+
     /// The dialect declares its own vocabulary as required, which is what tells
     /// a generic validator that it cannot fully process these documents on its
     /// own. Without the declaration `x-jdb` would look like an ignorable

@@ -474,6 +474,29 @@ pub fn decode(document: &Value) -> Result<Schema> {
     }
     reject_unsupported(root, ROOT_SEMANTIC, "schema")?;
 
+    // A table is an object of named columns. A document declaring any other
+    // root type describes a shape jdb has no relational meaning for, and
+    // reading its `properties` anyway would govern a table the file never
+    // claimed to describe.
+    match root.get("type") {
+        None => {
+            return Err(bad(
+                "SCHEMA_MISSING_REQUIRED",
+                "type is required and must be \"object\": a table is an object of columns",
+            ));
+        }
+        Some(Value::String(name)) if name == "object" => {}
+        Some(other) => {
+            return Err(bad(
+                "SCHEMA_TYPE_UNKNOWN",
+                format!(
+                    "a table is an object of columns, but this schema declares type {}",
+                    serde_json::to_string(other).unwrap_or_else(|_| "?".into())
+                ),
+            ));
+        }
+    }
+
     let extension = root.get(EXTENSION).and_then(Value::as_object).ok_or_else(|| {
         bad(
             "SCHEMA_MISSING_REQUIRED",
@@ -522,6 +545,16 @@ pub fn decode(document: &Value) -> Result<Schema> {
         .and_then(Value::as_array)
         .map(|values| values.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+
+    for name in generated.keys() {
+        if !properties.contains_key(name) {
+            return Err(bad_at(
+                "SCHEMA_COLUMN_UNKNOWN",
+                name,
+                format!("{EXTENSION}.generated names unknown column {name:?}"),
+            ));
+        }
+    }
 
     let order = column_order(extension.get("columnOrder"), properties, "columnOrder")?;
     let mut columns = IndexMap::new();
@@ -1248,6 +1281,50 @@ mod tests {
             "a default must not make a column nullable"
         );
         assert_eq!(after.columns["defaulted"].default, Some(json!("x")));
+    }
+
+    /// A document that does not describe a table is refused, not read around.
+    ///
+    /// The bundled meta-schema already rejects these, so a codec that accepted
+    /// them would make the two validators disagree -- with the codec, the one
+    /// that actually governs data, being the permissive one. Each case here is
+    /// a statement the file makes that jdb would otherwise silently discard.
+    #[test]
+    fn test1142_documents_that_do_not_describe_a_table_are_refused() {
+        let base = table(vec![("id", col(ColumnType::String))]);
+
+        // A table is an object of columns. Reading `properties` out of a
+        // document declaring another root type would govern a table the file
+        // never claimed to describe.
+        for declared in [json!("array"), json!("string"), json!(["object", "null"])] {
+            let mut document = encode(&base);
+            document["type"] = declared.clone();
+            let error = decode(&document)
+                .expect_err(&format!("root type {declared} must be refused"));
+            assert_eq!(error.diagnostic.code, "SCHEMA_TYPE_UNKNOWN");
+        }
+
+        let mut missing_type = encode(&base);
+        missing_type.as_object_mut().unwrap().remove("type");
+        assert_eq!(
+            decode(&missing_type)
+                .expect_err("a document with no root type is not a table")
+                .diagnostic
+                .code,
+            "SCHEMA_MISSING_REQUIRED"
+        );
+
+        // A generator for a column that does not exist is a declaration the
+        // database would otherwise drop on the floor.
+        let mut stray = encode(&base);
+        stray["x-jdb"]["generated"] = json!({ "ghost": "uuid" });
+        let error = decode(&stray).expect_err("a generator must name a real column");
+        assert_eq!(error.diagnostic.code, "SCHEMA_COLUMN_UNKNOWN");
+        assert!(
+            error.diagnostic.message.contains("ghost"),
+            "the message must name the column: {}",
+            error.diagnostic.message
+        );
     }
 
     /// Valid JSON Schema that jdb has no relational meaning for is refused by
