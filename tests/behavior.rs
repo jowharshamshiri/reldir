@@ -2732,3 +2732,274 @@ fn test0051_shell_answers_dot_commands_and_sql() {
         "SQL must execute in the shell: {stdout}"
     );
 }
+
+/// Zero-ceremony operation: a folder holding nothing is a legitimate state with
+/// a truthful answer, not a fault the user must clear before asking anything.
+#[test]
+fn test0052_an_empty_folder_answers_rather_than_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    for arguments in [vec!["tables"], vec!["status"], vec!["check"]] {
+        let mut command = db();
+        command.args(["--db", root.to_str().unwrap(), "--format", "jsonl"]);
+        command
+            .args(&arguments)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("EMPTY"));
+    }
+
+    // Reporting emptiness is an observation, so it creates nothing.
+    assert!(!root.join(".db").exists(), "an answer is not a bootstrap");
+    assert!(!root.join("schema").exists());
+}
+
+/// A query against ungoverned JSON succeeds with no prior lifecycle command:
+/// initialization and inference are the binary's bookkeeping, not the user's.
+#[test]
+fn test0053_ungoverned_data_answers_a_query_without_ceremony() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::write(
+        root.join("users/u1.json"),
+        "{\"id\":\"u1\",\"name\":\"Alice\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("users/u2.json"),
+        "{\"id\":\"u2\",\"name\":\"Bob\"}\n",
+    )
+    .unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT count(*) AS n FROM users",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"n\":2"));
+
+    // The folder is now a real database: metadata, a schema, and a first
+    // revision recorded with no predecessor it cannot substantiate.
+    assert!(root.join(".db/format").exists());
+    assert!(root.join("schema/users.json").exists());
+    assert_eq!(
+        fs::read_dir(root.join(".db/provenance")).unwrap().count(),
+        1,
+        "adoption records exactly one initial revision"
+    );
+
+    // Establishment is reported, and it happens once: a second query finds
+    // everything already in place.
+    let second = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "jsonl",
+            "sql",
+            "SELECT count(*) AS n FROM users",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        !stdout.contains("state_transition"),
+        "an established database is not re-established: {stdout}"
+    );
+}
+
+/// `--no-auto` is the "do not change my prerequisites" posture CI wants: it
+/// reports what would be needed and writes nothing.
+#[test]
+fn test0054_no_auto_reports_instead_of_establishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--no-auto",
+        "--format",
+        "table",
+        "tables",
+    ])
+    .assert()
+    .code(10)
+    .stderr(predicate::str::contains("UNINITIALIZED"));
+
+    assert!(!root.join(".db").exists(), "--no-auto establishes nothing");
+    assert!(!root.join("schema").exists());
+}
+
+/// Diagnosis observes; it does not change what it reports on. A command that
+/// repaired the folder could not be run twice for the same answer.
+#[test]
+fn test0055_diagnostics_never_establish_or_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+
+    // On an ungoverned folder, a diagnostic establishes nothing.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .failure();
+    assert!(!root.join(".db").exists());
+
+    // On a governed one, it adopts a valid external change -- that is
+    // authoritative -- but leaves derived state exactly as it found it.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "init",
+        root.to_str().unwrap(),
+        "--adopt",
+    ])
+    .assert()
+    .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+
+    let before = fs::read_to_string(root.join(".db/manifest.json")).unwrap();
+    fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
+    fs::remove_dir_all(root.join(".db/indexes")).unwrap();
+    fs::create_dir(root.join(".db/indexes")).unwrap();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_dir(root.join(".db/indexes")).unwrap().count(),
+        0,
+        "a diagnosis must not rebuild derived state"
+    );
+    assert_ne!(
+        before,
+        fs::read_to_string(root.join(".db/manifest.json")).unwrap(),
+        "a valid external change is adopted: that is authoritative, not derived"
+    );
+}
+
+/// Working inside a table directory operates on the database that contains it,
+/// so the user never has to explain where the root is.
+#[test]
+fn test0056_a_subdirectory_resolves_to_its_database_root() {
+    let dir = adopted();
+    let root = dir.path();
+
+    let output = db()
+        .args(["--format", "jsonl", "tables"])
+        .current_dir(root.join("users"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"table\":\"users\""),
+        "a subdirectory must resolve to the ancestor root"
+    );
+}
+
+/// An explicitly named root is used exactly. Silently operating on an ancestor
+/// database would act on data the user did not point at.
+#[test]
+fn test0057_an_explicit_root_is_not_walked_upward_from() {
+    let dir = adopted();
+    let root = dir.path();
+    let inner = root.join("nested");
+    fs::create_dir(&inner).unwrap();
+
+    // The ancestor is a database, but the named path is not, and it holds
+    // nothing -- so the answer is emptiness, not the ancestor's tables.
+    db().args([
+        "--db",
+        inner.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "tables",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("EMPTY"));
+}
+
+/// SQL given as a bare positional runs, so the common case is one word plus a
+/// query rather than a subcommand the user has to remember.
+#[test]
+fn test0058_bare_sql_runs_without_a_subcommand() {
+    let dir = adopted();
+    let root = dir.path();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Alice").and(predicate::str::contains("Bob")));
+
+    // A subcommand name is still a subcommand: it must never be parsed as SQL,
+    // which would silently run something the user did not write.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("VALID"));
+}
+
+/// An established database does not gain tables implicitly. A directory dropped
+/// beside it is surfaced for the user to adopt deliberately.
+#[test]
+fn test0059_established_databases_do_not_adopt_new_directories() {
+    let dir = adopted();
+    let root = dir.path();
+    fs::create_dir(root.join("junk")).unwrap();
+    fs::write(root.join("junk/x.json"), "{\"a\":1}\n").unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("UNGOVERNED_DIRECTORY"));
+
+    assert!(
+        !root.join("schema/junk.json").exists(),
+        "an unrelated directory must not silently become a table"
+    );
+}

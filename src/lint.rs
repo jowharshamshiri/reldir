@@ -521,10 +521,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             schema_sources: BTreeMap::from([(
                 table.clone(),
-                crate::canonical::pretty_with_indent(
-                    &serde_json::to_value(&schema).unwrap(),
-                    2,
-                ),
+                crate::canonical::pretty_with_indent(&serde_json::to_value(&schema).unwrap(), 2),
             )]),
             schemas: BTreeMap::from([(table.clone(), schema)]),
             rows: BTreeMap::from([(table, rows)]),
@@ -700,13 +697,7 @@ mod tests {
         });
         // Rows differ in whether `maybe` is present, and are not canonical, so
         // both schema-level and row-level findings are produced at once.
-        let catalog = catalog_with(
-            s,
-            &[
-                json!({"id": "a", "maybe": "x"}),
-                json!({"id": "b"}),
-            ],
-        );
+        let catalog = catalog_with(s, &[json!({"id": "a", "maybe": "x"}), json!({"id": "b"})]);
         let findings = lint(&catalog, &Config::default(), true);
         assert!(!findings.is_empty(), "expected findings to inspect");
 

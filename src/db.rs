@@ -9,15 +9,55 @@ use crate::{
 use fs2::FileExt;
 use serde_json::Value;
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
+/// What an observation is permitted to persist.
+///
+/// Repairing derived state and recording an accepted revision are independent
+/// permissions, because they answer to different rules. Rebuilding an index is
+/// derived work a diagnosis must not perform -- a command that reports what is
+/// wrong cannot alter what it reports on. Recording a valid external change is
+/// authoritative: it is the system's central promise, and a command that
+/// observed such a change without accepting it would leave the database
+/// permanently behind its own files.
+///
+/// Collapsing the two into one switch made every diagnostic silently stop
+/// adopting external edits, so they are kept apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObserveMode {
-    Record,
-    NoWrite,
-    ReadOnly,
+pub struct ObserveMode {
+    /// Rebuild a corrupt manifest or stale indexes when the state is valid.
+    pub repair_derived: bool,
+    /// Record an observed, valid external transition as a new revision.
+    pub record_provenance: bool,
+}
+
+impl ObserveMode {
+    /// Ordinary operation: establish and record whatever the state requires.
+    pub const RECORD: Self = Self {
+        repair_derived: true,
+        record_provenance: true,
+    };
+
+    /// Diagnosis: accept valid external changes, but leave derived state
+    /// exactly as found so the report describes the folder as it was.
+    pub const DIAGNOSE: Self = Self {
+        repair_derived: false,
+        record_provenance: true,
+    };
+
+    /// Read-only: persist nothing at all.
+    pub const READ_ONLY: Self = Self {
+        repair_derived: false,
+        record_provenance: false,
+    };
+
+    /// Whether this observation may take the writer lock. Only a mode that can
+    /// persist something needs it.
+    fn may_write(self) -> bool {
+        self.repair_derived || self.record_provenance
+    }
 }
 pub struct Database {
     pub root: PathBuf,
@@ -32,33 +72,6 @@ pub struct Database {
 }
 
 impl Database {
-    pub fn discover(explicit: Option<&Path>) -> Result<PathBuf> {
-        if let Some(p) = explicit {
-            return abs(p);
-        }
-        if let Ok(p) = env::var("DB_DIR") {
-            return abs(Path::new(&p));
-        }
-        let mut cur = env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?;
-        let mut tried = vec![];
-        loop {
-            tried.push(cur.display().to_string());
-            if cur.join(".db").is_dir() {
-                return Ok(cur);
-            }
-            if !cur.pop() {
-                break;
-            }
-        }
-        Err(DbError::from_diag(
-            Diagnostic::error(
-                "UNINITIALIZED",
-                format!("no .db directory found; searched {}", tried.join(", ")),
-            )
-            .help("run `db init` or `db init --adopt`"),
-            10,
-        ))
-    }
     pub fn open(root: PathBuf, mode: ObserveMode) -> Result<Self> {
         Self::open_with_overrides(root, mode, &ResourceOverrides::default())
     }
@@ -70,7 +83,7 @@ impl Database {
     ) -> Result<Self> {
         let validation_started = std::time::Instant::now();
         validate_format(&root)?;
-        let writer_lock = if mode == ObserveMode::Record {
+        let writer_lock = if mode.may_write() {
             let path = root.join(".db/lock");
             validate_optional_private_file(&path, "lock")?;
             let file = fs::OpenOptions::new()
@@ -92,7 +105,7 @@ impl Database {
             None
         };
         let pending = crate::transaction::has_pending(&root)?;
-        let recovered = if mode == ObserveMode::Record {
+        let recovered = if mode.may_write() {
             recover(&root)?
         } else {
             false
@@ -139,7 +152,7 @@ impl Database {
         };
         metadata::validate_provenance(&root, old.as_ref())?;
         let (hash, entries) = metadata::state(&catalog)?;
-        if manifest_rebuild && mode == ObserveMode::Record {
+        if manifest_rebuild && mode.repair_derived {
             if let Some(head) = &old {
                 metadata::write_manifest(&root, head)?;
                 crate::output::notice_stderr("rebuilt corrupt derived manifest");
@@ -152,7 +165,7 @@ impl Database {
         }
         let indexes_valid = crate::index::valid(&root, &catalog)?;
         if !indexes_valid {
-            if mode == ObserveMode::Record && diagnostics.is_empty() {
+            if mode.repair_derived && diagnostics.is_empty() {
                 crate::index::rebuild(&root, &catalog)?;
                 crate::output::notice_stderr("rebuilt stale or corrupt indexes");
             } else {
@@ -167,32 +180,30 @@ impl Database {
         } else {
             metadata::diff_entries(old.as_ref().map(|m| &m.entries), &entries)
         };
-        if !external_changes.is_empty() && mode != ObserveMode::Record {
+        if !external_changes.is_empty() && !mode.record_provenance {
             catalog.warnings.push(Diagnostic::warning(
                 "METADATA_STALE_READONLY",
                 "authoritative state is valid but differs from recorded metadata; read-only mode did not record it",
             ));
         }
-        let manifest = if diagnostics.is_empty()
-            && !external_changes.is_empty()
-            && mode == ObserveMode::Record
-        {
-            Some(metadata::record(
-                &catalog,
-                old.as_ref(),
-                hash,
-                entries,
-                if recovered { "recovery" } else { "external" },
-                None,
-            )?)
-        } else {
-            old
-        };
+        let manifest =
+            if diagnostics.is_empty() && !external_changes.is_empty() && mode.record_provenance {
+                Some(metadata::record(
+                    &catalog,
+                    old.as_ref(),
+                    hash,
+                    entries,
+                    if recovered { "recovery" } else { "external" },
+                    None,
+                )?)
+            } else {
+                old
+            };
         if recovered && diagnostics.is_empty() {
             crate::transaction::finalize_recovered(&root)?;
         }
         let manifest_needs_rebuild =
-            manifest_rebuild && !(mode == ObserveMode::Record && diagnostics.is_empty());
+            manifest_rebuild && !(mode.repair_derived && diagnostics.is_empty());
         let database = Self {
             root,
             config,
@@ -296,34 +307,24 @@ pub fn load_config(root: &Path) -> Result<Config> {
         .len();
     if config_size > crate::config::BOOTSTRAP_MAX_CONFIG_SIZE {
         return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
+            "CONFIG_INVALID",
             format!(
                 ".db/config exceeds the {} byte bootstrap limit",
                 crate::config::BOOTSTRAP_MAX_CONFIG_SIZE
             ),
-            6,
+            1,
         ));
     }
     let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
-    let value = crate::json::parse(&b).map_err(|e| {
-        DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("invalid .db/config: {e}"),
-            6,
-        )
-    })?;
-    let config: Config = serde_json::from_value(value).map_err(|e| {
-        DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("invalid .db/config: {e}"),
-            6,
-        )
-    })?;
+    let value = crate::json::parse(&b)
+        .map_err(|e| DbError::new("CONFIG_INVALID", format!("invalid .db/config: {e}"), 1))?;
+    let config: Config = serde_json::from_value(value)
+        .map_err(|e| DbError::new("CONFIG_INVALID", format!("invalid .db/config: {e}"), 1))?;
     config.validate().map_err(|message| {
         DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
+            "CONFIG_INVALID",
             format!("invalid .db/config: {message}"),
-            6,
+            1,
         )
     })?;
     Ok(config)
@@ -421,15 +422,6 @@ pub fn json_key_arg(text: &str) -> Result<Value> {
         .or_else(|_| Ok(Value::String(text.into())))
         .map_err(|_: serde_json::Error| DbError::usage("invalid key"))
 }
-fn abs(p: &Path) -> Result<PathBuf> {
-    if p.is_absolute() {
-        Ok(p.to_path_buf())
-    } else {
-        Ok(env::current_dir()
-            .map_err(|e| DbError::io(Path::new("."), e))?
-            .join(p))
-    }
-}
 pub fn recover(root: &Path) -> Result<bool> {
     crate::transaction::recover(root)
 }
@@ -466,48 +458,22 @@ mod tests {
         assert_eq!(json_key_arg("[1,2]").unwrap(), serde_json::json!([1, 2]));
     }
 
-    /// Section 49: database discovery resolves an explicit path to an absolute
-    /// location so that later path handling is unambiguous.
+    /// Root resolution never walks upward from a path the user named: operating
+    /// on a different database than the one they pointed at would be a surprise
+    /// no diagnostic could undo.
     #[test]
-    fn test9999_explicit_discovery_returns_an_absolute_path() {
+    fn test9999_an_explicitly_named_root_is_used_exactly() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = Database::discover(Some(dir.path())).unwrap();
-        assert!(resolved.is_absolute());
-        assert_eq!(resolved, dir.path());
-    }
-
-    /// Section 6: an uninitialised directory names what was searched and how to
-    /// proceed, and reports the documented exit status.
-    #[test]
-    fn test9999_discovery_failure_is_actionable() {
-        let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("a/b/c");
+        let nested = dir.path().join("child");
         fs::create_dir_all(&nested).unwrap();
-        let previous = env::current_dir().unwrap();
-        // `discover` walks up from the working directory when no path is given.
-        env::set_current_dir(&nested).unwrap();
-        let result = Database::discover(None);
-        env::set_current_dir(previous).unwrap();
+        fs::create_dir_all(dir.path().join(".db")).unwrap();
 
-        // The temporary directory has no .db anywhere above it inside the
-        // sandbox, but an ancestor of the system temp root might; only assert on
-        // the failure shape when discovery actually failed.
-        if let Err(error) = result {
-            assert_eq!(error.diagnostic.code, "UNINITIALIZED");
-            assert_eq!(error.exit, 10);
-            assert!(
-                error
-                    .diagnostic
-                    .help
-                    .as_deref()
-                    .is_some_and(|help| help.contains("db init")),
-                "the message must say how to proceed"
-            );
-            assert!(
-                error.diagnostic.message.contains("searched"),
-                "the message must name the directories tried"
-            );
-        }
+        let resolved = crate::state::resolve_root(Some(&nested)).unwrap();
+        assert!(resolved.path.is_absolute());
+        assert_eq!(
+            resolved.path, nested,
+            "the named directory is the root, even though an ancestor has .db"
+        );
     }
 
     /// Section 65: the on-disk format is explicitly versioned and an unsupported

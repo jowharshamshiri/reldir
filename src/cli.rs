@@ -29,7 +29,13 @@ use std::{
 #[command(
     name = "db",
     version,
-    about = "Filesystem-native relational JSON database"
+    about = "Filesystem-native relational JSON database",
+    // `db 'SELECT ...'` runs the query and bare `db` opens the shell, so the
+    // subcommand is optional and a leading positional that is not a subcommand
+    // name is captured as SQL. Global flags must remain usable alongside a
+    // subcommand, so the positional only negates the requirement -- it never
+    // conflicts with subcommand use.
+    subcommand_negates_reqs = true
 )]
 pub struct Cli {
     #[arg(long, global = true, env = "DB_DIR")]
@@ -66,8 +72,19 @@ pub struct Cli {
     max_result_rows: Option<usize>,
     #[arg(long, global = true)]
     max_transaction_size: Option<u64>,
+    /// Never establish prerequisites implicitly. Reports what would be needed
+    /// instead of creating it, which is the posture CI and debugging want.
+    #[arg(long, global = true)]
+    no_auto: bool,
+    /// Authorize transitions that would replace or discard authoritative state.
+    /// Authorization alone never selects between competing resolutions.
+    #[arg(long, global = true)]
+    allow_destructive: bool,
+    /// SQL to execute when no subcommand is given.
+    #[arg(value_name = "SQL")]
+    sql: Option<String>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 impl Cli {
     pub fn machine_error_format(&self) -> Option<&str> {
@@ -514,7 +531,23 @@ pub fn run(cli: Cli) -> Result<i32> {
         quiet: cli.quiet,
         verbose: cli.verbose,
     });
-    match cli.command {
+    // No subcommand: run the SQL given as a bare positional, or open the shell.
+    // A bare invocation carries no intent to make this folder a database, so it
+    // establishes nothing up front; the first statement that needs a persistent
+    // database performs its own establishment.
+    let command = match cli.command.clone() {
+        Some(command) => command,
+        None => match cli.sql.clone() {
+            Some(sql) => Command::Sql {
+                sql,
+                params: vec![],
+                explain: false,
+                explain_analyze: false,
+            },
+            None => Command::Shell,
+        },
+    };
+    match command {
         Command::Init {
             path,
             adopt,
@@ -548,25 +581,56 @@ pub fn run(cli: Cli) -> Result<i32> {
             &resource_overrides,
         ),
         command => {
-            let root = Database::discover(cli.db.as_deref())?;
-            if !metadata_writable(&root) {
+            let resolved = crate::state::resolve_root(cli.db.as_deref())?;
+            let root = resolved.path.clone();
+            let observation = crate::state::observe(&root)?;
+
+            // A read that promises not to write must not acquire hidden write
+            // side effects, and a diagnosis must not alter what it reports on:
+            // `check` in either form leaves derived state exactly as it found it.
+            // `status` is not in this set. Adopting a valid external change is
+            // the system's central promise, and recording that transition is
+            // authoritative work, not derived repair: a status that observed a
+            // change without accepting it would leave the database permanently
+            // behind its own files.
+            let diagnostic_only = matches!(
+                command,
+                Command::Check { .. }
+                    | Command::Lint { .. }
+                    | Command::Doctor { fix: false, .. }
+                    | Command::Infer { write: false, .. }
+                    | Command::Diff { .. }
+            );
+            if !observation.writable {
                 settings.readonly = true;
             }
-            let no_write = settings.readonly
-                || matches!(
-                    command,
-                    Command::Check { no_write: true, .. }
-                        | Command::Lint { .. }
-                        | Command::Doctor { fix: false, .. }
-                        | Command::Infer { write: false, .. }
-                        | Command::Diff { .. }
-                );
+
+            let requirements = command_requirements(&command, &settings, diagnostic_only);
+            let transitions =
+                crate::state::establish(&observation, requirements, &resource_overrides)?;
+            report_transitions(&transitions, format)?;
+
+            // A folder holding nothing at all has nothing to govern, and saying
+            // so is the answer rather than a prerequisite to satisfy first.
+            // Emptiness is a fact about the folder's contents, not about
+            // whether metadata happens to exist: a folder full of ungoverned
+            // JSON is emphatically not empty, and reporting it as such would
+            // be a lie that hides the user's own data from them.
+            if observation.format == crate::state::FormatState::Absent
+                && observation.topology.is_empty()
+            {
+                return empty_database_result(&command, format);
+            }
+
+            // A diagnosis still adopts a valid external change -- that is
+            // authoritative, not derived -- but leaves indexes and the manifest
+            // exactly as it found them.
             let mode = if settings.readonly {
-                ObserveMode::ReadOnly
-            } else if no_write {
-                ObserveMode::NoWrite
+                ObserveMode::READ_ONLY
+            } else if diagnostic_only {
+                ObserveMode::DIAGNOSE
             } else {
-                ObserveMode::Record
+                ObserveMode::RECORD
             };
             let mut db = Database::open_with_overrides(root, mode, &resource_overrides)?;
             if settings.readonly {
@@ -580,6 +644,103 @@ pub fn run(cli: Cli) -> Result<i32> {
                 }
             }
             dispatch(command, &mut db, format, &settings)
+        }
+    }
+}
+
+/// What a command needs established before it can run.
+///
+/// Declared per command rather than inferred, so a new command has to answer
+/// the question instead of inheriting the most permissive behavior.
+fn command_requirements(
+    command: &Command,
+    cli: &Cli,
+    diagnostic_only: bool,
+) -> crate::state::Requirements {
+    // `--no-auto` is the "do not change my prerequisites" posture: it disables
+    // implicit establishment without disabling the command itself.
+    if cli.no_auto || cli.readonly || cli.dry_run {
+        return crate::state::Requirements::structural();
+    }
+    match command {
+        // These operate on the folder rather than on relations. `Shell` joins
+        // them because a bare invocation carries no intent to make this folder
+        // a database; the first statement that needs one establishes it.
+        Command::Recover | Command::UpgradeFormat | Command::Shell => {
+            crate::state::Requirements::structural()
+        }
+        _ if diagnostic_only => crate::state::Requirements::diagnostic(),
+        _ => crate::state::Requirements::functional(),
+    }
+}
+
+/// Report automatic establishment once, after it succeeded and before the
+/// command's own output.
+fn report_transitions(transitions: &[crate::state::Transition], format: Format) -> Result<()> {
+    if transitions.is_empty() {
+        return Ok(());
+    }
+    if matches!(format, Format::Json | Format::Jsonl) {
+        // Establishment is part of the machine-readable contract, so it is
+        // emitted as data rather than as prose a consumer would have to parse.
+        let records = transitions
+            .iter()
+            .map(|transition| {
+                obj([
+                    ("kind", Value::String("state_transition".into())),
+                    ("transition", Value::String(transition.kind().into())),
+                    ("detail", Value::String(transition.describe())),
+                ])
+            })
+            .collect::<Vec<_>>();
+        output::records(&records, format)?;
+        return Ok(());
+    }
+    let summary = transitions
+        .iter()
+        .map(crate::state::Transition::describe)
+        .collect::<Vec<_>>()
+        .join("; ");
+    output::notice_stderr(&summary);
+    Ok(())
+}
+
+/// The answer for a folder that holds no database and no data.
+///
+/// Emptiness is a legitimate state with a truthful answer, not a fault the user
+/// has to clear before asking their first question.
+fn empty_database_result(command: &Command, format: Format) -> Result<i32> {
+    match command {
+        // Commands whose answer is "there is nothing here" can say so directly.
+        Command::Status | Command::Tables | Command::Check { .. } | Command::Lint { .. } => {
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("status".into())),
+                    ("valid", Value::Bool(true)),
+                    ("state", Value::String("EMPTY".into())),
+                    ("tables", Value::from(0)),
+                    ("rows", Value::from(0)),
+                ]),
+                "no tables, no data",
+            )?;
+            Ok(0)
+        }
+        // Everything else names a relation that cannot exist yet. Saying so is
+        // the truthful answer, and it is not a failure of the invocation.
+        _ => {
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("status".into())),
+                    ("valid", Value::Bool(true)),
+                    ("state", Value::String("EMPTY".into())),
+                    ("tables", Value::from(0)),
+                    ("rows", Value::from(0)),
+                ]),
+                "no tables, no data",
+            )?;
+            Ok(0)
         }
     }
 }
@@ -2974,7 +3135,13 @@ impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
 fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
-    db.require_valid()?;
+    // The shell opens against whatever model the folder provides, including an
+    // empty one. Refusing entry because the database is not yet valid would put
+    // the ceremony back: each statement enforces its own requirements when it
+    // runs, and a diagnostic statement is exactly what the user needs here.
+    if !db.diagnostics.is_empty() {
+        output::diagnostics(&db.diagnostics, format);
+    }
     if !io::stdin().is_terminal() {
         for line in io::stdin().lock().lines() {
             let line = line.map_err(|e| DbError::io(Path::new("stdin"), e))?;
@@ -3090,9 +3257,9 @@ fn shell_line(db: &mut Database, query: &str, format: Format, cli: &Cli) -> Resu
         Ok(_) => {
             if !read {
                 db.refresh(if cli.readonly {
-                    ObserveMode::ReadOnly
+                    ObserveMode::READ_ONLY
                 } else {
-                    ObserveMode::Record
+                    ObserveMode::RECORD
                 })?;
             }
         }
@@ -4739,19 +4906,4 @@ fn completions(shell: &str) -> Result<i32> {
         .map_err(|_| DbError::usage("shell must be bash, zsh, fish, elvish, or powershell"))?;
     clap_complete::generate(shell, &mut Cli::command(), "db", &mut io::stdout());
     Ok(0)
-}
-
-fn metadata_writable(root: &Path) -> bool {
-    let Ok(md) = fs::metadata(root.join(".db")) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        md.permissions().mode() & 0o222 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        !md.permissions().readonly()
-    }
 }
