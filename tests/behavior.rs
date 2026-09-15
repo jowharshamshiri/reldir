@@ -1191,3 +1191,861 @@ fn test0027_documented_flag_names_match_the_specified_cli_contract() {
         .assert()
         .success();
 }
+
+/// Section 37: a RESTRICT referential action must block the mutation and report
+/// it as a referential violation. SQLite implements RESTRICT with an internal
+/// trigger, so the underlying failure arrives as SQLITE_CONSTRAINT_TRIGGER; it
+/// must still be classified FOREIGN_KEY_VIOLATION (Section 75) with the INVALID
+/// exit status (Section 51), never as a query type error.
+#[test]
+fn test0028_restrict_referential_action_blocks_and_reports_a_referential_violation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::create_dir(root.join("posts")).unwrap();
+    fs::write(
+        root.join("schema/users.json"),
+        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+    fs::write(
+        root.join("posts/p1.json"),
+        "{\"id\":\"p1\",\"user_id\":\"u1\"}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    for arguments in [
+        vec!["delete", "users", "u1"],
+        vec!["sql", "DELETE FROM users WHERE id = 'u1'"],
+        vec!["update", "users", "u1", "{\"id\":\"u9\"}"],
+    ] {
+        let mut command = db();
+        command.args(["--db", root.to_str().unwrap(), "--format", "table"]);
+        command
+            .args(&arguments)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("FOREIGN_KEY_VIOLATION"));
+    }
+
+    // The refusal must leave both the parent and the dependent row untouched.
+    assert!(root.join("users/u1.json").exists());
+    assert!(root.join("posts/p1.json").exists());
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 37: set_null and set_default execute transactionally and every row
+/// touched by the action is listed in the command output.
+#[test]
+fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("users")).unwrap();
+    fs::create_dir(root.join("posts")).unwrap();
+    fs::write(
+        root.join("schema/users.json"),
+        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#).unwrap();
+    fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
+    fs::write(
+        root.join("posts/p1.json"),
+        "{\"id\":\"p1\",\"user_id\":\"u1\"}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "delete",
+        "users",
+        "u1",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("posts/p1.json"));
+    let row: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("posts/p1.json")).unwrap()).unwrap();
+    assert_eq!(row["user_id"], serde_json::Value::Null);
+
+    // set_default restores the declared default rather than null.
+    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true,"default":"gone"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_default","on_update":"restrict"}]}"#).unwrap();
+    fs::write(root.join("users/gone.json"), "{\"id\":\"gone\"}\n").unwrap();
+    fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
+    fs::write(
+        root.join("posts/p2.json"),
+        "{\"id\":\"p2\",\"user_id\":\"u2\"}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "delete",
+        "users",
+        "u2",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("posts/p2.json"));
+    let row: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("posts/p2.json")).unwrap()).unwrap();
+    assert_eq!(row["user_id"], "gone");
+}
+
+/// Section 11: every required and cross-schema grammar rule has a dedicated
+/// stable code, and SCHEMA_UNKNOWN_KEY names the nearest valid key so that a
+/// typo cannot become invisible state.
+#[test]
+fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
+
+    let base = r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#;
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "SCHEMA_UNKNOWN_KEY",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"uniqe":[["id"]]}"#,
+        ),
+        (
+            "SCHEMA_PK_NULLABLE",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string","nullable":true}}}"#,
+        ),
+        (
+            "SCHEMA_COLUMN_TYPE_MISSING",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{}}}"#,
+        ),
+        (
+            "SCHEMA_TYPE_UNKNOWN",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"nosuchtype"}}}"#,
+        ),
+        (
+            "SCHEMA_PK_COLUMN_UNKNOWN",
+            r#"{"table":"a","primary_key":["ghost"],"columns":{"id":{"type":"string"}}}"#,
+        ),
+        (
+            "SCHEMA_DEFAULT_TYPE_MISMATCH",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int","default":"text"}}}"#,
+        ),
+        (
+            "SCHEMA_TABLE_NAME_MISMATCH",
+            r#"{"table":"other","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        ),
+        (
+            "SCHEMA_FK_TARGET_MISSING",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b":{"type":"string"}},"foreign_keys":[{"columns":["b"],"references":{"table":"ghost","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+        ),
+        (
+            "SCHEMA_CHECK_INVALID",
+            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"check":[{"name":"c","expr":"ghost > 0"}]}"#,
+        ),
+    ];
+    for (code, body) in cases {
+        fs::write(root.join("schema/a.json"), body).unwrap();
+        db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(code));
+    }
+
+    // The unknown-key message must point at the intended key, not merely reject.
+    fs::write(
+        root.join("schema/a.json"),
+        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"uniqe":[["id"]]}"#,
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unique"));
+
+    fs::write(root.join("schema/a.json"), base).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 11: foreign-key semantics are validated across schemas.
+#[test]
+fn test0031_cross_schema_foreign_key_rules_are_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
+    fs::write(root.join("b/b1.json"), "{\"id\":\"b1\",\"a_id\":\"a1\"}\n").unwrap();
+    fs::write(
+        root.join("schema/a.json"),
+        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+    )
+    .unwrap();
+
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "SCHEMA_FK_TYPE_MISMATCH",
+            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"int"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+        ),
+        (
+            "SCHEMA_FK_TARGET_NOT_UNIQUE",
+            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["nope"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+        ),
+        (
+            "SCHEMA_FK_ACTION_INVALID",
+            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#,
+        ),
+    ];
+    for (code, body) in cases {
+        fs::write(root.join("schema/b.json"), body).unwrap();
+        db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(code));
+    }
+
+    // An all-cascade cycle is rejected (Section 11).
+    fs::write(root.join("schema/a.json"),r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
+    fs::write(root.join("schema/b.json"),r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("SCHEMA_FK_CYCLE"));
+}
+
+/// Sections 10 and 16: row-level structural and relational violations each have
+/// a dedicated code, and additional_fields governs unknown keys.
+#[test]
+fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir(root.join("t")).unwrap();
+    let strict = r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#;
+    fs::write(root.join("schema/t.json"), strict).unwrap();
+    fs::write(root.join("t/a.json"), "{\"id\":\"a\",\"n\":1}\n").unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    let cases: Vec<(&str, &str, &str)> = vec![
+        (
+            "ROW_UNKNOWN_FIELD",
+            "b.json",
+            "{\"id\":\"b\",\"n\":1,\"emial\":\"x\"}\n",
+        ),
+        ("ROW_MISSING_FIELD", "c.json", "{\"id\":\"c\"}\n"),
+        ("ROW_ROOT_NOT_OBJECT", "d.json", "[1,2]\n"),
+        ("INVALID_JSON", "e.json", "{\"id\":\"e\",,}\n"),
+        (
+            "NOT_NULL_VIOLATION",
+            "f.json",
+            "{\"id\":\"f\",\"n\":null}\n",
+        ),
+        ("TYPE_MISMATCH", "g.json", "{\"id\":\"g\",\"n\":\"text\"}\n"),
+    ];
+    for (code, name, body) in cases {
+        let path = root.join("t").join(name);
+        fs::write(&path, body).unwrap();
+        db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(code));
+        fs::remove_file(&path).unwrap();
+    }
+
+    // additional_fields: allow accepts the very key that reject refused.
+    fs::write(
+        root.join("t/b.json"),
+        "{\"id\":\"b\",\"n\":1,\"extra\":\"x\"}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("ROW_UNKNOWN_FIELD"));
+    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"additional_fields":"allow"}"#).unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // CHECK constraints are enforced over committed rows.
+    fs::remove_file(root.join("t/b.json")).unwrap();
+    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"check":[{"name":"pos","expr":"n > 0"}]}"#).unwrap();
+    fs::write(root.join("t/h.json"), "{\"id\":\"h\",\"n\":-5}\n").unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("CHECK_VIOLATION"));
+}
+
+/// Section 16: primary-key uniqueness is enforced over the logical row bodies,
+/// independently of which file each row happens to live in.
+#[test]
+fn test0033_duplicate_primary_keys_are_rejected_under_a_custom_filename_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::create_dir(root.join("t")).unwrap();
+    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"slug":{"type":"string"}},"unique":[["slug"]],"storage":{"filename":["slug"]}}"#).unwrap();
+    fs::write(root.join("t/s1.json"), "{\"id\":\"a\",\"slug\":\"s1\"}\n").unwrap();
+    fs::write(root.join("t/s2.json"), "{\"id\":\"a\",\"slug\":\"s2\"}\n").unwrap();
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    // Both filenames satisfy storage.filename, so the only violation is the
+    // duplicated primary key, and it must name the colliding file.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("PRIMARY_KEY_VIOLATION")
+                .and(predicate::str::contains("t/s1.json"))
+                .and(predicate::str::contains("IDENTITY_MISMATCH").not()),
+        );
+}
+
+/// Section 12: inference fails rather than guessing, and each failure names the
+/// file and the reason.
+#[test]
+fn test0034_inference_failures_are_specific_and_actionable() {
+    let base = tempfile::tempdir().unwrap();
+
+    // A table whose stems match no column and that has no conventional id
+    // column leaves several candidates, which must be refused, not guessed.
+    let ambiguous = base.path().join("ambiguous");
+    fs::create_dir_all(ambiguous.join("t")).unwrap();
+    fs::write(ambiguous.join("t/r0.json"), "{\"aa\":\"1\",\"bb\":\"9\"}\n").unwrap();
+    fs::write(ambiguous.join("t/r1.json"), "{\"aa\":\"2\",\"bb\":\"8\"}\n").unwrap();
+    db().args([
+        "--db",
+        ambiguous.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(
+        predicate::str::contains("INFER_AMBIGUOUS_PRIMARY_KEY")
+            .and(predicate::str::contains("aa"))
+            .and(predicate::str::contains("bb")),
+    );
+
+    // No candidate at all must explain why each column was rejected.
+    let none = base.path().join("none");
+    fs::create_dir_all(none.join("t")).unwrap();
+    fs::write(none.join("t/1.json"), "{\"aa\":\"dup\"}\n").unwrap();
+    fs::write(none.join("t/2.json"), "{\"aa\":\"dup\"}\n").unwrap();
+    db().args([
+        "--db",
+        none.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(
+        predicate::str::contains("INFER_NO_PRIMARY_KEY")
+            .and(predicate::str::contains("duplicate value")),
+    );
+
+    // Structural refusals.
+    let structural = base.path().join("structural");
+    fs::create_dir_all(structural.join("t")).unwrap();
+    fs::write(structural.join("t/x.json"), "{\"id\":\"x\"}\n").unwrap();
+
+    fs::create_dir(structural.join("t/nested")).unwrap();
+    db().args([
+        "--db",
+        structural.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("INFER_NESTED_DIRECTORY"));
+    fs::remove_dir(structural.join("t/nested")).unwrap();
+
+    fs::write(structural.join("t/note.txt"), "hi\n").unwrap();
+    db().args([
+        "--db",
+        structural.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("INFER_NON_JSON_FILE"));
+    fs::remove_file(structural.join("t/note.txt")).unwrap();
+
+    fs::write(structural.join("t/bad.json"), "{bad\n").unwrap();
+    db().args([
+        "--db",
+        structural.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("INFER_INVALID_JSON"));
+    fs::remove_file(structural.join("t/bad.json")).unwrap();
+
+    fs::write(structural.join("t/y.json"), "{\"id\":\"y\",\"v\":1}\n").unwrap();
+    fs::write(structural.join("t/z.json"), "{\"id\":\"z\",\"v\":\"s\"}\n").unwrap();
+    db().args([
+        "--db",
+        structural.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("INFER_TYPE_CONFLICT"));
+    // Loose strictness widens the conflict to json instead of failing.
+    db().args([
+        "--db",
+        structural.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+        "--strictness",
+        "loose",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"json\""));
+    fs::remove_file(structural.join("t/y.json")).unwrap();
+    fs::remove_file(structural.join("t/z.json")).unwrap();
+
+    // An empty table directory named explicitly cannot be typed.
+    let empty = base.path().join("empty");
+    fs::create_dir_all(empty.join("t")).unwrap();
+    fs::create_dir(empty.join("schema")).unwrap();
+    db().args(["--format", "table", "init", empty.to_str().unwrap()])
+        .assert()
+        .success();
+    db().args([
+        "--db",
+        empty.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+    ])
+    .assert()
+    .code(8)
+    .stderr(
+        predicate::str::contains("INFER_NO_ROWS").and(predicate::str::contains("db schema new t")),
+    );
+
+    // A column that is null in every row cannot be typed under strict.
+    let untyped = base.path().join("untyped");
+    fs::create_dir_all(untyped.join("t")).unwrap();
+    fs::write(untyped.join("t/y.json"), "{\"id\":\"y\",\"v\":null}\n").unwrap();
+    db().args([
+        "--db",
+        untyped.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+        "--strictness",
+        "strict",
+    ])
+    .assert()
+    .code(8)
+    .stderr(predicate::str::contains("INFER_UNTYPED_COLUMN"));
+}
+
+/// Section 12: an explicit --pk override is honoured, including composite keys,
+/// and a key whose values do not match the file stems is reported rather than
+/// silently accepted.
+#[test]
+fn test0035_primary_key_overrides_are_honoured_and_checked_against_filenames() {
+    let base = tempfile::tempdir().unwrap();
+
+    let composite = base.path().join("composite");
+    fs::create_dir_all(composite.join("t")).unwrap();
+    fs::write(composite.join("t/x,1.json"), "{\"a\":\"x\",\"b\":\"1\"}\n").unwrap();
+    fs::write(composite.join("t/x,2.json"), "{\"a\":\"x\",\"b\":\"2\"}\n").unwrap();
+    db().args([
+        "--db",
+        composite.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+        "--pk",
+        "a,b",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"a\"").and(predicate::str::contains("\"b\"")));
+
+    let mismatched = base.path().join("mismatched");
+    fs::create_dir_all(mismatched.join("t")).unwrap();
+    fs::write(
+        mismatched.join("t/r0.json"),
+        "{\"aa\":\"1\",\"bb\":\"9\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        mismatched.join("t/r1.json"),
+        "{\"aa\":\"2\",\"bb\":\"8\"}\n",
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        mismatched.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "t",
+        "--pk",
+        "bb",
+    ])
+    .assert()
+    .stderr(predicate::str::contains("INFER_FILENAME_INCONSISTENT"));
+}
+
+/// Section 54: files and directories that are neither governed rows nor ignored
+/// are surfaced rather than silently absorbed.
+#[test]
+fn test0036_unknown_files_and_directories_are_classified() {
+    let dir = adopted();
+    let root = dir.path();
+
+    // A non-.json file inside a governed table directory.
+    fs::write(root.join("users/notes.txt"), "hi\n").unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("UNEXPECTED_FILE"));
+    fs::remove_file(root.join("users/notes.txt")).unwrap();
+
+    // Editor artefacts are ignored by default.
+    fs::write(root.join("users/.DS_Store"), "\n").unwrap();
+    fs::write(root.join("users/scratch.json~"), "\n").unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    fs::remove_file(root.join("users/.DS_Store")).unwrap();
+    fs::remove_file(root.join("users/scratch.json~")).unwrap();
+
+    // An ungoverned top-level directory warns, and --strict promotes it.
+    fs::create_dir(root.join("junk")).unwrap();
+    fs::write(root.join("junk/x.json"), "{\"a\":1}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("UNGOVERNED_DIRECTORY"));
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "check",
+        "--strict",
+    ])
+    .assert()
+    .code(7)
+    .stderr(predicate::str::contains("UNGOVERNED_DIRECTORY"));
+}
+
+/// Section 53: the binary must not rewrite a row that is logically unchanged,
+/// and a formatting-only external edit must not advance the revision.
+#[test]
+fn test0037_logically_unchanged_rows_are_never_rewritten() {
+    let dir = adopted();
+    let root = dir.path();
+    let reformatted = "{\n    \"id\":    \"u1\",\n\n  \"name\":\"Alice\"\n}\n";
+    fs::write(root.join("users/u1.json"), reformatted).unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "status",
+    ])
+    .assert()
+    .success();
+    assert_eq!(
+        reformatted,
+        fs::read_to_string(root.join("users/u1.json")).unwrap(),
+        "validation must not normalize formatting of an unchanged row"
+    );
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    assert_eq!(
+        reformatted,
+        fs::read_to_string(root.join("users/u1.json")).unwrap(),
+        "check must not normalize formatting of an unchanged row"
+    );
+}
+
+/// Sections 6 and 13: a schema whose primary key names a column that does not
+/// exist is INVALID and must be reported as SCHEMA_PK_COLUMN_UNKNOWN. The
+/// diagnostic commands must keep operating on that state rather than aborting:
+/// lint analyses a declared shape, so it must decline to analyse a table whose
+/// primary key does not resolve instead of indexing a missing column.
+#[test]
+fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
+    let dir = adopted();
+    let root = dir.path();
+    fs::write(
+        root.join("schema/users.json"),
+        r#"{"table":"users","primary_key":["ghost"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+    )
+    .unwrap();
+
+    // `status` and `check` report violations on stderr and exit INVALID.
+    // A panic (exit 101) or a success code would both be defects.
+    for arguments in [vec!["status"], vec!["check"]] {
+        let mut command = db();
+        command.args(["--db", root.to_str().unwrap(), "--format", "table"]);
+        command
+            .args(&arguments)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("SCHEMA_PK_COLUMN_UNKNOWN"));
+    }
+
+    // `doctor` prints its plan on stdout, classifying a schema error a human
+    // must resolve as a `manual` fix (Section 14).
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "doctor",
+    ])
+    .assert()
+    .code(2)
+    .stdout(
+        predicate::str::contains("SCHEMA_PK_COLUMN_UNKNOWN")
+            .and(predicate::str::contains("manual")),
+    );
+
+    // `lint` reports lint findings only, so it says nothing about a table it
+    // declines to analyse. What must hold is that it terminates cleanly rather
+    // than indexing the missing column.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "lint"])
+        .assert()
+        .code(0)
+        .stderr(predicate::str::contains("panicked").not());
+
+    // The same must hold when the unresolvable key belongs to a *target* table
+    // that another table's foreign-key candidate scan would inspect.
+    fs::create_dir(root.join("posts")).unwrap();
+    fs::write(
+        root.join("posts/p1.json"),
+        "{\"id\":\"p1\",\"users\":\"u1\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("schema/posts.json"),
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"users":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    for arguments in [vec!["check"], vec!["lint"], vec!["doctor"]] {
+        let mut command = db();
+        command.args(["--db", root.to_str().unwrap(), "--format", "table"]);
+        command
+            .args(&arguments)
+            .assert()
+            .code(predicate::in_iter([0, 2, 7]))
+            .stderr(predicate::str::contains("panicked").not());
+    }
+
+    // Repairing the schema restores a fully valid database.
+    fs::write(
+        root.join("schema/users.json"),
+        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 49: `--quiet` suppresses informational output without ever
+/// suppressing diagnostics, machine-readable payload, command results, or
+/// changing an exit code.
+#[test]
+fn test0039_quiet_suppresses_only_informational_output() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+
+    // Informational confirmations disappear entirely under --quiet.
+    for arguments in [
+        vec!["status"],
+        vec!["check"],
+        vec!["doctor"],
+        vec!["gc", "--dry-run"],
+    ] {
+        let mut loud = db();
+        loud.args(["--db", root, "--format", "table"]);
+        let loud = loud.args(&arguments).output().unwrap();
+        assert!(
+            !loud.stdout.is_empty(),
+            "{arguments:?} should print informational output without --quiet"
+        );
+
+        let mut hushed = db();
+        hushed.args(["--db", root, "--format", "table", "--quiet"]);
+        let hushed = hushed.args(&arguments).output().unwrap();
+        assert!(
+            hushed.stdout.is_empty(),
+            "{arguments:?} must print nothing on stdout under --quiet, got {:?}",
+            String::from_utf8_lossy(&hushed.stdout)
+        );
+        assert_eq!(
+            loud.status.code(),
+            hushed.status.code(),
+            "--quiet must not change the exit code of {arguments:?}"
+        );
+    }
+
+    // A mutation still happens under --quiet; only its summary is suppressed.
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "table",
+        "--quiet",
+        "update",
+        "users",
+        "u1",
+        "{\"name\":\"Quietly\"}",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::is_empty());
+    assert!(
+        fs::read_to_string(dir.path().join("users/u1.json"))
+            .unwrap()
+            .contains("Quietly")
+    );
+
+    // Query results are the command's payload, not informational chatter.
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "table",
+        "--quiet",
+        "sql",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Quietly"));
+    db().args([
+        "--db", root, "--format", "table", "--quiet", "schema", "show", "users",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"table\""));
+
+    // Diagnostics and the INVALID exit code survive --quiet.
+    fs::write(
+        dir.path().join("users/broken.json"),
+        "{\"id\":\"broken\",\"name\":4}\n",
+    )
+    .unwrap();
+    db().args(["--db", root, "--format", "table", "--quiet", "check"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("TYPE_MISMATCH"));
+    // The machine-readable contract is never suppressed either.
+    db().args(["--db", root, "--format", "json", "--quiet", "check"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("TYPE_MISMATCH"));
+}
+
+/// Section 49: human diagnostics are colourised on a TTY only, and both
+/// `--no-color` and a non-empty `NO_COLOR` disable it. Tests never run on a
+/// TTY, so the observable contract here is that piped output is always clean.
+#[test]
+fn test0040_diagnostics_are_never_colourised_off_a_terminal() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+    fs::write(
+        dir.path().join("users/broken.json"),
+        "{\"id\":\"broken\",\"name\":4}\n",
+    )
+    .unwrap();
+
+    for extra in [vec![], vec!["--no-color"]] {
+        let mut command = db();
+        command.args(["--db", root, "--format", "table"]);
+        let output = command.args(&extra).arg("check").output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("TYPE_MISMATCH"),
+            "diagnostic must still be reported"
+        );
+        assert!(
+            !stderr.contains('\u{1b}'),
+            "redirected output must carry no ANSI escapes, got {stderr:?}"
+        );
+    }
+
+    // NO_COLOR is honoured as an environment setting.
+    db().args(["--db", root, "--format", "table", "check"])
+        .env("NO_COLOR", "1")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains('\u{1b}').not());
+}

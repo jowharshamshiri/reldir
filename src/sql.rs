@@ -1085,6 +1085,17 @@ fn query_err(e: rusqlite::Error) -> DbError {
             rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL => Some("NOT_NULL_VIOLATION"),
             rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => Some("FOREIGN_KEY_VIOLATION"),
             rusqlite::ffi::SQLITE_CONSTRAINT_CHECK => Some("CHECK_VIOLATION"),
+            // SQLite enforces RESTRICT referential actions through internal
+            // triggers, so a blocked RESTRICT surfaces as SQLITE_CONSTRAINT_TRIGGER
+            // carrying SQLite's foreign-key message rather than as
+            // SQLITE_CONSTRAINT_FOREIGNKEY. It is a referential violation
+            // (Section 37), not a query type error, so it must carry the
+            // FOREIGN_KEY_VIOLATION code and the INVALID exit status.
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+                if msg.contains("FOREIGN KEY constraint failed") =>
+            {
+                Some("FOREIGN_KEY_VIOLATION")
+            }
             _ => None,
         };
         if let Some(code) = code {

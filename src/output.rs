@@ -1,6 +1,105 @@
 use crate::diagnostic::{DbError, Diagnostic, Result};
 use serde_json::{Map, Value};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::sync::OnceLock;
+
+/// Presentation settings shared by every human-facing writer (Section 49).
+///
+/// These are process-wide because informational notices are emitted from layers
+/// that never see the parsed command line -- derived-state rebuild notices in
+/// `db`, staging notices in `transaction` -- and because `DbError::render_human`
+/// runs from `main` after a command has already failed. Storing one immutable
+/// value settled once at startup keeps a single source of truth rather than
+/// threading a parameter through every call site.
+#[derive(Debug, Clone, Copy)]
+pub struct Presentation {
+    /// Colour human diagnostics. Section 49 requires colour on a TTY, disabled
+    /// by `--no-color` and by a non-empty `NO_COLOR` environment variable.
+    pub color: bool,
+    /// Suppress informational stdout and progress. Diagnostics, machine-readable
+    /// output, and exit codes are never suppressed.
+    pub quiet: bool,
+    /// Emit progress for operations that exceed one second (Section 49).
+    pub verbose: bool,
+}
+
+impl Default for Presentation {
+    fn default() -> Self {
+        // Before `run` settles the flags -- for example a usage error rejected
+        // during argument parsing -- fall back to the environment alone.
+        Self {
+            color: io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            quiet: false,
+            verbose: false,
+        }
+    }
+}
+
+static PRESENTATION: OnceLock<Presentation> = OnceLock::new();
+
+/// Settle the presentation for this process. Called once from `run`; later calls
+/// are ignored so that the value can never change mid-command.
+pub fn set_presentation(presentation: Presentation) {
+    let _ = PRESENTATION.set(presentation);
+}
+
+pub fn presentation() -> Presentation {
+    *PRESENTATION.get_or_init(Presentation::default)
+}
+
+/// Write one informational line to stdout unless `--quiet` is in effect.
+/// Diagnostics never travel this path.
+pub fn notice(text: &str) {
+    if !presentation().quiet {
+        println!("{text}");
+    }
+}
+
+/// Write one informational notice to stderr unless `--quiet` is in effect.
+/// Used for derived-state rebuild and recovery notices, which Section 48
+/// requires the binary to report while leaving stdout free for results.
+pub fn notice_stderr(text: &str) {
+    if !presentation().quiet {
+        eprintln!("{text}");
+    }
+}
+
+const RED: &str = "\u{1b}[31m";
+const YELLOW: &str = "\u{1b}[33m";
+const CYAN: &str = "\u{1b}[36m";
+const BOLD: &str = "\u{1b}[1m";
+const RESET: &str = "\u{1b}[0m";
+
+/// Colour codes for a severity, empty when colour is disabled.
+pub fn severity_style(severity: &crate::diagnostic::Severity) -> (&'static str, &'static str) {
+    if !presentation().color {
+        return ("", "");
+    }
+    let colour = match severity {
+        crate::diagnostic::Severity::Error => RED,
+        crate::diagnostic::Severity::Warning => YELLOW,
+        crate::diagnostic::Severity::Suggestion | crate::diagnostic::Severity::Info => CYAN,
+    };
+    (colour, RESET)
+}
+
+/// Emphasis for the headline of a diagnostic, empty when colour is disabled.
+pub fn emphasis() -> (&'static str, &'static str) {
+    if presentation().color {
+        (BOLD, RESET)
+    } else {
+        ("", "")
+    }
+}
+
+pub fn severity_label(severity: &crate::diagnostic::Severity) -> &'static str {
+    match severity {
+        crate::diagnostic::Severity::Error => "error",
+        crate::diagnostic::Severity::Warning => "warning",
+        crate::diagnostic::Severity::Suggestion => "suggestion",
+        crate::diagnostic::Severity::Info => "info",
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -33,14 +132,11 @@ pub fn diagnostics(items: &[Diagnostic], format: Format) {
         }
         _ => {
             for d in items {
+                let (colour, reset) = severity_style(&d.severity);
+                let (bold, bold_reset) = emphasis();
                 eprintln!(
-                    "{}[{}]: {}",
-                    match d.severity {
-                        crate::diagnostic::Severity::Error => "error",
-                        crate::diagnostic::Severity::Warning => "warning",
-                        crate::diagnostic::Severity::Suggestion => "suggestion",
-                        crate::diagnostic::Severity::Info => "info",
-                    },
+                    "{colour}{}[{}]{reset}: {bold}{}{bold_reset}",
+                    severity_label(&d.severity),
                     d.code,
                     d.message
                 );

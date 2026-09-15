@@ -162,7 +162,14 @@ impl DbError {
     }
     pub fn render_human(&self) {
         let d = &self.diagnostic;
-        eprintln!("error[{}]: {}", d.code, d.message);
+        let (colour, reset) = crate::output::severity_style(&d.severity);
+        let (bold, bold_reset) = crate::output::emphasis();
+        eprintln!(
+            "{colour}{}[{}]{reset}: {bold}{}{bold_reset}",
+            crate::output::severity_label(&d.severity),
+            d.code,
+            d.message
+        );
         if let Some(p) = &d.path {
             if let Some(l) = &d.location {
                 eprintln!("  --> {}:{}:{}", p.display(), l.line, l.column)

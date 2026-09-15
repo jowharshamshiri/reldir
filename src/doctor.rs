@@ -300,8 +300,13 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
             "LINT_FK_CANDIDATE" => {
                 if let Some(f) = &d.field {
                     for (target, ts) in &db.catalog.schemas {
+                        // A target whose primary key does not resolve to a
+                        // declared column is already reported as
+                        // SCHEMA_PK_COLUMN_UNKNOWN; it cannot be a foreign-key
+                        // target and must not be indexed blindly here.
                         if target == t
                             || ts.primary_key.len() != 1
+                            || !ts.columns.contains_key(&ts.primary_key[0])
                             || ts.columns[&ts.primary_key[0]].kind != s.columns[f].kind
                         {
                             continue;

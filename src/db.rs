@@ -98,7 +98,7 @@ impl Database {
             false
         };
         if recovered {
-            eprintln!("recovered an interrupted committed transaction");
+            crate::output::notice_stderr("recovered an interrupted committed transaction");
         }
         if recovered {
             metadata::reconcile_after_recovery(&root)?;
@@ -142,7 +142,7 @@ impl Database {
         if manifest_rebuild && mode == ObserveMode::Record {
             if let Some(head) = &old {
                 metadata::write_manifest(&root, head)?;
-                eprintln!("rebuilt corrupt derived manifest");
+                crate::output::notice_stderr("rebuilt corrupt derived manifest");
             }
         } else if manifest_rebuild {
             catalog.warnings.push(Diagnostic::warning(
@@ -154,7 +154,7 @@ impl Database {
         if !indexes_valid {
             if mode == ObserveMode::Record && diagnostics.is_empty() {
                 crate::index::rebuild(&root, &catalog)?;
-                eprintln!("rebuilt stale or corrupt indexes");
+                crate::output::notice_stderr("rebuilt stale or corrupt indexes");
             } else {
                 catalog.warnings.push(Diagnostic::warning(
                     "INDEX_STALE",

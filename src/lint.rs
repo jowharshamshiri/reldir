@@ -1,9 +1,27 @@
 use crate::{catalog::Catalog, config::Config, diagnostic::Diagnostic, schema::ColumnType};
 use std::collections::HashSet;
 
+/// Lint reasons about a schema's declared shape, so it can only analyse a table
+/// whose primary key actually resolves to declared columns. A schema that fails
+/// that requirement is already reported by schema validation as
+/// `SCHEMA_PK_COLUMN_UNKNOWN` (Section 11); lint must contribute no findings for
+/// it rather than index a column that does not exist. Section 6 requires `lint`,
+/// `check`, and `doctor` to keep operating while the database is INVALID, so
+/// this is a precondition of the analysis, not an error path of its own.
+fn analyzable(schema: &crate::schema::Schema) -> bool {
+    !schema.primary_key.is_empty()
+        && schema
+            .primary_key
+            .iter()
+            .all(|column| schema.columns.contains_key(column))
+}
+
 pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic> {
     let mut out = vec![];
     for (table, s) in &c.schemas {
+        if !analyzable(s) {
+            continue;
+        }
         let rows = &c.rows[table];
         if s.inferred.is_some() {
             out.push(
@@ -282,10 +300,10 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 continue;
             }
             for (target, ts) in &c.schemas {
-                if target == table
-                    || ts.primary_key.len() != 1
-                    || ts.columns[&ts.primary_key[0]].kind != col.kind
-                {
+                if target == table || ts.primary_key.len() != 1 || !analyzable(ts) {
+                    continue;
+                }
+                if ts.columns[&ts.primary_key[0]].kind != col.kind {
                     continue;
                 }
                 let expected = [

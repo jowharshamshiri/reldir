@@ -505,6 +505,15 @@ pub fn run(cli: Cli) -> Result<i32> {
     } else {
         Format::Jsonl
     };
+    // Section 49: colour on a TTY, disabled by --no-color and by NO_COLOR.
+    // Settled once, before any command can emit, so every writer agrees.
+    output::set_presentation(output::Presentation {
+        color: !cli.no_color
+            && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+            && io::stderr().is_terminal(),
+        quiet: cli.quiet,
+        verbose: cli.verbose,
+    });
     match cli.command {
         Command::Init {
             path,
@@ -822,13 +831,13 @@ fn cmd_init(
     }
     if dry {
         if format == Format::Table {
-            println!(
+            output::notice(&format!(
                 "would adopt {} tables and infer {} schemas",
                 tables.len(),
                 schemas.len()
-            );
+            ));
             for (name, reason) in &skipped {
-                println!("skipped {name}: {reason}");
+                output::notice(&format!("skipped {name}: {reason}"));
             }
         } else {
             let mut records = vec![obj([
@@ -855,14 +864,14 @@ fn cmd_init(
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash.clone(), entries, "import", None)?;
     if matches!(format, Format::Table | Format::Sqlite) {
-        println!(
+        output::notice(&format!(
             "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",
             tables.len(),
             c.row_count(),
             &hash[..8]
-        );
+        ));
         for (name, reason) in &skipped {
-            println!("Skipped {name}: {reason}");
+            output::notice(&format!("Skipped {name}: {reason}"));
         }
     } else {
         let mut records = vec![obj([
@@ -1201,7 +1210,7 @@ fn status(db: &Database, format: Format) -> Result<i32> {
     }
     let m = db.manifest.as_ref();
     if format == Format::Table {
-        println!(
+        output::notice(&format!(
             "VALID   revision {}   root {}   external changes: {}",
             m.map_or(0, |m| m.revision),
             m.map_or("unknown", |m| &m.root_hash[..8]),
@@ -1210,16 +1219,19 @@ fn status(db: &Database, format: Format) -> Result<i32> {
             } else {
                 "accepted"
             }
-        );
+        ));
         if !db.external_changes.is_empty() {
-            println!("changed:");
+            output::notice("changed:");
             for p in &db.external_changes {
-                println!("  {p}");
+                output::notice(&format!("  {p}"));
             }
         }
         let findings = crate::lint::lint(&db.catalog, &db.config, false);
         if !findings.is_empty() {
-            println!("lint: {} findings (run `db lint`)", findings.len());
+            output::notice(&format!(
+                "lint: {} findings (run `db lint`)",
+                findings.len()
+            ));
         }
     }
     Ok(0)
@@ -1295,14 +1307,14 @@ fn check(db: &Database, format: Format, strict: bool) -> Result<i32> {
         output::diagnostics(&findings, format);
         return Ok(7);
     }
-    println!(
+    output::notice(&format!(
         "VALID: {} tables, {} rows, 0 violations, {} lint findings ({:?}), {} ms",
         db.catalog.schemas.len(),
         db.catalog.row_count(),
         lint.len(),
         lint_counts,
         db.validation_elapsed.as_millis(),
-    );
+    ));
     Ok(0)
 }
 fn lint(
@@ -1354,18 +1366,18 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
     }
     let mut machine_records = Vec::new();
     if format == Format::Table {
-        println!("Doctor plan:");
+        output::notice("Doctor plan:");
         for class in ["derived", "schema", "layout", "data", "manual"] {
             let items: Vec<_> = plan
                 .iter()
                 .filter(|f| f.class == class && doctor_fix_matches(only, &f.id))
                 .collect();
             if !items.is_empty() {
-                println!("  {class} ({}):", items.len());
+                output::notice(&format!("  {class} ({}):", items.len()));
                 for f in items {
-                    println!("    {}  {}", f.id, f.description);
+                    output::notice(&format!("    {}  {}", f.id, f.description));
                     for path in &f.paths {
-                        println!("      -> {}", path.display());
+                        output::notice(&format!("      -> {}", path.display()));
                     }
                 }
             }
@@ -2885,18 +2897,18 @@ fn gc(db: &Database, dry: bool, format: Format, yes: bool) -> Result<i32> {
     let reclaimable_bytes = targets.iter().map(|target| target.1).sum::<u64>();
     if format == Format::Table {
         for record in &records {
-            println!(
+            output::notice(&format!(
                 "{} {} ({} bytes)",
                 if dry { "would reclaim" } else { "reclaim" },
                 record["path"].as_str().unwrap_or(""),
                 record["bytes"]
-            );
+            ));
         }
-        println!(
+        output::notice(&format!(
             "{} item(s), {} byte(s) reclaimable",
             targets.len(),
             reclaimable_bytes
-        );
+        ));
     } else {
         records.push(obj([
             ("kind", Value::String("gc_summary".into())),
@@ -3995,7 +4007,9 @@ fn commit_changes(
             .iter()
             .filter(|path| path.starts_with("schema"))
             .count();
-        println!("migration plan: {row_files} row file(s), {schema_files} schema file(s)");
+        output::notice(&format!(
+            "migration plan: {row_files} row file(s), {schema_files} schema file(s)"
+        ));
     }
     print_mutation(
         &paths,
@@ -4032,14 +4046,14 @@ fn print_mutation(paths: &[PathBuf], revision: u64, dry: bool, format: Format) -
         } else {
             format!("; revision {revision}")
         };
-        println!(
+        output::notice(&format!(
             "{} {} path(s){}",
             if dry { "would change" } else { "changed" },
             paths.len(),
             suffix
-        );
+        ));
         for p in paths {
-            println!("  {}", p.display())
+            output::notice(&format!("  {}", p.display()))
         }
     } else {
         output::records(&rows, format)?
@@ -4408,7 +4422,9 @@ fn quote(s: &str) -> String {
 }
 fn event(format: Format, record: Map<String, Value>, human: &str) -> Result<()> {
     if matches!(format, Format::Table | Format::Sqlite) {
-        println!("{human}");
+        // Informational confirmation: suppressed by --quiet (Section 49).
+        // Machine-readable output is a contract and is never suppressed.
+        output::notice(human);
         Ok(())
     } else {
         output::records(&[record], format)
