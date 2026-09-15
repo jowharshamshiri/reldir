@@ -25,10 +25,18 @@ thread_local! {
 /// what makes it real: a check applied to the parsed value cannot protect the
 /// parse itself, which recurses before any caller sees a value.
 pub fn with_depth_limit<T>(limit: usize, body: impl FnOnce() -> T) -> T {
-    let previous = DEPTH_LIMIT.with(|cell| cell.replace(limit));
-    let result = body();
-    DEPTH_LIMIT.with(|cell| cell.set(previous));
-    result
+    // Restoring through `Drop` rather than after the call keeps the bound
+    // correct even if `body` panics. Threads are reused -- by the test harness
+    // and by any future concurrent caller -- so a limit left behind by an
+    // unwinding observation would silently govern an unrelated later parse.
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEPTH_LIMIT.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(DEPTH_LIMIT.with(|cell| cell.replace(limit)));
+    body()
 }
 
 fn enter<E: de::Error>() -> std::result::Result<usize, E> {
