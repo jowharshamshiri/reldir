@@ -3683,3 +3683,62 @@ fn test0073_every_emitted_diagnostic_code_is_documented() {
         "these codes are emitted but documented nowhere: {undocumented:?}"
     );
 }
+
+/// Ordinals exist so a test can be named in a review, a commit, or a bug
+/// report and then found. A repeated number defeats that, and the compiler
+/// cannot object because module paths keep the names distinct — which is
+/// exactly how eleven duplicates accumulated before anyone noticed.
+#[test]
+fn test0074_every_test_ordinal_is_unique() {
+    fn ordinals(text: &str) -> Vec<(String, String)> {
+        let mut found = vec![];
+        for (index, _) in text.match_indices("fn test") {
+            let rest = &text[index + "fn test".len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.len() == 4 {
+                let name: String = rest
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                found.push((digits, name));
+            }
+        }
+        found
+    }
+
+    let mut sources = vec![fs::read_to_string("tests/behavior.rs").unwrap()];
+    let mut stack = vec![std::path::PathBuf::from("src")];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|value| value == "rs") {
+                sources.push(fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    let mut seen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for text in &sources {
+        for (ordinal, name) in ordinals(text) {
+            seen.entry(ordinal).or_default().push(name);
+        }
+    }
+    assert!(
+        seen.len() > 150,
+        "the scan found only {} ordinals, so it is not finding them",
+        seen.len()
+    );
+
+    let repeated: Vec<_> = seen
+        .iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(ordinal, names)| format!("{ordinal}: {}", names.join(", ")))
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "these ordinals name more than one test:\n  {}",
+        repeated.join("\n  ")
+    );
+}
