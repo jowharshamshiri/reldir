@@ -422,16 +422,16 @@ pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
         ));
     }
     fs::create_dir_all(root).map_err(|e| DbError::io(root, e))?;
-    if !root.join("schema").exists() {
-        fs::create_dir(root.join("schema")).map_err(|e| DbError::io(&root.join("schema"), e))?
-    }
     fs::create_dir(root.join(".db")).map_err(|e| DbError::io(&root.join(".db"), e))?;
+    // `schema/` is the user's pin directory and is created only when they pin
+    // something. jdb's own schemas live in `.db/schema`, which it always needs.
     for d in [
         "provenance",
         "indexes",
         "statistics",
         "transactions",
         "snapshots",
+        "schema",
     ] {
         fs::create_dir(root.join(".db").join(d))
             .map_err(|e| DbError::io(&root.join(".db").join(d), e))?
@@ -462,9 +462,6 @@ pub fn init_empty(root: &Path, track_provenance: bool) -> Result<()> {
     // invariant across every path that creates a database.
     crate::index::rebuild(root, &c)?;
     Ok(())
-}
-pub fn write_schema(root: &Path, s: &crate::schema::Schema) -> Result<()> {
-    metadata::write_json_atomic(&root.join("schema").join(format!("{}.json", s.table)), s)
 }
 pub fn json_key_arg(text: &str) -> Result<Value> {
     serde_json::from_str(text)
@@ -557,13 +554,19 @@ mod tests {
             ".db/format",
             ".db/config",
             ".db/.gitignore",
-            "schema",
+            ".db/schema",
         ] {
             assert!(
                 dir.path().join(expected).exists(),
                 "{expected} must be created"
             );
         }
+        // `schema/` is the user's pin directory: it exists only once they pin
+        // something, so initialization must not conjure one.
+        assert!(
+            !dir.path().join("schema").exists(),
+            "initialization declares nothing on the user's behalf"
+        );
         let ignore = fs::read_to_string(dir.path().join(".db/.gitignore")).unwrap();
         assert!(
             ignore.contains("format") && ignore.contains("config"),

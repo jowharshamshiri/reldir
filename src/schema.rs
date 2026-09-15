@@ -2,11 +2,7 @@ use crate::diagnostic::{DbError, Diagnostic, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -112,16 +108,6 @@ pub struct Storage {
     pub filename: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Inferred {
-    pub at: String,
-    pub rows: usize,
-    pub strictness: String,
-    #[serde(default)]
-    pub evidence: BTreeMap<String, String>,
-}
-
 fn one() -> u32 {
     1
 }
@@ -159,8 +145,6 @@ pub struct Schema {
     pub storage: Option<Storage>,
     #[serde(default = "reject")]
     pub additional_fields: AdditionalFields,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inferred: Option<Inferred>,
 }
 
 impl Schema {
@@ -450,6 +434,11 @@ pub fn load(path: &Path) -> Result<Schema> {
         DbError::from_diag(diagnostic, 2)
     })?;
     let mut de = serde_json::Deserializer::from_slice(&data);
+    // The bound on how deep a document may be is `max_nesting_depth`, enforced
+    // by `json::parse` above. serde's own fixed recursion limit is a second,
+    // invisible bound that no configuration can reach: left on, it refuses a
+    // schema this database itself wrote and already accepted as data.
+    de.disable_recursion_limit();
     let schema: Schema = serde::Deserialize::deserialize(&mut de).map_err(|e| {
         let text = e.to_string();
         let code = if text.contains("unknown field") {
@@ -500,7 +489,6 @@ fn nearest_key_message(message: &str) -> String {
         "indexes",
         "storage",
         "additional_fields",
-        "inferred",
         "type",
         "nullable",
         "default",
@@ -576,7 +564,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 

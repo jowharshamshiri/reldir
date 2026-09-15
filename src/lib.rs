@@ -13,6 +13,7 @@ pub mod lint;
 pub mod metadata;
 pub mod output;
 pub mod schema;
+pub mod schema_store;
 pub mod sql;
 pub mod state;
 pub mod transaction;

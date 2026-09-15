@@ -175,7 +175,7 @@ impl Transition {
             Self::Bootstrapped => "would initialize metadata and record initial provenance".into(),
             Self::InferredSchemas(tables) => tables
                 .iter()
-                .map(|table| format!("would infer schema/{table}.json"))
+                .map(|table| format!("would infer .db/schema/{table}.json"))
                 .collect::<Vec<_>>()
                 .join("; "),
         }
@@ -382,10 +382,6 @@ fn survey(root: &Path) -> Result<Topology> {
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            // `<table>.inferred.json` is a comparison artefact, not a schema.
-            if stem.ends_with(".inferred") {
-                continue;
-            }
             declared_tables.push(stem.to_string());
         }
     }
@@ -568,7 +564,25 @@ fn establish_inner(
     }
 
     for schema in inferred.values() {
-        crate::db::write_schema(&observation.root, schema)?;
+        crate::schema_store::write_working(&observation.root, schema, config.indentation_width)?;
+    }
+
+    if bootstrapping {
+        // A pinned table is not inferred -- its schema is declared -- but it
+        // still needs a working copy, because that is the file every subsystem
+        // reads. This belongs to establishment alone: doing it on every
+        // invocation would have each concurrent command rewrite the same file
+        // outside the writer lock, turning a read into a write and racing every
+        // other reader for it.
+        for table in crate::schema_store::pinned_tables(&observation.root)? {
+            if let Some(pinned) = crate::schema_store::load_pin(&observation.root, &table)? {
+                crate::schema_store::write_working(
+                    &observation.root,
+                    &pinned,
+                    config.indentation_width,
+                )?;
+            }
+        }
     }
 
     if bootstrapping {
@@ -796,7 +810,11 @@ mod tests {
         ));
         assert!(root.join(".db/format").exists());
         assert!(root.join(".db/config").exists());
-        assert!(root.join("schema/users.json").exists());
+        assert!(root.join(".db/schema/users.json").exists());
+        assert!(
+            !root.join("schema").exists(),
+            "adoption derives a schema; it does not declare one on the user's behalf"
+        );
         assert_eq!(
             std::fs::read_dir(root.join(".db/provenance"))
                 .unwrap()
@@ -824,11 +842,27 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("schema/users.json")).unwrap(),
             handwritten,
-            "an existing schema must survive establishment untouched"
+            "a pin is the user's declaration and must survive establishment untouched"
+        );
+        // The pin becomes the working schema rather than being re-inferred from
+        // the rows, so what the user declared is what the database operates on.
+        let working: crate::schema::Schema =
+            serde_json::from_slice(&std::fs::read(root.join(".db/schema/users.json")).unwrap())
+                .unwrap();
+        let pinned: crate::schema::Schema =
+            serde_json::from_slice(&std::fs::read(root.join("schema/users.json")).unwrap())
+                .unwrap();
+        assert!(
+            crate::schema_store::equivalent(&working, &pinned).unwrap(),
+            "the working schema is taken from the pin"
         );
         assert!(
-            root.join("schema/posts.json").exists(),
-            "only the missing schema is inferred"
+            root.join(".db/schema/posts.json").exists(),
+            "only the unpinned table is inferred"
+        );
+        assert!(
+            !root.join("schema/posts.json").exists(),
+            "inference never writes a pin"
         );
     }
 

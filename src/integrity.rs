@@ -303,7 +303,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 

@@ -3,7 +3,7 @@ use crate::{
     catalog::Catalog,
     config::Config,
     diagnostic::{DbError, Diagnostic, Result},
-    schema::{AdditionalFields, Column, ColumnType, ForeignKey, Inferred, Reference, Schema},
+    schema::{AdditionalFields, Column, ColumnType, ForeignKey, Reference, Schema},
 };
 use indexmap::IndexMap;
 use serde_json::Value;
@@ -151,8 +151,6 @@ pub fn infer_all_with_references(
                         value.is_null() || target_values.contains(&canonical::compact(value))
                     })
                 {
-                    let matched = values.filter(|value| !value.is_null()).count();
-                    let foreign_key_index = s.foreign_keys.len();
                     s.foreign_keys.push(ForeignKey {
                         columns: vec![name.clone()],
                         references: Reference {
@@ -163,17 +161,6 @@ pub fn infer_all_with_references(
                         on_update: Some(crate::schema::Action::Restrict),
                     });
                     s.indexes.push(vec![name.clone()]);
-                    if let Some(inferred) = &mut s.inferred {
-                        inferred.evidence.insert(
-                            format!("foreign_keys[{foreign_key_index}]"),
-                            format!(
-                                "{matched}/{} non-null values present in {}.{}",
-                                rows.len(),
-                                target,
-                                ts.primary_key[0]
-                            ),
-                        );
-                    }
                     break;
                 }
             }
@@ -352,7 +339,6 @@ fn infer_table(
         names.extend(r.obj.keys().cloned())
     }
     let mut columns = IndexMap::new();
-    let mut evidence = BTreeMap::new();
     for name in names {
         let values: Vec<_> = rows.iter().filter_map(|r| r.obj.get(&name)).collect();
         let nullable = values.len() != rows.len() || values.iter().any(|v| v.is_null());
@@ -367,10 +353,6 @@ fn infer_table(
                 }
                 e
             })?;
-        evidence.insert(
-            format!("columns.{name}.type"),
-            format!("{}/{} non-null observations", nonnull.len(), rows.len()),
-        );
         columns.insert(name, col);
     }
     let pk = if let Some(p) = pk_override {
@@ -391,10 +373,6 @@ fn infer_table(
                 .collect();
             if vals.len() == rows.len() {
                 unique.push(vec![name.clone()]);
-                evidence.insert(
-                    format!("unique[{}]", unique.len() - 1),
-                    format!("{} distinct of {}", vals.len(), rows.len()),
-                );
             }
         }
     }
@@ -411,10 +389,6 @@ fn infer_table(
                     name: format!("{name}_nonnegative"),
                     expr: format!("\"{}\" >= 0", name.replace('"', "\"\"")),
                 });
-                evidence.insert(
-                    format!("check.{}_nonnegative", name),
-                    format!("{} rows contain no negative values", rows.len()),
-                );
             } else if column.kind == ColumnType::String
                 && values.clone().all(|value| {
                     value.is_null() || value.as_str().is_some_and(|value| !value.is_empty())
@@ -424,10 +398,6 @@ fn infer_table(
                     name: format!("{name}_nonempty"),
                     expr: format!("\"{}\" <> ''", name.replace('"', "\"\"")),
                 });
-                evidence.insert(
-                    format!("check.{}_nonempty", name),
-                    format!("{} rows contain no empty strings", rows.len()),
-                );
             }
         }
     }
@@ -444,12 +414,6 @@ fn infer_table(
         indexes: vec![],
         storage: None,
         additional_fields: AdditionalFields::Reject,
-        inferred: Some(Inferred {
-            at: chrono::Utc::now().to_rfc3339(),
-            rows: rows.len(),
-            strictness: strictness.name().into(),
-            evidence,
-        }),
     };
     for r in rows {
         let expected = canonical::filename(&schema, &r.obj);
@@ -726,7 +690,6 @@ fn infer_pk(
                     indexes: vec![],
                     storage: None,
                     additional_fields: AdditionalFields::Reject,
-                    inferred: None,
                 };
                 canonical::filename(&fake, &r.obj).as_deref() == Some(&format!("{}.json", r.stem))
                     && !value.is_null()

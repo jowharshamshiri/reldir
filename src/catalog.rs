@@ -37,6 +37,12 @@ pub struct Catalog {
     /// answer the `UNGOVERNED_DIRECTORY` warning was derived from. Deciding it a
     /// second time elsewhere would let the two disagree.
     pub ungoverned: Vec<String>,
+    /// Tables whose working schema is fixed by a pin in `schema/`.
+    ///
+    /// Recorded at observation because it is a property of the folder, not of
+    /// any one schema: a table is pinned or it is not, and every subsystem that
+    /// cares -- lint, doctor, the mutation rules -- must read the same answer.
+    pub pinned: BTreeSet<String>,
     pub schemas: BTreeMap<String, Schema>,
     /// The bytes each schema was parsed from, keyed by table.
     ///
@@ -86,6 +92,10 @@ impl Catalog {
         crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut c = Self::empty(root, config);
             c.schemas = schemas;
+            // Schemas supplied by the caller were never read from disk, so
+            // nothing here is pinned: this observation describes a folder that
+            // carries no database.
+            c.pinned = BTreeSet::new();
             c.load_rows(root, config)?;
             Ok(c)
         })
@@ -112,6 +122,7 @@ impl Catalog {
         Self {
             root: root.to_path_buf(),
             ungoverned: vec![],
+            pinned: BTreeSet::new(),
             schemas: BTreeMap::new(),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::new(),
@@ -123,20 +134,20 @@ impl Catalog {
 
     fn observe_bounded(root: &Path, config: &Config) -> Result<Self> {
         let mut c = Self::empty(root, config);
-        let schema_dir = root.join("schema");
-        if !schema_dir.is_dir() {
-            c.diagnostics.push(
-                Diagnostic::error("SCHEMA_MISSING", "mandatory schema/ directory is missing")
-                    .at("schema"),
-            );
-            return Ok(c);
-        }
-        let schema_dir_metadata =
-            fs::symlink_metadata(&schema_dir).map_err(|error| DbError::io(&schema_dir, error))?;
+        // Working schemas are what everything validates against. They live
+        // under `.db/`, so an absent directory means this folder has not been
+        // established yet -- a bootstrap condition the caller resolves, not a
+        // fault in a database that exists.
+        let schema_dir = crate::schema_store::working_dir(root);
+        let schema_dir_metadata = match fs::symlink_metadata(&schema_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(c),
+            Err(error) => return Err(DbError::io(&schema_dir, error)),
+        };
         if !schema_dir_metadata.file_type().is_dir() {
             c.diagnostics.push(
-                Diagnostic::error("NON_REGULAR_FILE", "schema/ must be a real directory")
-                    .at("schema"),
+                Diagnostic::error("NON_REGULAR_FILE", ".db/schema must be a real directory")
+                    .at(".db/schema"),
             );
             return Ok(c);
         }
@@ -156,13 +167,6 @@ impl Catalog {
                     Diagnostic::error("NON_REGULAR_FILE", "hard-linked schema files are rejected")
                         .at(rel),
                 );
-                continue;
-            }
-            if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.ends_with(".inferred.json"))
-            {
                 continue;
             }
             if meta.len() > config.max_json_file_size {
@@ -228,6 +232,41 @@ impl Catalog {
                 }
                 Err(e) => c.diagnostics.push(*e.diagnostic),
             }
+        }
+        // A pin is the declaration; the working copy is jdb's. When they
+        // disagree the pin governs, and the working copy -- derived state, like
+        // an index -- is rebuilt from it. That is what makes `schema/` worth
+        // keeping in version control and `.db/` safe to delete.
+        //
+        // There is deliberately no arbitration over which side moved. jdb only
+        // ever writes a working copy equal to the pin or to what it inferred,
+        // so a disagreement always resolves the same way, and the manifest --
+        // the only witness that could tell them apart -- goes stale the moment
+        // a pin is adopted without a revision being recorded.
+        c.pinned = crate::schema_store::pinned_tables(root)?;
+        for table in &c.pinned {
+            let Some(pin) = crate::schema_store::load_pin(root, table)? else {
+                continue;
+            };
+            if c.schemas.get(table).is_some_and(|working| {
+                crate::schema_store::equivalent(&pin, working).unwrap_or(false)
+            }) {
+                continue;
+            }
+            // A pin is checked exactly as a working schema is: it comes from a
+            // file a human wrote, so adopting it unchecked would let a
+            // malformed declaration govern silently.
+            c.diagnostics
+                .extend(pin.validate_local(table).into_iter().map(|diagnostic| {
+                    diagnostic
+                        .at(crate::schema_store::pin_relative(table))
+                        .table(table)
+                }));
+            c.schema_sources.insert(
+                table.clone(),
+                crate::schema_store::canonical_bytes(&pin, config.indentation_width)?,
+            );
+            c.schemas.insert(table.clone(), pin);
         }
         c.load_rows(root, config)?;
         Ok(c)
@@ -673,7 +712,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 

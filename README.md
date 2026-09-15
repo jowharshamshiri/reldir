@@ -76,7 +76,7 @@ db sql 'SELECT * FROM users LIMIT 10'
 ## What you get
 
 - **JSON files as rows** — one object per file, in canonical, diff-friendly formatting
-- **Explicit schemas** in `schema/*.json`, with 14 column types, constraints, and checks
+- **Explicit schemas** the binary maintains in `.db/schema/`, pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
 - **Schema inference** that bootstraps the strictest schema your data supports
 - **SQL** — `SELECT`/`INSERT`/`UPDATE`/`DELETE`, joins, grouping, aggregates, `EXPLAIN`
 - **Referential integrity** — primary keys, unique, foreign keys, `CHECK`, cascade actions

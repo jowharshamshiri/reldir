@@ -40,6 +40,17 @@ pub struct Provenance {
     pub entries: BTreeMap<String, ManifestEntry>,
 }
 
+/// The hash the manifest records for a schema.
+///
+/// One definition, used both when recording a revision and when asking whether
+/// a schema still matches what was recorded. Two spellings of this would let a
+/// database disagree with its own history.
+pub fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
+    let value = serde_json::to_value(schema).map_err(internal)?;
+    let bytes = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
+    Ok(canonical::hash_bytes(&bytes))
+}
+
 pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
     let mut entries = BTreeMap::new();
     let mut root = Sha256::new();
@@ -88,7 +99,7 @@ pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
         let rel = format!("schema/{table}.json");
         let val = serde_json::to_value(s).map_err(internal)?;
         let bytes = serde_json::to_vec(&canonical::normalize(&val)).map_err(internal)?;
-        let hash = canonical::hash_bytes(&bytes);
+        let hash = schema_hash(s)?;
         root.update(rel.as_bytes());
         root.update([0]);
         root.update(hash.as_bytes());
@@ -568,14 +579,24 @@ pub fn diff_entries(
     out
 }
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(internal)?;
+    bytes.push(b'\n');
+    write_bytes_atomic(path, &bytes)
+}
+
+/// Durably replace a file with exactly these bytes.
+///
+/// The one atomic-write mechanism: temp sibling, fsync, rename, fsync parent.
+/// Callers that have already rendered their content -- schemas, which must be
+/// byte-identical to the pin they came from -- use this rather than a second
+/// serializer that would produce a different encoding of the same value.
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).map_err(|e| DbError::io(p, e))?
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let mut f = fs::File::create(&tmp).map_err(|e| DbError::io(&tmp, e))?;
-    let mut b = serde_json::to_vec_pretty(value).map_err(internal)?;
-    b.push(b'\n');
-    f.write_all(&b).map_err(|e| DbError::io(&tmp, e))?;
+    f.write_all(bytes).map_err(|e| DbError::io(&tmp, e))?;
     f.sync_all().map_err(|e| DbError::io(&tmp, e))?;
     fs::rename(&tmp, path).map_err(|e| DbError::io(path, e))?;
     sync_parent(path)?;

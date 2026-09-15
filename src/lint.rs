@@ -18,13 +18,15 @@ fn analyzable(schema: &crate::schema::Schema) -> bool {
 
 /// Anchor a finding to the schema that declares the thing it is about.
 ///
-/// Every schema-level finding is resolved by editing `schema/<table>.json`, so
+/// Every schema-level finding is resolved by editing `.db/schema/<table>.json`, so
 /// that is the file a reader needs. `anchor` -- a column name, or the table name
 /// for table-level findings -- locates the declaration within it. The location is
 /// reported only when the schema's original text was retained; a diagnostic never
 /// points at a position that was guessed (Section 75).
 fn in_schema(diagnostic: Diagnostic, c: &Catalog, table: &str, anchor: &str) -> Diagnostic {
-    let mut diagnostic = diagnostic.at(format!("schema/{table}.json"));
+    // A finding is resolved by editing the working schema, which is the file
+    // jdb maintains; pinning afterwards is a separate, deliberate act.
+    let mut diagnostic = diagnostic.at(crate::schema_store::working_relative(table));
     if let Some(source) = c.schema_sources.get(table) {
         diagnostic.location = crate::integrity::locate(source, anchor);
         if let Some(location) = &diagnostic.location {
@@ -53,17 +55,20 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
             continue;
         }
         let rows = &c.rows[table];
-        if s.inferred.is_some() {
+        if !c.pinned.contains(table) {
             out.push(in_schema(
                 Diagnostic::warning(
-                    "LINT_SCHEMA_UNREVIEWED",
-                    format!("schema {table:?} was inferred and has not been accepted"),
+                    "LINT_SCHEMA_UNPINNED",
+                    format!(
+                        "schema {table:?} is maintained by jdb and is not pinned; \
+                         deleting .db discards any refinement inference cannot re-derive"
+                    ),
                 )
                 .table(table)
-                .fix("FIX_ACCEPT_INFERRED"),
+                .fix("FIX_PIN_SCHEMA"),
                 c,
                 table,
-                "inferred",
+                "table",
             ));
         }
         if s.additional_fields == crate::schema::AdditionalFields::Allow {
@@ -459,7 +464,7 @@ mod tests {
     use crate::schema::{AdditionalFields, Column, Schema};
     use indexmap::IndexMap;
     use serde_json::{Map, Value, json};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     fn column(kind: ColumnType, nullable: bool) -> Column {
@@ -493,7 +498,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 
@@ -520,6 +524,7 @@ mod tests {
         Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec![],
+            pinned: BTreeSet::new(),
             schema_sources: BTreeMap::from([(
                 table.clone(),
                 crate::canonical::pretty_with_indent(&serde_json::to_value(&schema).unwrap(), 2),
@@ -545,15 +550,9 @@ mod tests {
     /// does not exist.
     #[test]
     fn test1060_a_table_whose_primary_key_does_not_resolve_is_not_analysed() {
-        let mut broken = schema(&[("id", ColumnType::String, false)], &["ghost"]);
-        broken.inferred = Some(crate::schema::Inferred {
-            at: "2026-09-14T00:00:00Z".into(),
-            rows: 1,
-            strictness: "balanced".into(),
-            evidence: BTreeMap::new(),
-        });
+        let broken = schema(&[("id", ColumnType::String, false)], &["ghost"]);
         let catalog = catalog_with(broken, &[json!({"id": "a"})]);
-        // Would otherwise report LINT_SCHEMA_UNREVIEWED; contributes nothing
+        // Would otherwise report LINT_SCHEMA_UNPINNED; contributes nothing
         // instead, and above all does not panic.
         assert!(codes(&catalog, false).is_empty());
 
@@ -648,21 +647,15 @@ mod tests {
         assert!(codes(&sometimes, false).contains(&"LINT_INCONSISTENT_PRESENCE".to_string()));
     }
 
-    /// Section 13: an inferred schema is unreviewed until accepted, and a schema
+    /// Section 13: a schema jdb maintains is worth pinning, and a schema
     /// permitting unknown fields is worth flagging.
     #[test]
-    fn test1064_unreviewed_and_permissive_schemas_are_reported() {
+    fn test1064_unpinned_and_permissive_schemas_are_reported() {
         let mut s = schema(&[("id", ColumnType::String, false)], &["id"]);
-        s.inferred = Some(crate::schema::Inferred {
-            at: "2026-09-14T00:00:00Z".into(),
-            rows: 1,
-            strictness: "balanced".into(),
-            evidence: BTreeMap::new(),
-        });
         s.additional_fields = AdditionalFields::Allow;
         let catalog = catalog_with(s, &[json!({"id": "a"})]);
         let found = codes(&catalog, false);
-        assert!(found.contains(&"LINT_SCHEMA_UNREVIEWED".to_string()));
+        assert!(found.contains(&"LINT_SCHEMA_UNPINNED".to_string()));
         assert!(found.contains(&"LINT_ADDITIONAL_FIELDS_ALLOWED".to_string()));
     }
 
@@ -683,19 +676,13 @@ mod tests {
     /// actually exhibits it.
     #[test]
     fn test1066_every_finding_identifies_a_file() {
-        let mut s = schema(
+        let s = schema(
             &[
                 ("id", ColumnType::String, false),
                 ("maybe", ColumnType::String, true),
             ],
             &["id"],
         );
-        s.inferred = Some(crate::schema::Inferred {
-            at: "2026-09-15T00:00:00Z".into(),
-            rows: 2,
-            strictness: "balanced".into(),
-            evidence: BTreeMap::new(),
-        });
         // Rows differ in whether `maybe` is present, and are not canonical, so
         // both schema-level and row-level findings are produced at once.
         let catalog = catalog_with(s, &[json!({"id": "a", "maybe": "x"}), json!({"id": "b"})]);
@@ -717,7 +704,7 @@ mod tests {
                 ),
                 // Everything else is fixed by editing the schema.
                 _ => assert_eq!(
-                    path, "schema/t.json",
+                    path, ".db/schema/t.json",
                     "{} should name the schema",
                     finding.code
                 ),
@@ -728,8 +715,8 @@ mod tests {
         // the reader is pointed at a line rather than a whole file.
         let located = findings
             .iter()
-            .find(|f| f.code == "LINT_SCHEMA_UNREVIEWED")
-            .expect("an unreviewed-schema finding");
+            .find(|f| f.code == "LINT_SCHEMA_UNPINNED")
+            .expect("an unpinned-schema finding");
         let location = located
             .location
             .as_ref()
@@ -739,7 +726,7 @@ mod tests {
             located
                 .source_line
                 .as_deref()
-                .is_some_and(|line| line.contains("inferred")),
+                .is_some_and(|line| line.contains("table")),
             "the excerpt should show the declaration: {:?}",
             located.source_line
         );

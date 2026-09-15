@@ -82,8 +82,11 @@ pub fn commit(
             Change::Write { path, .. } | Change::Delete { path } => path,
         })?
     }
-    validate_prospective(root, changes, resource_overrides)?;
     if dry_run {
+        // A dry run performs no writes, so it validates without contending for
+        // the writer lock: refusing to report a plan because someone else is
+        // mid-commit would make the plan unavailable exactly when it is wanted.
+        validate_prospective(root, changes, resource_overrides)?;
         return Ok(changes
             .iter()
             .map(|c| match c {
@@ -107,6 +110,11 @@ pub fn commit(
             3,
         )
     })?;
+    // Validation reads the database and builds a shadow of it. Under the lock,
+    // because a concurrent commit moving files beneath a validating reader is
+    // not a conflict it can report -- it is a torn observation, and the reader
+    // would fail on a vanished path rather than saying who won.
+    validate_prospective(root, changes, resource_overrides)?;
     let current = Catalog::observe(root, config)?;
     let (current_hash, current_entries) = metadata::state(&current)?;
     if current_hash != start_root {
@@ -243,7 +251,6 @@ fn validate_prospective(
         .tempdir_in(&parent)
         .map_err(|e| DbError::io(&parent, e))?;
     let shadow = temp.path();
-    fs::create_dir(shadow.join("schema")).map_err(|e| DbError::io(shadow, e))?;
     fs::create_dir(shadow.join(".db")).map_err(|e| DbError::io(shadow, e))?;
     for name in ["format", "config"] {
         let source = root.join(".db").join(name);
@@ -252,28 +259,18 @@ fn validate_prospective(
                 .map_err(|e| DbError::io(&source, e))?;
         }
     }
-    let source_schema = root.join("schema");
-    let source_schema_metadata =
-        fs::symlink_metadata(&source_schema).map_err(|e| DbError::io(&source_schema, e))?;
-    if !source_schema_metadata.file_type().is_dir() {
-        return Err(DbError::from_diag(
-            Diagnostic::error("NON_REGULAR_FILE", "schema/ must be a real directory").at("schema"),
-            2,
-        ));
-    }
-    for entry in fs::read_dir(&source_schema).map_err(|e| DbError::io(&source_schema, e))? {
-        let p = entry.map_err(|e| DbError::io(&source_schema, e))?.path();
-        let metadata = fs::symlink_metadata(&p).map_err(|e| DbError::io(&p, e))?;
-        let filename = p
-            .file_name()
-            .ok_or_else(|| DbError::new("PATH_VIOLATION", "schema entry has no filename", 2))?;
-        let target = shadow.join("schema").join(filename);
-        if metadata.file_type().is_file() && !has_multiple_links(&metadata) {
-            fs::copy(&p, &target).map_err(|e| DbError::io(&p, e))?;
-        } else {
-            fs::create_dir(&target).map_err(|e| DbError::io(&target, e))?;
-        }
-    }
+    // Both schema locations are mirrored: the working copies the prospective
+    // catalog validates against, and the pins whose agreement with them the
+    // observation checks. Copying only one would make the shadow diverge from
+    // the database it is standing in for.
+    mirror_schema_directory(
+        &crate::schema_store::working_dir(root),
+        &crate::schema_store::working_dir(shadow),
+    )?;
+    mirror_schema_directory(
+        &crate::schema_store::pin_dir(root),
+        &crate::schema_store::pin_dir(shadow),
+    )?;
     let config = crate::db::load_config(root)?;
     let c = Catalog::observe(root, &config)?;
     for table in c.schemas.keys() {
@@ -354,6 +351,44 @@ fn validate_prospective(
             errors.len()
         ));
         return Err(DbError::from_diag(diagnostic, 2));
+    }
+    Ok(())
+}
+
+/// Copy one schema directory into a shadow tree, if it exists.
+///
+/// Entries that are not private regular files are reproduced as directories so
+/// that the shadow still exhibits the fault, rather than dereferencing whatever
+/// they point at.
+fn mirror_schema_directory(source: &Path, destination: &Path) -> Result<()> {
+    match fs::symlink_metadata(source) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(DbError::from_diag(
+                Diagnostic::error(
+                    "NON_REGULAR_FILE",
+                    format!("{} must be a real directory", source.display()),
+                )
+                .at(source),
+                2,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(DbError::io(source, error)),
+    }
+    fs::create_dir_all(destination).map_err(|e| DbError::io(destination, e))?;
+    for entry in fs::read_dir(source).map_err(|e| DbError::io(source, e))? {
+        let path = entry.map_err(|e| DbError::io(source, e))?.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+        let filename = path
+            .file_name()
+            .ok_or_else(|| DbError::new("PATH_VIOLATION", "schema entry has no filename", 2))?;
+        let target = destination.join(filename);
+        if metadata.file_type().is_file() && !has_multiple_links(&metadata) {
+            fs::copy(&path, &target).map_err(|e| DbError::io(&path, e))?;
+        } else {
+            fs::create_dir(&target).map_err(|e| DbError::io(&target, e))?;
+        }
     }
     Ok(())
 }
@@ -613,7 +648,11 @@ fn safe_relative(path: &Path) -> Result<()> {
         })
         || (path.starts_with(".db")
             && path != Path::new(".db/config")
-            && path != Path::new(".db/format"))
+            && path != Path::new(".db/format")
+            // Working schemas are written through the same transaction as the
+            // rows they describe, so that a migration changing both lands
+            // atomically. They are derived state, not authoritative intent.
+            && !is_working_schema(path))
     {
         return Err(DbError::new(
             "PATH_VIOLATION",
@@ -622,6 +661,12 @@ fn safe_relative(path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether a path names a working schema, which transactions may write.
+fn is_working_schema(path: &Path) -> bool {
+    path.parent() == Some(Path::new(".db/schema"))
+        && path.extension().and_then(|value| value.to_str()) == Some("json")
 }
 
 fn validate_lock_path(path: &Path) -> Result<()> {
@@ -653,6 +698,9 @@ mod tests {
             ".db/manifest.json",
             ".db/indexes/users--abc.json",
             ".db/transactions/x/journal.json",
+            ".db/schema",
+            ".db/schema/users.txt",
+            ".db/schema/nested/users.json",
         ] {
             let error = safe_relative(Path::new(rejected))
                 .expect_err(&format!("{rejected} must be refused"));
@@ -665,6 +713,7 @@ mod tests {
             "schema/users.json",
             ".db/config",
             ".db/format",
+            ".db/schema/users.json",
         ] {
             safe_relative(Path::new(accepted))
                 .unwrap_or_else(|error| panic!("{accepted} must be allowed: {error:?}"));

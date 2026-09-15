@@ -118,11 +118,13 @@ pub fn plan(db: &Database) -> Vec<Fix> {
     }
     for d in lint::lint(&db.catalog, &db.config, false) {
         match d.code.as_str() {
-            "LINT_SCHEMA_UNREVIEWED" => out.push(Fix {
-                id: "FIX_ACCEPT_INFERRED".into(),
+            "LINT_SCHEMA_UNPINNED" => out.push(Fix {
+                id: "FIX_PIN_SCHEMA".into(),
                 class: "schema".into(),
-                description: format!("accept inferred schema {}", d.table.as_deref().unwrap()),
-                paths: vec![PathBuf::from(format!("schema/{}.json", d.table.unwrap()))],
+                description: format!("pin schema {}", d.table.as_deref().unwrap()),
+                paths: vec![PathBuf::from(crate::schema_store::pin_relative(
+                    d.table.as_deref().unwrap(),
+                ))],
             }),
             "LINT_NULLABLE_NEVER_NULL" => out.push(Fix {
                 id: "FIX_TIGHTEN_NULLABLE".into(),
@@ -132,13 +134,17 @@ pub fn plan(db: &Database) -> Vec<Fix> {
                     d.table.as_deref().unwrap(),
                     d.field.as_deref().unwrap()
                 ),
-                paths: vec![PathBuf::from(format!("schema/{}.json", d.table.unwrap()))],
+                paths: vec![PathBuf::from(crate::schema_store::working_relative(
+                    &d.table.unwrap(),
+                ))],
             }),
             "LINT_FK_NO_INDEX" => out.push(Fix {
                 id: "FIX_ADD_INDEX".into(),
                 class: "schema".into(),
                 description: d.message,
-                paths: vec![PathBuf::from(format!("schema/{}.json", d.table.unwrap()))],
+                paths: vec![PathBuf::from(crate::schema_store::working_relative(
+                    &d.table.unwrap(),
+                ))],
             }),
             "LINT_WIDER_TYPE"
             | "LINT_ENUM_CANDIDATE"
@@ -158,7 +164,9 @@ pub fn plan(db: &Database) -> Vec<Fix> {
                     id: id.into(),
                     class: "schema".into(),
                     description: d.message,
-                    paths: vec![PathBuf::from(format!("schema/{}.json", d.table.unwrap()))],
+                    paths: vec![PathBuf::from(crate::schema_store::working_relative(
+                        &d.table.unwrap(),
+                    ))],
                 });
             }
             "LINT_NON_CANONICAL_FORMATTING" => out.push(Fix {
@@ -206,7 +214,6 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
         let Some(t) = d.table.as_ref() else { continue };
         let s = schemas.get_mut(t).unwrap();
         match d.code.as_str() {
-            "LINT_SCHEMA_UNREVIEWED" => s.inferred = None,
             "LINT_NULLABLE_NEVER_NULL" => {
                 if let Some(f) = d.field.as_ref() {
                     s.columns[f].nullable = false
@@ -345,7 +352,7 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
         let new = serde_json::to_value(&s).unwrap();
         if old != new {
             out.push(Change::Write {
-                path: PathBuf::from(format!("schema/{t}.json")),
+                path: PathBuf::from(crate::schema_store::working_relative(&t)),
                 bytes: canonical::pretty_with_indent(&new, db.config.indentation_width),
             })
         }
@@ -717,7 +724,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 

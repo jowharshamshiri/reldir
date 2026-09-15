@@ -312,10 +312,20 @@ enum SchemaCommand {
     )]
     New { table: String },
     #[command(
-        about = "Accept an inferred schema",
-        after_help = "Example: db schema accept users"
+        about = "Pin the working schema so it survives .db being rebuilt",
+        after_help = "Example: db schema pin users"
     )]
-    Accept { table: String },
+    Pin {
+        table: String,
+        /// Replace a pin that differs from the working schema.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    #[command(
+        about = "Rebuild the working schema from its pin",
+        after_help = "Example: db schema restore users"
+    )]
+    Restore { table: String },
     #[command(
         about = "Validate all schemas",
         after_help = "Example: db schema validate"
@@ -860,9 +870,11 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
         }
         Command::Describe { table } => {
             db.require_valid()?;
-            let s = db.catalog.schemas.get(&table).ok_or_else(|| {
-                db.catalog.unknown_table(&table)
-            })?;
+            let s = db
+                .catalog
+                .schemas
+                .get(&table)
+                .ok_or_else(|| db.catalog.unknown_table(&table))?;
             if format == Format::Table {
                 println!("{}", serde_json::to_string_pretty(s).unwrap());
             } else {
@@ -1070,7 +1082,15 @@ fn cmd_init(
     }
     crate::db::init_layout(&root, track)?;
     for s in schemas.values() {
-        crate::db::write_schema(&root, s)?
+        crate::schema_store::write_working(&root, s, inference_config.indentation_width)?
+    }
+    // A pinned table was not inferred, but it still needs the working copy every
+    // subsystem reads. Adoption takes it from the declaration rather than from
+    // the rows, so what the user wrote is what governs.
+    for table in crate::schema_store::pinned_tables(&root)? {
+        if let Some(pinned) = crate::schema_store::load_pin(&root, &table)? {
+            crate::schema_store::write_working(&root, &pinned, inference_config.indentation_width)?
+        }
     }
     let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let (hash, entries) = metadata::state(&c)?;
@@ -1150,9 +1170,15 @@ fn cmd_inspect(path: Option<PathBuf>, format: Format) -> Result<i32> {
     output::records(&rows, format)?;
     Ok(0)
 }
+/// Tables that already have a schema, from either location.
+///
+/// A pinned table is never inferred: the pin is the user's declaration, and
+/// inferring over it would produce a working copy that contradicts the very
+/// file meant to fix it. Adoption therefore counts a pin as an existing schema
+/// exactly as it counts jdb's own working copy.
 fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<String>> {
-    let mut out = std::collections::BTreeSet::new();
-    let dir = root.join("schema");
+    let mut out = crate::schema_store::pinned_tables(root)?;
+    let dir = crate::schema_store::working_dir(root);
     if !dir.exists() {
         return Ok(out);
     }
@@ -1180,12 +1206,6 @@ fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<Strin
                 2,
             ));
         }
-        if p.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".inferred.json"))
-        {
-            continue;
-        }
         if p.extension().and_then(|x| x.to_str()) == Some("json")
             && let Some(s) = p.file_stem().and_then(|x| x.to_str())
         {
@@ -1201,42 +1221,34 @@ fn adoption_preflight(
 ) -> Result<crate::catalog::Catalog> {
     let temp = tempfile::tempdir().map_err(|e| DbError::io(Path::new("/tmp"), e))?;
     let shadow = temp.path();
-    fs::create_dir(shadow.join("schema")).map_err(|e| DbError::io(shadow, e))?;
-    let schema_dir = root.join("schema");
-    if schema_dir.exists() {
-        let metadata =
-            fs::symlink_metadata(&schema_dir).map_err(|error| DbError::io(&schema_dir, error))?;
-        if !metadata.file_type().is_dir() {
-            return Err(DbError::from_diag(
-                crate::diagnostic::Diagnostic::error(
-                    "NON_REGULAR_FILE",
-                    "schema/ must be a real directory",
-                )
-                .at("schema"),
-                2,
-            ));
-        }
-        for e in fs::read_dir(&schema_dir).map_err(|e| DbError::io(&schema_dir, e))? {
-            let p = e.map_err(|e| DbError::io(&schema_dir, e))?.path();
-            let metadata = fs::symlink_metadata(&p).map_err(|error| DbError::io(&p, error))?;
-            if metadata.file_type().is_file() && !has_multiple_links(&metadata) {
-                fs::copy(
-                    &p,
-                    shadow.join("schema").join(p.file_name().ok_or_else(|| {
-                        DbError::new("PATH_VIOLATION", "schema entry has no filename", 2)
-                    })?),
-                )
-                .map_err(|e| DbError::io(&p, e))?;
-            } else {
-                fs::create_dir(shadow.join("schema").join(p.file_name().ok_or_else(|| {
-                    DbError::new("PATH_VIOLATION", "schema entry has no filename", 2)
-                })?))
-                .map_err(|error| DbError::io(&p, error))?;
-            }
+    // The shadow must look like a database, or observing it finds no working
+    // schemas and reports an unestablished folder instead of the prospective
+    // state under test.
+    fs::create_dir_all(crate::schema_store::working_dir(shadow))
+        .map_err(|e| DbError::io(shadow, e))?;
+    fs::write(
+        shadow.join(".db/format"),
+        format!("format_version = {}\n", crate::FORMAT_VERSION),
+    )
+    .map_err(|e| DbError::io(shadow, e))?;
+    // Pins come along so that the pin/working agreement the observation checks
+    // is the same question here as in the real database.
+    for table in crate::schema_store::pinned_tables(root)? {
+        if let Some(pinned) = crate::schema_store::load_pin(root, &table)? {
+            let destination = crate::schema_store::pin_path(shadow, &table);
+            fs::create_dir_all(crate::schema_store::pin_dir(shadow))
+                .map_err(|e| DbError::io(shadow, e))?;
+            metadata::write_bytes_atomic(
+                &destination,
+                &crate::schema_store::canonical_bytes(&pinned, config.indentation_width)?,
+            )?;
         }
     }
     for (t, s) in inferred {
-        metadata::write_json_atomic(&shadow.join(format!("schema/{t}.json")), s)?
+        metadata::write_bytes_atomic(
+            &crate::schema_store::working_path(shadow, t),
+            &crate::schema_store::canonical_bytes(s, config.indentation_width)?,
+        )?
     }
     let mut table_names = infer::discover_tables(root)?;
     table_names.extend(existing_schema_names(root)?);
@@ -1337,17 +1349,15 @@ fn infer_standalone(
         Some(&reference_catalog),
     )?;
     if write {
-        fs::create_dir_all(root.join("schema"))
-            .map_err(|e| DbError::io(&root.join("schema"), e))?;
         for s in schemas.values() {
-            let p = root.join(format!("schema/{}.json", s.table));
+            let p = crate::schema_store::working_path(root, &s.table);
             if p.exists() {
                 return Err(DbError::usage(format!(
                     "refusing to overwrite {}",
                     p.display()
                 )));
             }
-            metadata::write_json_atomic(&p, s)?
+            crate::schema_store::write_working(root, s, inference_config.indentation_width)?
         }
     } else {
         output_schemas(schemas.values(), format)?;
@@ -1633,7 +1643,9 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
         ));
     }
     let touches_rows = changes.iter().any(|c| match c {
-        Change::Write { path, .. } | Change::Delete { path } => !path.starts_with("schema"),
+        Change::Write { path, .. } | Change::Delete { path } => {
+            !crate::schema_store::is_schema_relative(&path.to_string_lossy())
+        }
     });
     if cli.dry_run || touches_rows {
         let diffs = doctor_diff_records(&db.root, &changes)?;
@@ -1757,18 +1769,25 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
     }
     let mut changes = vec![];
     for (t, s) in schemas {
-        let name = if all && db.catalog.schemas.contains_key(&t) {
-            format!("schema/{t}.inferred.json")
-        } else {
-            format!("schema/{t}.json")
-        };
-        if !name.ends_with(".inferred.json") && db.root.join(&name).exists() {
-            return Err(DbError::new(
-                "SCHEMA_MISSING_REQUIRED",
-                format!("refusing to overwrite {name}"),
+        // Re-inference replaces the working schema, which jdb owns. A pinned
+        // table is refused: the pin is the user's declaration, and silently
+        // diverging from it would break the equality the pin exists to assert.
+        if db.catalog.pinned.contains(&t) {
+            return Err(DbError::from_diag(
+                crate::diagnostic::Diagnostic::error(
+                    "SCHEMA_PINNED",
+                    format!("{t} is pinned; inference must not diverge from the pin"),
+                )
+                .at(crate::schema_store::pin_relative(&t))
+                .table(&t)
+                .help(format!(
+                    "edit schema/{t}.json and run `db schema restore {t}`, \
+                     or unpin by deleting it"
+                )),
                 1,
             ));
         }
+        let name = crate::schema_store::working_relative(&t);
         let bytes = canonical::pretty_with_indent(
             &serde_json::to_value(s)
                 .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?,
@@ -2282,12 +2301,11 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 indexes: vec![],
                 storage: None,
                 additional_fields: crate::schema::AdditionalFields::Reject,
-                inferred: None,
             };
             commit_changes(
                 db,
                 vec![Change::Write {
-                    path: format!("schema/{table}.json").into(),
+                    path: crate::schema_store::working_relative(&table).into(),
                     bytes: canonical::pretty_with_indent(
                         &serde_json::to_value(s).unwrap(),
                         db.config.indentation_width,
@@ -2298,36 +2316,80 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 cli,
             )
         }
-        SchemaCommand::Accept { table } => {
-            let mut s = schema_for(db, &table)?.clone();
-            if s.inferred.take().is_none() {
-                event(
-                    format,
-                    obj([
-                        ("kind", Value::String("no_change".into())),
-                        ("table", Value::String(table.clone())),
-                        (
-                            "message",
-                            Value::String("schema is already accepted".into()),
+        SchemaCommand::Pin { table, overwrite } => {
+            // Pinning declares the schema jdb derived: it copies the working
+            // copy into `schema/`, where it survives `.db` being deleted and is
+            // carried by version control.
+            let working = schema_for(db, &table)?.clone();
+            let bytes =
+                crate::schema_store::canonical_bytes(&working, db.config.indentation_width)?;
+            if let Some(pinned) = crate::schema_store::load_pin(&db.root, &table)? {
+                if crate::schema_store::equivalent(&pinned, &working)? {
+                    event(
+                        format,
+                        obj([
+                            ("kind", Value::String("no_change".into())),
+                            ("table", Value::String(table.clone())),
+                            ("message", Value::String("schema is already pinned".into())),
+                        ]),
+                        &format!("no change: schema {table} is already pinned"),
+                    )?;
+                    return Ok(0);
+                }
+                // A pin already exists and says something else. Replacing it
+                // discards a declaration the user wrote, which is theirs to
+                // authorize -- unlike the working copy, which jdb rebuilds from
+                // the pin without asking because it owns it.
+                if !overwrite {
+                    return Err(DbError::from_diag(
+                        crate::diagnostic::Diagnostic::error(
+                            "SCHEMA_ALREADY_PINNED",
+                            format!("schema/{table}.json already declares a different schema"),
+                        )
+                        .at(crate::schema_store::pin_relative(&table))
+                        .table(&table)
+                        .help(
+                            "pass --overwrite to replace the declaration with the working schema",
                         ),
-                    ]),
-                    &format!("no change: schema {table} is already accepted"),
-                )?;
-                return Ok(0);
+                        2,
+                    ));
+                }
             }
             commit_changes(
                 db,
                 vec![Change::Write {
-                    path: format!("schema/{table}.json").into(),
-                    bytes: canonical::pretty_with_indent(
-                        &serde_json::to_value(s).unwrap(),
-                        db.config.indentation_width,
-                    ),
+                    path: crate::schema_store::pin_relative(&table).into(),
+                    bytes,
                 }],
                 "internal",
                 format,
                 cli,
             )
+        }
+        SchemaCommand::Restore { table } => {
+            // The pin is the declaration, so restoring takes it as the working
+            // schema. This is how a divergence is resolved in the pin's favour.
+            let Some(pinned) = crate::schema_store::load_pin(&db.root, &table)? else {
+                return Err(DbError::from_diag(
+                    crate::diagnostic::Diagnostic::error(
+                        "SCHEMA_NOT_PINNED",
+                        format!("{table} has no pinned schema to restore from"),
+                    )
+                    .table(&table)
+                    .help(format!("run `db schema pin {table}` to create one")),
+                    1,
+                ));
+            };
+            crate::schema_store::write_working(&db.root, &pinned, db.config.indentation_width)?;
+            event(
+                format,
+                obj([
+                    ("kind", Value::String("schema_restored".into())),
+                    ("table", Value::String(table.clone())),
+                ]),
+                &format!("restored .db/schema/{table}.json from its pin"),
+            )?;
+            Ok(0)
         }
     }
 }
@@ -2627,7 +2689,7 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
     }
     for x in changes {
         let path = x[2..].to_string();
-        if schema_only && !path.starts_with("schema/") {
+        if schema_only && !crate::schema_store::is_pin_relative(&path) {
             continue;
         }
         if let Some(t) = table_filter
@@ -3361,7 +3423,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
             commit_changes(
                 db,
                 vec![Change::Write {
-                    path: format!("schema/{table}.json").into(),
+                    path: crate::schema_store::working_relative(&table).into(),
                     bytes: canonical::pretty_with_indent(
                         &serde_json::to_value(&mut s).unwrap(),
                         db.config.indentation_width,
@@ -3375,7 +3437,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
         MigrateCommand::DropTable { table } => {
             let _ = schema_for(db, &table)?;
             let mut changes = vec![Change::Delete {
-                path: format!("schema/{table}.json").into(),
+                path: crate::schema_store::working_relative(&table).into(),
             }];
             changes.extend(db.catalog.rows[&table].iter().map(|r| Change::Delete {
                 path: r.relative.clone(),
@@ -3391,9 +3453,9 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                 ));
             }
             let mut schemas = db.catalog.schemas.clone();
-            let mut renamed = schemas.remove(&table).ok_or_else(|| {
-                db.catalog.unknown_table(&table)
-            })?;
+            let mut renamed = schemas
+                .remove(&table)
+                .ok_or_else(|| db.catalog.unknown_table(&table))?;
             renamed.table = new.clone();
             schemas.insert(new.clone(), renamed);
             for schema in schemas.values_mut() {
@@ -3404,7 +3466,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                 }
             }
             let mut changes = vec![Change::Delete {
-                path: format!("schema/{table}.json").into(),
+                path: crate::schema_store::working_relative(&table).into(),
             }];
             for (name, schema) in schemas {
                 let old = db
@@ -3416,7 +3478,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
                 if old.as_ref() != Some(&value) {
                     changes.push(Change::Write {
-                        path: format!("schema/{name}.json").into(),
+                        path: crate::schema_store::working_relative(&name).into(),
                         bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
                     });
                 }
@@ -3583,7 +3645,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     let value = serde_json::to_value(updated)
                         .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
                     changes.push(Change::Write {
-                        path: format!("schema/{name}.json").into(),
+                        path: crate::schema_store::working_relative(name).into(),
                         bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
                     });
                 }
@@ -3696,7 +3758,7 @@ fn commit_schema(db: &Database, s: Schema, format: Format, cli: &Cli) -> Result<
     commit_changes(
         db,
         vec![Change::Write {
-            path: format!("schema/{table}.json").into(),
+            path: crate::schema_store::working_relative(&table).into(),
             bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
         }],
         "migration",
@@ -3739,9 +3801,9 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         2,
                     ));
                 }
-                let mut s = schemas.remove(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let mut s = schemas
+                    .remove(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 s.table = new.clone();
                 schemas.insert(new.clone(), s);
                 let moved = rows.remove(&table).unwrap_or_default();
@@ -3761,9 +3823,9 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 nullable,
                 default,
             } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 if s.columns.contains_key(&column) {
                     return Err(DbError::new(
                         "SCHEMA_COLUMN_UNKNOWN",
@@ -3796,9 +3858,9 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 }
             }
             MigrationOperation::DropColumn { table, column } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 if s.columns.shift_remove(&column).is_none() {
                     return Err(DbError::new(
                         "UNKNOWN_COLUMN",
@@ -3811,9 +3873,9 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 }
             }
             MigrationOperation::RenameColumn { table, column, new } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 let index = s.columns.get_index_of(&column).ok_or_else(|| {
                     DbError::new("UNKNOWN_COLUMN", format!("unknown column {column}"), 4)
                 })?;
@@ -3855,9 +3917,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             } => {
                 let old_schema = schemas
                     .get(&table)
-                    .ok_or_else(|| {
-                        db.catalog.unknown_table(&table)
-                    })?
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?
                     .clone();
                 let mut target_column =
                     old_schema.columns.get(&column).cloned().ok_or_else(|| {
@@ -3873,9 +3933,10 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         .map(|c| format!("{} = ?", quote(c)))
                         .collect::<Vec<_>>()
                         .join(" AND ");
-                    for row in rows.get_mut(&table).ok_or_else(|| {
-                        db.catalog.unknown_table(&table)
-                    })? {
+                    for row in rows
+                        .get_mut(&table)
+                        .ok_or_else(|| db.catalog.unknown_table(&table))?
+                    {
                         let params: Vec<_> = s
                             .primary_key
                             .iter()
@@ -3912,9 +3973,9 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                     }
                 } else {
                     let mut offenders = Vec::new();
-                    let table_rows = rows.get_mut(&table).ok_or_else(|| {
-                        db.catalog.unknown_table(&table)
-                    })?;
+                    let table_rows = rows
+                        .get_mut(&table)
+                        .ok_or_else(|| db.catalog.unknown_table(&table))?;
                     for (index, row) in table_rows.iter_mut().enumerate() {
                         if let Some(value) = row.get(&column) {
                             if let Some(converted) =
@@ -3950,29 +4011,29 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                     })? = target_column;
             }
             MigrationOperation::AddConstraint { table, definition } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 add_constraint(s, definition)?;
             }
             MigrationOperation::DropConstraint { table, name } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 drop_constraint(s, &name)?;
             }
             MigrationOperation::AddIndex { table, columns } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 if !s.indexes.contains(&columns) {
                     s.indexes.push(columns)
                 }
             }
             MigrationOperation::DropIndex { table, columns } => {
-                let s = schemas.get_mut(&table).ok_or_else(|| {
-                    db.catalog.unknown_table(&table)
-                })?;
+                let s = schemas
+                    .get_mut(&table)
+                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
                 let n = s.indexes.len();
                 s.indexes.retain(|x| x != &columns);
                 if n == s.indexes.len() {
@@ -4057,9 +4118,21 @@ fn virtual_catalog(
     rows: &std::collections::BTreeMap<String, Vec<Map<String, Value>>>,
 ) -> Result<crate::catalog::Catalog> {
     let temp = tempfile::tempdir().map_err(|e| DbError::io(Path::new("/tmp"), e))?;
-    fs::create_dir(temp.path().join("schema")).map_err(|e| DbError::io(temp.path(), e))?;
+    fs::create_dir_all(crate::schema_store::working_dir(temp.path()))
+        .map_err(|e| DbError::io(temp.path(), e))?;
+    fs::write(
+        temp.path().join(".db/format"),
+        format!("format_version = {}\n", crate::FORMAT_VERSION),
+    )
+    .map_err(|e| DbError::io(temp.path(), e))?;
     for (t, s) in schemas {
-        metadata::write_json_atomic(&temp.path().join(format!("schema/{t}.json")), s)?;
+        metadata::write_bytes_atomic(
+            &crate::schema_store::working_path(temp.path(), t),
+            &crate::schema_store::canonical_bytes(
+                s,
+                crate::config::Config::default().indentation_width,
+            )?,
+        )?;
         fs::create_dir(temp.path().join(t)).map_err(|e| DbError::io(&temp.path().join(t), e))?;
         for row in &rows[t] {
             let name = canonical::filename(s, row).ok_or_else(|| {
@@ -4087,7 +4160,7 @@ fn authoritative_diff(
     for t in db.catalog.schemas.keys() {
         if !schemas.contains_key(t) {
             changes.push(Change::Delete {
-                path: format!("schema/{t}.json").into(),
+                path: crate::schema_store::working_relative(t).into(),
             })
         }
     }
@@ -4103,7 +4176,7 @@ fn authoritative_diff(
             != Some(&value)
         {
             changes.push(Change::Write {
-                path: format!("schema/{t}.json").into(),
+                path: crate::schema_store::working_relative(t).into(),
                 bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
             })
         }
@@ -4171,7 +4244,7 @@ fn schema_row_changes<F: Fn(&mut Map<String, Value>) -> Result<()>>(
 ) -> Result<Vec<Change>> {
     let table = s.table.clone();
     let mut changes = vec![Change::Write {
-        path: format!("schema/{table}.json").into(),
+        path: crate::schema_store::working_relative(&table).into(),
         bytes: canonical::pretty_with_indent(
             &serde_json::to_value(s)
                 .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?,
@@ -4223,6 +4296,12 @@ fn commit_changes(
         )?;
         return Ok(0);
     }
+    // An operation that rewrites a pinned table's working schema rewrites its
+    // pin in the same transaction. The pin exists to fix the working schema, so
+    // letting jdb's own work move one without the other would manufacture the
+    // divergence the pin is meant to rule out -- and would do it atomically
+    // enough that the user could never see which side moved.
+    let changes = pair_pinned_schema_writes(db, changes)?;
     let paths = transaction::commit(
         &db.root,
         &db.config,
@@ -4237,13 +4316,13 @@ fn commit_changes(
             .iter()
             .filter(|path| {
                 path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                    && !path.starts_with("schema")
+                    && !crate::schema_store::is_schema_relative(&path.to_string_lossy())
                     && !path.starts_with(".db")
             })
             .count();
         let schema_files = paths
             .iter()
-            .filter(|path| path.starts_with("schema"))
+            .filter(|path| crate::schema_store::is_schema_relative(&path.to_string_lossy()))
             .count();
         output::notice(&format!(
             "migration plan: {row_files} row file(s), {schema_files} schema file(s)"
@@ -4369,6 +4448,37 @@ fn print_prefixed_content(prefix: char, value: &Value) {
         _ => unreachable!("doctor diff content has a fixed shape"),
     }
 }
+/// Keep pins in step with the working schemas they fix.
+///
+/// A change plan names working schemas; for every pinned table it touches, the
+/// same bytes are written to the pin. Deletions propagate too: dropping a table
+/// removes its declaration along with jdb's copy of it.
+fn pair_pinned_schema_writes(db: &Database, changes: Vec<Change>) -> Result<Vec<Change>> {
+    let mut paired = Vec::with_capacity(changes.len());
+    for change in changes {
+        let relative = match &change {
+            Change::Write { path, .. } | Change::Delete { path } => {
+                path.to_string_lossy().into_owned()
+            }
+        };
+        let table = crate::schema_store::working_table(&relative).map(str::to_string);
+        paired.push(change);
+        let Some(table) = table else { continue };
+        if !db.catalog.pinned.contains(&table) {
+            continue;
+        }
+        let pin = PathBuf::from(crate::schema_store::pin_relative(&table));
+        match paired.last().expect("just pushed") {
+            Change::Write { bytes, .. } => {
+                let bytes = bytes.clone();
+                paired.push(Change::Write { path: pin, bytes });
+            }
+            Change::Delete { .. } => paired.push(Change::Delete { path: pin }),
+        }
+    }
+    Ok(paired)
+}
+
 fn current_root(db: &Database) -> Result<String> {
     Ok(metadata::state(&db.catalog)?.0)
 }
@@ -4708,7 +4818,7 @@ fn doctor_fix_matches(only: Option<&str>, fix: &str) -> bool {
                     "FOREIGN_KEY_VIOLATION",
                     "FIX_ORPHAN_SET_NULL" | "FIX_ORPHAN_DELETE_ROW"
                 )
-                | ("LINT_SCHEMA_UNREVIEWED", "FIX_ACCEPT_INFERRED")
+                | ("LINT_SCHEMA_UNPINNED", "FIX_PIN_SCHEMA")
                 | ("LINT_NULLABLE_NEVER_NULL", "FIX_TIGHTEN_NULLABLE")
                 | ("LINT_WIDER_TYPE", "FIX_NARROW_TYPE")
                 | ("LINT_ENUM_CANDIDATE", "FIX_ADD_ENUM")
@@ -4821,7 +4931,7 @@ fn reject_snapshot_collision(base: &Path, candidate: &str) -> Result<()> {
     Ok(())
 }
 fn copy_authoritative(db: &Database, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest.join("schema")).map_err(|e| DbError::io(dest, e))?;
+    fs::create_dir_all(crate::schema_store::working_dir(dest)).map_err(|e| DbError::io(dest, e))?;
     fs::create_dir_all(dest.join(".db")).map_err(|e| DbError::io(dest, e))?;
     for name in ["format", "config"] {
         let source = db.root.join(".db").join(name);
@@ -4834,8 +4944,19 @@ fn copy_authoritative(db: &Database, dest: &Path) -> Result<()> {
         }
     }
     for t in db.catalog.schemas.keys() {
-        let src = db.root.join(format!("schema/{t}.json"));
-        copy_file_synced(&src, &dest.join(format!("schema/{t}.json")))?;
+        copy_file_synced(
+            &crate::schema_store::working_path(&db.root, t),
+            &crate::schema_store::working_path(dest, t),
+        )?;
+    }
+    // Pins are the user's declaration, so a snapshot that dropped them would
+    // restore a database that had forgotten what was declared.
+    for t in crate::schema_store::pinned_tables(&db.root)? {
+        fs::create_dir_all(crate::schema_store::pin_dir(dest)).map_err(|e| DbError::io(dest, e))?;
+        copy_file_synced(
+            &crate::schema_store::pin_path(&db.root, &t),
+            &crate::schema_store::pin_path(dest, &t),
+        )?;
     }
     Ok(())
 }
@@ -4898,11 +5019,11 @@ fn changes_from_snapshot(db: &Database, src: &Path) -> Result<Vec<Change>> {
     snapshot_paths.extend(
         snap.schemas
             .keys()
-            .map(|table| PathBuf::from(format!("schema/{table}.json"))),
+            .map(|table| PathBuf::from(crate::schema_store::working_relative(table))),
     );
     snapshot_paths.extend(snap.rows.values().flatten().map(|row| row.relative.clone()));
     let mut current_paths = std::collections::BTreeSet::new();
-    let schema_dir = db.root.join("schema");
+    let schema_dir = crate::schema_store::working_dir(&db.root);
     for entry in fs::read_dir(&schema_dir).map_err(|error| DbError::io(&schema_dir, error))? {
         let path = entry
             .map_err(|error| DbError::io(&schema_dir, error))?
@@ -4952,7 +5073,7 @@ fn changes_from_snapshot(db: &Database, src: &Path) -> Result<Vec<Change>> {
         }
     }
     for t in snap.schemas.keys() {
-        let p = PathBuf::from(format!("schema/{t}.json"));
+        let p = PathBuf::from(crate::schema_store::working_relative(t));
         let bytes = fs::read(src.join(&p)).map_err(|e| DbError::io(&src.join(&p), e))?;
         if fs::read(db.root.join(&p)).ok().as_deref() != Some(bytes.as_slice()) {
             changes.push(Change::Write {

@@ -1410,6 +1410,7 @@ mod tests {
         let mut catalog = Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec!["posts".into()],
+            pinned: std::collections::BTreeSet::new(),
             schemas: BTreeMap::new(),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::new(),
@@ -1445,6 +1446,7 @@ mod tests {
         let catalog = Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec!["posts".into()],
+            pinned: std::collections::BTreeSet::new(),
             schemas: BTreeMap::new(),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::new(),

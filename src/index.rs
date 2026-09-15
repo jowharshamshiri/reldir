@@ -179,7 +179,6 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
-            inferred: None,
         }
     }
 
@@ -202,6 +201,7 @@ mod tests {
         Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec![],
+            pinned: BTreeSet::new(),
             schemas: BTreeMap::from([(table.clone(), schema)]),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::from([(table, rows)]),

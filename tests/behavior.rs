@@ -6,6 +6,16 @@ fn db() -> Command {
     Command::cargo_bin("db").unwrap()
 }
 
+/// Declare a pinned schema.
+///
+/// `schema/` is the user's pin directory: jdb never creates it, so a fixture
+/// that declares a schema creates it the way a user would.
+fn pin(root: impl AsRef<std::path::Path>, table: &str, body: &str) {
+    let root = root.as_ref();
+    fs::create_dir_all(root.join("schema")).unwrap();
+    fs::write(root.join(format!("schema/{table}.json")), body).unwrap();
+}
+
 fn adopted() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("users")).unwrap();
@@ -145,12 +155,16 @@ fn test0005_sql_delete_executes_declared_cascade_in_one_revision() {
         .success();
     fs::create_dir(root.join("users")).unwrap();
     fs::create_dir(root.join("posts")).unwrap();
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
-    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
+    );
+    pin(
+        root,
+        "posts",
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+    );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
         root.join("posts/p1.json"),
@@ -193,12 +207,16 @@ fn test0006_direct_primary_key_update_uses_declared_cascade() {
         .success();
     fs::create_dir(root.join("users")).unwrap();
     fs::create_dir(root.join("posts")).unwrap();
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
-    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
+    );
+    pin(
+        root,
+        "posts",
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+    );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
         root.join("posts/p1.json"),
@@ -262,11 +280,11 @@ fn test0007_sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_out
         .assert()
         .success();
     fs::create_dir(root.join("items")).unwrap();
-    fs::write(
-        root.join("schema/items.json"),
+    pin(
+        root,
+        "items",
         r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"count":{"type":"int"},"active":{"type":"bool"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(
         root.join("items/a.json"),
         "{\"id\":\"a\",\"count\":1,\"active\":true}\n",
@@ -540,11 +558,13 @@ fn test0013_schema_errors_have_specific_codes_and_locations() {
     db().args(["init", dir.path().to_str().unwrap()])
         .assert()
         .success();
-    fs::write(
-        dir.path().join("schema/bad.json"),
+    // A hand-written schema is a pin, and `db init` creates no pin directory.
+    fs::create_dir(dir.path().join("schema")).unwrap();
+    pin(
+        dir.path(),
+        "bad",
         "{\n  \"table\": \"bad\",\n  \"primary_key\": [\"id\"],\n  \"columns\": {\"id\": {}}\n}\n",
-    )
-    .unwrap();
+    );
     db().args([
         "--db",
         dir.path().to_str().unwrap(),
@@ -593,21 +613,21 @@ fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() 
         .assert()
         .success();
     fs::create_dir(root.join("items")).unwrap();
-    fs::write(
-        root.join("schema/items.json"),
+    pin(
+        root,
+        "items",
         r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string","default":"fixed"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(root.join("items/fixed.json"), "{}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .success();
 
-    fs::write(
-        root.join("schema/items.json"),
+    pin(
+        root,
+        "items",
         r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"unique":[["tag"]]}"#,
-    )
-    .unwrap();
+    );
     fs::write(root.join("items/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(root.join("items/b.json"), "{\"id\":\"b\"}\n").unwrap();
     fs::remove_file(root.join("items/fixed.json")).unwrap();
@@ -624,11 +644,11 @@ fn test0016_check_schema_typechecking_rejects_unknown_identifiers() {
     db().args(["init", root.to_str().unwrap()])
         .assert()
         .success();
-    fs::write(
-        root.join("schema/items.json"),
+    pin(
+        root,
+        "items",
         r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"count":{"type":"int"}},"check":[{"name":"positive","expr":"typo > 0"}]}"#,
-    )
-    .unwrap();
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .code(2)
@@ -686,11 +706,11 @@ fn test0018_decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
         .assert()
         .success();
     fs::create_dir(root.join("numbers")).unwrap();
-    fs::write(
-        root.join("schema/numbers.json"),
+    pin(
+        root,
+        "numbers",
         r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"amount":{"type":"decimal"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(
         root.join("numbers/a.json"),
         r#"{"id":"a","amount":"1000000000000000000000000000000000000000000"}"#,
@@ -755,11 +775,11 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
         .assert()
         .success();
     fs::create_dir(root.join("numbers")).unwrap();
-    fs::write(
-        root.join("schema/numbers.json"),
+    pin(
+        root,
+        "numbers",
         r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string","default":"10"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(root.join("numbers/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(
         root.join("numbers/b.json"),
@@ -784,7 +804,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     .assert()
     .success();
     let schema: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join("schema/numbers.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(root.join(".db/schema/numbers.json")).unwrap()).unwrap();
     let omitted: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("numbers/a.json")).unwrap()).unwrap();
     let explicit: serde_json::Value =
@@ -803,11 +823,11 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
         .assert()
         .success();
     fs::create_dir(failed_root.join("numbers")).unwrap();
-    fs::write(
-        failed_root.join("schema/numbers.json"),
+    pin(
+        failed_root,
+        "numbers",
         r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(
         failed_root.join("numbers/a.json"),
         "{\"id\":\"a\",\"score\":\"01\"}\n",
@@ -828,6 +848,9 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     .assert()
     .success();
     let manifest_before = fs::read(failed_root.join(".db/manifest.json")).unwrap();
+    // The pin is the declaration a refused migration must leave alone. There is
+    // no working copy to compare here: this database was established empty and
+    // the table declared afterwards, so the pin is the only schema on disk.
     let schema_before = fs::read(failed_root.join("schema/numbers.json")).unwrap();
     db().args([
         "--db",
@@ -851,7 +874,8 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     );
     assert_eq!(
         schema_before,
-        fs::read(failed_root.join("schema/numbers.json")).unwrap()
+        fs::read(failed_root.join("schema/numbers.json")).unwrap(),
+        "a refused migration leaves the pin as the user declared it"
     );
 }
 
@@ -918,11 +942,11 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
         .assert()
         .success();
     fs::create_dir(root.join("bad")).unwrap();
-    fs::write(
-        root.join("schema/bad.json"),
+    pin(
+        root,
+        "bad",
         r#"{"table":"bad","primary_key":["id"],"columns":{"id":{"type":"string","values":["x"]}}}"#,
-    )
-    .unwrap();
+    );
     db().args([
         "--db",
         root.to_str().unwrap(),
@@ -936,11 +960,11 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
         "values is only valid for enum columns",
     ));
 
-    fs::write(
-        root.join("schema/bad.json"),
+    pin(
+        root,
+        "bad",
         r#"{"table":"bad","schema_format":999,"primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .code(6)
@@ -955,11 +979,11 @@ fn test0023_primary_key_arguments_are_decoded_against_the_declared_type() {
         .assert()
         .success();
     fs::create_dir(root.join("things")).unwrap();
-    fs::write(
-        root.join("schema/things.json"),
+    pin(
+        root,
+        "things",
         r#"{"table":"things","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
     fs::write(
         root.join("things/123.json"),
         "{\"id\":\"123\",\"name\":\"numeric text\"}\n",
@@ -980,17 +1004,14 @@ fn test0023_primary_key_arguments_are_decoded_against_the_declared_type() {
 }
 
 #[test]
-fn test0024_inference_records_foreign_key_evidence_and_rejects_invalid_pk_overrides() {
+fn test0024_inference_derives_foreign_keys_and_rejects_invalid_pk_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     fs::create_dir(root.join("users")).unwrap();
     fs::create_dir(root.join("posts")).unwrap();
-    fs::create_dir(root.join("schema")).unwrap();
-    fs::write(
-        root.join("schema/users.json"),
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    // `users` is deliberately left unpinned: the point of this test is that
+    // inference derives the relationship, and a pinned table is declared rather
+    // than inferred.
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
     fs::write(
@@ -1013,15 +1034,19 @@ fn test0024_inference_records_foreign_key_evidence_and_rejects_invalid_pk_overri
     .assert()
     .success();
     let posts: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.join("schema/posts.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(root.join(".db/schema/posts.json")).unwrap()).unwrap();
     assert_eq!(posts["foreign_keys"][0]["columns"][0], "user_id");
     assert_eq!(posts["foreign_keys"][0]["references"]["table"], "users");
     assert_eq!(posts["indexes"][0][0], "user_id");
-    assert!(
-        posts["inferred"]["evidence"]["foreign_keys[0]"]
-            .as_str()
-            .unwrap()
-            .contains("users.id")
+    // Inference records the relationship it found, not a prose account of
+    // finding it: the schema is the evidence, and it is checkable.
+    assert_eq!(
+        posts["foreign_keys"][0]["references"]["columns"][0], "id",
+        "the foreign key names the column it references"
+    );
+    assert_eq!(
+        posts["foreign_keys"][0]["on_delete"], "restrict",
+        "an inferred foreign key is conservative about deletion"
     );
 
     let invalid = tempfile::tempdir().unwrap();
@@ -1035,58 +1060,6 @@ fn test0024_inference_records_foreign_key_evidence_and_rejects_invalid_pk_overri
             predicate::str::contains("INFER_NO_PRIMARY_KEY")
                 .and(predicate::str::contains("unknown column \"missing\"")),
         );
-}
-
-#[test]
-fn test0025_inferred_comparison_files_are_non_authoritative_and_replaceable() {
-    let dir = adopted();
-    let root = dir.path();
-    let manifest_before = fs::read(root.join(".db/manifest.json")).unwrap();
-    db().args([
-        "--db",
-        root.to_str().unwrap(),
-        "--format",
-        "table",
-        "infer",
-        "--all",
-        "--write",
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("revision 1"));
-    let proposal = root.join("schema/users.inferred.json");
-    assert!(proposal.exists());
-    assert_eq!(
-        manifest_before,
-        fs::read(root.join(".db/manifest.json")).unwrap()
-    );
-
-    fs::write(&proposal, "not json\n").unwrap();
-    db().args([
-        "--db",
-        root.to_str().unwrap(),
-        "--format",
-        "table",
-        "status",
-    ])
-    .assert()
-    .success();
-    db().args([
-        "--db",
-        root.to_str().unwrap(),
-        "--format",
-        "table",
-        "infer",
-        "--all",
-        "--write",
-    ])
-    .assert()
-    .success();
-    assert!(serde_json::from_slice::<serde_json::Value>(&fs::read(&proposal).unwrap()).is_ok());
-    assert_eq!(
-        manifest_before,
-        fs::read(root.join(".db/manifest.json")).unwrap()
-    );
 }
 
 #[cfg(unix)]
@@ -1206,12 +1179,16 @@ fn test0028_restrict_referential_action_blocks_and_reports_a_referential_violati
         .success();
     fs::create_dir(root.join("users")).unwrap();
     fs::create_dir(root.join("posts")).unwrap();
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
-    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#).unwrap();
+    );
+    pin(
+        root,
+        "posts",
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+    );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
         root.join("posts/p1.json"),
@@ -1255,12 +1232,16 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
         .success();
     fs::create_dir(root.join("users")).unwrap();
     fs::create_dir(root.join("posts")).unwrap();
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
-    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#).unwrap();
+    );
+    pin(
+        root,
+        "posts",
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#,
+    );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
         root.join("posts/p1.json"),
@@ -1287,7 +1268,11 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
     assert_eq!(row["user_id"], serde_json::Value::Null);
 
     // set_default restores the declared default rather than null.
-    fs::write(root.join("schema/posts.json"),r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true,"default":"gone"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_default","on_update":"restrict"}]}"#).unwrap();
+    pin(
+        root,
+        "posts",
+        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true,"default":"gone"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_default","on_update":"restrict"}]}"#,
+    );
     fs::write(root.join("users/gone.json"), "{\"id\":\"gone\"}\n").unwrap();
     fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
     fs::write(
@@ -1368,7 +1353,7 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
         ),
     ];
     for (code, body) in cases {
-        fs::write(root.join("schema/a.json"), body).unwrap();
+        pin(root, "a", body);
         db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
             .assert()
             .code(2)
@@ -1376,17 +1361,17 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
     }
 
     // The unknown-key message must point at the intended key, not merely reject.
-    fs::write(
-        root.join("schema/a.json"),
+    pin(
+        root,
+        "a",
         r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"uniqe":[["id"]]}"#,
-    )
-    .unwrap();
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .code(2)
         .stderr(predicate::str::contains("unique"));
 
-    fs::write(root.join("schema/a.json"), base).unwrap();
+    pin(root, "a", base);
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .success();
@@ -1404,11 +1389,11 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     fs::create_dir(root.join("b")).unwrap();
     fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
     fs::write(root.join("b/b1.json"), "{\"id\":\"b1\",\"a_id\":\"a1\"}\n").unwrap();
-    fs::write(
-        root.join("schema/a.json"),
+    pin(
+        root,
+        "a",
         r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
 
     let cases: Vec<(&str, &str)> = vec![
         (
@@ -1425,7 +1410,7 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
         ),
     ];
     for (code, body) in cases {
-        fs::write(root.join("schema/b.json"), body).unwrap();
+        pin(root, "b", body);
         db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
             .assert()
             .code(2)
@@ -1433,8 +1418,16 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     }
 
     // An all-cascade cycle is rejected (Section 11).
-    fs::write(root.join("schema/a.json"),r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
-    fs::write(root.join("schema/b.json"),r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#).unwrap();
+    pin(
+        root,
+        "a",
+        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+    );
+    pin(
+        root,
+        "b",
+        r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .code(2)
@@ -1452,7 +1445,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
         .success();
     fs::create_dir(root.join("t")).unwrap();
     let strict = r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#;
-    fs::write(root.join("schema/t.json"), strict).unwrap();
+    pin(root, "t", strict);
     fs::write(root.join("t/a.json"), "{\"id\":\"a\",\"n\":1}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1494,14 +1487,22 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("ROW_UNKNOWN_FIELD"));
-    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"additional_fields":"allow"}"#).unwrap();
+    pin(
+        root,
+        "t",
+        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"additional_fields":"allow"}"#,
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .success();
 
     // CHECK constraints are enforced over committed rows.
     fs::remove_file(root.join("t/b.json")).unwrap();
-    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"check":[{"name":"pos","expr":"n > 0"}]}"#).unwrap();
+    pin(
+        root,
+        "t",
+        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"check":[{"name":"pos","expr":"n > 0"}]}"#,
+    );
     fs::write(root.join("t/h.json"), "{\"id\":\"h\",\"n\":-5}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1517,7 +1518,11 @@ fn test0033_duplicate_primary_keys_are_rejected_under_a_custom_filename_rule() {
     let root = dir.path();
     fs::create_dir(root.join("schema")).unwrap();
     fs::create_dir(root.join("t")).unwrap();
-    fs::write(root.join("schema/t.json"),r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"slug":{"type":"string"}},"unique":[["slug"]],"storage":{"filename":["slug"]}}"#).unwrap();
+    pin(
+        root,
+        "t",
+        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"slug":{"type":"string"}},"unique":[["slug"]],"storage":{"filename":["slug"]}}"#,
+    );
     fs::write(root.join("t/s1.json"), "{\"id\":\"a\",\"slug\":\"s1\"}\n").unwrap();
     fs::write(root.join("t/s2.json"), "{\"id\":\"a\",\"slug\":\"s2\"}\n").unwrap();
     db().args(["--format", "table", "init", root.to_str().unwrap()])
@@ -1842,11 +1847,11 @@ fn test0037_logically_unchanged_rows_are_never_rewritten() {
 fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     let dir = adopted();
     let root = dir.path();
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["ghost"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
 
     // `status` and `check` report violations on stderr and exit INVALID.
     // A panic (exit 101) or a success code would both be defects.
@@ -1892,11 +1897,11 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
         "{\"id\":\"p1\",\"users\":\"u1\"}\n",
     )
     .unwrap();
-    fs::write(
-        root.join("schema/posts.json"),
+    pin(
+        root,
+        "posts",
         r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"users":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
     for arguments in [vec!["check"], vec!["lint"], vec!["doctor"]] {
         let mut command = db();
         command.args(["--db", root.to_str().unwrap(), "--format", "table"]);
@@ -1908,11 +1913,11 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     }
 
     // Repairing the schema restores a fully valid database.
-    fs::write(
-        root.join("schema/users.json"),
+    pin(
+        root,
+        "users",
         r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
-    )
-    .unwrap();
+    );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
         .success();
@@ -2061,11 +2066,11 @@ fn test0041_concurrent_writers_never_silently_lose_an_update() {
     let root = dir.path().to_path_buf();
     fs::create_dir(root.join("counters")).unwrap();
     fs::create_dir(root.join("schema")).unwrap();
-    fs::write(
-        root.join("schema/counters.json"),
+    pin(
+        &root,
+        "counters",
         r#"{"table":"counters","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#,
-    )
-    .unwrap();
+    );
     for index in 0..8 {
         fs::write(
             root.join(format!("counters/c{index}.json")),
@@ -2296,11 +2301,11 @@ fn test0044_many_rows_validate_query_and_mutate_correctly() {
     let root = dir.path();
     fs::create_dir(root.join("events")).unwrap();
     fs::create_dir(root.join("schema")).unwrap();
-    fs::write(
-        root.join("schema/events.json"),
+    pin(
+        root,
+        "events",
         r#"{"table":"events","primary_key":["id"],"columns":{"id":{"type":"int"},"bucket":{"type":"string"},"n":{"type":"int"}}}"#,
-    )
-    .unwrap();
+    );
 
     let rows = 2_000usize;
     for index in 0..rows {
@@ -2376,11 +2381,11 @@ fn test0045_result_row_limits_are_enforced_not_truncated() {
     let root = dir.path();
     fs::create_dir(root.join("items")).unwrap();
     fs::create_dir(root.join("schema")).unwrap();
-    fs::write(
-        root.join("schema/items.json"),
+    pin(
+        root,
+        "items",
         r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"int"}}}"#,
-    )
-    .unwrap();
+    );
     for index in 0..25 {
         fs::write(
             root.join(format!("items/{index}.json")),
@@ -2433,11 +2438,11 @@ fn test0046_pathological_json_is_refused_by_configured_limits() {
     let root = dir.path();
     fs::create_dir(root.join("blobs")).unwrap();
     fs::create_dir(root.join("schema")).unwrap();
-    fs::write(
-        root.join("schema/blobs.json"),
+    pin(
+        root,
+        "blobs",
         r#"{"table":"blobs","primary_key":["id"],"columns":{"id":{"type":"string"},"data":{"type":"json"}}}"#,
-    )
-    .unwrap();
+    );
     let deep = format!(
         "{{\"id\":\"a\",\"data\":{}{}}}\n",
         "[".repeat(300),
@@ -2788,7 +2793,11 @@ fn test0053_ungoverned_data_answers_a_query_without_ceremony() {
     // The folder is now a real database: metadata, a schema, and a first
     // revision recorded with no predecessor it cannot substantiate.
     assert!(root.join(".db/format").exists());
-    assert!(root.join("schema/users.json").exists());
+    assert!(root.join(".db/schema/users.json").exists());
+    assert!(
+        !root.join("schema").exists(),
+        "adoption derives a schema; declaring one is the user's act"
+    );
     assert_eq!(
         fs::read_dir(root.join(".db/provenance")).unwrap().count(),
         1,
@@ -3027,8 +3036,9 @@ fn test0060_dry_run_plans_establishment_without_performing_it() {
     // The plan is a notice, and Section 48 keeps notices on stderr so stdout
     // stays free for results: a dry run remains pipeable.
     .stderr(
-        predicate::str::contains("would initialize metadata")
-            .and(predicate::str::contains("would infer schema/users.json")),
+        predicate::str::contains("would initialize metadata").and(predicate::str::contains(
+            "would infer .db/schema/users.json",
+        )),
     )
     .stdout(predicate::str::contains("users"));
 
@@ -3310,7 +3320,13 @@ fn test0066_an_unknown_table_names_the_ungoverned_directory_holding_it() {
     // The advice is the same one `status` gives, because both read the same
     // observation rather than deciding separately.
     let status = db()
-        .args(["--db", root.to_str().unwrap(), "--format", "table", "status"])
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "table",
+            "status",
+        ])
         .output()
         .unwrap();
     assert!(
