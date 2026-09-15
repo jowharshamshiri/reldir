@@ -3073,3 +3073,73 @@ fn test0061_dry_run_with_no_auto_refuses_and_promises_nothing() {
     assert!(!root.join(".db").exists());
     assert!(!root.join("schema").exists());
 }
+
+/// Recall spans invocations: history belongs to the database rather than to
+/// the process that typed it, so a session loads what earlier ones left and
+/// leaves its own additions behind.
+///
+/// Driven through a pre-seeded file rather than a terminal: rustyline falls
+/// back to a direct line reader when stdin is not a TTY, and that reader keeps
+/// no history at all. Piping SQL therefore cannot exercise recall, so what is
+/// pinned here is the surrounding contract -- the file is read, survives a
+/// session, and stays out of Git.
+#[test]
+fn test0062_shell_history_is_per_database_state() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+    let history = dir.path().join(".db/shell-history");
+
+    fs::write(&history, "#V2\nSELECT name FROM users ORDER BY name\n").unwrap();
+
+    let session = db()
+        .args(["--db", root, "--format", "table", "shell"])
+        .write_stdin("SELECT 7 AS seven;\n.quit\n")
+        .output()
+        .unwrap();
+    assert!(
+        session.status.success(),
+        "a shell session with existing history must succeed: {}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+
+    // Loading history is not destructive: what an earlier session recorded is
+    // still there for the next one.
+    let recorded = fs::read_to_string(&history).unwrap();
+    assert!(
+        recorded.contains("SELECT name FROM users"),
+        "an earlier session's queries survive a later one: {recorded}"
+    );
+    assert!(
+        !recorded.contains(".quit"),
+        "leaving the shell is not a recallable query: {recorded}"
+    );
+
+    // Section 50: everything under `.db/` but `format` and `config` stays out
+    // of version control, so recorded query text is never committed.
+    let ignored = fs::read_to_string(dir.path().join(".db/.gitignore")).unwrap();
+    assert!(ignored.contains('*') && !ignored.contains("!shell-history"));
+}
+
+/// `--readonly` promises the folder is not written, and a convenience file is
+/// no exception. Pinned against a database that already has history, so the
+/// assertion fails if the read-only gate is removed rather than passing
+/// because nothing would have been written anyway.
+#[test]
+fn test0063_readonly_shell_records_no_history() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+    let history = dir.path().join(".db/shell-history");
+    fs::write(&history, "#V2\nSELECT name FROM users\n").unwrap();
+    let before = fs::metadata(&history).unwrap().len();
+
+    db().args(["--db", root, "--readonly", "--format", "table", "shell"])
+        .write_stdin("SELECT 7 AS seven;\n.quit\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(&history).unwrap().len(),
+        before,
+        "--readonly writes nothing, history included"
+    );
+}

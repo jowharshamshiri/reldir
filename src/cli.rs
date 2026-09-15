@@ -3239,6 +3239,9 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
     let mut editor = Editor::<ShellHelper, DefaultHistory>::new()
         .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
     editor.set_helper(Some(ShellHelper { candidates }));
+    // Input history persists per database, so recall survives the session:
+    // `.db/.gitignore` already excludes everything but `format` and `config`,
+    // which keeps query text -- literals included -- out of the repository.
     let history = db.root.join(".db/shell-history");
     if history.exists() {
         editor
@@ -3252,9 +3255,14 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
                 if query.is_empty() {
                     continue;
                 }
-                editor
-                    .add_history_entry(query)
-                    .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+                // Leaving the shell is not a query worth recalling: recording
+                // it would put `.quit` at the top of every later session's
+                // history, one keystroke from ending that session too.
+                if !matches!(query, ".quit" | ".exit") {
+                    editor
+                        .add_history_entry(query)
+                        .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+                }
                 if !shell_line(db, query, format, cli)? {
                     break;
                 }
@@ -3264,9 +3272,22 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
         }
     }
     if !cli.readonly {
-        editor
-            .save_history(&history)
-            .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+        // rustyline rewrites the history file in place and does not create it,
+        // so the first session on a database must put it there. Without this
+        // the initial save fails with ENOENT and nothing is ever persisted.
+        if !history.exists() {
+            fs::write(&history, "")
+                .map_err(|error| DbError::new("IO_ERROR", error.to_string(), 6))?;
+        }
+        // A session that answered every question has succeeded. Failing it here
+        // would discard that work over a convenience file, so the inability to
+        // record history is reported and the exit stays clean.
+        if let Err(error) = editor.save_history(&history) {
+            crate::output::notice_stderr(&format!(
+                "warning: could not save shell history to {}: {error}",
+                history.display()
+            ));
+        }
     }
     Ok(0)
 }
