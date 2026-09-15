@@ -75,14 +75,6 @@ pub fn execute_with_limits(
 pub fn execute_params(catalog: &Catalog, text: &str, params: &[SqlParam]) -> Result<SqlResult> {
     execute_params_with_limits(catalog, text, params, QueryLimits::unbounded(None))
 }
-pub fn execute_params_timeout(
-    catalog: &Catalog,
-    text: &str,
-    params: &[SqlParam],
-    timeout: Option<std::time::Duration>,
-) -> Result<SqlResult> {
-    execute_params_with_limits(catalog, text, params, QueryLimits::unbounded(timeout))
-}
 pub fn execute_params_with_limits(
     catalog: &Catalog,
     text: &str,

@@ -45,7 +45,7 @@ pub struct Provenance {
 /// One definition, used both when recording a revision and when asking whether
 /// a schema still matches what was recorded. Two spellings of this would let a
 /// database disagree with its own history.
-pub fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
+fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
     let value = serde_json::to_value(schema).map_err(internal)?;
     let bytes = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
     Ok(canonical::hash_bytes(&bytes))
@@ -398,7 +398,7 @@ pub fn provenance_head(root: &Path) -> Result<Option<Manifest>> {
 pub fn write_manifest(root: &Path, m: &Manifest) -> Result<()> {
     write_json_atomic(&root.join(".db/manifest.json"), m)
 }
-pub fn write_provenance(root: &Path, p: &Provenance) -> Result<()> {
+fn write_provenance(root: &Path, p: &Provenance) -> Result<()> {
     ensure_real_directory(&root.join(".db/provenance"), true, "provenance")?;
     let path = root.join(format!(".db/provenance/{:020}.json", p.revision));
     if path.exists() {

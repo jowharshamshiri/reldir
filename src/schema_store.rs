@@ -68,7 +68,7 @@ pub fn pin_relative(table: &str) -> String {
 /// Distinct from [`is_pin_relative`] because `.db/schema/x.json` also ends in
 /// `schema/x.json`: a prefix test that did not know the difference would count
 /// jdb's own copy as the user's declaration.
-pub fn is_working_relative(path: &str) -> bool {
+fn is_working_relative(path: &str) -> bool {
     path.starts_with(".db/schema/") && path.ends_with(".json")
 }
 
@@ -87,11 +87,6 @@ pub fn is_pin_relative(path: &str) -> bool {
     path.starts_with("schema/") && path.ends_with(".json")
 }
 
-/// The table a pin path names, if it is one.
-pub fn pin_table(path: &str) -> Option<&str> {
-    path.strip_prefix("schema/")?.strip_suffix(".json")
-}
-
 /// Write a working schema, creating `.db/schema/` if this is the first.
 ///
 /// Writing here needs no authorization: the working schema is derived state,
@@ -105,16 +100,6 @@ pub fn write_working(root: &Path, schema: &Schema, indentation_width: usize) -> 
     // the other can fail.
     let bytes = canonical_bytes(schema, indentation_width)?;
     crate::metadata::write_bytes_atomic(&working_path(root, &schema.table), &bytes)
-}
-
-/// Remove a working schema, for a table that no longer exists.
-pub fn remove_working(root: &Path, table: &str) -> Result<()> {
-    let path = working_path(root, table);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(DbError::io(&path, error)),
-    }
 }
 
 /// The tables that have a pin.
@@ -260,12 +245,15 @@ mod tests {
     fn test1110_only_pins_have_a_recorded_relative_path() {
         assert_eq!(pin_relative("users"), "schema/users.json");
         assert!(is_pin_relative("schema/users.json"));
-        assert_eq!(pin_table("schema/users.json"), Some("users"));
 
-        // Working schemas live under .db/ and are not manifest paths.
+        // Working schemas live under `.db/` and are not manifest paths. The
+        // two spellings share a suffix, so a prefix test that did not know the
+        // difference would record jdb's own copy as the user's declaration.
+        assert_eq!(working_relative("users"), ".db/schema/users.json");
         assert!(!is_pin_relative(".db/schema/users.json"));
-        assert_eq!(pin_table(".db/schema/users.json"), None);
+        assert!(is_schema_relative(".db/schema/users.json"));
         assert!(!is_pin_relative("users/u1.json"));
+        assert!(!is_schema_relative("users/u1.json"));
         assert!(!is_pin_relative("schema/users.txt"));
     }
 
