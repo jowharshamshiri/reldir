@@ -552,6 +552,165 @@ fn test0012_declarative_migration_is_atomic_across_schema_and_rows() {
         .success();
 }
 
+/// A migration file carries a schema, and that schema is a JSON Schema document
+/// like any other -- not a second grammar maintained alongside the first.
+///
+/// `add_table` used to embed jdb's own schema shape inside migration files,
+/// which made the migration format a parallel way to spell a schema: a change
+/// to the dialect would have left it behind, silently accepting documents the
+/// rest of the binary had stopped understanding. It now goes through the same
+/// codec as a schema file, so there is one definition of what a schema is.
+#[test]
+fn test0075_migrations_carry_schemas_in_the_dialect_and_refuse_any_other() {
+    let dir = adopted();
+    let root = dir.path();
+
+    let accepted = root.join("add-tags.json");
+    fs::write(
+        &accepted,
+        r#"{"operations":[{"op":"add_table","table":"tags","schema":{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["id","label"],"additionalProperties":false,"x-jdb":{"table":"tags","primaryKey":["id"],"columnOrder":["id","label"]}}}]}"#,
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "apply",
+        accepted.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+
+    // The table exists, and the schema written for it is the dialect -- the
+    // same bytes the codec would have produced for a hand-written pin.
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".db/schema/tags.json")).unwrap()).unwrap();
+    assert_eq!(written["$schema"], "https://jdb.dev/schema/jdb-1");
+    assert_eq!(written["x-jdb"]["table"], "tags");
+    assert_eq!(written["x-jdb"]["columnOrder"][1], "label");
+    assert_eq!(written["properties"]["label"]["type"], "string");
+
+    // The old grammar is refused by name rather than quietly accepted through a
+    // path the dialect does not govern.
+    let refused = root.join("add-legacy.json");
+    fs::write(
+        &refused,
+        r#"{"operations":[{"op":"add_table","table":"legacy","schema":{"table":"legacy","primary_key":["id"],"columns":{"id":{"type":"string"}}}}]}"#,
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "apply",
+        refused.to_str().unwrap(),
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("SCHEMA_UNSUPPORTED_KEYWORD"));
+    assert!(
+        !root.join(".db/schema/legacy.json").exists(),
+        "a refused migration must write nothing"
+    );
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// A schema change is reported in the terms the schema is written in.
+///
+/// Stored revision objects hold the semantic encoding, because that is what a
+/// schema's identity is taken over. Printing it verbatim would show a reader a
+/// shape that appears in no file they can edit -- snake_case keys, columns as
+/// [name, definition] pairs -- so `diff` reports what changed about the table
+/// instead. `db diff` promises semantic changes; for a schema those are its
+/// columns and constraints, not its serialization.
+#[test]
+fn test0076_schema_changes_are_reported_semantically() {
+    let dir = adopted();
+    let root = dir.path();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "add-column",
+        "users",
+        "active",
+        "--type",
+        "bool",
+        "--default",
+        "true",
+    ])
+    .assert()
+    .success();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "diff",
+        "1",
+        "2",
+        "--schema",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("\"kind\":\"column_added\"")
+            .and(predicate::str::contains("\"name\":\"active\""))
+            // The column reads as the file spells it, so a reader can act on
+            // the diff without translating it.
+            .and(predicate::str::contains("\"type\":\"boolean\""))
+            .and(predicate::str::contains("\"default\":true"))
+            // None of the internal encoding may reach the reader: neither the
+            // document keys the hash is taken over, nor `nullable`, nor jdb's
+            // own type names, appear in any schema file.
+            .and(predicate::str::contains("\"primary_key\"").not())
+            .and(predicate::str::contains("additional_fields").not())
+            .and(predicate::str::contains("nullable").not())
+            .and(predicate::str::contains("\"type\":\"bool\"").not()),
+    );
+
+    // A constraint change is named by the key the dialect spells it with.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "migrate",
+        "add-index",
+        "users",
+        "active",
+    ])
+    .assert()
+    .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "diff",
+        "2",
+        "3",
+        "--schema",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("\"kind\":\"schema_change\"")
+            .and(predicate::str::contains("\"name\":\"indexes\"")),
+    );
+}
+
 #[test]
 fn test0013_schema_errors_have_specific_codes_and_locations() {
     let dir = tempfile::tempdir().unwrap();

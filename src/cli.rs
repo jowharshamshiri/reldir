@@ -2777,7 +2777,11 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
             } else {
                 load_object(db, &new[&path].hash)?
             };
-            rows.extend(field_diff(&path, &old_value, &new_value));
+            if crate::schema_store::is_pin_relative(&path) {
+                rows.extend(schema_diff(&path, &old_value, &new_value));
+            } else {
+                rows.extend(field_diff(&path, &old_value, &new_value));
+            }
         }
     }
     output::records(&rows, format)?;
@@ -2918,6 +2922,224 @@ fn current_object(db: &Database, path: &str) -> Result<Value> {
         &db.catalog.schemas[table],
     ))
 }
+/// One column's definition, spelled the way the schema file spells it.
+///
+/// The stored form is the semantic encoding, which names jdb's types directly
+/// and carries `nullable` as a flag. A schema file says neither: it says
+/// `"type": "integer"` with an `x-jdb-type` tag, and expresses nullability as a
+/// union with `"null"`. Reporting a change in the reader's own vocabulary is the
+/// difference between a diff they can act on and one they have to translate.
+fn as_dialect(definition: &Value) -> Value {
+    let Some(object) = definition.as_object() else {
+        return definition.clone();
+    };
+    let nullable = object
+        .get("nullable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let kind = object.get("type").and_then(Value::as_str).unwrap_or("json");
+
+    // The same mapping the codec writes to disk, read off the semantic form.
+    let (name, tag, extra): (&str, Option<&str>, Option<(&str, Value)>) = match kind {
+        "bool" => ("boolean", None, None),
+        "int" => ("integer", Some("int"), None),
+        "float" => ("number", None, None),
+        "decimal" => ("string", Some("decimal"), None),
+        "string" => ("string", None, None),
+        "bytes" => (
+            "string",
+            None,
+            Some(("contentEncoding", Value::String("base64".into()))),
+        ),
+        "date" => ("string", None, Some(("format", Value::String("date".into())))),
+        "timestamp" => (
+            "string",
+            None,
+            Some(("format", Value::String("date-time".into()))),
+        ),
+        "uuid" => ("string", None, Some(("format", Value::String("uuid".into())))),
+        "ulid" => ("string", Some("ulid"), None),
+        "enum" => ("string", None, None),
+        "array" => ("array", None, None),
+        "object" => ("object", None, None),
+        // `json` admits any value, which the dialect spells as the empty schema.
+        _ => {
+            return Value::Object(Map::new());
+        }
+    };
+
+    let mut out = Map::new();
+    out.insert(
+        "type".into(),
+        if nullable {
+            Value::Array(vec![
+                Value::String(name.into()),
+                Value::String("null".into()),
+            ])
+        } else {
+            Value::String(name.into())
+        },
+    );
+    if let Some((key, value)) = extra {
+        out.insert(key.into(), value);
+    }
+    if let Some(tag) = tag {
+        out.insert("x-jdb-type".into(), Value::String(tag.into()));
+    }
+    if let Some(values) = object.get("values") {
+        out.insert("enum".into(), values.clone());
+    }
+    if let Some(items) = object.get("items") {
+        out.insert("items".into(), as_dialect(items));
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_array) {
+        let mut nested = Map::new();
+        for entry in properties {
+            if let Some(pair) = entry.as_array()
+                && let (Some(key), Some(value)) = (pair.first().and_then(Value::as_str), pair.get(1))
+            {
+                nested.insert(key.to_string(), as_dialect(value));
+            }
+        }
+        out.insert("properties".into(), Value::Object(nested));
+    }
+    if let Some(default) = object.get("default") {
+        out.insert("default".into(), default.clone());
+    }
+    if let Some(description) = object.get("description") {
+        out.insert("description".into(), description.clone());
+    }
+    Value::Object(out)
+}
+
+/// What changed about a table, rather than what changed about its file.
+///
+/// Both sides are the semantic encoding: that is what the object store holds,
+/// because identity is taken over it. Printing it verbatim would show a reader
+/// a shape that appears in no file they can edit -- snake_case keys and columns
+/// as pairs -- so the change is reported in the terms the schema is written in
+/// instead. `db diff` promises semantic changes, and for a schema the semantics
+/// are its columns and constraints, not its serialization.
+fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> {
+    let mut out = vec![];
+    let change = |kind: &str, name: String, before: Value, after: Value| {
+        obj([
+            ("kind", Value::String(kind.into())),
+            ("path", Value::String(path.into())),
+            ("name", Value::String(name)),
+            ("old", before),
+            ("new", after),
+        ])
+    };
+
+    // Columns are encoded as ordered [name, definition] pairs, so both which
+    // columns exist and the order they are written in are visible here.
+    let columns = |value: &Value| -> Vec<(String, Value)> {
+        value
+            .get("columns")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let pair = entry.as_array()?;
+                        Some((pair.first()?.as_str()?.to_string(), pair.get(1)?.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let before = columns(old);
+    let after = columns(new);
+
+    // Generators live under `x-jdb.generated` in a schema file, keyed by column,
+    // so a change to one is reported as the table fact it is rather than as a
+    // property of the column subschema.
+    let generators = |entries: &[(String, Value)]| -> Value {
+        let mut map = Map::new();
+        for (name, definition) in entries {
+            if let Some(kind) = definition.get("generated").and_then(|g| g.get("kind")) {
+                map.insert(name.clone(), kind.clone());
+            }
+        }
+        Value::Object(map)
+    };
+    let generated_before = generators(&before);
+    let generated_after = generators(&after);
+    if generated_before != generated_after {
+        out.push(change(
+            "schema_change",
+            "generated".into(),
+            generated_before,
+            generated_after,
+        ));
+    }
+    let before_names: Vec<&str> = before.iter().map(|(name, _)| name.as_str()).collect();
+    let after_names: Vec<&str> = after.iter().map(|(name, _)| name.as_str()).collect();
+
+    for (name, definition) in &after {
+        match before.iter().find(|(existing, _)| existing == name) {
+            None => out.push(change(
+                "column_added",
+                name.clone(),
+                Value::Null,
+                as_dialect(definition),
+            )),
+            Some((_, previous)) if previous != definition => out.push(change(
+                "column_changed",
+                name.clone(),
+                as_dialect(previous),
+                as_dialect(definition),
+            )),
+            Some(_) => {}
+        }
+    }
+    for (name, definition) in &before {
+        if !after_names.contains(&name.as_str()) {
+            out.push(change(
+                "column_removed",
+                name.clone(),
+                as_dialect(definition),
+                Value::Null,
+            ));
+        }
+    }
+    // Order is logical state -- rows are written in it -- so a reordering is a
+    // change even when every column survives unaltered.
+    if before_names != after_names
+        && before_names.len() == after_names.len()
+        && before_names.iter().all(|name| after_names.contains(name))
+    {
+        out.push(change(
+            "column_order_changed",
+            String::new(),
+            Value::Array(before_names.iter().map(|n| Value::String((*n).into())).collect()),
+            Value::Array(after_names.iter().map(|n| Value::String((*n).into())).collect()),
+        ));
+    }
+
+    // Everything else a schema says, reported under the name it is written by.
+    for (key, label) in [
+        ("primary_key", "primaryKey"),
+        ("unique", "unique"),
+        ("indexes", "indexes"),
+        ("foreign_keys", "foreignKeys"),
+        ("check", "checks"),
+        ("storage", "filename"),
+        ("additional_fields", "additionalProperties"),
+        ("schema_version", "schemaVersion"),
+        ("schema_format", "schemaFormat"),
+        ("description", "description"),
+    ] {
+        let before = old.get(key).cloned().unwrap_or(Value::Null);
+        let after = new.get(key).cloned().unwrap_or(Value::Null);
+        if before != after {
+            out.push(change("schema_change", label.into(), before, after));
+        }
+    }
+    out
+}
+
 fn field_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> {
     let mut out = vec![];
     if let (Some(a), Some(b)) = (old.as_object(), new.as_object()) {
@@ -5183,6 +5405,7 @@ mod tests {
     use super::*;
     use crate::schema::{AdditionalFields, Column, ColumnType};
     use indexmap::IndexMap;
+    use serde_json::json;
 
     fn column(kind: ColumnType) -> Column {
         Column {
@@ -5218,6 +5441,122 @@ mod tests {
             additional_fields: AdditionalFields::Reject,
             annotations: Default::default(),
         }
+    }
+
+    /// A schema change is described in the words the schema file uses.
+    ///
+    /// `schema_diff` reads the semantic encoding, because that is what revision
+    /// objects hold -- but that form names jdb's types directly, carries
+    /// nullability as a flag, and lists columns as pairs. None of that appears
+    /// in a file anyone edits. Every branch of the mapping is checked here
+    /// rather than through the CLI, because a wrong spelling in a branch that
+    /// never runs is invisible until someone diffs that kind of column.
+    #[test]
+    fn test1139_diffed_columns_are_described_in_the_dialects_spelling() {
+        let semantic = |kind: ColumnType, nullable: bool| {
+            let mut column = column(kind);
+            column.nullable = nullable;
+            crate::schema::semantic::encode_v1(&{
+                let mut s = schema(&[("id", ColumnType::String)], &["id"]);
+                s.columns.insert("v".into(), column);
+                s
+            })["columns"][1][1]
+                .clone()
+        };
+        let dialect = |kind: ColumnType, nullable: bool| as_dialect(&semantic(kind, nullable));
+
+        // Standard keywords carry the type wherever they can.
+        assert_eq!(dialect(ColumnType::Bool, false)["type"], json!("boolean"));
+        assert_eq!(dialect(ColumnType::Float, false)["type"], json!("number"));
+        assert_eq!(dialect(ColumnType::String, false)["type"], json!("string"));
+        assert_eq!(dialect(ColumnType::Array, false)["type"], json!("array"));
+        assert_eq!(dialect(ColumnType::Object, false)["type"], json!("object"));
+        assert_eq!(dialect(ColumnType::Date, false)["format"], json!("date"));
+        assert_eq!(
+            dialect(ColumnType::Timestamp, false)["format"],
+            json!("date-time")
+        );
+        assert_eq!(dialect(ColumnType::Uuid, false)["format"], json!("uuid"));
+        assert_eq!(
+            dialect(ColumnType::Bytes, false)["contentEncoding"],
+            json!("base64")
+        );
+
+        // The tag appears only where no standard keyword distinguishes two jdb
+        // types, and it agrees with what the codec writes to disk.
+        assert_eq!(dialect(ColumnType::Int, false)["x-jdb-type"], json!("int"));
+        assert_eq!(
+            dialect(ColumnType::Decimal, false)["x-jdb-type"],
+            json!("decimal")
+        );
+        assert_eq!(dialect(ColumnType::Ulid, false)["x-jdb-type"], json!("ulid"));
+        assert!(dialect(ColumnType::String, false).get("x-jdb-type").is_none());
+
+        // A column admitting any value is the empty schema, not a type name.
+        assert_eq!(dialect(ColumnType::Json, false), json!({}));
+
+        // Nullability is a union, never a flag.
+        assert_eq!(
+            dialect(ColumnType::String, true)["type"],
+            json!(["string", "null"])
+        );
+        for kind in [
+            ColumnType::Bool,
+            ColumnType::Int,
+            ColumnType::Float,
+            ColumnType::Decimal,
+            ColumnType::String,
+            ColumnType::Bytes,
+            ColumnType::Date,
+            ColumnType::Timestamp,
+            ColumnType::Uuid,
+            ColumnType::Ulid,
+            ColumnType::Enum,
+            ColumnType::Array,
+            ColumnType::Object,
+            ColumnType::Json,
+        ] {
+            for nullable in [false, true] {
+                let rendered = dialect(kind.clone(), nullable);
+                let text = serde_json::to_string(&rendered).unwrap();
+                assert!(
+                    !text.contains("nullable"),
+                    "{kind:?}: nullability is a union, not a flag: {text}"
+                );
+                for internal in ["\"bool\"", "\"int\"", "\"decimal\"", "\"ulid\"", "\"json\""] {
+                    assert!(
+                        !text.contains(&format!("\"type\":{internal}")),
+                        "{kind:?}: jdb's own type names must not reach a reader: {text}"
+                    );
+                }
+                assert!(
+                    !text.contains("x-jdb-generated"),
+                    "{kind:?}: generators are a table fact, not a column keyword"
+                );
+            }
+        }
+
+        // Nested shape is part of a column's type, so it is translated too.
+        let mut inner = column(ColumnType::Decimal);
+        inner.nullable = true;
+        let mut array = column(ColumnType::Array);
+        array.items = Some(Box::new(inner));
+        let mut with_array = schema(&[("id", ColumnType::String)], &["id"]);
+        with_array.columns.insert("v".into(), array);
+        let rendered =
+            as_dialect(&crate::schema::semantic::encode_v1(&with_array)["columns"][1][1]);
+        assert_eq!(rendered["type"], json!("array"));
+        assert_eq!(rendered["items"]["x-jdb-type"], json!("decimal"));
+        assert_eq!(rendered["items"]["type"], json!(["string", "null"]));
+
+        // An enum is a string constrained by `enum`, as a schema file spells it.
+        let mut enumeration = column(ColumnType::Enum);
+        enumeration.values = Some(vec!["a".into(), "b".into()]);
+        let mut with_enum = schema(&[("id", ColumnType::String)], &["id"]);
+        with_enum.columns.insert("v".into(), enumeration);
+        let rendered = as_dialect(&crate::schema::semantic::encode_v1(&with_enum)["columns"][1][1]);
+        assert_eq!(rendered["type"], json!("string"));
+        assert_eq!(rendered["enum"], json!(["a", "b"]));
     }
 
     /// Section 29: a key given on the command line is decoded against the type

@@ -765,13 +765,23 @@ fn decode_column(
             .collect()
     });
 
-    // Nullability comes from the type union alone. `required` is derived on the
-    // way out -- a column with a default is absent from it precisely because a
-    // row may omit the key, which says nothing about whether null is an
-    // admissible *value*. Reading nullability back out of `required` would make
-    // every defaulted NOT NULL column nullable on the next load.
-    let _ = required;
     let default = object.get("default").cloned();
+
+    // Nullability comes from the type union, because that is where a schema
+    // states it: `required` says whether a row may omit the key, which is a
+    // different question. Reading nullability out of `required` would make
+    // every defaulted NOT NULL column nullable on the next load.
+    //
+    // A column with no declared type is the exception, and the only one. It is
+    // the empty schema -- jdb's `json` -- which admits any value including
+    // null, so there is no union to carry the flag. For those, absence from
+    // `required` is the only statement the document makes about whether a row
+    // may leave the column out, and it is what `integrity` reads back when it
+    // decides between a missing field and a legitimate omission.
+    let nullable = match type_name {
+        Some(_) => nullable,
+        None => nullable || (!required && default.is_none() && generated.is_none()),
+    };
 
     Ok(Column {
         kind,
@@ -1048,6 +1058,19 @@ mod tests {
         nullable.nullable = true;
         out.push(("nullable", nullable));
 
+        // A `json` column is the empty schema, so it has no type union to carry
+        // nullability. It is exactly the shape the law would otherwise not
+        // cover, and the one where losing the flag turns a legitimate omission
+        // into ROW_MISSING_FIELD.
+        let mut nullable_json = col(ColumnType::Json);
+        nullable_json.nullable = true;
+        out.push(("nullable_json", nullable_json));
+
+        let mut nullable_array = col(ColumnType::Array);
+        nullable_array.nullable = true;
+        nullable_array.items = Some(Box::new(col(ColumnType::String)));
+        out.push(("nullable_array", nullable_array));
+
         let mut defaulted = col(ColumnType::String);
         defaulted.default = Some(json!("fixed"));
         out.push(("default_not_null", defaulted));
@@ -1062,6 +1085,30 @@ mod tests {
         out.push(("described", described));
 
         out
+    }
+
+    /// A nullable `json` column must survive the file form.
+    ///
+    /// `json` admits any value, which the dialect spells as the empty schema --
+    /// and an empty schema already admits null. The risk is that nullability
+    /// then has nowhere to live, so the column comes back NOT NULL and a row
+    /// that legitimately omits it becomes invalid.
+    #[test]
+    fn test1140_a_nullable_json_column_stays_nullable() {
+        let mut nullable = col(ColumnType::Json);
+        nullable.nullable = true;
+        let before = table(vec![("id", col(ColumnType::String)), ("v", nullable)]);
+        let document = encode(&before);
+        let after = decode(&document).expect("decodes");
+        assert!(
+            after.columns["v"].nullable,
+            "a nullable json column must not come back NOT NULL: {}",
+            serde_json::to_string(&document).unwrap()
+        );
+        assert_eq!(
+            crate::schema::semantic::encode_v1(&before),
+            crate::schema::semantic::encode_v1(&after)
+        );
     }
 
     /// `decode(encode(s)) == s`, for every column shape jdb can hold.
