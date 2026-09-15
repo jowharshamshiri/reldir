@@ -428,7 +428,7 @@ fn infer_table(
                     ),
                 )
                 .at(r.path.clone())
-                .help("rename with `db doctor` or choose an appropriate storage.filename"),
+                .help("rename with `db doctor` or choose an appropriate x-jdb.filename"),
                 8,
             ));
         }

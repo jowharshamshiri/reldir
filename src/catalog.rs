@@ -418,7 +418,7 @@ impl Catalog {
                         .at(rel.clone())
                         .table(table)
                         .expected(expected.unwrap_or_else(|| {
-                            "a filename derived from non-null storage.filename columns".into()
+                            "a filename derived from non-null x-jdb.filename columns".into()
                         }))
                         .observed(name)
                         .fix("FIX_RENAME_TO_IDENTITY"),

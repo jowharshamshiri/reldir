@@ -188,19 +188,19 @@ impl Schema {
         if self.primary_key.is_empty() {
             out.push(Diagnostic::error(
                 "SCHEMA_MISSING_REQUIRED",
-                "primary_key must be a non-empty array",
+                "x-jdb.primaryKey must be a non-empty array",
             ));
         }
         if self.primary_key.iter().collect::<BTreeSet<_>>().len() != self.primary_key.len() {
             out.push(Diagnostic::error(
                 "SCHEMA_PK_COLUMN_UNKNOWN",
-                "primary_key must not repeat a column",
+                "x-jdb.primaryKey must not repeat a column",
             ));
         }
         if self.columns.is_empty() {
             out.push(Diagnostic::error(
                 "SCHEMA_MISSING_REQUIRED",
-                "columns must be a non-empty object",
+                "properties must declare at least one column",
             ));
         }
         let mut normalized_columns = BTreeSet::new();
@@ -271,7 +271,7 @@ impl Schema {
         {
             out.push(Diagnostic::error(
                 "SCHEMA_FILENAME_NOT_UNIQUE",
-                "storage.filename must be a NOT NULL primary key or unique constraint",
+                "x-jdb.filename must be a NOT NULL primary key or unique constraint",
             ));
         }
         let mut check_names = BTreeSet::new();
@@ -323,7 +323,7 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
     if c.kind != ColumnType::Enum && c.values.is_some() {
         out.push(Diagnostic::error(
             "SCHEMA_UNKNOWN_KEY",
-            format!("{table}.{name}: values is only valid for enum columns"),
+            format!("{table}.{name}: enum is only valid for string columns"),
         ));
     }
     if let Some(values) = &c.values {

@@ -76,7 +76,7 @@ db sql 'SELECT * FROM users LIMIT 10'
 ## What you get
 
 - **JSON files as rows** — one object per file, in canonical, diff-friendly formatting
-- **Explicit schemas** the binary maintains in `.db/schema/`, pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
+- **Schemas as JSON Schema** — 2020-12 documents in a declared dialect, maintained in `.db/schema/` and pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
 - **Schema inference** that bootstraps the strictest schema your data supports
 - **SQL** — `SELECT`/`INSERT`/`UPDATE`/`DELETE`, joins, grouping, aggregates, `EXPLAIN`
 - **Referential integrity** — primary keys, unique, foreign keys, `CHECK`, cascade actions
@@ -91,7 +91,7 @@ db sql 'SELECT * FROM users LIMIT 10'
 |---|---|
 | [Getting started](https://jowharshamshiri.github.io/jdb/getting-started) | Adopt a directory and run your first queries |
 | [Concepts](https://jowharshamshiri.github.io/jdb/concepts) | The model: validity, external edits, provenance |
-| [Schemas](https://jowharshamshiri.github.io/jdb/schemas) | Grammar, types, constraints |
+| [Schemas](https://jowharshamshiri.github.io/jdb/schemas) | The JSON Schema dialect, types, constraints |
 | [CLI reference](https://jowharshamshiri.github.io/jdb/cli) | Every command and flag |
 | [SQL](https://jowharshamshiri.github.io/jdb/sql) | The supported subset |
 | [Validation](https://jowharshamshiri.github.io/jdb/validation) | `check`, `lint`, and `doctor` |
