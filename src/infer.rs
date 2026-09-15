@@ -182,7 +182,17 @@ pub fn infer_all_with_references(
     Ok(schemas)
 }
 
+/// Read every row of a table as an inference sample.
+///
+/// Row files are untrusted input, so sampling runs under the configured nesting
+/// bound (Sections 57 and 61), enforced by the parser as it deserializes.
 fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>> {
+    crate::json::with_depth_limit(config.max_nesting_depth, || {
+        load_samples_bounded(root, table, config)
+    })
+}
+
+fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>> {
     let dir = root.join(table);
     if !dir.is_dir() {
         return Err(DbError::from_diag(
@@ -313,14 +323,6 @@ fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>
         ));
     }
     Ok(rows)
-}
-
-fn json_depth(value: &Value) -> usize {
-    match value {
-        Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or(0),
-        Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or(0),
-        _ => 0,
-    }
 }
 
 #[cfg(unix)]

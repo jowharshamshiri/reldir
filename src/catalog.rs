@@ -31,7 +31,19 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Observe the governed directory.
+    ///
+    /// Every document read here is untrusted input, so the whole observation
+    /// runs under the configured nesting bound (Sections 57 and 61). The bound
+    /// is applied by the parser during deserialization, which is the only place
+    /// it can protect the recursion itself.
     pub fn observe(root: &Path, config: &Config) -> Result<Self> {
+        crate::json::with_depth_limit(config.max_nesting_depth, || {
+            Self::observe_bounded(root, config)
+        })
+    }
+
+    fn observe_bounded(root: &Path, config: &Config) -> Result<Self> {
         let mut c = Self {
             root: root.to_path_buf(),
             schemas: BTreeMap::new(),
@@ -817,21 +829,6 @@ mod tests {
         let nullable = column(ColumnType::String, true);
         assert!(same_column_type(&plain, &nullable, false));
         assert!(!same_column_type(&plain, &nullable, true));
-    }
-
-    /// Section 61: nesting depth counts containers, so a limit can bound
-    /// pathological structures without rejecting ordinary rows.
-    #[test]
-    fn test9999_json_depth_counts_nested_containers() {
-        assert_eq!(json_depth(&json!(1)), 0);
-        assert_eq!(json_depth(&json!("text")), 0);
-        assert_eq!(json_depth(&json!([])), 1);
-        assert_eq!(json_depth(&json!({})), 1);
-        assert_eq!(json_depth(&json!({"a": 1})), 1);
-        assert_eq!(json_depth(&json!({"a": {"b": 1}})), 2);
-        assert_eq!(json_depth(&json!([[[1]]])), 3);
-        // Depth is the deepest branch, not the total number of containers.
-        assert_eq!(json_depth(&json!({"a": 1, "b": {"c": {"d": 1}}})), 3);
     }
 
     /// A schema with no storage override names files by its primary key, which
