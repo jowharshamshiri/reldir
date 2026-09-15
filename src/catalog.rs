@@ -543,3 +543,316 @@ fn same_column_type(
         _ => true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        Action, AdditionalFields, Column, ColumnType, ForeignKey, Reference, Storage,
+    };
+    use indexmap::IndexMap;
+    use serde_json::json;
+
+    fn column(kind: ColumnType, nullable: bool) -> Column {
+        Column {
+            kind,
+            nullable,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn schema(table: &str, columns: &[(&str, ColumnType, bool)], primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, kind, nullable) in columns {
+            map.insert((*name).to_string(), column(kind.clone(), *nullable));
+        }
+        Schema {
+            table: table.into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+            inferred: None,
+        }
+    }
+
+    fn foreign_key(columns: &[&str], table: &str, target: &[&str]) -> ForeignKey {
+        ForeignKey {
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            references: Reference {
+                table: table.into(),
+                columns: target.iter().map(|c| (*c).to_string()).collect(),
+            },
+            on_delete: Some(Action::Restrict),
+            on_update: Some(Action::Restrict),
+        }
+    }
+
+    fn cross(schemas: Vec<Schema>) -> Vec<String> {
+        let map: BTreeMap<String, Schema> = schemas
+            .into_iter()
+            .map(|s| (s.table.clone(), s))
+            .collect();
+        let mut out = vec![];
+        validate_cross(&map, &mut out);
+        out.into_iter().map(|d| d.code).collect()
+    }
+
+    fn parent() -> Schema {
+        schema("a", &[("id", ColumnType::String, false)], &["id"])
+    }
+
+    /// Section 11: a foreign key must reference a table that exists, name real
+    /// columns on both sides, and target a key that actually identifies a row.
+    #[test]
+    fn test9999_foreign_keys_must_reference_a_real_unique_target() {
+        let mut child = schema(
+            "b",
+            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &["id"],
+        );
+        child.foreign_keys = vec![foreign_key(&["a_id"], "ghost", &["id"])];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_TARGET_MISSING".into()));
+
+        // A target column that does not exist on the target table.
+        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["nope"])];
+        let codes = cross(vec![parent(), child.clone()]);
+        assert!(codes.contains(&"SCHEMA_COLUMN_UNKNOWN".into()));
+        assert!(codes.contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into()));
+
+        // A local column that does not exist on the referencing table.
+        child.foreign_keys = vec![foreign_key(&["ghost"], "a", &["id"])];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_COLUMN_UNKNOWN".into()));
+
+        // A target that exists but is neither a primary key nor unique.
+        let mut wide = schema(
+            "a",
+            &[("id", ColumnType::String, false), ("label", ColumnType::String, false)],
+            &["id"],
+        );
+        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["label"])];
+        assert!(
+            cross(vec![wide.clone(), child.clone()]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
+        );
+
+        // Declaring that target unique makes the same foreign key legitimate.
+        wide.unique = vec![vec!["label".into()]];
+        assert!(
+            !cross(vec![wide, child]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
+        );
+    }
+
+    /// Section 11: referencing and referenced column types must be identical, so
+    /// a key can never be compared across incompatible representations.
+    #[test]
+    fn test9999_foreign_key_column_types_must_match_exactly() {
+        let mut child = schema(
+            "b",
+            &[("id", ColumnType::String, false), ("a_id", ColumnType::Int, false)],
+            &["id"],
+        );
+        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
+        assert!(cross(vec![parent(), child]).contains(&"SCHEMA_FK_TYPE_MISMATCH".into()));
+
+        // The same types agree.
+        let mut ok = schema(
+            "b",
+            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &["id"],
+        );
+        ok.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
+        assert!(!cross(vec![parent(), ok]).contains(&"SCHEMA_FK_TYPE_MISMATCH".into()));
+    }
+
+    /// Section 11: arity must match and neither side may repeat a column,
+    /// because a malformed pairing has no defined meaning.
+    #[test]
+    fn test9999_foreign_key_column_lists_must_be_well_formed() {
+        let mut child = schema(
+            "b",
+            &[
+                ("id", ColumnType::String, false),
+                ("x", ColumnType::String, false),
+                ("y", ColumnType::String, false),
+            ],
+            &["id"],
+        );
+        // Two local columns against one target column.
+        child.foreign_keys = vec![foreign_key(&["x", "y"], "a", &["id"])];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+
+        // An empty column list.
+        child.foreign_keys = vec![foreign_key(&[], "a", &[])];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+
+        // A repeated column on the referencing side.
+        let mut composite = schema(
+            "a",
+            &[("p", ColumnType::String, false), ("q", ColumnType::String, false)],
+            &["p", "q"],
+        );
+        composite.table = "a".into();
+        child.foreign_keys = vec![foreign_key(&["x", "x"], "a", &["p", "q"])];
+        assert!(cross(vec![composite, child]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+    }
+
+    /// Section 11: set_null needs somewhere to put the null and set_default
+    /// needs a default to restore, otherwise the action could not be executed.
+    #[test]
+    fn test9999_referential_actions_require_columns_that_can_hold_them() {
+        let mut child = schema(
+            "b",
+            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &["id"],
+        );
+        let mut fk = foreign_key(&["a_id"], "a", &["id"]);
+        fk.on_delete = Some(Action::SetNull);
+        child.foreign_keys = vec![fk.clone()];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+
+        // Making the column nullable satisfies set_null.
+        child.columns.get_mut("a_id").unwrap().nullable = true;
+        assert!(!cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+
+        // set_default requires a declared default.
+        let mut fk = foreign_key(&["a_id"], "a", &["id"]);
+        fk.on_delete = Some(Action::SetDefault);
+        child.foreign_keys = vec![fk];
+        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+
+        child.columns.get_mut("a_id").unwrap().default = Some(json!("fallback"));
+        assert!(!cross(vec![parent(), child]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
+    }
+
+    /// Section 11: a cycle in which every edge cascades has no defined
+    /// termination, and is rejected for delete and update edges independently.
+    #[test]
+    fn test9999_all_cascade_cycles_are_rejected_per_action() {
+        let cyclic = |action: Action| {
+            let mut a = schema(
+                "a",
+                &[("id", ColumnType::String, false), ("b_id", ColumnType::String, true)],
+                &["id"],
+            );
+            let mut b = schema(
+                "b",
+                &[("id", ColumnType::String, false), ("a_id", ColumnType::String, true)],
+                &["id"],
+            );
+            let mut to_b = foreign_key(&["b_id"], "b", &["id"]);
+            let mut to_a = foreign_key(&["a_id"], "a", &["id"]);
+            to_b.on_delete = Some(action);
+            to_b.on_update = Some(action);
+            to_a.on_delete = Some(action);
+            to_a.on_update = Some(action);
+            a.foreign_keys = vec![to_b];
+            b.foreign_keys = vec![to_a];
+            cross(vec![a, b])
+        };
+        assert!(cyclic(Action::Cascade).contains(&"SCHEMA_FK_CYCLE".into()));
+        // A cycle whose edges restrict instead terminates and is allowed.
+        assert!(!cyclic(Action::Restrict).contains(&"SCHEMA_FK_CYCLE".into()));
+
+        // A self-referencing cascade is a cycle of length one.
+        let mut self_ref = schema(
+            "a",
+            &[("id", ColumnType::String, false), ("parent", ColumnType::String, true)],
+            &["id"],
+        );
+        let mut fk = foreign_key(&["parent"], "a", &["id"]);
+        fk.on_delete = Some(Action::Cascade);
+        fk.on_update = Some(Action::Cascade);
+        self_ref.foreign_keys = vec![fk];
+        assert!(cross(vec![self_ref]).contains(&"SCHEMA_FK_CYCLE".into()));
+    }
+
+    /// Type identity is structural: two columns agree only when their nested
+    /// shapes agree, so a foreign key cannot bridge differently shaped values.
+    #[test]
+    fn test9999_column_type_identity_is_structural() {
+        let plain = column(ColumnType::String, false);
+        assert!(same_column_type(&plain, &plain, true));
+        assert!(!same_column_type(
+            &plain,
+            &column(ColumnType::Int, false),
+            true
+        ));
+
+        // Enum membership is part of the type.
+        let mut left = column(ColumnType::Enum, false);
+        left.values = Some(vec!["a".into(), "b".into()]);
+        let mut right = column(ColumnType::Enum, false);
+        right.values = Some(vec!["a".into()]);
+        assert!(!same_column_type(&left, &right, false));
+        right.values = Some(vec!["a".into(), "b".into()]);
+        assert!(same_column_type(&left, &right, false));
+
+        // Array element types must agree.
+        let mut left = column(ColumnType::Array, false);
+        left.items = Some(Box::new(column(ColumnType::Int, false)));
+        let mut right = column(ColumnType::Array, false);
+        right.items = Some(Box::new(column(ColumnType::String, false)));
+        assert!(!same_column_type(&left, &right, false));
+        right.items = Some(Box::new(column(ColumnType::Int, false)));
+        assert!(same_column_type(&left, &right, false));
+
+        // Object property sets must agree in both name and shape.
+        let mut properties = IndexMap::new();
+        properties.insert("n".to_string(), column(ColumnType::Int, false));
+        let mut left = column(ColumnType::Object, false);
+        left.properties = Some(properties.clone());
+        let mut right = column(ColumnType::Object, false);
+        properties.insert("extra".to_string(), column(ColumnType::Int, false));
+        right.properties = Some(properties);
+        assert!(!same_column_type(&left, &right, false));
+
+        // Nullability participates only when the caller asks for it, because a
+        // foreign key may point from a nullable column at a NOT NULL key.
+        let nullable = column(ColumnType::String, true);
+        assert!(same_column_type(&plain, &nullable, false));
+        assert!(!same_column_type(&plain, &nullable, true));
+    }
+
+    /// Section 61: nesting depth counts containers, so a limit can bound
+    /// pathological structures without rejecting ordinary rows.
+    #[test]
+    fn test9999_json_depth_counts_nested_containers() {
+        assert_eq!(json_depth(&json!(1)), 0);
+        assert_eq!(json_depth(&json!("text")), 0);
+        assert_eq!(json_depth(&json!([])), 1);
+        assert_eq!(json_depth(&json!({})), 1);
+        assert_eq!(json_depth(&json!({"a": 1})), 1);
+        assert_eq!(json_depth(&json!({"a": {"b": 1}})), 2);
+        assert_eq!(json_depth(&json!([[[1]]])), 3);
+        // Depth is the deepest branch, not the total number of containers.
+        assert_eq!(json_depth(&json!({"a": 1, "b": {"c": {"d": 1}}})), 3);
+    }
+
+    /// A schema with no storage override names files by its primary key, which
+    /// the observer relies on to map a row to its path.
+    #[test]
+    fn test9999_filename_columns_track_the_storage_declaration() {
+        let mut s = schema(
+            "t",
+            &[("id", ColumnType::String, false), ("slug", ColumnType::String, false)],
+            &["id"],
+        );
+        assert_eq!(s.filename_columns(), ["id".to_string()]);
+        s.storage = Some(Storage {
+            filename: vec!["slug".into()],
+        });
+        assert_eq!(s.filename_columns(), ["slug".to_string()]);
+    }
+}
