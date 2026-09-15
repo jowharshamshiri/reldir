@@ -793,7 +793,7 @@ mod tests {
     /// Section 12: the type ladder picks the narrowest type every observed value
     /// satisfies, so that inference produces the strictest valid schema.
     #[test]
-    fn test9999_the_type_ladder_prefers_the_narrowest_valid_type() {
+    fn test1037_the_type_ladder_prefers_the_narrowest_valid_type() {
         let cases: Vec<(Vec<Value>, ColumnType)> = vec![
             (vec![json!(true), json!(false)], ColumnType::Bool),
             (vec![json!(1), json!(-2)], ColumnType::Int),
@@ -831,7 +831,7 @@ mod tests {
     /// Section 12: an integer-valued float column stays float only when a
     /// fractional value is actually observed; a whole number is an int.
     #[test]
-    fn test9999_integers_are_not_widened_to_float() {
+    fn test1038_integers_are_not_widened_to_float() {
         let column = infer(&[json!(1), json!(2), json!(3)], false, Strictness::Balanced).unwrap();
         assert_eq!(column.kind, ColumnType::Int);
         let column = infer(&[json!(1), json!(2.5)], false, Strictness::Balanced).unwrap();
@@ -841,7 +841,7 @@ mod tests {
     /// Section 12: a low-cardinality string column becomes an enum only when the
     /// sample is large enough to justify it, so a small sample is not over-fit.
     #[test]
-    fn test9999_enum_inference_requires_supporting_evidence() {
+    fn test1039_enum_inference_requires_supporting_evidence() {
         // Three rows per distinct value satisfies the ratio rule.
         let plenty: Vec<Value> = (0..9)
             .map(|index| json!(if index % 3 == 0 { "a" } else { "b" }))
@@ -860,7 +860,7 @@ mod tests {
     /// Section 12: mixed JSON kinds are a conflict that strict and balanced
     /// inference refuse; only loose widens to the opaque json type.
     #[test]
-    fn test9999_mixed_kinds_are_refused_except_under_loose_strictness() {
+    fn test1040_mixed_kinds_are_refused_except_under_loose_strictness() {
         let mixed = [json!(1), json!("text")];
         for strictness in [Strictness::Strict, Strictness::Balanced] {
             let error = infer(&mixed, false, strictness).unwrap_err();
@@ -874,7 +874,7 @@ mod tests {
     /// Section 12: a column with no observed value cannot be typed. Strict
     /// refuses; the looser modes fall back to a nullable json column.
     #[test]
-    fn test9999_an_unobserved_column_cannot_be_typed_under_strict() {
+    fn test1041_an_unobserved_column_cannot_be_typed_under_strict() {
         let error = infer(&[], true, Strictness::Strict).unwrap_err();
         assert_eq!(error.diagnostic.code, "INFER_UNTYPED_COLUMN");
 
@@ -888,7 +888,7 @@ mod tests {
     /// Section 12: arrays infer their element type over every element of every
     /// row, so a single row cannot fix the element type for the rest.
     #[test]
-    fn test9999_array_items_are_inferred_across_all_rows() {
+    fn test1042_array_items_are_inferred_across_all_rows() {
         let column = infer(&[json!([1, 2]), json!([3])], false, Strictness::Balanced).unwrap();
         assert_eq!(column.kind, ColumnType::Array);
         assert_eq!(column.items.unwrap().kind, ColumnType::Int);
@@ -901,7 +901,7 @@ mod tests {
     /// Section 12: object properties are inferred recursively, and a property
     /// missing from some rows is nullable.
     #[test]
-    fn test9999_object_properties_are_inferred_recursively_with_nullability() {
+    fn test1043_object_properties_are_inferred_recursively_with_nullability() {
         let column = infer(
             &[json!({"a": 1, "b": "x"}), json!({"a": 2})],
             false,
@@ -919,7 +919,7 @@ mod tests {
     /// Section 12: a uuid must be canonical lowercase and a ulid canonical
     /// uppercase, otherwise the value is merely a string.
     #[test]
-    fn test9999_identifier_types_require_canonical_spelling() {
+    fn test1044_identifier_types_require_canonical_spelling() {
         let upper_uuid = infer(
             &[json!("0193B1F4-7C3A-7B1E-9C2D-3F4A5B6C7D8E")],
             false,
@@ -939,7 +939,7 @@ mod tests {
 
     /// Section 12: nullability is recorded as observed, independently of type.
     #[test]
-    fn test9999_nullability_is_propagated_onto_the_inferred_column() {
+    fn test1045_nullability_is_propagated_onto_the_inferred_column() {
         let column = infer(&[json!("x")], true, Strictness::Balanced).unwrap();
         assert_eq!(column.kind, ColumnType::String);
         assert!(column.nullable);
@@ -951,7 +951,7 @@ mod tests {
     /// Section 12: a table name's singular form drives conventional primary-key
     /// and foreign-key naming.
     #[test]
-    fn test9999_singular_forms_drive_conventional_names() {
+    fn test1046_singular_forms_drive_conventional_names() {
         assert_eq!(singular("users"), "user");
         assert_eq!(singular("posts"), "post");
         // A name that is already singular is unchanged.

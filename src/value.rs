@@ -264,7 +264,7 @@ mod tests {
     /// so every non-canonical spelling of a number must be rejected rather than
     /// silently accepted and later compared wrongly.
     #[test]
-    fn test9999_canonical_decimal_accepts_exactly_one_spelling_per_value() {
+    fn test1109_canonical_decimal_accepts_exactly_one_spelling_per_value() {
         for accepted in [
             "0",
             "-1",
@@ -290,7 +290,7 @@ mod tests {
     /// Section 15: decimal ordering is arbitrary-precision; it must not degrade
     /// to i64 or f64 comparison at the extremes.
     #[test]
-    fn test9999_decimal_comparison_is_arbitrary_precision() {
+    fn test1110_decimal_comparison_is_arbitrary_precision() {
         let huge = "9".repeat(40);
         let bigger = format!("1{}", "0".repeat(40));
         assert_eq!(compare_decimal(&huge, &bigger), Some(Ordering::Less));
@@ -318,7 +318,7 @@ mod tests {
     /// Section 15: coercion is never silently lossy. Doctor may apply only
     /// conversions that round-trip to the same logical value.
     #[test]
-    fn test9999_lossless_convert_refuses_every_lossy_conversion() {
+    fn test1111_lossless_convert_refuses_every_lossy_conversion() {
         let int = column(ColumnType::Int);
         assert_eq!(lossless_convert(&json!("42"), &int), Some(json!(42)));
         assert_eq!(lossless_convert(&json!(42.0), &int), Some(json!(42)));
@@ -368,7 +368,7 @@ mod tests {
     /// Section 15: an enum accepts only its declared members, and an int column
     /// rejects a fractional number rather than truncating it.
     #[test]
-    fn test9999_column_matching_is_strict_about_logical_values() {
+    fn test1112_column_matching_is_strict_about_logical_values() {
         let mut enumeration = column(ColumnType::Enum);
         enumeration.values = Some(vec!["admin".into(), "member".into()]);
         assert!(matches_column(&json!("admin"), &enumeration));
@@ -397,7 +397,7 @@ mod tests {
     /// Section 15: timestamps are normalised to UTC for their canonical textual
     /// rendering, so the same instant written in any offset has one identity.
     #[test]
-    fn test9999_timestamp_text_is_normalised_to_utc() {
+    fn test1113_timestamp_text_is_normalised_to_utc() {
         let timestamp = column(ColumnType::Timestamp);
         let offset = textual(&json!("2026-09-14T12:00:00+02:00"), &timestamp).unwrap();
         let utc = textual(&json!("2026-09-14T10:00:00Z"), &timestamp).unwrap();

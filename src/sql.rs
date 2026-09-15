@@ -1264,7 +1264,7 @@ mod tests {
     /// database, so it carries its own stable code and the INVALID exit status,
     /// never the generic query-error status.
     #[test]
-    fn test9999_constraint_failures_map_to_relational_codes() {
+    fn test1088_constraint_failures_map_to_relational_codes() {
         for (extended_code, expected) in [
             (
                 rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -1292,7 +1292,7 @@ mod tests {
     /// carrying SQLite's foreign-key message. It is a referential violation and
     /// must not be reported as a query type error.
     #[test]
-    fn test9999_restrict_violations_are_classified_as_referential_violations() {
+    fn test1089_restrict_violations_are_classified_as_referential_violations() {
         let error = query_err(failure(
             rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
             "FOREIGN KEY constraint failed",
@@ -1312,7 +1312,7 @@ mod tests {
     /// Section 25 and 51: query faults are distinguished so a caller can tell a
     /// malformed query from an unknown name, and all use the query exit status.
     #[test]
-    fn test9999_query_faults_are_classified_by_kind() {
+    fn test1090_query_faults_are_classified_by_kind() {
         for (message, expected) in [
             (r#"near "SELCT": syntax error"#, "QUERY_UNSUPPORTED"),
             ("no such table: ghosts", "UNKNOWN_TABLE"),
@@ -1331,7 +1331,7 @@ mod tests {
     /// Section 61: an interrupted statement is a resource-limit outcome (the
     /// timeout fired), not a malformed query.
     #[test]
-    fn test9999_interrupted_statements_report_a_resource_limit() {
+    fn test1091_interrupted_statements_report_a_resource_limit() {
         let error = query_err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
             Some("interrupted".to_string()),

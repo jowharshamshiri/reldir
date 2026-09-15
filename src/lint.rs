@@ -543,7 +543,7 @@ mod tests {
     /// lint must decline to analyse that table rather than index a column that
     /// does not exist.
     #[test]
-    fn test9999_a_table_whose_primary_key_does_not_resolve_is_not_analysed() {
+    fn test1060_a_table_whose_primary_key_does_not_resolve_is_not_analysed() {
         let mut broken = schema(&[("id", ColumnType::String, false)], &["ghost"]);
         broken.inferred = Some(crate::schema::Inferred {
             at: "2026-09-14T00:00:00Z".into(),
@@ -564,7 +564,7 @@ mod tests {
 
     /// Section 13: a nullable column that is never null can be tightened.
     #[test]
-    fn test9999_a_nullable_column_that_is_never_null_is_reported() {
+    fn test1061_a_nullable_column_that_is_never_null_is_reported() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -595,7 +595,7 @@ mod tests {
     /// Section 13: a string column whose every value is a narrower type should
     /// be narrowed, and a float column holding only integers likewise.
     #[test]
-    fn test9999_wider_types_than_the_data_requires_are_reported() {
+    fn test1062_wider_types_than_the_data_requires_are_reported() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -632,7 +632,7 @@ mod tests {
     /// Section 13: a column declared but never populated, and a column present
     /// in only some rows, are both reported so the schema can be corrected.
     #[test]
-    fn test9999_unpopulated_and_inconsistently_present_columns_are_reported() {
+    fn test1063_unpopulated_and_inconsistently_present_columns_are_reported() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -650,7 +650,7 @@ mod tests {
     /// Section 13: an inferred schema is unreviewed until accepted, and a schema
     /// permitting unknown fields is worth flagging.
     #[test]
-    fn test9999_unreviewed_and_permissive_schemas_are_reported() {
+    fn test1064_unreviewed_and_permissive_schemas_are_reported() {
         let mut s = schema(&[("id", ColumnType::String, false)], &["id"]);
         s.inferred = Some(crate::schema::Inferred {
             at: "2026-09-14T00:00:00Z".into(),
@@ -668,7 +668,7 @@ mod tests {
     /// Section 13: description findings are opt-in, so ordinary runs are not
     /// noisy with them.
     #[test]
-    fn test9999_description_findings_are_opt_in() {
+    fn test1065_description_findings_are_opt_in() {
         let s = schema(&[("id", ColumnType::String, false)], &["id"]);
         let catalog = catalog_with(s, &[json!({"id": "a"})]);
         assert!(!codes(&catalog, false).contains(&"LINT_NO_DESCRIPTION".to_string()));
@@ -681,7 +681,7 @@ mod tests {
     /// declares the offending thing, and row-level findings name a row that
     /// actually exhibits it.
     #[test]
-    fn test9999_every_finding_identifies_a_file() {
+    fn test1066_every_finding_identifies_a_file() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -759,7 +759,7 @@ mod tests {
     /// Section 13: a uuid primary key without a generator is a suggestion, so
     /// that new rows get identifiers from the binary rather than by hand.
     #[test]
-    fn test9999_an_ungenerated_identifier_primary_key_is_reported() {
+    fn test1067_an_ungenerated_identifier_primary_key_is_reported() {
         let s = schema(&[("id", ColumnType::Uuid, false)], &["id"]);
         let catalog = catalog_with(s, &[json!({"id": "0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"})]);
         assert!(codes(&catalog, false).contains(&"LINT_PK_NOT_GENERATED".to_string()));

@@ -323,7 +323,7 @@ mod tests {
     /// ROW_MISSING_FIELD, while an explicit null in such a column is a
     /// NOT_NULL_VIOLATION. These are different faults and must not be conflated.
     #[test]
-    fn test9999_absent_and_null_are_distinct_faults() {
+    fn test1047_absent_and_null_are_distinct_faults() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -380,7 +380,7 @@ mod tests {
     /// Section 10: a default satisfies a NOT NULL column that the row omits, so
     /// the row is valid without the key being physically present.
     #[test]
-    fn test9999_a_default_satisfies_an_omitted_not_null_column() {
+    fn test1048_a_default_satisfies_an_omitted_not_null_column() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -402,7 +402,7 @@ mod tests {
     /// Section 10: unknown fields are rejected by default so a typo cannot
     /// become invisible state, and accepted only under additional_fields allow.
     #[test]
-    fn test9999_unknown_fields_follow_the_additional_fields_policy() {
+    fn test1049_unknown_fields_follow_the_additional_fields_policy() {
         let mut s = schema(&[("id", ColumnType::String, false)], &["id"]);
         let row = body(&[("id", json!("a")), ("emial", json!("x"))]);
 
@@ -421,7 +421,7 @@ mod tests {
     /// form are a collision regardless of host behaviour, at the row root and
     /// nested inside values.
     #[test]
-    fn test9999_normalisation_collisions_are_rejected_at_every_depth() {
+    fn test1050_normalisation_collisions_are_rejected_at_every_depth() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -462,7 +462,7 @@ mod tests {
     /// composite keys cannot be confused by concatenation, and a null component
     /// yields no key at all (a null never matches a foreign key).
     #[test]
-    fn test9999_keys_are_unambiguous_and_null_free() {
+    fn test1051_keys_are_unambiguous_and_null_free() {
         let s = schema(
             &[
                 ("a", ColumnType::String, false),
@@ -502,7 +502,7 @@ mod tests {
     /// Section 15: defaults are logical values, so two rows that omit a
     /// defaulted column share that column's value for uniqueness purposes.
     #[test]
-    fn test9999_defaults_participate_in_key_identity() {
+    fn test1052_defaults_participate_in_key_identity() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -524,7 +524,7 @@ mod tests {
     /// Section 10: storage.filename defaults to the primary key and is
     /// overridden by an explicit declaration.
     #[test]
-    fn test9999_filename_columns_default_to_the_primary_key() {
+    fn test1053_filename_columns_default_to_the_primary_key() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),

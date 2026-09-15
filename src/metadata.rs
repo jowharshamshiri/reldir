@@ -636,7 +636,7 @@ mod tests {
     /// Anything else is corrupt internal metadata, not a hash to look up
     /// (Section 58).
     #[test]
-    fn test9999_object_hashes_must_be_lowercase_sha256_hex() {
+    fn test1068_object_hashes_must_be_lowercase_sha256_hex() {
         let root = Path::new("/nonexistent-root");
         for invalid in [
             String::new(),
@@ -657,7 +657,7 @@ mod tests {
     /// An object's declared kind is derived from its path, so a mislabelled
     /// entry means the metadata disagrees with the layout it describes.
     #[test]
-    fn test9999_object_kind_is_derived_from_its_path() {
+    fn test1069_object_kind_is_derived_from_its_path() {
         let root = Path::new("/nonexistent-root");
         for (path, expected) in [
             (".db/format", "format"),
@@ -688,7 +688,7 @@ mod tests {
     /// schema, and every row, so the digest is stable across processes and
     /// changes whenever any authoritative input changes.
     #[test]
-    fn test9999_manifest_entries_round_trip_through_json() {
+    fn test1070_manifest_entries_round_trip_through_json() {
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             revision: 7,
@@ -716,7 +716,7 @@ mod tests {
     /// Section 23: a provenance record names the transition it describes, and
     /// the representation is closed so an unknown field cannot be ignored.
     #[test]
-    fn test9999_provenance_records_round_trip_and_reject_unknown_fields() {
+    fn test1071_provenance_records_round_trip_and_reject_unknown_fields() {
         let provenance = Provenance {
             revision: 1,
             timestamp: "2026-09-14T00:00:00Z".into(),
@@ -747,7 +747,7 @@ mod tests {
     /// Section 32: a provenance file is named for the revision it records, so a
     /// zero-padded twenty-digit name sorts chronologically.
     #[test]
-    fn test9999_provenance_filenames_sort_chronologically() {
+    fn test1072_provenance_filenames_sort_chronologically() {
         let names: Vec<String> = [1u64, 2, 10, 100, 1000]
             .iter()
             .map(|revision| format!("{revision:020}.json"))

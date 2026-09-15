@@ -168,7 +168,7 @@ mod tests {
     /// [A-Za-z0-9._-], so a value can never escape its table directory or
     /// collide with the separator.
     #[test]
-    fn test9999_filename_encoding_is_unambiguous_and_reversible() {
+    fn test1000_filename_encoding_is_unambiguous_and_reversible() {
         let s = schema(&[("id", ColumnType::String)], &["id"]);
 
         // A path separator must never survive into the filename.
@@ -206,7 +206,7 @@ mod tests {
     /// Section 56: a single-component key that would form a Windows reserved
     /// device name is encoded so the path is portable.
     #[test]
-    fn test9999_windows_reserved_names_are_escaped() {
+    fn test1001_windows_reserved_names_are_escaped() {
         let s = schema(&[("id", ColumnType::String)], &["id"]);
         for reserved in ["CON", "con", "PRN", "aux", "NUL", "COM1", "lpt9"] {
             let produced = filename(&s, &row(&[("id", json!(reserved))])).unwrap();
@@ -230,7 +230,7 @@ mod tests {
     /// Section 10: a composite filename key joins its components with a comma,
     /// and each component is encoded independently.
     #[test]
-    fn test9999_composite_filenames_join_encoded_components() {
+    fn test1002_composite_filenames_join_encoded_components() {
         let mut s = schema(
             &[("a", ColumnType::String), ("b", ColumnType::String)],
             &["a", "b"],
@@ -253,7 +253,7 @@ mod tests {
     /// nested object keys lexicographically, so the same logical state always
     /// produces the same bytes.
     #[test]
-    fn test9999_canonical_rows_follow_schema_then_lexicographic_order() {
+    fn test1003_canonical_rows_follow_schema_then_lexicographic_order() {
         let s = schema(
             &[
                 ("zeta", ColumnType::String),
@@ -297,7 +297,7 @@ mod tests {
     /// Section 20: numeric and Unicode normalisation give one identity per
     /// logical value.
     #[test]
-    fn test9999_normalisation_collapses_incidental_representations() {
+    fn test1004_normalisation_collapses_incidental_representations() {
         // Negative zero is a distinct IEEE value but not a distinct logical one.
         assert_eq!(compact(&json!(-0.0)), "0");
         // Strings are NFC, so a decomposed sequence hashes as its composed form.
@@ -313,7 +313,7 @@ mod tests {
     /// Section 20: hashing covers the canonical logical value, so formatting
     /// differences in the source bytes cannot change identity.
     #[test]
-    fn test9999_hashing_is_independent_of_incidental_formatting() {
+    fn test1005_hashing_is_independent_of_incidental_formatting() {
         let s = schema(
             &[("id", ColumnType::String), ("n", ColumnType::Int)],
             &["id"],
@@ -332,7 +332,7 @@ mod tests {
     /// Section 10: a column absent from the row body reads as its declared
     /// default, so identity and hashing see the same logical value either way.
     #[test]
-    fn test9999_defaults_participate_in_the_canonical_value() {
+    fn test1006_defaults_participate_in_the_canonical_value() {
         let mut s = schema(
             &[("id", ColumnType::String), ("tag", ColumnType::String)],
             &["id"],
@@ -346,7 +346,7 @@ mod tests {
     /// Section 20: binary writes use the configured indentation and always end
     /// with exactly one trailing newline.
     #[test]
-    fn test9999_pretty_output_honours_indentation_and_trailing_newline() {
+    fn test1007_pretty_output_honours_indentation_and_trailing_newline() {
         let value = json!({"a": 1});
         let two = String::from_utf8(pretty_with_indent(&value, 2)).unwrap();
         let four = String::from_utf8(pretty_with_indent(&value, 4)).unwrap();

@@ -725,7 +725,7 @@ mod tests {
     /// never guess at a conversion that would change the logical value, because
     /// the fix rewrites authoritative data.
     #[test]
-    fn test9999_value_coercion_offered_by_doctor_is_always_lossless() {
+    fn test1030_value_coercion_offered_by_doctor_is_always_lossless() {
         // Representational corrections that preserve the value.
         assert_eq!(
             lossless_coerce(&json!("42"), &column(ColumnType::Int)),
@@ -758,7 +758,7 @@ mod tests {
     /// unambiguous: a tie between two equally close columns is not a typo that
     /// doctor may resolve on the user's behalf.
     #[test]
-    fn test9999_field_rename_suggestions_require_an_unambiguous_near_match() {
+    fn test1031_field_rename_suggestions_require_an_unambiguous_near_match() {
         let s = schema(&[
             ("id", ColumnType::String),
             ("email", ColumnType::String),

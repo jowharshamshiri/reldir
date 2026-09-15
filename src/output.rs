@@ -428,7 +428,7 @@ mod tests {
     /// Section 52: the severity label is part of the human diagnostic contract
     /// and must name each severity exactly.
     #[test]
-    fn test9999_severity_labels_are_stable() {
+    fn test1073_severity_labels_are_stable() {
         assert_eq!(severity_label(&Severity::Error), "error");
         assert_eq!(severity_label(&Severity::Warning), "warning");
         assert_eq!(severity_label(&Severity::Suggestion), "suggestion");
@@ -439,7 +439,7 @@ mod tests {
     /// output redirected, so colour must be off and every style must be empty,
     /// leaving diagnostics byte-for-byte parseable by tooling.
     #[test]
-    fn test9999_redirected_output_carries_no_escape_sequences() {
+    fn test1074_redirected_output_carries_no_escape_sequences() {
         // Whatever the ambient environment, a non-terminal stderr means no
         // colour: the default derivation requires a terminal.
         let settings = Presentation {
@@ -463,7 +463,7 @@ mod tests {
     /// stay byte-for-byte clean, because machine consumers and the diagnostic
     /// contract read it; a progress line leaking into a pipe would corrupt both.
     #[test]
-    fn test9999_progress_is_silent_off_a_terminal() {
+    fn test1075_progress_is_silent_off_a_terminal() {
         set_presentation(Presentation {
             color: false,
             quiet: false,
@@ -486,7 +486,7 @@ mod tests {
     /// Format parsing accepts exactly the documented encodings (Section 60) and
     /// rejects anything else as a usage error rather than falling back.
     #[test]
-    fn test9999_output_formats_are_a_closed_set() {
+    fn test1076_output_formats_are_a_closed_set() {
         for (text, expected) in [
             ("table", Format::Table),
             ("json", Format::Json),

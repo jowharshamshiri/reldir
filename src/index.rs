@@ -214,7 +214,7 @@ mod tests {
     /// constraint, every declared secondary index, and every foreign key, with
     /// no duplicates when those definitions overlap.
     #[test]
-    fn test9999_every_declared_access_path_gets_exactly_one_index() {
+    fn test1032_every_declared_access_path_gets_exactly_one_index() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -246,7 +246,7 @@ mod tests {
     /// key is represented rather than silently collapsed -- the index must be
     /// able to describe an invalid state, not hide it.
     #[test]
-    fn test9999_index_entries_list_every_row_for_a_key() {
+    fn test1033_index_entries_list_every_row_for_a_key() {
         let s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -283,7 +283,7 @@ mod tests {
     /// does not appear in that index rather than being grouped under a
     /// synthetic null key.
     #[test]
-    fn test9999_rows_with_a_null_key_are_absent_from_the_index() {
+    fn test1034_rows_with_a_null_key_are_absent_from_the_index() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -311,7 +311,7 @@ mod tests {
     /// produces byte-identical index files and a clone rebuilds to the same
     /// state.
     #[test]
-    fn test9999_index_derivation_is_deterministic() {
+    fn test1035_index_derivation_is_deterministic() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),
@@ -341,7 +341,7 @@ mod tests {
     /// A composite index is named and keyed by its whole column list, so two
     /// indexes over the same columns in a different order stay distinct.
     #[test]
-    fn test9999_composite_indexes_are_keyed_by_their_full_column_list() {
+    fn test1036_composite_indexes_are_keyed_by_their_full_column_list() {
         let mut s = schema(
             &[
                 ("id", ColumnType::String, false),

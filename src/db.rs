@@ -76,6 +76,50 @@ impl Database {
         Self::open_with_overrides(root, mode, &ResourceOverrides::default())
     }
 
+    /// Build a database entirely in memory from schemas that were never written.
+    ///
+    /// A folder of JSON with no `.db/` is still a readable relational database:
+    /// the schemas that describe it can be inferred without persisting them, and
+    /// a read can then be answered against the files as they are. Read-only
+    /// operation promises zero writes, so it cannot bootstrap -- but refusing to
+    /// answer at all would make `--readonly` useless on exactly the folders it
+    /// most needs to inspect.
+    ///
+    /// The result carries no manifest and records no provenance, because nothing
+    /// was accepted: this is an observation, not a revision.
+    pub fn ephemeral(
+        root: PathBuf,
+        schemas: std::collections::BTreeMap<String, crate::schema::Schema>,
+        overrides: &ResourceOverrides,
+    ) -> Result<Self> {
+        let validation_started = std::time::Instant::now();
+        // An absent `.db/config` yields defaults; one that exists but cannot be
+        // read is a fault the user must see. Falling back to defaults here would
+        // answer the query under settings they never chose.
+        let mut config = load_config(&root)?;
+        config.apply_overrides(overrides);
+        config.validate().map_err(|message| {
+            DbError::new(
+                "RESOURCE_LIMIT",
+                format!("invalid command-line resource limit: {message}"),
+                1,
+            )
+        })?;
+        let catalog = Catalog::observe_with_schemas(&root, &config, schemas)?;
+        let diagnostics = integrity::validate(&catalog);
+        Ok(Self {
+            root,
+            config,
+            catalog,
+            diagnostics,
+            manifest: None,
+            external_changes: vec![],
+            validation_elapsed: validation_started.elapsed(),
+            manifest_needs_rebuild: false,
+            resource_overrides: overrides.clone(),
+        })
+    }
+
     pub fn open_with_overrides(
         root: PathBuf,
         mode: ObserveMode,
@@ -435,7 +479,7 @@ mod tests {
     /// arrives as a number, and bare text is taken as a string rather than being
     /// rejected -- `db get users abc` must work without shell quoting games.
     #[test]
-    fn test9999_primary_key_arguments_decode_json_then_fall_back_to_text() {
+    fn test1021_primary_key_arguments_decode_json_then_fall_back_to_text() {
         assert_eq!(json_key_arg("123").unwrap(), Value::from(123));
         assert_eq!(json_key_arg("1.5").unwrap(), Value::from(1.5));
         assert_eq!(json_key_arg("true").unwrap(), Value::Bool(true));
@@ -462,7 +506,7 @@ mod tests {
     /// on a different database than the one they pointed at would be a surprise
     /// no diagnostic could undo.
     #[test]
-    fn test9999_an_explicitly_named_root_is_used_exactly() {
+    fn test1022_an_explicitly_named_root_is_used_exactly() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("child");
         fs::create_dir_all(&nested).unwrap();
@@ -479,7 +523,7 @@ mod tests {
     /// Section 65: the on-disk format is explicitly versioned and an unsupported
     /// version is refused rather than interpreted optimistically.
     #[test]
-    fn test9999_unsupported_formats_are_refused() {
+    fn test1023_unsupported_formats_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         init_layout(dir.path(), false).unwrap();
         validate_format(dir.path()).expect("a freshly written format is supported");
@@ -500,7 +544,7 @@ mod tests {
     /// Section 50: initialisation writes the metadata layout a clone needs, and
     /// ignores derived state so only authoritative files are versioned.
     #[test]
-    fn test9999_initialisation_writes_the_documented_layout() {
+    fn test1024_initialisation_writes_the_documented_layout() {
         let dir = tempfile::tempdir().unwrap();
         init_layout(dir.path(), false).unwrap();
         for expected in [
@@ -530,7 +574,7 @@ mod tests {
     /// Section 50: `--track-provenance` opts history into version control, which
     /// is a different ignore policy from the default.
     #[test]
-    fn test9999_tracked_provenance_changes_the_ignore_policy() {
+    fn test1025_tracked_provenance_changes_the_ignore_policy() {
         let default_dir = tempfile::tempdir().unwrap();
         init_layout(default_dir.path(), false).unwrap();
         let default_ignore = fs::read_to_string(default_dir.path().join(".db/.gitignore")).unwrap();

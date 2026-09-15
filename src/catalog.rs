@@ -50,8 +50,35 @@ impl Catalog {
         })
     }
 
-    fn observe_bounded(root: &Path, config: &Config) -> Result<Self> {
-        let mut c = Self {
+    /// Observe using schemas supplied by the caller rather than read from
+    /// `schema/`.
+    ///
+    /// A folder of JSON with no `schema/` is still describable: inference can
+    /// produce the schemas without writing them, and the rows are then read and
+    /// validated exactly as they would be for a governed database. This is what
+    /// lets a read-only invocation answer over an unadopted folder without
+    /// creating anything.
+    ///
+    /// Row loading and validation are shared with `observe`, so there is one
+    /// interpretation of validity regardless of where the schemas came from.
+    /// The schemas carry no source bytes, which the only consumer -- lint's
+    /// location reporting -- already handles by omitting a location rather than
+    /// inventing one.
+    pub fn observe_with_schemas(
+        root: &Path,
+        config: &Config,
+        schemas: BTreeMap<String, Schema>,
+    ) -> Result<Self> {
+        crate::json::with_depth_limit(config.max_nesting_depth, || {
+            let mut c = Self::empty(root, config);
+            c.schemas = schemas;
+            c.load_rows(root, config)?;
+            Ok(c)
+        })
+    }
+
+    fn empty(root: &Path, config: &Config) -> Self {
+        Self {
             root: root.to_path_buf(),
             schemas: BTreeMap::new(),
             schema_sources: BTreeMap::new(),
@@ -59,7 +86,11 @@ impl Catalog {
             diagnostics: vec![],
             warnings: vec![],
             indentation_width: config.indentation_width,
-        };
+        }
+    }
+
+    fn observe_bounded(root: &Path, config: &Config) -> Result<Self> {
+        let mut c = Self::empty(root, config);
         let schema_dir = root.join("schema");
         if !schema_dir.is_dir() {
             c.diagnostics.push(
@@ -166,19 +197,29 @@ impl Catalog {
                 Err(e) => c.diagnostics.push(*e.diagnostic),
             }
         }
-        validate_cross(&c.schemas, &mut c.diagnostics);
+        c.load_rows(root, config)?;
+        Ok(c)
+    }
+    pub fn row_count(&self) -> usize {
+        self.rows.values().map(Vec::len).sum()
+    }
+
+    /// Validate the schema set, read every governed row, and report top-level
+    /// directories that no schema claims.
+    fn load_rows(&mut self, root: &Path, config: &Config) -> Result<()> {
+        validate_cross(&self.schemas, &mut self.diagnostics);
         let ignores = config
             .ignore_set()
             .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error, 6))?;
-        for (table, s) in &c.schemas {
+        for (table, s) in &self.schemas {
             let dir = root.join(table);
-            c.rows.insert(table.clone(), vec![]);
+            self.rows.insert(table.clone(), vec![]);
             if !dir.exists() {
                 continue;
             }
             let md = fs::symlink_metadata(&dir).map_err(|e| DbError::io(&dir, e))?;
             if !md.file_type().is_dir() {
-                c.diagnostics.push(
+                self.diagnostics.push(
                     Diagnostic::error("NON_REGULAR_FILE", "table path must be a directory")
                         .at(table),
                 );
@@ -198,7 +239,7 @@ impl Catalog {
                 }
                 let norm: String = name.nfc().flat_map(char::to_lowercase).collect();
                 if !names.insert(norm) {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error(
                             "PATH_COLLISION",
                             "row paths collide under case-insensitive normalization",
@@ -209,7 +250,7 @@ impl Catalog {
                 }
                 let md = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
                 if !md.file_type().is_file() {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error(
                             if md.file_type().is_dir() {
                                 "UNEXPECTED_FILE"
@@ -223,14 +264,14 @@ impl Catalog {
                     continue;
                 }
                 if has_multiple_links(&md) {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error("NON_REGULAR_FILE", "hard-linked row files are rejected")
                             .at(rel),
                     );
                     continue;
                 }
                 if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error(
                             "UNEXPECTED_FILE",
                             "governed table entries must be .json files",
@@ -240,7 +281,7 @@ impl Catalog {
                     continue;
                 }
                 if md.len() > config.max_json_file_size {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error(
                             "RESOURCE_LIMIT",
                             format!("file exceeds {} byte limit", config.max_json_file_size),
@@ -252,7 +293,7 @@ impl Catalog {
                 let raw = match fs::read(&path) {
                     Ok(v) => v,
                     Err(e) => {
-                        c.diagnostics
+                        self.diagnostics
                             .push(Diagnostic::error("INVALID_JSON", e.to_string()).at(rel));
                         continue;
                     }
@@ -263,7 +304,7 @@ impl Catalog {
                         // A document that is well formed but too deep is a
                         // resource-limit refusal, not malformed JSON.
                         if crate::json::is_depth_limit(&e) {
-                            c.diagnostics.push(
+                            self.diagnostics.push(
                                 Diagnostic::error(
                                     "RESOURCE_LIMIT",
                                     format!(
@@ -284,12 +325,12 @@ impl Catalog {
                             .lines()
                             .nth(e.line().saturating_sub(1))
                             .map(String::from);
-                        c.diagnostics.push(d);
+                        self.diagnostics.push(d);
                         continue;
                     }
                 };
                 let Some(obj) = val.as_object() else {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error("ROW_ROOT_NOT_OBJECT", "row JSON root must be an object")
                             .at(rel)
                             .table(table),
@@ -298,7 +339,7 @@ impl Catalog {
                 };
                 let expected = crate::canonical::filename(s, obj);
                 if expected.as_deref() != Some(name) {
-                    c.diagnostics.push(
+                    self.diagnostics.push(
                         Diagnostic::error(
                             "IDENTITY_MISMATCH",
                             format!("filename {name:?} does not match row identity"),
@@ -312,7 +353,7 @@ impl Catalog {
                         .fix("FIX_RENAME_TO_IDENTITY"),
                     );
                 }
-                c.rows.get_mut(table).unwrap().push(Row {
+                self.rows.get_mut(table).unwrap().push(Row {
                     table: table.clone(),
                     path,
                     relative: rel,
@@ -324,14 +365,14 @@ impl Catalog {
         for entry in read_dir_sorted(root)? {
             let name = entry.file_name().and_then(|x| x.to_str()).unwrap_or("");
             if matches!(name, "schema" | ".db" | ".git")
-                || c.schemas.contains_key(name)
+                || self.schemas.contains_key(name)
                 || ignores.is_match(name)
             {
                 continue;
             }
             let md = fs::symlink_metadata(&entry).map_err(|e| DbError::io(&entry, e))?;
             if md.is_dir() {
-                c.warnings.push(
+                self.warnings.push(
                     Diagnostic::warning(
                         "UNGOVERNED_DIRECTORY",
                         format!("top-level directory {name:?} has no schema"),
@@ -343,10 +384,7 @@ impl Catalog {
                 );
             }
         }
-        Ok(c)
-    }
-    pub fn row_count(&self) -> usize {
-        self.rows.values().map(Vec::len).sum()
+        Ok(())
     }
 }
 
@@ -635,7 +673,7 @@ mod tests {
     /// Section 11: a foreign key must reference a table that exists, name real
     /// columns on both sides, and target a key that actually identifies a row.
     #[test]
-    fn test9999_foreign_keys_must_reference_a_real_unique_target() {
+    fn test1008_foreign_keys_must_reference_a_real_unique_target() {
         let mut child = schema(
             "b",
             &[
@@ -680,7 +718,7 @@ mod tests {
     /// Section 11: referencing and referenced column types must be identical, so
     /// a key can never be compared across incompatible representations.
     #[test]
-    fn test9999_foreign_key_column_types_must_match_exactly() {
+    fn test1009_foreign_key_column_types_must_match_exactly() {
         let mut child = schema(
             "b",
             &[
@@ -708,7 +746,7 @@ mod tests {
     /// Section 11: arity must match and neither side may repeat a column,
     /// because a malformed pairing has no defined meaning.
     #[test]
-    fn test9999_foreign_key_column_lists_must_be_well_formed() {
+    fn test1010_foreign_key_column_lists_must_be_well_formed() {
         let mut child = schema(
             "b",
             &[
@@ -743,7 +781,7 @@ mod tests {
     /// Section 11: set_null needs somewhere to put the null and set_default
     /// needs a default to restore, otherwise the action could not be executed.
     #[test]
-    fn test9999_referential_actions_require_columns_that_can_hold_them() {
+    fn test1011_referential_actions_require_columns_that_can_hold_them() {
         let mut child = schema(
             "b",
             &[
@@ -774,7 +812,7 @@ mod tests {
     /// Section 11: a cycle in which every edge cascades has no defined
     /// termination, and is rejected for delete and update edges independently.
     #[test]
-    fn test9999_all_cascade_cycles_are_rejected_per_action() {
+    fn test1012_all_cascade_cycles_are_rejected_per_action() {
         let cyclic = |action: Action| {
             let mut a = schema(
                 "a",
@@ -825,7 +863,7 @@ mod tests {
     /// Type identity is structural: two columns agree only when their nested
     /// shapes agree, so a foreign key cannot bridge differently shaped values.
     #[test]
-    fn test9999_column_type_identity_is_structural() {
+    fn test1013_column_type_identity_is_structural() {
         let plain = column(ColumnType::String, false);
         assert!(same_column_type(&plain, &plain, true));
         assert!(!same_column_type(
@@ -872,7 +910,7 @@ mod tests {
     /// A schema with no storage override names files by its primary key, which
     /// the observer relies on to map a row to its path.
     #[test]
-    fn test9999_filename_columns_track_the_storage_declaration() {
+    fn test1014_filename_columns_track_the_storage_declaration() {
         let mut s = schema(
             "t",
             &[

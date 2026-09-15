@@ -170,7 +170,7 @@ mod tests {
     /// nonsensical state that must be rejected rather than silently treated as
     /// "unlimited" or as an immediate failure of every operation.
     #[test]
-    fn test9999_zero_limits_are_rejected() {
+    fn test1015_zero_limits_are_rejected() {
         for mutate in [
             (|c: &mut Config| c.indentation_width = 0) as fn(&mut Config),
             |c: &mut Config| c.max_json_file_size = 0,
@@ -196,7 +196,7 @@ mod tests {
     /// invalid configuration rather than a pattern that silently matches
     /// nothing.
     #[test]
-    fn test9999_invalid_ignore_globs_are_rejected() {
+    fn test1016_invalid_ignore_globs_are_rejected() {
         let mut config = Config {
             ignore: vec!["[unclosed".into()],
             ..Default::default()
@@ -213,7 +213,7 @@ mod tests {
 
     /// The default ignore list covers the editor artefacts named in Section 54.
     #[test]
-    fn test9999_default_ignores_cover_editor_artefacts() {
+    fn test1017_default_ignores_cover_editor_artefacts() {
         let set = Config::default().ignore_set().unwrap();
         for ignored in [".DS_Store", "row.json~", "row.swp", ".gitkeep"] {
             assert!(set.is_match(ignored), "{ignored} should be ignored");
@@ -224,7 +224,7 @@ mod tests {
     /// Section 61: a command-line limit overrides the stored configuration, and
     /// an unset override leaves the stored value untouched.
     #[test]
-    fn test9999_overrides_replace_only_what_they_specify() {
+    fn test1018_overrides_replace_only_what_they_specify() {
         let mut config = Config {
             max_result_rows: 500,
             timeout_seconds: Some(30),
@@ -251,7 +251,7 @@ mod tests {
     /// Configuration is authoritative state (Section 7): an unknown key is a
     /// mistake to surface, not a field to ignore.
     #[test]
-    fn test9999_unknown_configuration_keys_are_rejected() {
+    fn test1019_unknown_configuration_keys_are_rejected() {
         let parsed: std::result::Result<Config, _> =
             serde_json::from_str(r#"{"indentation_width":2,"typo_key":1}"#);
         assert!(parsed.is_err());
@@ -260,7 +260,7 @@ mod tests {
     /// Omitted keys fall back to documented defaults so an existing database
     /// keeps working when a new limit is introduced.
     #[test]
-    fn test9999_omitted_keys_take_documented_defaults() {
+    fn test1020_omitted_keys_take_documented_defaults() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.indentation_width, 2);
         assert_eq!(config.enum_max_values, 10);

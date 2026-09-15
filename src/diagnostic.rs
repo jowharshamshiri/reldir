@@ -213,7 +213,7 @@ mod tests {
     /// record carries its kind, severity, code, and message, and optional fields
     /// are omitted rather than serialised as null.
     #[test]
-    fn test9999_diagnostics_serialise_to_the_documented_shape() {
+    fn test1026_diagnostics_serialise_to_the_documented_shape() {
         let diagnostic = Diagnostic::error("FOREIGN_KEY_VIOLATION", "posts.user_id is an orphan")
             .at("posts/42.json")
             .table("posts")
@@ -261,7 +261,7 @@ mod tests {
 
     /// Section 52: each severity serialises to its documented lowercase name.
     #[test]
-    fn test9999_severities_serialise_in_lowercase() {
+    fn test1027_severities_serialise_in_lowercase() {
         for (diagnostic, expected) in [
             (Diagnostic::error("C", "m"), "error"),
             (Diagnostic::warning("C", "m"), "warning"),
@@ -279,7 +279,7 @@ mod tests {
     /// format faults outrank an incomplete transaction, which outranks an
     /// ordinary invalid database, and a clean run exits zero.
     #[test]
-    fn test9999_diagnostic_exit_codes_follow_the_documented_precedence() {
+    fn test1028_diagnostic_exit_codes_follow_the_documented_precedence() {
         assert_eq!(exit_code_for_diagnostics(&[]), 0);
         assert_eq!(
             exit_code_for_diagnostics(&[Diagnostic::error("FOREIGN_KEY_VIOLATION", "m")]),
@@ -308,7 +308,7 @@ mod tests {
 
     /// Errors raised by the CLI carry the exit status their kind implies.
     #[test]
-    fn test9999_error_constructors_carry_their_exit_status() {
+    fn test1029_error_constructors_carry_their_exit_status() {
         assert_eq!(DbError::usage("bad flag").exit_code(), 1);
         assert_eq!(DbError::usage("bad flag").diagnostic.code, "USAGE");
         assert_eq!(DbError::invalid("bad state").exit_code(), 2);

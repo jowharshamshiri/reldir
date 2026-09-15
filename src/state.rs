@@ -606,7 +606,7 @@ mod tests {
     /// observation must say so rather than reporting an error a user would
     /// have to resolve before asking their first question.
     #[test]
-    fn test9999_an_empty_folder_observes_as_empty() {
+    fn test1092_an_empty_folder_observes_as_empty() {
         let directory = tempfile::tempdir().unwrap();
         let observed = observe(directory.path()).unwrap();
         assert_eq!(observed.format, FormatState::Absent);
@@ -618,7 +618,7 @@ mod tests {
     /// in a project is not a table: a tool that recursively adopted arbitrary
     /// files would consume directories the user never meant to govern.
     #[test]
-    fn test9999_table_candidates_are_immediate_children_only() {
+    fn test1093_table_candidates_are_immediate_children_only() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
@@ -642,7 +642,7 @@ mod tests {
     /// Rows at the root have no table identity. Inventing a name would be an
     /// irreversible guess, so establishment refuses and explains instead.
     #[test]
-    fn test9999_loose_root_json_is_refused_rather_than_guessed() {
+    fn test1094_loose_root_json_is_refused_rather_than_guessed() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(&root.join("a.json"), "{\"id\":\"a\"}\n");
@@ -661,7 +661,7 @@ mod tests {
     /// holds schemas. JSON Schema documents and migrations must not capture an
     /// unrelated project.
     #[test]
-    fn test9999_schema_marker_recognition_is_structural() {
+    fn test1095_schema_marker_recognition_is_structural() {
         let unrelated = tempfile::tempdir().unwrap();
         write(
             &unrelated.path().join("schema/openapi.json"),
@@ -691,7 +691,7 @@ mod tests {
     /// Diagnostic commands observe without establishing. A command that reports
     /// what is wrong must not change what it reports on.
     #[test]
-    fn test9999_diagnostic_requirements_establish_nothing() {
+    fn test1096_diagnostic_requirements_establish_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
@@ -708,7 +708,7 @@ mod tests {
     /// there is nothing to govern, and creating metadata to say "empty" is
     /// ceremony.
     #[test]
-    fn test9999_an_empty_folder_establishes_nothing() {
+    fn test1097_an_empty_folder_establishes_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let observed = observe(directory.path()).unwrap();
         let transitions =
@@ -720,7 +720,7 @@ mod tests {
     /// Data with no metadata is adopted in one step, and the result is a real
     /// database: metadata, schemas, and a first revision.
     #[test]
-    fn test9999_ungoverned_data_is_adopted_without_ceremony() {
+    fn test1098_ungoverned_data_is_adopted_without_ceremony() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(
@@ -755,7 +755,7 @@ mod tests {
     /// An existing schema is authoritative intent. Establishment fills the gaps
     /// around it and never rewrites it.
     #[test]
-    fn test9999_existing_schemas_are_preserved_byte_for_byte() {
+    fn test1099_existing_schemas_are_preserved_byte_for_byte() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         // Deliberately non-canonical formatting, so any rewrite is detectable.
@@ -781,7 +781,7 @@ mod tests {
     /// Inference failure leaves nothing behind. A folder that could not be
     /// interpreted must look exactly as it did before the attempt.
     #[test]
-    fn test9999_failed_inference_writes_nothing() {
+    fn test1100_failed_inference_writes_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         // An array root cannot be a row, so inference cannot type this table.
@@ -798,7 +798,7 @@ mod tests {
     /// `.db/` that does not declare its format is never guessed at: reading a
     /// database under the wrong format could misinterpret every byte.
     #[test]
-    fn test9999_metadata_without_a_format_marker_is_refused() {
+    fn test1101_metadata_without_a_format_marker_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::create_dir_all(root.join(".db")).unwrap();
@@ -814,7 +814,7 @@ mod tests {
     /// A format this binary cannot read stops the operation rather than being
     /// bootstrapped over.
     #[test]
-    fn test9999_unsupported_format_is_refused() {
+    fn test1102_unsupported_format_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(
@@ -832,7 +832,7 @@ mod tests {
     /// the folder, which is what makes read-only operation possible on
     /// ungoverned data.
     #[test]
-    fn test9999_ephemeral_schemas_leave_the_folder_untouched() {
+    fn test1103_ephemeral_schemas_leave_the_folder_untouched() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(
@@ -851,7 +851,7 @@ mod tests {
     /// user supplied could operate on a different database than the one they
     /// named.
     #[test]
-    fn test9999_an_explicit_root_is_never_walked_upward_from() {
+    fn test1104_an_explicit_root_is_never_walked_upward_from() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         std::fs::create_dir_all(root.join(".db")).unwrap();

@@ -76,10 +76,6 @@ pub struct Cli {
     /// instead of creating it, which is the posture CI and debugging want.
     #[arg(long, global = true)]
     no_auto: bool,
-    /// Authorize transitions that would replace or discard authoritative state.
-    /// Authorization alone never selects between competing resolutions.
-    #[arg(long, global = true)]
-    allow_destructive: bool,
     /// SQL to execute when no subcommand is given.
     #[arg(value_name = "SQL")]
     sql: Option<String>,
@@ -632,7 +628,28 @@ pub fn run(cli: Cli) -> Result<i32> {
             } else {
                 ObserveMode::RECORD
             };
-            let mut db = Database::open_with_overrides(root, mode, &resource_overrides)?;
+            // The folder holds data but carries no metadata. An invocation that
+            // *cannot* write still owes an answer, so the relational model is
+            // built in memory and the files are read exactly as they are.
+            //
+            // Being unable to write is not the same as having been told not to
+            // establish. `--no-auto` asks to be shown what is missing rather
+            // than have it worked around, and a diagnostic's whole job is to
+            // report the folder's state -- answering from an invented model
+            // would conceal the very thing they were run to reveal. Both fall
+            // through and surface UNINITIALIZED.
+            let cannot_write = settings.readonly;
+            let establishes_on_demand = matches!(command, Command::Shell);
+            let answers_ephemerally =
+                !cli.no_auto && (cannot_write || establishes_on_demand) && !diagnostic_only;
+            let mut db = if observation.format == crate::state::FormatState::Absent
+                && answers_ephemerally
+            {
+                let schemas = crate::state::ephemeral_schemas(&observation, &resource_overrides)?;
+                Database::ephemeral(root, schemas, &resource_overrides)?
+            } else {
+                Database::open_with_overrides(root, mode, &resource_overrides)?
+            };
             if settings.readonly {
                 for warning in db.catalog.warnings.iter().filter(|warning| {
                     matches!(

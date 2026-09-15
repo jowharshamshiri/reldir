@@ -592,7 +592,7 @@ mod tests {
     /// `schema`, and must avoid Windows reserved device names so that every
     /// governed directory is portable.
     #[test]
-    fn test9999_table_names_are_restricted_and_portable() {
+    fn test1077_table_names_are_restricted_and_portable() {
         for accepted in ["users", "u", "a_b", "t1", "order_items"] {
             assert!(valid_name(accepted), "{accepted} should be a valid name");
         }
@@ -627,7 +627,7 @@ mod tests {
     /// Section 11: the schema's `table` must equal its file stem, so a renamed
     /// schema file cannot silently govern a different relation.
     #[test]
-    fn test9999_table_must_equal_the_file_stem() {
+    fn test1078_table_must_equal_the_file_stem() {
         let s = base(&[("id", column(ColumnType::String))], &["id"]);
         assert!(
             s.validate_local("t")
@@ -644,7 +644,7 @@ mod tests {
     /// Section 11: a schema may pin its grammar version; an unsupported pin is a
     /// format error rather than a best-effort interpretation.
     #[test]
-    fn test9999_a_pinned_unsupported_grammar_is_refused() {
+    fn test1079_a_pinned_unsupported_grammar_is_refused() {
         let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
         s.schema_format = Some(crate::FORMAT_VERSION);
         assert!(!codes(&s).contains(&"FORMAT_UNSUPPORTED".to_string()));
@@ -655,7 +655,7 @@ mod tests {
     /// Section 11: required elements are required, and the primary key must name
     /// real, non-nullable, non-repeating columns.
     #[test]
-    fn test9999_primary_keys_must_name_real_non_nullable_columns() {
+    fn test1080_primary_keys_must_name_real_non_nullable_columns() {
         let mut missing = base(&[("id", column(ColumnType::String))], &["ghost"]);
         assert!(codes(&missing).contains(&"SCHEMA_PK_COLUMN_UNKNOWN".to_string()));
 
@@ -677,7 +677,7 @@ mod tests {
     /// Section 10: storage.filename must identify rows uniquely and never be
     /// nullable, otherwise two rows could claim one path.
     #[test]
-    fn test9999_filename_columns_must_be_unique_and_not_null() {
+    fn test1081_filename_columns_must_be_unique_and_not_null() {
         let mut s = base(
             &[
                 ("id", column(ColumnType::String)),
@@ -703,7 +703,7 @@ mod tests {
     /// Section 11: every constraint column list must be non-empty, free of
     /// repeats, and name declared columns.
     #[test]
-    fn test9999_constraint_column_lists_are_validated() {
+    fn test1082_constraint_column_lists_are_validated() {
         let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
         s.unique = vec![vec![]];
         assert!(codes(&s).contains(&"SCHEMA_COLUMN_UNKNOWN".to_string()));
@@ -719,7 +719,7 @@ mod tests {
     /// Section 11: type-specific members belong only to their own type, and a
     /// declared default must match the column it defaults.
     #[test]
-    fn test9999_type_specific_members_are_strict() {
+    fn test1083_type_specific_members_are_strict() {
         // enum requires values; values are meaningless elsewhere.
         let mut enumeration = column(ColumnType::Enum);
         let s = base(
@@ -780,7 +780,7 @@ mod tests {
     /// Section 11: a generated column must be generated in a way its type can
     /// represent, and cannot also carry a default.
     #[test]
-    fn test9999_generated_columns_match_their_type() {
+    fn test1084_generated_columns_match_their_type() {
         for (kind, generated, valid) in [
             (ColumnType::Uuid, GeneratedKind::Uuid, true),
             (ColumnType::Ulid, GeneratedKind::Ulid, true),
@@ -808,7 +808,7 @@ mod tests {
     /// Section 11: nested column definitions are validated recursively, so a
     /// fault inside an array's items or an object's properties is still caught.
     #[test]
-    fn test9999_nested_column_definitions_are_validated_recursively() {
+    fn test1085_nested_column_definitions_are_validated_recursively() {
         // An array whose items are an enum without values.
         let mut items = column(ColumnType::Enum);
         items.values = None;
@@ -834,7 +834,7 @@ mod tests {
     /// Section 11: check constraints need a name and a non-empty expression, and
     /// names must be distinct within a table.
     #[test]
-    fn test9999_check_constraints_require_distinct_names_and_expressions() {
+    fn test1086_check_constraints_require_distinct_names_and_expressions() {
         let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
         s.check = vec![Check {
             name: String::new(),
@@ -864,7 +864,7 @@ mod tests {
     /// A schema exercising many features at once must validate cleanly, so the
     /// rules above reject faults rather than well-formed schemas.
     #[test]
-    fn test9999_a_fully_featured_valid_schema_reports_nothing() {
+    fn test1087_a_fully_featured_valid_schema_reports_nothing() {
         let mut id = column(ColumnType::Uuid);
         id.generated = Some(Generated {
             kind: GeneratedKind::Uuid,

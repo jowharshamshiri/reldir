@@ -645,7 +645,7 @@ mod tests {
     /// Anything that could escape the database root, or reach into internal
     /// metadata that is not itself authoritative, is refused before staging.
     #[test]
-    fn test9999_unsafe_authoritative_paths_are_refused() {
+    fn test1105_unsafe_authoritative_paths_are_refused() {
         for rejected in [
             "../escape.json",
             "users/../../escape.json",
@@ -676,7 +676,7 @@ mod tests {
     /// describe that directory's staged bytes, so it is refused rather than
     /// guessed through.
     #[test]
-    fn test9999_journal_identity_must_match_its_directory() {
+    fn test1106_journal_identity_must_match_its_directory() {
         let id = uuid::Uuid::new_v4().to_string();
         let journal = Journal {
             id: id.clone(),
@@ -716,7 +716,7 @@ mod tests {
     /// means the journal was not written by this system and must not be
     /// replayed into authoritative state.
     #[test]
-    fn test9999_journal_origin_is_a_closed_set() {
+    fn test1107_journal_origin_is_a_closed_set() {
         let id = uuid::Uuid::new_v4().to_string();
         let directory = std::path::PathBuf::from("/tmp").join(&id);
         let journal = |origin: &str| Journal {
@@ -751,7 +751,7 @@ mod tests {
     /// Section 31: a journal must describe an unambiguous set of changes. A
     /// repeated path or a reused staged object would make replay order-dependent.
     #[test]
-    fn test9999_journals_reject_ambiguous_change_sets() {
+    fn test1108_journals_reject_ambiguous_change_sets() {
         let id = uuid::Uuid::new_v4().to_string();
         let directory = std::path::PathBuf::from("/tmp").join(&id);
         let with = |changes: Vec<JournalChange>| Journal {
