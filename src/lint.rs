@@ -16,6 +16,36 @@ fn analyzable(schema: &crate::schema::Schema) -> bool {
             .all(|column| schema.columns.contains_key(column))
 }
 
+/// Anchor a finding to the schema that declares the thing it is about.
+///
+/// Every schema-level finding is resolved by editing `schema/<table>.json`, so
+/// that is the file a reader needs. `anchor` -- a column name, or the table name
+/// for table-level findings -- locates the declaration within it. The location is
+/// reported only when the schema's original text was retained; a diagnostic never
+/// points at a position that was guessed (Section 75).
+fn in_schema(diagnostic: Diagnostic, c: &Catalog, table: &str, anchor: &str) -> Diagnostic {
+    let mut diagnostic = diagnostic.at(format!("schema/{table}.json"));
+    if let Some(source) = c.schema_sources.get(table) {
+        diagnostic.location = crate::integrity::locate(source, anchor);
+        if let Some(location) = &diagnostic.location {
+            diagnostic.source_line = std::str::from_utf8(source)
+                .ok()
+                .and_then(|text| text.lines().nth(location.line.saturating_sub(1)))
+                .map(str::to_string);
+        }
+    }
+    diagnostic
+}
+
+/// Anchor a finding to a row file that exhibits it.
+///
+/// Findings about the rows themselves -- how they are formatted, which fields
+/// they carry -- are properties of particular files, so they name one rather than
+/// leaving the reader to search the table for it.
+fn in_row(diagnostic: Diagnostic, row: &crate::catalog::Row) -> Diagnostic {
+    diagnostic.at(row.relative.clone())
+}
+
 pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic> {
     let mut out = vec![];
     for (table, s) in &c.schemas {
@@ -24,23 +54,29 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
         }
         let rows = &c.rows[table];
         if s.inferred.is_some() {
-            out.push(
+            out.push(in_schema(
                 Diagnostic::warning(
                     "LINT_SCHEMA_UNREVIEWED",
                     format!("schema {table:?} was inferred and has not been accepted"),
                 )
                 .table(table)
                 .fix("FIX_ACCEPT_INFERRED"),
-            );
+                c,
+                table,
+                "inferred",
+            ));
         }
         if s.additional_fields == crate::schema::AdditionalFields::Allow {
-            out.push(
+            out.push(in_schema(
                 Diagnostic::warning(
                     "LINT_ADDITIONAL_FIELDS_ALLOWED",
                     format!("{table} permits unknown row fields"),
                 )
                 .table(table),
-            );
+                c,
+                table,
+                "additional_fields",
+            ));
         }
         for (name, col) in &s.columns {
             let physical_values: Vec<_> = rows.iter().map(|r| r.value.get(name)).collect();
@@ -52,7 +88,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 && col.nullable
                 && values.iter().all(|v| v.is_some_and(|v| !v.is_null()))
             {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::warning(
                         "LINT_NULLABLE_NEVER_NULL",
                         format!("{table}.{name} is nullable but no row is null"),
@@ -60,28 +96,40 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .table(table)
                     .field(name)
                     .fix("FIX_TIGHTEN_NULLABLE"),
-                );
+                    c,
+                    table,
+                    name,
+                ));
             }
             if !rows.is_empty() && values.iter().all(|v| v.is_none_or(|v| v.is_null())) {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::warning(
                         "LINT_COLUMN_NEVER_POPULATED",
                         format!("{table}.{name} is never populated"),
                     )
                     .table(table)
                     .field(name),
-                );
+                    c,
+                    table,
+                    name,
+                ));
             }
             let present = physical_values.iter().filter(|v| v.is_some()).count();
-            if present > 0 && present < rows.len() {
-                out.push(
+            if present > 0
+                && present < rows.len()
+                && let Some(absent) = rows.iter().find(|row| !row.value.contains_key(name))
+            {
+                // A row that actually lacks the field, so the reader can see the
+                // inconsistency rather than search the table for an example.
+                out.push(in_row(
                     Diagnostic::warning(
                         "LINT_INCONSISTENT_PRESENCE",
                         format!("{table}.{name} is present in {present}/{} rows", rows.len()),
                     )
                     .table(table)
                     .field(name),
-                );
+                    absent,
+                ));
             }
             if col.kind == ColumnType::String {
                 let strings: Vec<_> = values
@@ -119,7 +167,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     None
                 };
                 if let Some(kind) = narrower {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::warning(
                             "LINT_WIDER_TYPE",
                             format!("{table}.{name} can be narrowed from string to {kind}"),
@@ -127,11 +175,14 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_NARROW_TYPE"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                 }
                 let distinct: HashSet<_> = strings.iter().copied().collect();
                 if strings.len() >= 3 * distinct.len() && distinct.len() <= config.enum_max_values {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::suggestion(
                             "LINT_ENUM_CANDIDATE",
                             format!("{table}.{name} has {} distinct values", distinct.len()),
@@ -139,7 +190,10 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_ADD_ENUM"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                 }
             }
             if col.kind == ColumnType::Float
@@ -150,7 +204,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     value.is_none_or(|value| value.is_null() || value.as_i64().is_some())
                 })
             {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::warning(
                         "LINT_WIDER_TYPE",
                         format!("{table}.{name} can be narrowed from float to int"),
@@ -158,7 +212,10 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .table(table)
                     .field(name)
                     .fix("FIX_NARROW_TYPE"),
-                );
+                    c,
+                    table,
+                    name,
+                ));
             }
             let nonnull: Vec<_> = values
                 .iter()
@@ -174,7 +231,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .map(|v| crate::canonical::compact(v))
                     .collect();
                 if distinct.len() == rows.len() {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::suggestion(
                             "LINT_UNIQUE_CANDIDATE",
                             format!("{table}.{name} has {} distinct values", distinct.len()),
@@ -182,7 +239,10 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_ADD_UNIQUE"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                 }
             }
             if rows.len() >= config.unique_min_rows && !nonnull.is_empty() {
@@ -192,7 +252,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         check.expr == format!("\"{}\" >= 0", name.replace('"', "\"\""))
                     })
                 {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::suggestion(
                             "LINT_CHECK_CANDIDATE",
                             format!("{table}.{name} is never negative"),
@@ -200,7 +260,10 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_ADD_CHECK"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                 }
                 if col.kind == ColumnType::String
                     && nonnull
@@ -210,7 +273,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         check.expr == format!("\"{}\" <> ''", name.replace('"', "\"\""))
                     })
                 {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::suggestion(
                             "LINT_CHECK_CANDIDATE",
                             format!("{table}.{name} is never empty"),
@@ -218,23 +281,29 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_ADD_CHECK"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                 }
             }
             if descriptions && col.description.is_none() {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::suggestion(
                         "LINT_NO_DESCRIPTION",
                         format!("{table}.{name} has no description"),
                     )
                     .table(table)
                     .field(name),
-                );
+                    c,
+                    table,
+                    name,
+                ));
             }
         }
         for fk in &s.foreign_keys {
             if !s.indexes.iter().any(|i| i == &fk.columns) {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::warning(
                         "LINT_FK_NO_INDEX",
                         format!(
@@ -244,11 +313,15 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         ),
                     )
                     .table(table)
+                    .field(fk.columns.join(","))
                     .fix("FIX_ADD_INDEX"),
-                );
+                    c,
+                    table,
+                    &fk.columns[0],
+                ));
             }
             if fk.on_delete.is_none() || fk.on_update.is_none() {
-                out.push(
+                out.push(in_schema(
                     Diagnostic::warning(
                         "LINT_FK_ACTION_DEFAULTED",
                         format!(
@@ -257,8 +330,12 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                             fk.columns.join(",")
                         ),
                     )
-                    .table(table),
-                );
+                    .table(table)
+                    .field(fk.columns.join(",")),
+                    c,
+                    table,
+                    &fk.columns[0],
+                ));
             }
         }
         if s.primary_key
@@ -268,29 +345,43 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 .iter()
                 .any(|n| s.columns[n].generated.is_none())
         {
-            out.push(
+            out.push(in_schema(
                 Diagnostic::suggestion(
                     "LINT_PK_NOT_GENERATED",
                     format!("{table} primary key has no generator"),
                 )
-                .table(table),
-            );
+                .table(table)
+                .field(s.primary_key.join(",")),
+                c,
+                table,
+                &s.primary_key[0],
+            ));
         }
-        if rows.iter().any(|r| {
-            r.raw
-                != crate::canonical::pretty_with_indent(
-                    &crate::canonical::canonical_row(&r.value, s),
-                    config.indentation_width,
-                )
-        }) {
-            out.push(
+        let non_canonical: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.raw
+                    != crate::canonical::pretty_with_indent(
+                        &crate::canonical::canonical_row(&r.value, s),
+                        config.indentation_width,
+                    )
+            })
+            .collect();
+        if let Some(first) = non_canonical.first() {
+            // Formatting is a property of particular files, so name one and say
+            // how many share the finding.
+            out.push(in_row(
                 Diagnostic::info(
                     "LINT_NON_CANONICAL_FORMATTING",
-                    format!("{table} contains rows not in canonical formatting"),
+                    format!(
+                        "{table} contains {} row(s) not in canonical formatting",
+                        non_canonical.len()
+                    ),
                 )
                 .table(table)
                 .fix("FIX_CANONICALIZE"),
-            );
+                first,
+            ));
         }
         for (name, col) in &s.columns {
             if s.foreign_keys
@@ -329,7 +420,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     .map(crate::canonical::compact)
                     .collect();
                 if !values.is_empty() && values.iter().all(|v| targets.contains(v)) {
-                    out.push(
+                    out.push(in_schema(
                         Diagnostic::suggestion(
                             "LINT_FK_CANDIDATE",
                             format!("{table}.{name} values match {target}.{}", ts.primary_key[0]),
@@ -337,19 +428,25 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                         .table(table)
                         .field(name)
                         .fix("FIX_ADD_FK"),
-                    );
+                        c,
+                        table,
+                        name,
+                    ));
                     break;
                 }
             }
         }
         if descriptions && s.description.is_none() {
-            out.push(
+            out.push(in_schema(
                 Diagnostic::suggestion(
                     "LINT_NO_DESCRIPTION",
                     format!("table {table} has no description"),
                 )
                 .table(table),
-            );
+                c,
+                table,
+                "table",
+            ));
         }
     }
     out
@@ -422,6 +519,13 @@ mod tests {
             .collect();
         Catalog {
             root: PathBuf::from("/tmp"),
+            schema_sources: BTreeMap::from([(
+                table.clone(),
+                crate::canonical::pretty_with_indent(
+                    &serde_json::to_value(&schema).unwrap(),
+                    2,
+                ),
+            )]),
             schemas: BTreeMap::from([(table.clone(), schema)]),
             rows: BTreeMap::from([(table, rows)]),
             diagnostics: vec![],
@@ -572,6 +676,93 @@ mod tests {
         let catalog = catalog_with(s, &[json!({"id": "a"})]);
         assert!(!codes(&catalog, false).contains(&"LINT_NO_DESCRIPTION".to_string()));
         assert!(codes(&catalog, true).contains(&"LINT_NO_DESCRIPTION".to_string()));
+    }
+
+    /// Section 75: a diagnostic identifies where the problem is. A lint finding
+    /// that names only a table leaves the reader to hunt for the file, so every
+    /// finding carries a path: schema-level findings point at the schema that
+    /// declares the offending thing, and row-level findings name a row that
+    /// actually exhibits it.
+    #[test]
+    fn test9999_every_finding_identifies_a_file() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("maybe", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        s.inferred = Some(crate::schema::Inferred {
+            at: "2026-09-15T00:00:00Z".into(),
+            rows: 2,
+            strictness: "balanced".into(),
+            evidence: BTreeMap::new(),
+        });
+        // Rows differ in whether `maybe` is present, and are not canonical, so
+        // both schema-level and row-level findings are produced at once.
+        let catalog = catalog_with(
+            s,
+            &[
+                json!({"id": "a", "maybe": "x"}),
+                json!({"id": "b"}),
+            ],
+        );
+        let findings = lint(&catalog, &Config::default(), true);
+        assert!(!findings.is_empty(), "expected findings to inspect");
+
+        for finding in &findings {
+            let path = finding
+                .path
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} carries no path", finding.code));
+            let path = path.to_string_lossy();
+            match finding.code.as_str() {
+                // Row-level findings name a row file.
+                "LINT_INCONSISTENT_PRESENCE" | "LINT_NON_CANONICAL_FORMATTING" => assert!(
+                    path.starts_with("t/"),
+                    "{} should name a row file, got {path}",
+                    finding.code
+                ),
+                // Everything else is fixed by editing the schema.
+                _ => assert_eq!(
+                    path, "schema/t.json",
+                    "{} should name the schema",
+                    finding.code
+                ),
+            }
+        }
+
+        // A schema-level finding locates the declaration inside the schema, so
+        // the reader is pointed at a line rather than a whole file.
+        let located = findings
+            .iter()
+            .find(|f| f.code == "LINT_SCHEMA_UNREVIEWED")
+            .expect("an unreviewed-schema finding");
+        let location = located
+            .location
+            .as_ref()
+            .expect("a schema finding carries a location");
+        assert!(location.line >= 1);
+        assert!(
+            located
+                .source_line
+                .as_deref()
+                .is_some_and(|line| line.contains("inferred")),
+            "the excerpt should show the declaration: {:?}",
+            located.source_line
+        );
+
+        // The row-level finding names the row that actually lacks the field,
+        // not merely the first row of the table.
+        let presence = findings
+            .iter()
+            .find(|f| f.code == "LINT_INCONSISTENT_PRESENCE")
+            .expect("an inconsistent-presence finding");
+        assert_eq!(
+            presence.path.as_ref().unwrap().to_string_lossy(),
+            "t/1.json",
+            "the named row must be the one missing the field"
+        );
     }
 
     /// Section 13: a uuid primary key without a generator is a suggestion, so

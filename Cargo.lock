@@ -553,7 +553,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jdb"
-version = "0.34.279"
+version = "0.35.296"
 dependencies = [
  "assert_cmd",
  "base64",

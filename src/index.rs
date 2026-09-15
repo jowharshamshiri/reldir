@@ -202,6 +202,7 @@ mod tests {
         Catalog {
             root: PathBuf::from("/tmp"),
             schemas: BTreeMap::from([(table.clone(), schema)]),
+            schema_sources: BTreeMap::new(),
             rows: BTreeMap::from([(table, rows)]),
             diagnostics: vec![],
             warnings: vec![],

@@ -24,6 +24,13 @@ pub struct Row {
 pub struct Catalog {
     pub root: PathBuf,
     pub schemas: BTreeMap<String, Schema>,
+    /// The bytes each schema was parsed from, keyed by table.
+    ///
+    /// Retained so that a finding about a schema can report where in the file
+    /// the offending declaration sits. Without the original text there is no
+    /// honest way to compute a line and column, and a diagnostic that points
+    /// nowhere is no better than one that points at the wrong place.
+    pub schema_sources: BTreeMap<String, Vec<u8>>,
     pub rows: BTreeMap<String, Vec<Row>>,
     pub diagnostics: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
@@ -47,6 +54,7 @@ impl Catalog {
         let mut c = Self {
             root: root.to_path_buf(),
             schemas: BTreeMap::new(),
+            schema_sources: BTreeMap::new(),
             rows: BTreeMap::new(),
             diagnostics: vec![],
             warnings: vec![],
@@ -147,6 +155,7 @@ impl Catalog {
                     let local = s.validate_local(stem);
                     c.diagnostics
                         .extend(local.into_iter().map(|d| d.at(rel.clone()).table(stem)));
+                    c.schema_sources.insert(stem.into(), schema_bytes);
                     if c.schemas.insert(stem.into(), s).is_some() {
                         c.diagnostics.push(
                             Diagnostic::error("PATH_COLLISION", "duplicate normalized schema path")

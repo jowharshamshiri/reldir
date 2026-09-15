@@ -244,7 +244,13 @@ pub fn rows_by_key<'a>(c: &'a Catalog, table: &str) -> BTreeMap<String, &'a crat
         .collect()
 }
 
-fn locate(raw: &[u8], field: &str) -> Option<crate::diagnostic::Location> {
+/// The line and column at which `field` is declared inside `raw`.
+///
+/// Shared with `lint` so that a finding about a schema column points at the
+/// column's declaration in `schema/<table>.json`, rather than every layer
+/// growing its own locator (Section 75: diagnostics identify line and column
+/// wherever applicable).
+pub(crate) fn locate(raw: &[u8], field: &str) -> Option<crate::diagnostic::Location> {
     let text = std::str::from_utf8(raw).ok()?;
     let needle = format!("\"{}\"", field.replace('"', "\\\""));
     let at = text.find(&needle)?;
