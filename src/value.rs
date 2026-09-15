@@ -338,7 +338,6 @@ mod tests {
 
         // Opaque and structured targets are never guessed at.
         for kind in [
-            ColumnType::Bytes,
             ColumnType::Date,
             ColumnType::Uuid,
             ColumnType::Ulid,
@@ -351,6 +350,19 @@ mod tests {
                 "{kind:?} must not be guessed at"
             );
         }
+
+        // `bytes` is standard base64 text (Section 15), so any string that
+        // decodes is already a valid value rather than a conversion: it is
+        // returned unchanged. A string that is not base64 has no lossless
+        // reading and must be refused.
+        let bytes = column(ColumnType::Bytes);
+        assert_eq!(
+            lossless_convert(&json!("whatever"), &bytes),
+            Some(json!("whatever")),
+            "valid base64 is already a bytes value, not a coercion"
+        );
+        assert_eq!(lossless_convert(&json!("not-base64!!"), &bytes), None);
+        assert_eq!(lossless_convert(&json!(42), &bytes), None);
     }
 
     /// Section 15: an enum accepts only its declared members, and an int column

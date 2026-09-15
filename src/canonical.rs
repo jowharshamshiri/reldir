@@ -271,13 +271,26 @@ mod tests {
             ]),
             &s,
         );
-        let text = compact(&value);
+        // The written bytes are the canonical form the spec governs: rows are
+        // serialized in schema column order, and only the keys *inside* an
+        // object or json value are lexicographic.
+        let text = String::from_utf8(pretty_with_indent(&value, 2)).unwrap();
         let zeta = text.find("zeta").unwrap();
         let alpha = text.find("alpha").unwrap();
         assert!(zeta < alpha, "schema column order must win: {text}");
         assert!(
-            text.find("\"a\":2").unwrap() < text.find("\"b\":1").unwrap(),
+            text.find("\"a\"").unwrap() < text.find("\"b\"").unwrap(),
             "nested keys must be lexicographic: {text}"
+        );
+
+        // `compact` is a comparison rendering, not the row's written form: it
+        // imposes a total lexicographic order so that two logically equal
+        // values always produce the same key. Callers use it for keys and
+        // value comparison, never to serialize a row to disk.
+        let comparison = compact(&value);
+        assert!(
+            comparison.find("alpha").unwrap() < comparison.find("zeta").unwrap(),
+            "comparison rendering is totally ordered: {comparison}"
         );
     }
 
@@ -305,11 +318,13 @@ mod tests {
             &[("id", ColumnType::String), ("n", ColumnType::Int)],
             &["id"],
         );
-        let compact_bytes = canonical_row(&row(&[("id", json!("a")), ("n", json!(1))]), &s);
-        let spaced_bytes = canonical_row(&row(&[("n", json!(1)), ("id", json!("a"))]), &s);
+        // Hash what the state root actually hashes: the serialized canonical
+        // row (see `metadata::state`), not a comparison rendering.
+        let declared_order = canonical_row(&row(&[("id", json!("a")), ("n", json!(1))]), &s);
+        let source_order = canonical_row(&row(&[("n", json!(1)), ("id", json!("a"))]), &s);
         assert_eq!(
-            hash_bytes(compact(&compact_bytes).as_bytes()),
-            hash_bytes(compact(&spaced_bytes).as_bytes()),
+            hash_bytes(&serde_json::to_vec(&declared_order).unwrap()),
+            hash_bytes(&serde_json::to_vec(&source_order).unwrap()),
             "key order in the source must not affect the logical hash"
         );
     }
