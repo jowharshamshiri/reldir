@@ -861,7 +861,7 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
         Command::Describe { table } => {
             db.require_valid()?;
             let s = db.catalog.schemas.get(&table).ok_or_else(|| {
-                DbError::new("UNKNOWN_TABLE", format!("unknown table {table:?}"), 4)
+                db.catalog.unknown_table(&table)
             })?;
             if format == Format::Table {
                 println!("{}", serde_json::to_string_pretty(s).unwrap());
@@ -3392,7 +3392,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
             }
             let mut schemas = db.catalog.schemas.clone();
             let mut renamed = schemas.remove(&table).ok_or_else(|| {
-                DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                db.catalog.unknown_table(&table)
             })?;
             renamed.table = new.clone();
             schemas.insert(new.clone(), renamed);
@@ -3727,11 +3727,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             }
             MigrationOperation::DropTable { table } => {
                 if schemas.remove(&table).is_none() {
-                    return Err(DbError::new(
-                        "UNKNOWN_TABLE",
-                        format!("unknown table {table}"),
-                        4,
-                    ));
+                    return Err(db.catalog.unknown_table(&table));
                 }
                 rows.remove(&table);
             }
@@ -3744,7 +3740,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                     ));
                 }
                 let mut s = schemas.remove(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 s.table = new.clone();
                 schemas.insert(new.clone(), s);
@@ -3766,7 +3762,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 default,
             } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 if s.columns.contains_key(&column) {
                     return Err(DbError::new(
@@ -3801,7 +3797,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             }
             MigrationOperation::DropColumn { table, column } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 if s.columns.shift_remove(&column).is_none() {
                     return Err(DbError::new(
@@ -3816,7 +3812,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             }
             MigrationOperation::RenameColumn { table, column, new } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 let index = s.columns.get_index_of(&column).ok_or_else(|| {
                     DbError::new("UNKNOWN_COLUMN", format!("unknown column {column}"), 4)
@@ -3860,7 +3856,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 let old_schema = schemas
                     .get(&table)
                     .ok_or_else(|| {
-                        DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                        db.catalog.unknown_table(&table)
                     })?
                     .clone();
                 let mut target_column =
@@ -3878,7 +3874,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         .collect::<Vec<_>>()
                         .join(" AND ");
                     for row in rows.get_mut(&table).ok_or_else(|| {
-                        DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                        db.catalog.unknown_table(&table)
                     })? {
                         let params: Vec<_> = s
                             .primary_key
@@ -3917,7 +3913,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                 } else {
                     let mut offenders = Vec::new();
                     let table_rows = rows.get_mut(&table).ok_or_else(|| {
-                        DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                        db.catalog.unknown_table(&table)
                     })?;
                     for (index, row) in table_rows.iter_mut().enumerate() {
                         if let Some(value) = row.get(&column) {
@@ -3955,19 +3951,19 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             }
             MigrationOperation::AddConstraint { table, definition } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 add_constraint(s, definition)?;
             }
             MigrationOperation::DropConstraint { table, name } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 drop_constraint(s, &name)?;
             }
             MigrationOperation::AddIndex { table, columns } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 if !s.indexes.contains(&columns) {
                     s.indexes.push(columns)
@@ -3975,7 +3971,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
             }
             MigrationOperation::DropIndex { table, columns } => {
                 let s = schemas.get_mut(&table).ok_or_else(|| {
-                    DbError::new("UNKNOWN_TABLE", format!("unknown table {table}"), 4)
+                    db.catalog.unknown_table(&table)
                 })?;
                 let n = s.indexes.len();
                 s.indexes.retain(|x| x != &columns);
@@ -4380,7 +4376,7 @@ fn schema_for<'a>(db: &'a Database, table: &str) -> Result<&'a Schema> {
     db.catalog
         .schemas
         .get(table)
-        .ok_or_else(|| DbError::new("UNKNOWN_TABLE", format!("unknown table {table:?}"), 4))
+        .ok_or_else(|| db.catalog.unknown_table(table))
 }
 fn find_row<'a>(db: &'a Database, table: &str, key: &str) -> Result<&'a crate::catalog::Row> {
     let s = schema_for(db, table)?;

@@ -519,6 +519,7 @@ mod tests {
             .collect();
         Catalog {
             root: PathBuf::from("/tmp"),
+            ungoverned: vec![],
             schema_sources: BTreeMap::from([(
                 table.clone(),
                 crate::canonical::pretty_with_indent(&serde_json::to_value(&schema).unwrap(), 2),

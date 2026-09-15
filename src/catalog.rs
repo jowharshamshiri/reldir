@@ -20,9 +20,23 @@ pub struct Row {
     pub raw: Vec<u8>,
 }
 
+/// What to tell someone holding a directory of rows the database does not
+/// govern. One text, so the `UNGOVERNED_DIRECTORY` warning and the
+/// `UNKNOWN_TABLE` error can never advise two different things.
+fn ungoverned_help(name: &str) -> String {
+    format!("run `db infer {name} --write` or add it to .db/config ignore")
+}
+
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pub root: PathBuf,
+    /// Top-level directories that hold data but no schema governs.
+    ///
+    /// Recorded by the observation that decides the question, so that anything
+    /// needing to know whether a name is an ungoverned directory reads the same
+    /// answer the `UNGOVERNED_DIRECTORY` warning was derived from. Deciding it a
+    /// second time elsewhere would let the two disagree.
+    pub ungoverned: Vec<String>,
     pub schemas: BTreeMap<String, Schema>,
     /// The bytes each schema was parsed from, keyed by table.
     ///
@@ -77,9 +91,27 @@ impl Catalog {
         })
     }
 
+    /// The `UNKNOWN_TABLE` error for a name this catalog does not govern.
+    ///
+    /// A directory of rows sitting unclaimed beside the database is the case
+    /// where the user is one command from what they wanted, so the error says
+    /// which command. Where no such directory exists the name is simply wrong --
+    /// a typo, a dropped table -- and advising inference of a directory that is
+    /// not there would send them after nothing.
+    pub fn unknown_table(&self, table: &str) -> DbError {
+        let diagnostic = Diagnostic::error("UNKNOWN_TABLE", format!("unknown table {table:?}"));
+        let diagnostic = if self.ungoverned.iter().any(|name| name == table) {
+            diagnostic.at(table).help(ungoverned_help(table))
+        } else {
+            diagnostic
+        };
+        DbError::from_diag(diagnostic, 4)
+    }
+
     fn empty(root: &Path, config: &Config) -> Self {
         Self {
             root: root.to_path_buf(),
+            ungoverned: vec![],
             schemas: BTreeMap::new(),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::new(),
@@ -372,15 +404,14 @@ impl Catalog {
             }
             let md = fs::symlink_metadata(&entry).map_err(|e| DbError::io(&entry, e))?;
             if md.is_dir() {
+                self.ungoverned.push(name.to_string());
                 self.warnings.push(
                     Diagnostic::warning(
                         "UNGOVERNED_DIRECTORY",
                         format!("top-level directory {name:?} has no schema"),
                     )
                     .at(name)
-                    .help(format!(
-                        "run `db infer {name} --write` or add it to .db/config ignore"
-                    )),
+                    .help(ungoverned_help(name)),
                 );
             }
         }

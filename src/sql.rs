@@ -89,6 +89,16 @@ pub fn execute_params_with_limits(
     params: &[SqlParam],
     limits: QueryLimits,
 ) -> Result<SqlResult> {
+    execute_params_inner(catalog, text, params, limits)
+        .map_err(|error| explain_unknown_table(catalog, error))
+}
+
+fn execute_params_inner(
+    catalog: &Catalog,
+    text: &str,
+    params: &[SqlParam],
+    limits: QueryLimits,
+) -> Result<SqlResult> {
     let token = statement_kind(text)?;
     enforce_query_workspace(catalog, text, &limits)?;
     let mut conn = load(catalog, true)?;
@@ -130,6 +140,20 @@ pub fn is_read_statement(text: &str) -> Result<bool> {
 }
 
 pub fn query_each_timeout<F>(
+    catalog: &Catalog,
+    text: &str,
+    params: &[SqlParam],
+    limits: QueryLimits,
+    emit: F,
+) -> Result<usize>
+where
+    F: FnMut(Map<String, Value>) -> Result<()>,
+{
+    query_each_inner(catalog, text, params, limits, emit)
+        .map_err(|error| explain_unknown_table(catalog, error))
+}
+
+fn query_each_inner<F>(
     catalog: &Catalog,
     text: &str,
     params: &[SqlParam],
@@ -201,6 +225,36 @@ where
         emitted += 1;
     }
     Ok(emitted)
+}
+
+/// The table SQLite says is missing, from the message it says it in.
+///
+/// SQLite reports `no such table: users`, or `no such table: main.users` where
+/// the statement qualified it. Reading the name from that one shape is
+/// deliberate: the alternative is walking the parsed statement for every
+/// relation position -- FROM, JOIN, subquery, CTE, mutation target -- to guess
+/// which one the engine meant, and a second opinion about that is a second
+/// source of truth. Anything this does not recognize yields no name, and the
+/// error is passed through exactly as SQLite phrased it.
+fn missing_table(message: &str) -> Option<&str> {
+    let name = message.strip_prefix("no such table: ")?;
+    Some(name.strip_prefix("main.").unwrap_or(name))
+}
+
+/// Point an unknown table at the directory it is probably sitting in.
+///
+/// A folder of rows beside the database that no schema governs is the one case
+/// where `UNKNOWN_TABLE` has an answer rather than just a refusal, and it is
+/// the case a user hits immediately after adding a directory. Where the name
+/// matches nothing on disk it is simply wrong, and the error stays as it was.
+fn explain_unknown_table(catalog: &Catalog, error: DbError) -> DbError {
+    if error.diagnostic.code != "UNKNOWN_TABLE" {
+        return error;
+    }
+    match missing_table(&error.diagnostic.message) {
+        Some(table) => catalog.unknown_table(table),
+        None => error,
+    }
 }
 
 fn statement_kind(text: &str) -> Result<String> {
@@ -1326,6 +1380,82 @@ mod tests {
             assert_eq!(error.diagnostic.code, expected, "for message {message:?}");
             assert_eq!(error.exit, 4);
         }
+    }
+
+    /// The name is read from SQLite's own phrasing, so both the bare and the
+    /// schema-qualified form must yield the same table. A message this does not
+    /// recognize yields nothing rather than a guess: the error then passes
+    /// through as SQLite wrote it instead of carrying advice about a table
+    /// nobody named.
+    #[test]
+    fn test1106_the_missing_table_is_read_from_sqlites_own_message() {
+        assert_eq!(missing_table("no such table: users"), Some("users"));
+        assert_eq!(missing_table("no such table: main.users"), Some("users"));
+        assert_eq!(
+            missing_table("no such table: main.order_items"),
+            Some("order_items")
+        );
+
+        // Not a missing-table message at all.
+        assert_eq!(missing_table("no such column: users.name"), None);
+        assert_eq!(missing_table("syntax error near \"FROM\""), None);
+        assert_eq!(missing_table(""), None);
+    }
+
+    /// Advice is attached only where it applies. A catalog that knows of an
+    /// ungoverned directory says how to govern it; one that does not leaves the
+    /// error exactly as it was, because there is nothing on disk to infer from.
+    #[test]
+    fn test1107_only_an_ungoverned_directory_earns_inference_advice() {
+        let mut catalog = Catalog {
+            root: PathBuf::from("/tmp"),
+            ungoverned: vec!["posts".into()],
+            schemas: BTreeMap::new(),
+            schema_sources: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            diagnostics: vec![],
+            warnings: vec![],
+            indentation_width: 2,
+        };
+
+        let bare = DbError::new("UNKNOWN_TABLE", "no such table: posts", 4);
+        let explained = explain_unknown_table(&catalog, bare);
+        assert_eq!(explained.diagnostic.code, "UNKNOWN_TABLE");
+        assert_eq!(explained.exit, 4);
+        assert_eq!(
+            explained.diagnostic.help.as_deref(),
+            Some("run `db infer posts --write` or add it to .db/config ignore"),
+            "an ungoverned directory earns the command that governs it"
+        );
+
+        // A name matching nothing on disk keeps the plain error.
+        let ghost = DbError::new("UNKNOWN_TABLE", "no such table: ghosts", 4);
+        assert_eq!(explain_unknown_table(&catalog, ghost).diagnostic.help, None);
+
+        // And with nothing ungoverned, even a real directory name gets nothing.
+        catalog.ungoverned.clear();
+        let posts = DbError::new("UNKNOWN_TABLE", "no such table: posts", 4);
+        assert_eq!(explain_unknown_table(&catalog, posts).diagnostic.help, None);
+    }
+
+    /// Enrichment is scoped to the one code it explains. A different failure
+    /// carrying a similar message must not acquire advice about inference.
+    #[test]
+    fn test1108_other_errors_are_passed_through_untouched() {
+        let catalog = Catalog {
+            root: PathBuf::from("/tmp"),
+            ungoverned: vec!["posts".into()],
+            schemas: BTreeMap::new(),
+            schema_sources: BTreeMap::new(),
+            rows: BTreeMap::new(),
+            diagnostics: vec![],
+            warnings: vec![],
+            indentation_width: 2,
+        };
+        let other = DbError::new("QUERY_UNSUPPORTED", "no such table: posts", 4);
+        let passed = explain_unknown_table(&catalog, other);
+        assert_eq!(passed.diagnostic.code, "QUERY_UNSUPPORTED");
+        assert_eq!(passed.diagnostic.help, None);
     }
 
     /// Section 61: an interrupted statement is a resource-limit outcome (the

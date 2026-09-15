@@ -3271,3 +3271,105 @@ fn test0065_a_clone_rebuilds_derived_state_it_did_not_receive() {
         "derived state is rebuilt once, not on every read"
     );
 }
+
+/// A directory of rows sitting beside the database, governed by nothing, is
+/// the one case where "no such table" has an answer rather than just a
+/// refusal. `status` and `check --strict` already name the command that fixes
+/// it; the query path is where the user actually hits it.
+#[test]
+fn test0066_an_unknown_table_names_the_ungoverned_directory_holding_it() {
+    let dir = adopted();
+    let root = dir.path();
+
+    // A new directory of rows beside an established database is an ungoverned
+    // sibling: Section 42 surfaces it rather than adopting it silently.
+    fs::create_dir(root.join("posts")).unwrap();
+    fs::write(root.join("posts/p1.json"), "{\"id\":\"p1\"}\n").unwrap();
+
+    let query = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "table",
+            "sql",
+            "SELECT * FROM posts",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&query.stderr);
+    assert!(
+        stderr.contains("UNKNOWN_TABLE"),
+        "an ungoverned directory is not a table: {stderr}"
+    );
+    assert!(
+        stderr.contains("db infer posts --write"),
+        "the error names the command that governs it: {stderr}"
+    );
+
+    // The advice is the same one `status` gives, because both read the same
+    // observation rather than deciding separately.
+    let status = db()
+        .args(["--db", root.to_str().unwrap(), "--format", "table", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("db infer posts --write")
+            || String::from_utf8_lossy(&status.stderr).contains("db infer posts --write"),
+        "status and the query path agree on the remedy"
+    );
+
+    // And taking the advice works: the table is governed and answers.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "infer",
+        "posts",
+        "--write",
+    ])
+    .assert()
+    .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT count(*) AS n FROM posts",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"n\":1"));
+}
+
+/// Advice is only advice where it applies. A name that matches nothing on disk
+/// is a typo or a dropped table, and telling the user to infer a directory
+/// that is not there would send them after nothing.
+#[test]
+fn test0067_an_unknown_table_with_no_directory_offers_no_inference() {
+    let dir = adopted();
+    let root = dir.path();
+
+    let query = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "table",
+            "sql",
+            "SELECT * FROM ghosts",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&query.stderr);
+    assert!(
+        stderr.contains("UNKNOWN_TABLE"),
+        "the table really is unknown: {stderr}"
+    );
+    assert!(
+        !stderr.contains("db infer"),
+        "there is no directory to infer from: {stderr}"
+    );
+}

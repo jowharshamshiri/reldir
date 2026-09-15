@@ -201,6 +201,7 @@ mod tests {
             .collect();
         Catalog {
             root: PathBuf::from("/tmp"),
+            ungoverned: vec![],
             schemas: BTreeMap::from([(table.clone(), schema)]),
             schema_sources: BTreeMap::new(),
             rows: BTreeMap::from([(table, rows)]),
