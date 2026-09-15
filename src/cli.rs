@@ -56,6 +56,14 @@ pub struct Cli {
     yes: bool,
     #[arg(long, global = true)]
     dry_run: bool,
+    /// Discard `.db/` and re-establish it from the rows and pins.
+    ///
+    /// The authorization for destroying metadata that cannot be rebuilt --
+    /// recorded history, configuration, snapshots. Functionally identical to
+    /// removing `.db/` by hand and running the command again, which is exactly
+    /// what it does, so there is one recovery path rather than two.
+    #[arg(long, global = true)]
+    rebuild_metadata: bool,
     #[arg(long, global = true)]
     timeout: Option<u64>,
     #[arg(long, global = true)]
@@ -608,11 +616,33 @@ pub fn run(cli: Cli) -> Result<i32> {
             // printing a plan before refusing would describe work that was never
             // going to happen.
             let transitions = if cli.dry_run {
-                crate::state::plan(&observation, requirements, &resource_overrides)?
+                crate::state::plan(
+                    &observation,
+                    requirements,
+                    &resource_overrides,
+                    cli.rebuild_metadata,
+                )?
             } else {
-                crate::state::establish(&observation, requirements, &resource_overrides)?
+                crate::state::establish(
+                    &observation,
+                    requirements,
+                    &resource_overrides,
+                    cli.rebuild_metadata,
+                )?
             };
             report_transitions(&transitions, format, cli.dry_run)?;
+
+            // A dry run that planned a metadata rebuild has said everything it
+            // has to say. Continuing would open a database whose format marker
+            // is exactly what the plan proposes to restore, so it would fail on
+            // the condition being reported rather than reporting it.
+            if cli.dry_run
+                && transitions
+                    .iter()
+                    .any(|transition| matches!(transition, crate::state::Transition::RebuiltMetadata(_)))
+            {
+                return Ok(0);
+            }
 
             // A folder holding nothing at all has nothing to govern, and saying
             // so is the answer rather than a prerequisite to satisfy first.

@@ -3388,3 +3388,229 @@ fn test0067_an_unknown_table_with_no_directory_offers_no_inference() {
         "there is no directory to infer from: {stderr}"
     );
 }
+
+/// `.db/` is disposable, but only to the extent that it can be rebuilt. An
+/// unlabelled metadata directory holding nothing but derived state is rebuilt
+/// without ceremony; one holding recorded history is not, because discarding it
+/// destroys the only copy of something the rows do not say.
+#[test]
+fn test0070_unlabelled_metadata_is_rebuilt_only_when_nothing_would_be_lost() {
+    // Derived state alone: rebuilt silently, and the command still answers.
+    let derived = tempfile::tempdir().unwrap();
+    let root = derived.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+    fs::remove_file(root.join(".db/format")).unwrap();
+    fs::remove_dir_all(root.join(".db/provenance")).unwrap();
+    fs::remove_dir_all(root.join(".db/objects")).unwrap();
+    fs::remove_file(root.join(".db/config")).unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT count(*) AS n FROM a",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("metadata_rebuilt").and(predicate::str::contains("\"n\":1")),
+    );
+    assert!(root.join(".db/format").exists(), "the database is re-established");
+
+    // Recorded history: refused, naming what would be lost, and leaving it be.
+    let historic = tempfile::tempdir().unwrap();
+    let root = historic.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+    fs::remove_file(root.join(".db/format")).unwrap();
+    let revisions = fs::read_dir(root.join(".db/provenance")).unwrap().count();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .code(6)
+        .stderr(
+            predicate::str::contains("FORMAT_MISSING")
+                .and(predicate::str::contains("provenance"))
+                .and(predicate::str::contains("--rebuild-metadata")),
+        );
+    assert_eq!(
+        fs::read_dir(root.join(".db/provenance")).unwrap().count(),
+        revisions,
+        "a refusal destroys nothing"
+    );
+
+    // The flag is the authorization, and it says what it destroyed.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--rebuild-metadata",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT count(*) AS n FROM a",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("metadata_rebuilt")
+            .and(predicate::str::contains("provenance"))
+            .and(predicate::str::contains("\"n\":1")),
+    );
+    assert!(root.join(".db/format").exists());
+}
+
+/// A dry run promises the rebuild without performing it. Destroying history is
+/// exactly the operation a user would reach for `--dry-run` to preview first.
+#[test]
+fn test0071_a_dry_run_promises_a_metadata_rebuild_without_performing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+    fs::remove_file(root.join(".db/format")).unwrap();
+    let revisions = fs::read_dir(root.join(".db/provenance")).unwrap().count();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--dry-run",
+        "--rebuild-metadata",
+        "--format",
+        "table",
+        "tables",
+    ])
+    .assert()
+    .success()
+    .stderr(
+        predicate::str::contains("would rebuild unreadable metadata")
+            .and(predicate::str::contains("provenance")),
+    );
+
+    assert_eq!(
+        fs::read_dir(root.join(".db/provenance")).unwrap().count(),
+        revisions,
+        "a dry run destroys nothing"
+    );
+    assert!(
+        !root.join(".db/format").exists(),
+        "a dry run establishes nothing either"
+    );
+}
+
+/// Section 12: a schema change applies freely when every existing row stays
+/// valid under it, and is refused when one would not. The rule is about the
+/// rows, not about which direction the type moved.
+#[test]
+fn test0072_a_schema_change_applies_only_while_every_row_stays_valid() {
+    // int -> string: every value has a faithful string form, so it applies and
+    // the rows are rewritten to match.
+    let widening = tempfile::tempdir().unwrap();
+    let root = widening.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\",\"n\":1}\n").unwrap();
+    fs::write(root.join("a/a2.json"), "{\"id\":\"a2\",\"n\":2}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--yes",
+        "--format",
+        "table",
+        "migrate",
+        "change-type",
+        "a",
+        "n",
+        "string",
+    ])
+    .assert()
+    .success();
+    let row: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("a/a1.json")).unwrap()).unwrap();
+    assert_eq!(row["n"], "1", "the row is carried across, not left behind");
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // string -> int where one row holds text that is not a number: refused, and
+    // the row is left exactly as it was.
+    let lossy = tempfile::tempdir().unwrap();
+    let root = lossy.path();
+    fs::create_dir(root.join("a")).unwrap();
+    fs::write(root.join("a/a1.json"), "{\"id\":\"a1\",\"n\":\"not-a-number\"}\n").unwrap();
+    fs::write(root.join("a/a2.json"), "{\"id\":\"a2\",\"n\":\"7\"}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT 1 AS x",
+    ])
+    .assert()
+    .success();
+    let before = fs::read(root.join("a/a1.json")).unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--yes",
+        "--format",
+        "table",
+        "migrate",
+        "change-type",
+        "a",
+        "n",
+        "int",
+    ])
+    .assert()
+    .code(2)
+    .stderr(predicate::str::contains("TYPE_MISMATCH"));
+
+    assert_eq!(
+        before,
+        fs::read(root.join("a/a1.json")).unwrap(),
+        "a refused migration leaves every row untouched"
+    );
+}

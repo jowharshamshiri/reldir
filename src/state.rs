@@ -49,9 +49,16 @@ pub enum FormatState {
     Absent,
     /// `.db/` exists and declares a format this binary reads.
     Supported,
-    /// `.db/` exists but carries no format marker. Whether this is
-    /// recoverable depends on what else is in there.
-    MarkerMissing,
+    /// `.db/` exists without a format marker, but holds nothing that cannot be
+    /// rebuilt. Recoverable without asking: discarding a manifest or an index
+    /// loses nothing the rows do not already say.
+    MarkerMissingRecoverable,
+    /// `.db/` exists without a format marker and holds state that is not
+    /// reconstructible -- recorded history, user configuration, snapshots, or
+    /// an entry this binary does not recognize. Guessing a format could misread
+    /// every byte; discarding it would destroy something only this directory
+    /// holds. The named entries are what the user must account for.
+    MarkerMissingUnrecoverable(Vec<String>),
     /// `.db/` exists and declares a format this binary cannot read.
     Unsupported(String),
 }
@@ -143,6 +150,12 @@ pub enum Transition {
     Bootstrapped,
     /// Inferred and wrote schemas for tables that had none.
     InferredSchemas(Vec<String>),
+    /// Discarded an uninterpretable `.db/` and rebuilt it from the rows.
+    ///
+    /// Carries what was destroyed, because a rebuild that silently dropped
+    /// recorded history would be indistinguishable from one that had nothing to
+    /// drop.
+    RebuiltMetadata(Vec<String>),
 }
 
 impl Transition {
@@ -151,6 +164,12 @@ impl Transition {
             Self::Bootstrapped => "initialized database".into(),
             Self::InferredSchemas(tables) => {
                 format!("inferred schemas for {}", tables.join(", "))
+            }
+            Self::RebuiltMetadata(discarded) if discarded.is_empty() => {
+                "rebuilt unreadable metadata".into()
+            }
+            Self::RebuiltMetadata(discarded) => {
+                format!("rebuilt unreadable metadata, discarding {}", discarded.join(", "))
             }
         }
     }
@@ -168,6 +187,13 @@ impl Transition {
                 .map(|table| format!("would infer .db/schema/{table}.json"))
                 .collect::<Vec<_>>()
                 .join("; "),
+            Self::RebuiltMetadata(discarded) if discarded.is_empty() => {
+                "would rebuild unreadable metadata".into()
+            }
+            Self::RebuiltMetadata(discarded) => format!(
+                "would rebuild unreadable metadata, discarding {}",
+                discarded.join(", ")
+            ),
         }
     }
 
@@ -176,6 +202,7 @@ impl Transition {
         match self {
             Self::Bootstrapped => "bootstrapped",
             Self::InferredSchemas(_) => "schemas_inferred",
+            Self::RebuiltMetadata(_) => "metadata_rebuilt",
         }
     }
 }
@@ -300,10 +327,56 @@ pub fn observe(root: &Path) -> Result<Observation> {
     })
 }
 
+/// Entries under `.db/` that are reconstructible from the user's files.
+///
+/// Everything else -- recorded history, the object store behind it, user
+/// configuration, snapshots, and anything unrecognized -- is state this
+/// directory is the only copy of.
+const REBUILDABLE_METADATA: &[&str] = &[
+    "format",
+    "manifest.json",
+    "catalog",
+    "indexes",
+    "statistics",
+    "transactions",
+    "schema",
+    "lock",
+    ".gitignore",
+];
+
+/// What in `.db/` could not be rebuilt if the directory were discarded.
+fn irreplaceable_metadata(metadata_directory: &Path) -> Result<Vec<String>> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(metadata_directory)
+        .map_err(|error| DbError::io(metadata_directory, error))?
+    {
+        let path = entry
+            .map_err(|error| DbError::io(metadata_directory, error))?
+            .path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if REBUILDABLE_METADATA.contains(&name) {
+            continue;
+        }
+        // An empty history or snapshot directory holds nothing to lose.
+        if matches!(name, "provenance" | "objects" | "snapshots")
+            && std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    out.sort();
+    Ok(out)
+}
+
 fn classify_format(metadata_directory: &Path) -> Result<FormatState> {
     let marker = metadata_directory.join("format");
     if !marker.exists() {
-        return Ok(FormatState::MarkerMissing);
+        return marker_missing(metadata_directory);
     }
     let text = std::fs::read_to_string(&marker).map_err(|error| DbError::io(&marker, error))?;
     let declared = text
@@ -313,7 +386,17 @@ fn classify_format(metadata_directory: &Path) -> Result<FormatState> {
     match declared {
         Some(version) if version == crate::FORMAT_VERSION => Ok(FormatState::Supported),
         Some(version) => Ok(FormatState::Unsupported(version.to_string())),
-        None => Ok(FormatState::MarkerMissing),
+        None => marker_missing(metadata_directory),
+    }
+}
+
+/// Classify an unlabelled `.db/` by what would be lost in rebuilding it.
+fn marker_missing(metadata_directory: &Path) -> Result<FormatState> {
+    let irreplaceable = irreplaceable_metadata(metadata_directory)?;
+    if irreplaceable.is_empty() {
+        Ok(FormatState::MarkerMissingRecoverable)
+    } else {
+        Ok(FormatState::MarkerMissingUnrecoverable(irreplaceable))
     }
 }
 
@@ -426,14 +509,16 @@ pub fn establish(
     observation: &Observation,
     requirements: Requirements,
     overrides: &crate::config::ResourceOverrides,
+    rebuild_metadata: bool,
 ) -> Result<Vec<Transition>> {
-    establish_inner(observation, requirements, overrides, true)
+    establish_inner(observation, requirements, overrides, rebuild_metadata, true)
 }
 
 fn establish_inner(
     observation: &Observation,
     requirements: Requirements,
     overrides: &crate::config::ResourceOverrides,
+    rebuild_metadata: bool,
     execute: bool,
 ) -> Result<Vec<Transition>> {
     if !requirements.relational_model || !requirements.may_establish {
@@ -461,15 +546,61 @@ fn establish_inner(
                 6,
             ));
         }
-        FormatState::MarkerMissing => {
-            // `.db/` exists but does not say what it is. Guessing a version
-            // could misread every byte in the database.
+        FormatState::MarkerMissingRecoverable => {
+            // `.db/` does not say what it is, but holds nothing that cannot be
+            // rebuilt from the rows. Rebuilding is derived work, so it needs no
+            // authorization -- the same rule that lets any command refresh a
+            // stale index.
+            if !execute {
+                return Ok(vec![Transition::RebuiltMetadata(vec![])]);
+            }
+            std::fs::remove_dir_all(observation.root.join(".db"))
+                .map_err(|error| DbError::io(&observation.root.join(".db"), error))?;
+            let mut transitions = vec![Transition::RebuiltMetadata(vec![])];
+            transitions.extend(establish_inner(
+                &observe(&observation.root)?,
+                requirements,
+                overrides,
+                rebuild_metadata,
+                execute,
+            )?);
+            return Ok(transitions);
+        }
+        FormatState::MarkerMissingUnrecoverable(entries) if rebuild_metadata => {
+            // Authorized: this is the user saying "discard it", and it does
+            // exactly what removing `.db/` by hand would do, so there is one
+            // recovery path rather than two that could drift apart.
+            if !execute {
+                return Ok(vec![Transition::RebuiltMetadata(entries.clone())]);
+            }
+            std::fs::remove_dir_all(observation.root.join(".db"))
+                .map_err(|error| DbError::io(&observation.root.join(".db"), error))?;
+            let mut transitions = vec![Transition::RebuiltMetadata(entries.clone())];
+            transitions.extend(establish_inner(
+                &observe(&observation.root)?,
+                requirements,
+                overrides,
+                rebuild_metadata,
+                execute,
+            )?);
+            return Ok(transitions);
+        }
+        FormatState::MarkerMissingUnrecoverable(entries) => {
+            // Guessing a format could misread every byte; discarding the
+            // directory would destroy history, configuration, or snapshots that
+            // exist nowhere else. Neither is the binary's decision to make.
             return Err(DbError::from_diag(
                 Diagnostic::error(
                     "FORMAT_MISSING",
-                    ".db exists but declares no format version",
+                    format!(
+                        ".db declares no format version and holds state that cannot be rebuilt: {}",
+                        entries.join(", ")
+                    ),
                 )
-                .help("remove .db to re-establish it, or restore .db/format"),
+                .help(
+                    "restore .db/format, or pass --rebuild-metadata to discard .db and \
+                     re-establish it from your files",
+                ),
                 6,
             ));
         }
@@ -602,8 +733,9 @@ pub fn plan(
     observation: &Observation,
     requirements: Requirements,
     overrides: &crate::config::ResourceOverrides,
+    rebuild_metadata: bool,
 ) -> Result<Vec<Transition>> {
-    establish_inner(observation, requirements, overrides, false)
+    establish_inner(observation, requirements, overrides, rebuild_metadata, false)
 }
 
 /// Schemas a read needs but that must not be persisted.
@@ -708,7 +840,7 @@ mod tests {
         let observed = observe(root).unwrap();
         assert_eq!(observed.topology.loose_json, vec!["a.json".to_string()]);
 
-        let error = establish(&observed, Requirements::functional(), &Default::default())
+        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
             .expect_err("loose rows cannot be adopted");
         assert_eq!(error.diagnostic.code, "ROOT_JSON_AMBIGUOUS");
         // Nothing was created while refusing.
@@ -758,7 +890,7 @@ mod tests {
 
         let observed = observe(root).unwrap();
         let transitions =
-            establish(&observed, Requirements::structural(), &Default::default()).unwrap();
+            establish(&observed, Requirements::structural(), &Default::default(), false).unwrap();
         assert!(transitions.is_empty());
         assert!(!root.join(".db").exists(), "structural work bootstraps nothing");
         assert!(!root.join("schema").exists());
@@ -772,7 +904,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let observed = observe(directory.path()).unwrap();
         let transitions =
-            establish(&observed, Requirements::functional(), &Default::default()).unwrap();
+            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
         assert!(transitions.is_empty());
         assert!(!directory.path().join(".db").exists());
     }
@@ -794,7 +926,7 @@ mod tests {
 
         let observed = observe(root).unwrap();
         let transitions =
-            establish(&observed, Requirements::functional(), &Default::default()).unwrap();
+            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
 
         assert!(transitions.contains(&Transition::Bootstrapped));
         assert!(transitions.iter().any(
@@ -829,7 +961,7 @@ mod tests {
         write(&root.join("posts/p1.json"), "{\"id\":\"p1\"}\n");
 
         let observed = observe(root).unwrap();
-        establish(&observed, Requirements::functional(), &Default::default()).unwrap();
+        establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(root.join("schema/users.json")).unwrap(),
@@ -868,27 +1000,64 @@ mod tests {
         write(&root.join("things/a.json"), "[1,2]\n");
 
         let observed = observe(root).unwrap();
-        let error = establish(&observed, Requirements::functional(), &Default::default())
+        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
             .expect_err("inference cannot succeed here");
         assert!(error.diagnostic.code.starts_with("INFER_"));
         assert!(!root.join(".db").exists(), "no partial bootstrap remains");
         assert!(!root.join("schema").exists());
     }
 
-    /// `.db/` that does not declare its format is never guessed at: reading a
-    /// database under the wrong format could misinterpret every byte.
+    /// `.db/` that does not declare its format is never guessed at -- reading a
+    /// database under the wrong format could misinterpret every byte -- but
+    /// what to do about it depends on what would be lost. A directory holding
+    /// only rebuildable state is rebuilt; one holding history is not, because
+    /// discarding it destroys the only copy.
     #[test]
-    fn test1101_metadata_without_a_format_marker_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        std::fs::create_dir_all(root.join(".db")).unwrap();
+    fn test1101_unlabelled_metadata_is_rebuilt_only_when_nothing_is_lost() {
+        let rebuildable = tempfile::tempdir().unwrap();
+        let root = rebuildable.path();
+        std::fs::create_dir_all(root.join(".db/indexes")).unwrap();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
 
         let observed = observe(root).unwrap();
-        assert_eq!(observed.format, FormatState::MarkerMissing);
-        let error = establish(&observed, Requirements::functional(), &Default::default())
-            .expect_err("an unlabelled database cannot be interpreted");
+        assert_eq!(observed.format, FormatState::MarkerMissingRecoverable);
+        let transitions =
+            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
+        assert!(transitions.contains(&Transition::RebuiltMetadata(vec![])));
+        assert!(root.join(".db/format").exists(), "the database is re-established");
+
+        // Recorded history is not rebuildable, so the same missing marker is a
+        // refusal rather than a rebuild.
+        let historic = tempfile::tempdir().unwrap();
+        let root = historic.path();
+        std::fs::create_dir_all(root.join(".db/provenance")).unwrap();
+        write(
+            &root.join(".db/provenance/00000000000000000001.json"),
+            "{}\n",
+        );
+        write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
+
+        let observed = observe(root).unwrap();
+        assert_eq!(
+            observed.format,
+            FormatState::MarkerMissingUnrecoverable(vec!["provenance".to_string()])
+        );
+        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
+            .expect_err("history must not be discarded without authorization");
         assert_eq!(error.diagnostic.code, "FORMAT_MISSING");
+        assert!(
+            error.diagnostic.message.contains("provenance"),
+            "the refusal names what would be lost: {}",
+            error.diagnostic.message
+        );
+
+        // The flag is that authorization, and it says what it destroyed.
+        let transitions =
+            establish(&observed, Requirements::functional(), &Default::default(), true).unwrap();
+        assert!(transitions.contains(&Transition::RebuiltMetadata(vec![
+            "provenance".to_string()
+        ])));
+        assert!(root.join(".db/format").exists());
     }
 
     /// A format this binary cannot read stops the operation rather than being
@@ -903,7 +1072,7 @@ mod tests {
         );
         let observed = observe(root).unwrap();
         assert!(matches!(observed.format, FormatState::Unsupported(_)));
-        let error = establish(&observed, Requirements::functional(), &Default::default())
+        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
             .expect_err("a newer format cannot be read");
         assert_eq!(error.diagnostic.code, "FORMAT_UNSUPPORTED");
     }
