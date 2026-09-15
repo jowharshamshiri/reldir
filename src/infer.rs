@@ -262,6 +262,21 @@ fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>
         }
         let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
         let v: Value = crate::json::parse(&b).map_err(|e| {
+            // A document that is well formed but too deep is a resource-limit
+            // refusal, not malformed JSON.
+            if crate::json::is_depth_limit(&e) {
+                return DbError::from_diag(
+                    Diagnostic::error(
+                        "RESOURCE_LIMIT",
+                        format!(
+                            "JSON nesting exceeds depth limit {}",
+                            config.max_nesting_depth
+                        ),
+                    )
+                    .at(rel.clone()),
+                    8,
+                );
+            }
             let mut diagnostic =
                 Diagnostic::error("INFER_INVALID_JSON", e.to_string()).at(rel.clone());
             diagnostic.location = Some(crate::diagnostic::Location {
@@ -274,19 +289,6 @@ fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>
                 .map(String::from);
             DbError::from_diag(diagnostic, 8)
         })?;
-        if json_depth(&v) > config.max_nesting_depth {
-            return Err(DbError::from_diag(
-                Diagnostic::error(
-                    "RESOURCE_LIMIT",
-                    format!(
-                        "JSON nesting exceeds depth limit {}",
-                        config.max_nesting_depth
-                    ),
-                )
-                .at(rel),
-                8,
-            ));
-        }
         let Some(obj) = v.as_object() else {
             return Err(DbError::from_diag(
                 Diagnostic::error("INFER_ROOT_NOT_OBJECT", "row root is not an object").at(rel),

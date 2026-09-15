@@ -241,13 +241,44 @@ mod tests {
         assert_eq!(value["a"], serde_json::json!([1, 2]));
     }
 
-    /// A deeply nested document parses; depth limits are a policy applied by the
-    /// caller against configuration, not a parser-level refusal.
+    /// Sections 57 and 61: nesting is bounded by the configured limit, enforced
+    /// during deserialization. A document within the limit parses; one beyond it
+    /// is refused with an error a caller can distinguish from malformed JSON,
+    /// and the refusal happens while parsing rather than after, so the recursion
+    /// itself is bounded.
     #[test]
-    fn test9999_deep_nesting_parses_so_limits_stay_configurable() {
-        let depth = 64;
-        let text = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-        assert!(parse_str(&text).is_ok());
+    fn test9999_nesting_is_bounded_by_the_configured_depth_limit() {
+        // Comfortably within the bootstrap bound.
+        let shallow = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        assert!(parse_str(&shallow).is_ok());
+
+        // Beyond serde's own historical recursion ceiling, but allowed when the
+        // configured limit permits it -- the point of making the limit real.
+        let deep = format!("{}{}", "[".repeat(300), "]".repeat(300));
+        with_depth_limit(512, || {
+            assert!(parse_str(&deep).is_ok(), "512 must admit a depth of 300");
+        });
+
+        // Past the limit the document is refused, and the refusal is
+        // identifiable as a limit rather than as malformed syntax.
+        with_depth_limit(64, || {
+            let error = parse_str(&deep).expect_err("300 exceeds a limit of 64");
+            assert!(is_depth_limit(&error), "unexpected error: {error}");
+        });
+
+        // Objects are bounded on the same footing as arrays.
+        let nested_objects = format!("{}1{}", "{\"a\":".repeat(40), "}".repeat(40));
+        with_depth_limit(8, || {
+            let error = parse_str(&nested_objects).expect_err("40 exceeds a limit of 8");
+            assert!(is_depth_limit(&error), "unexpected error: {error}");
+        });
+        with_depth_limit(64, || {
+            assert!(parse_str(&nested_objects).is_ok());
+        });
+
+        // The limit is restored after each scope, so one parse cannot leak its
+        // bound into the next.
+        assert!(parse_str(&shallow).is_ok());
     }
 
     /// Reported error positions carry line and column so diagnostics can point

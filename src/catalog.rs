@@ -103,8 +103,8 @@ impl Catalog {
                 continue;
             }
             let schema_bytes = fs::read(&path).map_err(|error| DbError::io(&path, error))?;
-            if let Ok(schema_value) = crate::json::parse(&schema_bytes)
-                && json_depth(&schema_value) > config.max_nesting_depth
+            if let Err(error) = crate::json::parse(&schema_bytes)
+                && crate::json::is_depth_limit(&error)
             {
                 c.diagnostics.push(
                     Diagnostic::error(
@@ -234,6 +234,21 @@ impl Catalog {
                 let val: Value = match crate::json::parse(&raw) {
                     Ok(v) => v,
                     Err(e) => {
+                        // A document that is well formed but too deep is a
+                        // resource-limit refusal, not malformed JSON.
+                        if crate::json::is_depth_limit(&e) {
+                            c.diagnostics.push(
+                                Diagnostic::error(
+                                    "RESOURCE_LIMIT",
+                                    format!(
+                                        "JSON nesting exceeds depth limit {}",
+                                        config.max_nesting_depth
+                                    ),
+                                )
+                                .at(rel),
+                            );
+                            continue;
+                        }
                         let mut d = Diagnostic::error("INVALID_JSON", e.to_string()).at(rel);
                         d.location = Some(crate::diagnostic::Location {
                             line: e.line(),
@@ -247,19 +262,6 @@ impl Catalog {
                         continue;
                     }
                 };
-                if json_depth(&val) > config.max_nesting_depth {
-                    c.diagnostics.push(
-                        Diagnostic::error(
-                            "RESOURCE_LIMIT",
-                            format!(
-                                "JSON nesting exceeds depth limit {}",
-                                config.max_nesting_depth
-                            ),
-                        )
-                        .at(rel),
-                    );
-                    continue;
-                }
                 let Some(obj) = val.as_object() else {
                     c.diagnostics.push(
                         Diagnostic::error("ROW_ROOT_NOT_OBJECT", "row JSON root must be an object")
@@ -319,14 +321,6 @@ impl Catalog {
     }
     pub fn row_count(&self) -> usize {
         self.rows.values().map(Vec::len).sum()
-    }
-}
-
-fn json_depth(v: &Value) -> usize {
-    match v {
-        Value::Array(a) => 1 + a.iter().map(json_depth).max().unwrap_or(0),
-        Value::Object(o) => 1 + o.values().map(json_depth).max().unwrap_or(0),
-        _ => 0,
     }
 }
 
