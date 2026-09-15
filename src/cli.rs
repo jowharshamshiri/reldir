@@ -1075,6 +1075,9 @@ fn cmd_init(
     let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash.clone(), entries, "import", None)?;
+    // Adoption builds the indexes for everything it adopted, so the database is
+    // complete when this returns rather than repairing itself on first read.
+    crate::index::rebuild(&root, &c)?;
     if matches!(format, Format::Table | Format::Sqlite) {
         output::notice(&format!(
             "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",

@@ -577,6 +577,13 @@ fn establish_inner(
         let catalog = crate::catalog::Catalog::observe(&observation.root, &config)?;
         let (hash, entries) = crate::metadata::state(&catalog)?;
         crate::metadata::record(&catalog, None, hash, entries, "import", None)?;
+        // Establishment leaves derived state complete. `init_layout` creates an
+        // empty `.db/indexes`, which is not the same thing as a built one: the
+        // next read would find an index missing for every table, class the
+        // database as needing repair, and announce a rebuild of what had never
+        // been built. Derived state is either current or it is a fault, and a
+        // database this binary just created must not be born a fault.
+        crate::index::rebuild(&observation.root, &catalog)?;
     }
 
     Ok(transitions)

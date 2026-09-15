@@ -456,6 +456,11 @@ pub fn init_empty(root: &Path, track_provenance: bool) -> Result<()> {
     let c = Catalog::observe(root, &Config::default())?;
     let (hash, entries) = metadata::state(&c)?;
     metadata::record(&c, None, hash, entries, "import", None)?;
+    // An empty database derives no indexes, so this writes nothing today. It is
+    // here because the rule is that establishment leaves derived state
+    // complete, not that it does so when the result happens to be empty: one
+    // invariant across every path that creates a database.
+    crate::index::rebuild(root, &c)?;
     Ok(())
 }
 pub fn write_schema(root: &Path, s: &crate::schema::Schema) -> Result<()> {

@@ -3143,3 +3143,131 @@ fn test0063_readonly_shell_records_no_history() {
         "--readonly writes nothing, history included"
     );
 }
+
+/// A database this binary just created is complete, not convalescent. Indexes
+/// are derived state, so establishment builds them: the first read must find
+/// nothing to repair and say nothing about repairing it.
+#[test]
+fn test0064_establishment_leaves_derived_state_complete() {
+    for (label, establish) in [
+        ("adoption", true),
+        ("implicit establishment on first query", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("users")).unwrap();
+        fs::write(
+            root.join("users/u1.json"),
+            "{\"id\":\"u1\",\"name\":\"Alice\"}\n",
+        )
+        .unwrap();
+
+        if establish {
+            db().args([
+                "--format",
+                "table",
+                "init",
+                root.to_str().unwrap(),
+                "--adopt",
+            ])
+            .assert()
+            .success();
+        } else {
+            db().args([
+                "--db",
+                root.to_str().unwrap(),
+                "--format",
+                "jsonl",
+                "sql",
+                "SELECT count(*) AS n FROM users",
+            ])
+            .assert()
+            .success();
+        }
+
+        // An index exists for the primary key, rather than the directory
+        // standing empty until something notices.
+        let built = fs::read_dir(root.join(".db/indexes")).unwrap().count();
+        assert!(built > 0, "{label} builds indexes: none found");
+
+        // The next read repairs nothing and announces nothing.
+        let next = db()
+            .args([
+                "--db",
+                root.to_str().unwrap(),
+                "--format",
+                "jsonl",
+                "sql",
+                "SELECT count(*) AS n FROM users",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&next.stderr);
+        assert!(
+            !stderr.contains("rebuilt stale or corrupt indexes"),
+            "{label}: a freshly established database must not report a repair: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&next.stdout);
+        assert!(
+            !stdout.contains("INDEX_STALE"),
+            "{label}: derived state is current: {stdout}"
+        );
+    }
+}
+
+/// Section 50: after `git clone` the first command rebuilds derived state from
+/// nothing but `.db/format`. Building indexes at establishment must not cost
+/// that, because a clone carries no indexes to begin with.
+#[test]
+fn test0065_a_clone_rebuilds_derived_state_it_did_not_receive() {
+    let dir = adopted();
+    let root = dir.path();
+
+    // What Git would carry: the tracked format marker, the schemas and the
+    // rows. Everything else under `.db/` is ignored and absent on a fresh
+    // clone.
+    fs::remove_dir_all(root.join(".db/indexes")).unwrap();
+    fs::remove_file(root.join(".db/manifest.json")).unwrap();
+
+    let first = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "jsonl",
+            "sql",
+            "SELECT count(*) AS n FROM users",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "a clone answers its first query: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&first.stdout).contains("\"n\":2"),
+        "the query is answered from the cloned rows"
+    );
+    assert!(
+        root.join(".db/indexes").exists(),
+        "the first command rebuilds the indexes a clone never received"
+    );
+
+    // And having rebuilt them, it does not rebuild them again.
+    let second = db()
+        .args([
+            "--db",
+            root.to_str().unwrap(),
+            "--format",
+            "jsonl",
+            "sql",
+            "SELECT count(*) AS n FROM users",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&second.stderr).contains("rebuilt stale or corrupt indexes"),
+        "derived state is rebuilt once, not on every read"
+    );
+}
