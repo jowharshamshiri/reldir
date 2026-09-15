@@ -642,10 +642,25 @@ fn near_field(db: &Database, d: &crate::diagnostic::Diagnostic) -> Option<String
     let row = db.catalog.rows[table]
         .iter()
         .find(|r| d.path.as_ref() == Some(&r.relative))?;
-    let mut candidates = db.catalog.schemas[table]
+    nearest_missing_column(&db.catalog.schemas[table], &row.value, unknown)
+}
+
+/// The schema column that an unknown field most plausibly misspells, if any.
+///
+/// A rename is only proposed when the intent is unambiguous: the column must be
+/// within a small edit distance, must not already be present in the row (which
+/// would make the rename destructive), and must be strictly closer than every
+/// other candidate. A tie is not a typo this can resolve on the user's behalf
+/// (Section 14).
+fn nearest_missing_column(
+    schema: &crate::schema::Schema,
+    row: &serde_json::Map<String, serde_json::Value>,
+    unknown: &str,
+) -> Option<String> {
+    let mut candidates = schema
         .columns
         .keys()
-        .filter(|name| !row.value.contains_key(*name))
+        .filter(|name| !row.contains_key(*name))
         .filter_map(|name| {
             let distance = strsim::levenshtein(unknown, name);
             (distance <= 2).then_some((distance, name.clone()))
@@ -661,5 +676,126 @@ fn near_field(db: &Database, d: &crate::diagnostic::Diagnostic) -> Option<String
         candidates.first().map(|x| x.1.clone())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{AdditionalFields, Column, ColumnType, Schema};
+    use indexmap::IndexMap;
+    use serde_json::json;
+
+    fn column(kind: ColumnType) -> Column {
+        Column {
+            kind,
+            nullable: false,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn schema(columns: &[(&str, ColumnType)]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, kind) in columns {
+            map.insert((*name).to_string(), column(kind.clone()));
+        }
+        Schema {
+            table: "t".into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: vec!["id".into()],
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+            inferred: None,
+        }
+    }
+
+    /// Section 14: FIX_COERCE_VALUE applies only lossless coercions. Doctor must
+    /// never guess at a conversion that would change the logical value, because
+    /// the fix rewrites authoritative data.
+    #[test]
+    fn test9999_value_coercion_offered_by_doctor_is_always_lossless() {
+        // Representational corrections that preserve the value.
+        assert_eq!(
+            lossless_coerce(&json!("42"), &column(ColumnType::Int)),
+            Some(json!(42))
+        );
+        assert_eq!(
+            lossless_coerce(&json!("true"), &column(ColumnType::Bool)),
+            Some(json!(true))
+        );
+
+        // Conversions that would lose or invent information are refused, so no
+        // fix is offered and doctor classifies the violation as manual instead.
+        assert_eq!(lossless_coerce(&json!(1.5), &column(ColumnType::Int)), None);
+        assert_eq!(lossless_coerce(&json!("01"), &column(ColumnType::Int)), None);
+        assert_eq!(
+            lossless_coerce(&json!("yes"), &column(ColumnType::Bool)),
+            None
+        );
+        assert_eq!(
+            lossless_coerce(&json!("not-a-uuid"), &column(ColumnType::Uuid)),
+            None
+        );
+    }
+
+    /// Section 14: FIX_RENAME_FIELD is offered when an unknown field is a near
+    /// miss for a schema column that the row is missing. The match must be
+    /// unambiguous: a tie between two equally close columns is not a typo that
+    /// doctor may resolve on the user's behalf.
+    #[test]
+    fn test9999_field_rename_suggestions_require_an_unambiguous_near_match() {
+        let s = schema(&[
+            ("id", ColumnType::String),
+            ("email", ColumnType::String),
+            ("name", ColumnType::String),
+        ]);
+
+        // "emial" is distance 2 from "email" and far from everything else.
+        let row = json!({"id": "a", "emial": "x"});
+        let row = row.as_object().unwrap().clone();
+        assert_eq!(
+            nearest_missing_column(&s, &row, "emial"),
+            Some("email".to_string())
+        );
+
+        // A column already present in the row is not a rename target: renaming
+        // onto it would destroy the value that is already there.
+        let occupied = json!({"id": "a", "email": "real", "emial": "x"});
+        assert_eq!(
+            nearest_missing_column(&s, occupied.as_object().unwrap(), "emial"),
+            None
+        );
+
+        // Too distant to be a typo.
+        let distant = json!({"id": "a", "telephone": "x"});
+        assert_eq!(
+            nearest_missing_column(&s, distant.as_object().unwrap(), "telephone"),
+            None
+        );
+
+        // An exact tie between two candidates is ambiguous and must be refused.
+        let tied = schema(&[
+            ("id", ColumnType::String),
+            ("ax", ColumnType::String),
+            ("bx", ColumnType::String),
+        ]);
+        let row = json!({"id": "a", "cx": "v"});
+        assert_eq!(
+            nearest_missing_column(&tied, row.as_object().unwrap(), "cx"),
+            None,
+            "a tie must not be resolved by chance ordering"
+        );
     }
 }

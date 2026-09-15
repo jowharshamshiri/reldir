@@ -636,3 +636,191 @@ fn validate_lock_path(path: &Path) -> Result<()> {
         Err(error) => Err(DbError::io(path, error)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Section 56: authoritative paths are validated canonical relative paths.
+    /// Anything that could escape the database root, or reach into internal
+    /// metadata that is not itself authoritative, is refused before staging.
+    #[test]
+    fn test9999_unsafe_authoritative_paths_are_refused() {
+        for rejected in [
+            "../escape.json",
+            "users/../../escape.json",
+            "/absolute/row.json",
+            ".db/manifest.json",
+            ".db/indexes/users--abc.json",
+            ".db/transactions/x/journal.json",
+        ] {
+            let error = safe_relative(Path::new(rejected))
+                .expect_err(&format!("{rejected} must be refused"));
+            assert_eq!(error.diagnostic.code, "PATH_VIOLATION");
+        }
+
+        // Governed rows, schemas, and the two authoritative .db files pass.
+        for accepted in [
+            "users/u1.json",
+            "schema/users.json",
+            ".db/config",
+            ".db/format",
+        ] {
+            safe_relative(Path::new(accepted))
+                .unwrap_or_else(|error| panic!("{accepted} must be allowed: {error:?}"));
+        }
+    }
+
+    /// Section 31: a journal is replayed only when it is internally consistent.
+    /// A journal whose id does not match its directory cannot be trusted to
+    /// describe that directory's staged bytes, so it is refused rather than
+    /// guessed through.
+    #[test]
+    fn test9999_journal_identity_must_match_its_directory() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let journal = Journal {
+            id: id.clone(),
+            start_root: "root".into(),
+            origin: "internal".into(),
+            changes: vec![JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some("00000000".into()),
+            }],
+        };
+        let directory = std::path::PathBuf::from("/tmp").join(&id);
+        validate_journal(&directory, &journal).expect("a matching id validates");
+
+        let mismatched = std::path::PathBuf::from("/tmp").join(uuid::Uuid::new_v4().to_string());
+        let error = validate_journal(&mismatched, &journal).expect_err("mismatch must be refused");
+        assert_eq!(error.diagnostic.code, "TRANSACTION_INCOMPLETE");
+        assert_eq!(error.exit, 5);
+
+        // A non-UUID id is refused even when the directory agrees.
+        let bogus = Journal {
+            id: "not-a-uuid".into(),
+            ..Journal {
+                id: String::new(),
+                start_root: "root".into(),
+                origin: "internal".into(),
+                changes: vec![JournalChange {
+                    path: PathBuf::from("users/u1.json"),
+                    stage: None,
+                }],
+            }
+        };
+        let directory = std::path::PathBuf::from("/tmp/not-a-uuid");
+        assert!(validate_journal(&directory, &bogus).is_err());
+    }
+
+    /// Section 23: provenance origin is a closed set. An unrecognised origin
+    /// means the journal was not written by this system and must not be
+    /// replayed into authoritative state.
+    #[test]
+    fn test9999_journal_origin_is_a_closed_set() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = std::path::PathBuf::from("/tmp").join(&id);
+        let journal = |origin: &str| Journal {
+            id: id.clone(),
+            start_root: "root".into(),
+            origin: origin.into(),
+            changes: vec![JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: None,
+            }],
+        };
+        for origin in [
+            "internal",
+            "recovery",
+            "repair",
+            "migration",
+            "import",
+            "snapshot_restore",
+        ] {
+            validate_journal(&directory, &journal(origin))
+                .unwrap_or_else(|error| panic!("{origin} is a valid origin: {error:?}"));
+        }
+        // `external` describes an observation, never a journal this binary wrote.
+        for origin in ["external", "", "arbitrary"] {
+            assert!(
+                validate_journal(&directory, &journal(origin)).is_err(),
+                "{origin} must be refused"
+            );
+        }
+    }
+
+    /// Section 31: a journal must describe an unambiguous set of changes. A
+    /// repeated path or a reused staged object would make replay order-dependent.
+    #[test]
+    fn test9999_journals_reject_ambiguous_change_sets() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let directory = std::path::PathBuf::from("/tmp").join(&id);
+        let with = |changes: Vec<JournalChange>| Journal {
+            id: id.clone(),
+            start_root: "root".into(),
+            origin: "internal".into(),
+            changes,
+        };
+
+        // An empty journal has nothing to commit and is not a valid transaction.
+        assert!(validate_journal(&directory, &with(vec![])).is_err());
+
+        // The same path twice is ambiguous.
+        let repeated = with(vec![
+            JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some("00000000".into()),
+            },
+            JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some("00000001".into()),
+            },
+        ]);
+        assert!(validate_journal(&directory, &repeated).is_err());
+
+        // Two paths claiming the same staged object is ambiguous.
+        let shared_stage = with(vec![
+            JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some("00000000".into()),
+            },
+            JournalChange {
+                path: PathBuf::from("users/u2.json"),
+                stage: Some("00000000".into()),
+            },
+        ]);
+        assert!(validate_journal(&directory, &shared_stage).is_err());
+
+        // A staged name that is a path rather than a single component would
+        // escape the staging directory.
+        for escape in ["../evil", "a/b", "/abs", ".."] {
+            let traversal = with(vec![JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some(escape.into()),
+            }]);
+            assert!(
+                validate_journal(&directory, &traversal).is_err(),
+                "staged name {escape:?} must be refused"
+            );
+        }
+
+        // An unsafe target path inside the journal is refused as well.
+        let traversal = with(vec![JournalChange {
+            path: PathBuf::from("../escape.json"),
+            stage: None,
+        }]);
+        assert!(validate_journal(&directory, &traversal).is_err());
+
+        // A well-formed mixed write/delete journal validates.
+        let good = with(vec![
+            JournalChange {
+                path: PathBuf::from("users/u1.json"),
+                stage: Some("00000000".into()),
+            },
+            JournalChange {
+                path: PathBuf::from("users/u2.json"),
+                stage: None,
+            },
+        ]);
+        validate_journal(&directory, &good).expect("a consistent journal validates");
+    }
+}

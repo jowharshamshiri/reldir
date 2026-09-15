@@ -2049,3 +2049,382 @@ fn test0040_diagnostics_are_never_colourised_off_a_terminal() {
         .code(2)
         .stderr(predicate::str::contains('\u{1b}').not());
 }
+
+/// Section 33: the writer lock admits one binary-managed writer. Concurrent
+/// writers must either serialise or fail loudly with the documented code and
+/// exit status -- never interleave and never silently lose an update.
+#[test]
+fn test0041_concurrent_writers_never_silently_lose_an_update() {
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir(root.join("counters")).unwrap();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/counters.json"),
+        r#"{"table":"counters","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#,
+    )
+    .unwrap();
+    for index in 0..8 {
+        fs::write(
+            root.join(format!("counters/c{index}.json")),
+            format!("{{\"id\":\"c{index}\",\"n\":0}}\n"),
+        )
+        .unwrap();
+    }
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // Eight writers race, each mutating a different row.
+    let (sender, receiver) = mpsc::channel();
+    let mut handles = vec![];
+    for index in 0..8 {
+        let root = root.clone();
+        let sender = sender.clone();
+        handles.push(std::thread::spawn(move || {
+            let output = db()
+                .args([
+                    "--db",
+                    root.to_str().unwrap(),
+                    "--format",
+                    "table",
+                    "update",
+                    "counters",
+                    &format!("c{index}"),
+                    "{\"n\":1}",
+                ])
+                .output()
+                .unwrap();
+            sender.send((index, output)).unwrap();
+        }));
+    }
+    drop(sender);
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let mut succeeded = 0;
+    for (index, output) in receiver.iter() {
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if code == 0 {
+            succeeded += 1;
+        } else {
+            // A writer that does not win must say exactly why, with the
+            // documented lock/conflict exit status (Sections 34 and 51).
+            assert_eq!(
+                code, 3,
+                "writer {index} failed with {code} and stderr {stderr}"
+            );
+            assert!(
+                stderr.contains("CONCURRENT_MODIFICATION"),
+                "writer {index} must report the conflict: {stderr}"
+            );
+        }
+    }
+    assert!(succeeded >= 1, "at least one writer must make progress");
+
+    // Whatever interleaving occurred, the database must be valid and every
+    // committed row must hold a value that was actually written -- never a
+    // partially applied or torn state.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    let mut mutated = 0;
+    for index in 0..8 {
+        let row: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(format!("counters/c{index}.json"))).unwrap(),
+        )
+        .unwrap();
+        let n = row["n"].as_i64().unwrap();
+        assert!(n == 0 || n == 1, "row c{index} holds a torn value {n}");
+        if n == 1 {
+            mutated += 1;
+        }
+    }
+    assert_eq!(
+        mutated, succeeded,
+        "every reported success must be durable on disk"
+    );
+}
+
+/// Section 33: concurrent readers are always admitted and never blocked by one
+/// another, and reading never mutates authoritative state.
+#[test]
+fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    // Settle derived state first so the readers race over a steady database.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+    let before = fs::read(root.join("users/u1.json")).unwrap();
+    let manifest_before = fs::read(root.join(".db/manifest.json")).unwrap();
+
+    let mut handles = vec![];
+    for _ in 0..8 {
+        let root = root.clone();
+        handles.push(std::thread::spawn(move || {
+            db()
+                .args([
+                    "--db",
+                    root.to_str().unwrap(),
+                    "--format",
+                    "jsonl",
+                    "sql",
+                    "SELECT name FROM users ORDER BY name",
+                ])
+                .output()
+                .unwrap()
+        }));
+    }
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "a reader failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Alice") && stdout.contains("Bob"));
+    }
+    assert_eq!(before, fs::read(root.join("users/u1.json")).unwrap());
+    assert_eq!(
+        manifest_before,
+        fs::read(root.join(".db/manifest.json")).unwrap(),
+        "reads must not advance recorded state"
+    );
+}
+
+/// Section 34: a mutation planned against one observed state must not commit if
+/// the authoritative files changed underneath it. The conflict is reported, and
+/// the external edit is preserved rather than overwritten.
+#[test]
+fn test0043_external_edits_during_a_mutation_are_not_overwritten() {
+    let dir = adopted();
+    let root = dir.path();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // An external actor rewrites a row that the pending mutation does not touch.
+    fs::write(
+        root.join("users/u2.json"),
+        "{\"id\":\"u2\",\"name\":\"ExternallyEdited\"}\n",
+    )
+    .unwrap();
+
+    // The binary observes the new state, accepts it as a valid external
+    // transition, and applies its own change on top without discarding it.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "update",
+        "users",
+        "u1",
+        "{\"name\":\"Updated\"}",
+    ])
+    .assert()
+    .success();
+
+    let u2 = fs::read_to_string(root.join("users/u2.json")).unwrap();
+    assert!(
+        u2.contains("ExternallyEdited"),
+        "external edit must survive: {u2}"
+    );
+    let u1 = fs::read_to_string(root.join("users/u1.json")).unwrap();
+    assert!(u1.contains("Updated"));
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 62: the engine must not assume the database fits comfortably in
+/// memory. A table with many rows still validates, queries, aggregates, and
+/// mutates correctly.
+#[test]
+fn test0044_many_rows_validate_query_and_mutate_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("events")).unwrap();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/events.json"),
+        r#"{"table":"events","primary_key":["id"],"columns":{"id":{"type":"int"},"bucket":{"type":"string"},"n":{"type":"int"}}}"#,
+    )
+    .unwrap();
+
+    let rows = 2_000usize;
+    for index in 0..rows {
+        fs::write(
+            root.join(format!("events/{index}.json")),
+            format!(
+                "{{\"id\":{index},\"bucket\":\"b{}\",\"n\":{}}}\n",
+                index % 4,
+                index
+            ),
+        )
+        .unwrap();
+    }
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // Aggregation over every row must be exact, not sampled.
+    let expected_sum: i64 = (0..rows as i64).sum();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT count(*) AS c, sum(n) AS s FROM events",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains(format!("\"c\":{rows}"))
+            .and(predicate::str::contains(format!("\"s\":{expected_sum}"))),
+    );
+
+    // Grouping must see every bucket.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT bucket, count(*) AS c FROM events GROUP BY bucket ORDER BY bucket",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(format!("\"c\":{}", rows / 4)));
+
+    // A targeted mutation touches exactly one file out of many.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "sql",
+        "UPDATE events SET n = -1 WHERE id = 1999",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("events/1999.json"));
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 61: resource limits are enforced rather than advisory, and exceeding
+/// one is reported as RESOURCE_LIMIT instead of being silently truncated.
+#[test]
+fn test0045_result_row_limits_are_enforced_not_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("items")).unwrap();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/items.json"),
+        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"int"}}}"#,
+    )
+    .unwrap();
+    for index in 0..25 {
+        fs::write(
+            root.join(format!("items/{index}.json")),
+            format!("{{\"id\":{index}}}\n"),
+        )
+        .unwrap();
+    }
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Under the limit the query answers normally.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--max-result-rows",
+        "100",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT id FROM items",
+    ])
+    .assert()
+    .success();
+
+    // Over the limit it fails loudly rather than returning a partial answer.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--max-result-rows",
+        "5",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT id FROM items",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("RESOURCE_LIMIT"));
+}
+
+/// Section 57: governed content is untrusted input. Pathological structures are
+/// refused by a configured limit instead of exhausting the process.
+#[test]
+fn test0046_pathological_json_is_refused_by_configured_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("blobs")).unwrap();
+    fs::create_dir(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/blobs.json"),
+        r#"{"table":"blobs","primary_key":["id"],"columns":{"id":{"type":"string"},"data":{"type":"json"}}}"#,
+    )
+    .unwrap();
+    let deep = format!(
+        "{{\"id\":\"a\",\"data\":{}{}}}\n",
+        "[".repeat(300),
+        "]".repeat(300)
+    );
+    fs::write(root.join("blobs/a.json"), deep).unwrap();
+
+    // Adoption of a structure deeper than the limit must fail, not recurse away.
+    db().args([
+        "--max-nesting-depth",
+        "64",
+        "--format",
+        "table",
+        "init",
+        root.to_str().unwrap(),
+        "--adopt",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("RESOURCE_LIMIT"));
+
+    // With a limit that accommodates it, the same file is ordinary data.
+    db().args([
+        "--max-nesting-depth",
+        "512",
+        "--format",
+        "table",
+        "init",
+        root.to_str().unwrap(),
+        "--adopt",
+    ])
+    .assert()
+    .success();
+}

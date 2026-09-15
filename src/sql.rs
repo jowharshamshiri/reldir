@@ -1248,3 +1248,94 @@ pub fn export_sqlite(c: &Catalog, table: &str, path: &std::path::Path) -> Result
         .map_err(query_err)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(extended_code: std::os::raw::c_int, message: &str) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended_code),
+            Some(message.to_string()),
+        )
+    }
+
+    /// Sections 51 and 75: a constraint failure is a relational violation of the
+    /// database, so it carries its own stable code and the INVALID exit status,
+    /// never the generic query-error status.
+    #[test]
+    fn test9999_constraint_failures_map_to_relational_codes() {
+        for (extended_code, expected) in [
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+                "PRIMARY_KEY_VIOLATION",
+            ),
+            (rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE, "UNIQUE_VIOLATION"),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
+                "NOT_NULL_VIOLATION",
+            ),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+                "FOREIGN_KEY_VIOLATION",
+            ),
+            (rusqlite::ffi::SQLITE_CONSTRAINT_CHECK, "CHECK_VIOLATION"),
+        ] {
+            let error = query_err(failure(extended_code, "constraint failed"));
+            assert_eq!(error.diagnostic.code, expected);
+            assert_eq!(error.exit, 2, "{expected} is a database-invalid condition");
+        }
+    }
+
+    /// Section 37: SQLite enforces a RESTRICT referential action with an
+    /// internal trigger, so a blocked RESTRICT arrives as a trigger constraint
+    /// carrying SQLite's foreign-key message. It is a referential violation and
+    /// must not be reported as a query type error.
+    #[test]
+    fn test9999_restrict_violations_are_classified_as_referential_violations() {
+        let error = query_err(failure(
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+            "FOREIGN KEY constraint failed",
+        ));
+        assert_eq!(error.diagnostic.code, "FOREIGN_KEY_VIOLATION");
+        assert_eq!(error.exit, 2);
+
+        // A trigger failure that is not a foreign-key message keeps the generic
+        // classification: the mapping is deliberately narrow.
+        let other = query_err(failure(
+            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+            "some other trigger aborted",
+        ));
+        assert_ne!(other.diagnostic.code, "FOREIGN_KEY_VIOLATION");
+    }
+
+    /// Section 25 and 51: query faults are distinguished so a caller can tell a
+    /// malformed query from an unknown name, and all use the query exit status.
+    #[test]
+    fn test9999_query_faults_are_classified_by_kind() {
+        for (message, expected) in [
+            (r#"near "SELCT": syntax error"#, "QUERY_UNSUPPORTED"),
+            ("no such table: ghosts", "UNKNOWN_TABLE"),
+            ("no such column: ghost", "UNKNOWN_COLUMN"),
+            ("datatype mismatch", "QUERY_TYPE_ERROR"),
+        ] {
+            let error = query_err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(message.to_string()),
+            ));
+            assert_eq!(error.diagnostic.code, expected, "for message {message:?}");
+            assert_eq!(error.exit, 4);
+        }
+    }
+
+    /// Section 61: an interrupted statement is a resource-limit outcome (the
+    /// timeout fired), not a malformed query.
+    #[test]
+    fn test9999_interrupted_statements_report_a_resource_limit() {
+        let error = query_err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+            Some("interrupted".to_string()),
+        ));
+        assert_eq!(error.diagnostic.code, "RESOURCE_LIMIT");
+    }
+}

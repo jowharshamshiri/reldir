@@ -350,3 +350,62 @@ fn cell(v: &Value) -> String {
 fn out(e: csv::Error) -> DbError {
     DbError::new("IO_ERROR", e.to_string(), 6)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostic::Severity;
+
+    /// Section 52: the severity label is part of the human diagnostic contract
+    /// and must name each severity exactly.
+    #[test]
+    fn test9999_severity_labels_are_stable() {
+        assert_eq!(severity_label(&Severity::Error), "error");
+        assert_eq!(severity_label(&Severity::Warning), "warning");
+        assert_eq!(severity_label(&Severity::Suggestion), "suggestion");
+        assert_eq!(severity_label(&Severity::Info), "info");
+    }
+
+    /// Section 49: presentation is settled once per process. Tests run with
+    /// output redirected, so colour must be off and every style must be empty,
+    /// leaving diagnostics byte-for-byte parseable by tooling.
+    #[test]
+    fn test9999_redirected_output_carries_no_escape_sequences() {
+        // Whatever the ambient environment, a non-terminal stderr means no
+        // colour: the default derivation requires a terminal.
+        let settings = Presentation {
+            color: false,
+            quiet: false,
+            verbose: false,
+        };
+        set_presentation(settings);
+
+        let (colour, reset) = severity_style(&Severity::Error);
+        let (bold, bold_reset) = emphasis();
+        for piece in [colour, reset, bold, bold_reset] {
+            assert!(
+                piece.is_empty(),
+                "no styling may be emitted when colour is off, got {piece:?}"
+            );
+        }
+    }
+
+    /// Format parsing accepts exactly the documented encodings (Section 60) and
+    /// rejects anything else as a usage error rather than falling back.
+    #[test]
+    fn test9999_output_formats_are_a_closed_set() {
+        for (text, expected) in [
+            ("table", Format::Table),
+            ("json", Format::Json),
+            ("jsonl", Format::Jsonl),
+            ("csv", Format::Csv),
+            ("sqlite", Format::Sqlite),
+        ] {
+            assert_eq!(Format::parse(text).unwrap(), expected);
+        }
+        for invalid in ["", "JSON", "yaml", "tsv", "table "] {
+            let error = Format::parse(invalid).expect_err(&format!("{invalid:?} must be refused"));
+            assert_eq!(error.diagnostic.code, "USAGE");
+        }
+    }
+}

@@ -139,3 +139,220 @@ fn has_multiple_links(metadata: &fs::Metadata) -> bool {
 fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Row;
+    use crate::schema::{AdditionalFields, Column, ColumnType, Schema};
+    use indexmap::IndexMap;
+    use serde_json::{Map, Value, json};
+
+    fn column(kind: ColumnType, nullable: bool) -> Column {
+        Column {
+            kind,
+            nullable,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn schema(columns: &[(&str, ColumnType, bool)], primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, kind, nullable) in columns {
+            map.insert((*name).to_string(), column(kind.clone(), *nullable));
+        }
+        Schema {
+            table: "t".into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+            inferred: None,
+        }
+    }
+
+    fn catalog(schema: Schema, rows: &[Value]) -> Catalog {
+        let table = schema.table.clone();
+        let rows: Vec<Row> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let object: Map<String, Value> = value.as_object().unwrap().clone();
+                Row {
+                    table: table.clone(),
+                    path: PathBuf::from(format!("/tmp/{table}/{index}.json")),
+                    relative: PathBuf::from(format!("{table}/{index}.json")),
+                    value: object,
+                    raw: b"{}\n".to_vec(),
+                }
+            })
+            .collect();
+        Catalog {
+            root: PathBuf::from("/tmp"),
+            schemas: BTreeMap::from([(table.clone(), schema)]),
+            rows: BTreeMap::from([(table, rows)]),
+            diagnostics: vec![],
+            warnings: vec![],
+            indentation_width: 2,
+        }
+    }
+
+    /// Section 35: the derived index set covers the primary key, every unique
+    /// constraint, every declared secondary index, and every foreign key, with
+    /// no duplicates when those definitions overlap.
+    #[test]
+    fn test9999_every_declared_access_path_gets_exactly_one_index() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("email", ColumnType::String, false),
+                ("team", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        s.unique = vec![vec!["email".into()]];
+        s.indexes = vec![vec!["team".into()], vec!["email".into()]];
+        let c = catalog(s, &[json!({"id": "a", "email": "a@x", "team": "t1"})]);
+
+        let built = expected(&c);
+        let mut covered: Vec<Vec<String>> = built.values().map(|i| i.columns.clone()).collect();
+        covered.sort();
+        // id (primary key), email (unique and declared index -- once), team.
+        assert_eq!(
+            covered,
+            vec![
+                vec!["email".to_string()],
+                vec!["id".to_string()],
+                vec!["team".to_string()]
+            ],
+            "overlapping definitions must not produce duplicate indexes"
+        );
+    }
+
+    /// Section 35: an index maps a key to every row holding it, so a duplicate
+    /// key is represented rather than silently collapsed -- the index must be
+    /// able to describe an invalid state, not hide it.
+    #[test]
+    fn test9999_index_entries_list_every_row_for_a_key() {
+        let s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("team", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        let mut s = s;
+        s.indexes = vec![vec!["team".into()]];
+        let c = catalog(
+            s,
+            &[
+                json!({"id": "a", "team": "shared"}),
+                json!({"id": "b", "team": "shared"}),
+                json!({"id": "c", "team": "alone"}),
+            ],
+        );
+        let built = expected(&c);
+        let team = built
+            .values()
+            .find(|index| index.columns == vec!["team".to_string()])
+            .expect("a team index exists");
+        let shared = team
+            .rows
+            .values()
+            .find(|paths| paths.len() == 2)
+            .expect("two rows share a key");
+        assert!(shared.contains(&"t/0.json".to_string()));
+        assert!(shared.contains(&"t/1.json".to_string()));
+        assert_eq!(team.rows.len(), 2, "one entry per distinct key");
+    }
+
+    /// Section 16: a null has no key, so a row with a null indexed column simply
+    /// does not appear in that index rather than being grouped under a
+    /// synthetic null key.
+    #[test]
+    fn test9999_rows_with_a_null_key_are_absent_from_the_index() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("team", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        s.indexes = vec![vec!["team".into()]];
+        let c = catalog(
+            s,
+            &[
+                json!({"id": "a", "team": Value::Null}),
+                json!({"id": "b", "team": "t1"}),
+            ],
+        );
+        let built = expected(&c);
+        let team = built
+            .values()
+            .find(|index| index.columns == vec!["team".to_string()])
+            .unwrap();
+        assert_eq!(team.rows.len(), 1, "only the non-null row is indexed");
+    }
+
+    /// Section 74: index derivation is deterministic, so the same catalog always
+    /// produces byte-identical index files and a clone rebuilds to the same
+    /// state.
+    #[test]
+    fn test9999_index_derivation_is_deterministic() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("email", ColumnType::String, false),
+            ],
+            &["id"],
+        );
+        s.unique = vec![vec!["email".into()]];
+        let c = catalog(
+            s,
+            &[
+                json!({"id": "a", "email": "a@x"}),
+                json!({"id": "b", "email": "b@x"}),
+            ],
+        );
+        let first = expected(&c);
+        let second = expected(&c);
+        assert_eq!(first.keys().collect::<Vec<_>>(), second.keys().collect::<Vec<_>>());
+        for (path, index) in &first {
+            assert_eq!(&second[path], index);
+        }
+    }
+
+    /// A composite index is named and keyed by its whole column list, so two
+    /// indexes over the same columns in a different order stay distinct.
+    #[test]
+    fn test9999_composite_indexes_are_keyed_by_their_full_column_list() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("a", ColumnType::String, false),
+                ("b", ColumnType::String, false),
+            ],
+            &["id"],
+        );
+        s.indexes = vec![vec!["a".into(), "b".into()], vec!["b".into(), "a".into()]];
+        let c = catalog(s, &[json!({"id": "x", "a": "1", "b": "2"})]);
+        let built = expected(&c);
+        assert_eq!(
+            built.len(),
+            3,
+            "primary key plus two distinct composite indexes"
+        );
+    }
+}

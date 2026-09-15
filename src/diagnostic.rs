@@ -204,3 +204,99 @@ impl DbError {
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Section 52: machine-readable diagnostics are a stable contract. Every
+    /// record carries its kind, severity, code, and message, and optional fields
+    /// are omitted rather than serialised as null.
+    #[test]
+    fn test9999_diagnostics_serialise_to_the_documented_shape() {
+        let diagnostic = Diagnostic::error("FOREIGN_KEY_VIOLATION", "posts.user_id is an orphan")
+            .at("posts/42.json")
+            .table("posts")
+            .field("user_id")
+            .expected("existing users.id")
+            .observed("\"missing\"")
+            .fix("FIX_ORPHAN_SET_NULL")
+            .fix("FIX_ORPHAN_DELETE_ROW")
+            .help("run `db doctor`");
+        let value = serde_json::to_value(&diagnostic).unwrap();
+
+        assert_eq!(value["kind"], "diagnostic");
+        assert_eq!(value["severity"], "error");
+        assert_eq!(value["code"], "FOREIGN_KEY_VIOLATION");
+        assert_eq!(value["table"], "posts");
+        assert_eq!(value["path"], "posts/42.json");
+        assert_eq!(value["field"], "user_id");
+        assert_eq!(value["expected"], "existing users.id");
+        assert_eq!(value["fixes"][0], "FIX_ORPHAN_SET_NULL");
+        assert_eq!(value["fixes"][1], "FIX_ORPHAN_DELETE_ROW");
+
+        // Absent optional members are omitted entirely.
+        let minimal = serde_json::to_value(Diagnostic::error("UNKNOWN_TABLE", "no such table"))
+            .unwrap();
+        for absent in ["table", "path", "location", "field", "constraint", "expected", "observed", "help"] {
+            assert!(
+                minimal.get(absent).is_none(),
+                "{absent} must be omitted when unset"
+            );
+        }
+        assert!(
+            minimal.get("fixes").is_none(),
+            "an empty fix list is omitted"
+        );
+    }
+
+    /// Section 52: each severity serialises to its documented lowercase name.
+    #[test]
+    fn test9999_severities_serialise_in_lowercase() {
+        for (diagnostic, expected) in [
+            (Diagnostic::error("C", "m"), "error"),
+            (Diagnostic::warning("C", "m"), "warning"),
+            (Diagnostic::suggestion("C", "m"), "suggestion"),
+            (Diagnostic::info("C", "m"), "info"),
+        ] {
+            assert_eq!(serde_json::to_value(&diagnostic).unwrap()["severity"], expected);
+        }
+    }
+
+    /// Section 51: exit codes are a machine-readable contract. Metadata and
+    /// format faults outrank an incomplete transaction, which outranks an
+    /// ordinary invalid database, and a clean run exits zero.
+    #[test]
+    fn test9999_diagnostic_exit_codes_follow_the_documented_precedence() {
+        assert_eq!(exit_code_for_diagnostics(&[]), 0);
+        assert_eq!(
+            exit_code_for_diagnostics(&[Diagnostic::error("FOREIGN_KEY_VIOLATION", "m")]),
+            2
+        );
+        assert_eq!(
+            exit_code_for_diagnostics(&[Diagnostic::error("TRANSACTION_INCOMPLETE", "m")]),
+            5
+        );
+        for code in ["FORMAT_UNSUPPORTED", "INTERNAL_METADATA_CORRUPT"] {
+            assert_eq!(exit_code_for_diagnostics(&[Diagnostic::error(code, "m")]), 6);
+        }
+
+        // Precedence holds when several faults are present at once.
+        let mixed = vec![
+            Diagnostic::error("UNIQUE_VIOLATION", "m"),
+            Diagnostic::error("TRANSACTION_INCOMPLETE", "m"),
+            Diagnostic::error("FORMAT_UNSUPPORTED", "m"),
+        ];
+        assert_eq!(exit_code_for_diagnostics(&mixed), 6);
+        assert_eq!(exit_code_for_diagnostics(&mixed[..2]), 5);
+    }
+
+    /// Errors raised by the CLI carry the exit status their kind implies.
+    #[test]
+    fn test9999_error_constructors_carry_their_exit_status() {
+        assert_eq!(DbError::usage("bad flag").exit_code(), 1);
+        assert_eq!(DbError::usage("bad flag").diagnostic.code, "USAGE");
+        assert_eq!(DbError::invalid("bad state").exit_code(), 2);
+        assert_eq!(DbError::new("QUERY_UNSUPPORTED", "m", 4).exit_code(), 4);
+    }
+}

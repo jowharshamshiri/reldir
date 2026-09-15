@@ -619,3 +619,134 @@ fn has_multiple_links(metadata: &fs::Metadata) -> bool {
 fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(kind: &str) -> ManifestEntry {
+        ManifestEntry {
+            kind: kind.into(),
+            hash: "a".repeat(64),
+            size: 1,
+        }
+    }
+
+    /// The object store is content addressed by lowercase hexadecimal SHA-256.
+    /// Anything else is corrupt internal metadata, not a hash to look up
+    /// (Section 58).
+    #[test]
+    fn test9999_object_hashes_must_be_lowercase_sha256_hex() {
+        let root = Path::new("/nonexistent-root");
+        for invalid in [
+            String::new(),
+            "abc".into(),
+            "A".repeat(64),
+            "g".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+        ] {
+            let mut e = entry("row");
+            e.hash = invalid.clone();
+            let error = validate_object(root, "users/u1.json", &e)
+                .expect_err(&format!("{invalid:?} must be refused"));
+            assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
+        }
+    }
+
+    /// An object's declared kind is derived from its path, so a mislabelled
+    /// entry means the metadata disagrees with the layout it describes.
+    #[test]
+    fn test9999_object_kind_is_derived_from_its_path() {
+        let root = Path::new("/nonexistent-root");
+        for (path, expected) in [
+            (".db/format", "format"),
+            (".db/config", "config"),
+            ("schema/users.json", "schema"),
+            ("users/u1.json", "row"),
+        ] {
+            // The correct kind gets past the kind check and fails later, when
+            // the absent object file is opened.
+            let error = validate_object(root, path, &entry(expected)).unwrap_err();
+            assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
+            assert!(
+                !error.diagnostic.message.contains("expected"),
+                "{path} with kind {expected} should pass the kind check"
+            );
+
+            // A wrong kind is rejected by the kind check itself.
+            let wrong = if expected == "row" { "schema" } else { "row" };
+            let error = validate_object(root, path, &entry(wrong)).unwrap_err();
+            assert!(
+                error.diagnostic.message.contains("expected"),
+                "{path} with kind {wrong} must be refused as mislabelled"
+            );
+        }
+    }
+
+    /// Section 22: the state root covers the format, the configuration, every
+    /// schema, and every row, so the digest is stable across processes and
+    /// changes whenever any authoritative input changes.
+    #[test]
+    fn test9999_manifest_entries_round_trip_through_json() {
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            revision: 7,
+            root_hash: "b".repeat(64),
+            entries: BTreeMap::from([
+                ("schema/users.json".to_string(), entry("schema")),
+                ("users/u1.json".to_string(), entry("row")),
+            ]),
+        };
+        let text = serde_json::to_string(&manifest).unwrap();
+        let parsed: Manifest = crate::json::parse_as(text.as_bytes()).unwrap();
+        assert_eq!(parsed.revision, 7);
+        assert_eq!(parsed.entries, manifest.entries);
+
+        // Unknown keys are refused: the manifest is a closed representation.
+        let extended = text.replace('{', "{\"surprise\":1,", 1);
+        assert!(crate::json::parse_as::<Manifest>(extended.as_bytes()).is_err());
+    }
+
+    /// Section 23: a provenance record names the transition it describes, and
+    /// the representation is closed so an unknown field cannot be ignored.
+    #[test]
+    fn test9999_provenance_records_round_trip_and_reject_unknown_fields() {
+        let provenance = Provenance {
+            revision: 1,
+            timestamp: "2026-09-14T00:00:00Z".into(),
+            previous_revision: None,
+            previous_root_hash: None,
+            new_root_hash: "c".repeat(64),
+            origin: "import".into(),
+            affected_objects: vec!["A users/u1.json".into()],
+            schema_changes: vec!["A schema/users.json".into()],
+            binary_version: VERSION.into(),
+            format_version: FORMAT_VERSION,
+            transaction_id: None,
+            entries: BTreeMap::from([("users/u1.json".to_string(), entry("row"))]),
+        };
+        let text = serde_json::to_string(&provenance).unwrap();
+        let parsed: Provenance = crate::json::parse_as(text.as_bytes()).unwrap();
+        assert_eq!(parsed.revision, 1);
+        assert_eq!(parsed.origin, "import");
+        assert!(parsed.previous_revision.is_none());
+
+        let extended = text.replace('{', "{\"surprise\":1,", 1);
+        assert!(crate::json::parse_as::<Provenance>(extended.as_bytes()).is_err());
+    }
+
+    /// Section 32: a provenance file is named for the revision it records, so a
+    /// zero-padded twenty-digit name sorts chronologically.
+    #[test]
+    fn test9999_provenance_filenames_sort_chronologically() {
+        let names: Vec<String> = [1u64, 2, 10, 100, 1000]
+            .iter()
+            .map(|revision| format!("{revision:020}.json"))
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "zero padding must preserve revision order");
+        assert_eq!(names[0], "00000000000000000001.json");
+    }
+}

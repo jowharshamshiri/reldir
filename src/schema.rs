@@ -539,3 +539,324 @@ fn missing_key_message(message: &str) -> String {
         message.into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn column(kind: ColumnType) -> Column {
+        Column {
+            kind,
+            nullable: false,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn base(columns: &[(&str, Column)], primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, c) in columns {
+            map.insert((*name).to_string(), c.clone());
+        }
+        Schema {
+            table: "t".into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+            inferred: None,
+        }
+    }
+
+    fn codes(schema: &Schema) -> Vec<String> {
+        schema
+            .validate_local("t")
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// Section 9: table names are a restricted lowercase identifier, must not be
+    /// `schema`, and must avoid Windows reserved device names so that every
+    /// governed directory is portable.
+    #[test]
+    fn test9999_table_names_are_restricted_and_portable() {
+        for accepted in ["users", "u", "a_b", "t1", "order_items"] {
+            assert!(valid_name(accepted), "{accepted} should be a valid name");
+        }
+        for rejected in [
+            "", "Users", "1users", "_users", "user-items", "user.items", "üsers", "con", "prn",
+            "aux", "nul", "com1", "lpt9", ".hidden",
+        ] {
+            assert!(!valid_name(rejected), "{rejected:?} must be rejected");
+        }
+        // `schema` is a reserved directory even though it is a valid identifier.
+        let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
+        s.table = "schema".into();
+        assert!(
+            s.validate_local("schema")
+                .iter()
+                .any(|d| d.code == "SCHEMA_INVALID_TABLE_NAME")
+        );
+    }
+
+    /// Section 11: the schema's `table` must equal its file stem, so a renamed
+    /// schema file cannot silently govern a different relation.
+    #[test]
+    fn test9999_table_must_equal_the_file_stem() {
+        let s = base(&[("id", column(ColumnType::String))], &["id"]);
+        assert!(s.validate_local("t").iter().all(|d| d.code
+            != "SCHEMA_TABLE_NAME_MISMATCH"));
+        assert!(
+            s.validate_local("other")
+                .iter()
+                .any(|d| d.code == "SCHEMA_TABLE_NAME_MISMATCH")
+        );
+    }
+
+    /// Section 11: a schema may pin its grammar version; an unsupported pin is a
+    /// format error rather than a best-effort interpretation.
+    #[test]
+    fn test9999_a_pinned_unsupported_grammar_is_refused() {
+        let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
+        s.schema_format = Some(crate::FORMAT_VERSION);
+        assert!(!codes(&s).contains(&"FORMAT_UNSUPPORTED".to_string()));
+        s.schema_format = Some(crate::FORMAT_VERSION + 1);
+        assert!(codes(&s).contains(&"FORMAT_UNSUPPORTED".to_string()));
+    }
+
+    /// Section 11: required elements are required, and the primary key must name
+    /// real, non-nullable, non-repeating columns.
+    #[test]
+    fn test9999_primary_keys_must_name_real_non_nullable_columns() {
+        let mut missing = base(&[("id", column(ColumnType::String))], &["ghost"]);
+        assert!(codes(&missing).contains(&"SCHEMA_PK_COLUMN_UNKNOWN".to_string()));
+
+        missing.primary_key = vec![];
+        assert!(codes(&missing).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
+
+        let repeated = base(&[("id", column(ColumnType::String))], &["id", "id"]);
+        assert!(codes(&repeated).contains(&"SCHEMA_PK_COLUMN_UNKNOWN".to_string()));
+
+        let mut nullable_column = column(ColumnType::String);
+        nullable_column.nullable = true;
+        let nullable = base(&[("id", nullable_column)], &["id"]);
+        assert!(codes(&nullable).contains(&"SCHEMA_PK_NULLABLE".to_string()));
+
+        let empty = base(&[], &["id"]);
+        assert!(codes(&empty).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
+    }
+
+    /// Section 10: storage.filename must identify rows uniquely and never be
+    /// nullable, otherwise two rows could claim one path.
+    #[test]
+    fn test9999_filename_columns_must_be_unique_and_not_null() {
+        let mut s = base(
+            &[
+                ("id", column(ColumnType::String)),
+                ("slug", column(ColumnType::String)),
+            ],
+            &["id"],
+        );
+        // A non-unique column cannot name files.
+        s.storage = Some(Storage {
+            filename: vec!["slug".into()],
+        });
+        assert!(codes(&s).contains(&"SCHEMA_FILENAME_NOT_UNIQUE".to_string()));
+
+        // Declaring it unique makes it a legitimate filename key.
+        s.unique = vec![vec!["slug".into()]];
+        assert!(!codes(&s).contains(&"SCHEMA_FILENAME_NOT_UNIQUE".to_string()));
+
+        // A nullable filename column is refused even when unique.
+        s.columns.get_mut("slug").unwrap().nullable = true;
+        assert!(codes(&s).contains(&"SCHEMA_FILENAME_NOT_UNIQUE".to_string()));
+    }
+
+    /// Section 11: every constraint column list must be non-empty, free of
+    /// repeats, and name declared columns.
+    #[test]
+    fn test9999_constraint_column_lists_are_validated() {
+        let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
+        s.unique = vec![vec![]];
+        assert!(codes(&s).contains(&"SCHEMA_COLUMN_UNKNOWN".to_string()));
+
+        s.unique = vec![vec!["id".into(), "id".into()]];
+        assert!(codes(&s).contains(&"SCHEMA_COLUMN_UNKNOWN".to_string()));
+
+        s.unique = vec![];
+        s.indexes = vec![vec!["ghost".into()]];
+        assert!(codes(&s).contains(&"SCHEMA_COLUMN_UNKNOWN".to_string()));
+    }
+
+    /// Section 11: type-specific members belong only to their own type, and a
+    /// declared default must match the column it defaults.
+    #[test]
+    fn test9999_type_specific_members_are_strict() {
+        // enum requires values; values are meaningless elsewhere.
+        let mut enumeration = column(ColumnType::Enum);
+        let s = base(&[("id", column(ColumnType::String)), ("e", enumeration.clone())], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
+
+        enumeration.values = Some(vec!["a".into(), "a".into()]);
+        let s = base(&[("id", column(ColumnType::String)), ("e", enumeration.clone())], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
+
+        let mut misplaced = column(ColumnType::String);
+        misplaced.values = Some(vec!["a".into()]);
+        let s = base(&[("id", column(ColumnType::String)), ("v", misplaced)], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_UNKNOWN_KEY".to_string()));
+
+        // array requires items; items are meaningless elsewhere.
+        let s = base(
+            &[("id", column(ColumnType::String)), ("a", column(ColumnType::Array))],
+            &["id"],
+        );
+        assert!(codes(&s).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
+
+        let mut with_items = column(ColumnType::String);
+        with_items.items = Some(Box::new(column(ColumnType::Int)));
+        let s = base(&[("id", column(ColumnType::String)), ("v", with_items)], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_UNKNOWN_KEY".to_string()));
+
+        // a default must satisfy its own column type.
+        let mut wrong_default = column(ColumnType::Int);
+        wrong_default.default = Some(json!("text"));
+        let s = base(
+            &[("id", column(ColumnType::String)), ("n", wrong_default)],
+            &["id"],
+        );
+        assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
+    }
+
+    /// Section 11: a generated column must be generated in a way its type can
+    /// represent, and cannot also carry a default.
+    #[test]
+    fn test9999_generated_columns_match_their_type() {
+        for (kind, generated, valid) in [
+            (ColumnType::Uuid, GeneratedKind::Uuid, true),
+            (ColumnType::Ulid, GeneratedKind::Ulid, true),
+            (ColumnType::Timestamp, GeneratedKind::Now, true),
+            (ColumnType::Int, GeneratedKind::Sequence, true),
+            (ColumnType::String, GeneratedKind::Uuid, false),
+            (ColumnType::Int, GeneratedKind::Now, false),
+        ] {
+            let mut c = column(kind);
+            c.generated = Some(Generated { kind: generated });
+            let s = base(&[("id", column(ColumnType::String)), ("g", c)], &["id"]);
+            let mismatched = codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string());
+            assert_eq!(!mismatched, valid, "unexpected result for {s:?}");
+        }
+
+        let mut both = column(ColumnType::Uuid);
+        both.generated = Some(Generated {
+            kind: GeneratedKind::Uuid,
+        });
+        both.default = Some(json!("0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"));
+        let s = base(&[("id", column(ColumnType::String)), ("g", both)], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
+    }
+
+    /// Section 11: nested column definitions are validated recursively, so a
+    /// fault inside an array's items or an object's properties is still caught.
+    #[test]
+    fn test9999_nested_column_definitions_are_validated_recursively() {
+        // An array whose items are an enum without values.
+        let mut items = column(ColumnType::Enum);
+        items.values = None;
+        let mut array = column(ColumnType::Array);
+        array.items = Some(Box::new(items));
+        let s = base(&[("id", column(ColumnType::String)), ("a", array)], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
+
+        // An object whose property carries a mistyped default.
+        let mut property = column(ColumnType::Int);
+        property.default = Some(json!("text"));
+        let mut properties = IndexMap::new();
+        properties.insert("n".to_string(), property);
+        let mut object = column(ColumnType::Object);
+        object.properties = Some(properties);
+        let s = base(&[("id", column(ColumnType::String)), ("o", object)], &["id"]);
+        assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
+    }
+
+    /// Section 11: check constraints need a name and a non-empty expression, and
+    /// names must be distinct within a table.
+    #[test]
+    fn test9999_check_constraints_require_distinct_names_and_expressions() {
+        let mut s = base(&[("id", column(ColumnType::String))], &["id"]);
+        s.check = vec![Check {
+            name: String::new(),
+            expr: "1=1".into(),
+        }];
+        assert!(codes(&s).contains(&"SCHEMA_CHECK_INVALID".to_string()));
+
+        s.check = vec![Check {
+            name: "c".into(),
+            expr: "   ".into(),
+        }];
+        assert!(codes(&s).contains(&"SCHEMA_CHECK_INVALID".to_string()));
+
+        s.check = vec![
+            Check {
+                name: "dup".into(),
+                expr: "id <> ''".into(),
+            },
+            Check {
+                name: "dup".into(),
+                expr: "id <> 'x'".into(),
+            },
+        ];
+        assert!(codes(&s).contains(&"SCHEMA_CHECK_INVALID".to_string()));
+    }
+
+    /// A schema exercising many features at once must validate cleanly, so the
+    /// rules above reject faults rather than well-formed schemas.
+    #[test]
+    fn test9999_a_fully_featured_valid_schema_reports_nothing() {
+        let mut id = column(ColumnType::Uuid);
+        id.generated = Some(Generated {
+            kind: GeneratedKind::Uuid,
+        });
+        let mut role = column(ColumnType::Enum);
+        role.values = Some(vec!["admin".into(), "member".into()]);
+        role.default = Some(json!("member"));
+        let mut tags = column(ColumnType::Array);
+        tags.items = Some(Box::new(column(ColumnType::String)));
+        let mut email = column(ColumnType::String);
+        email.description = Some("contact address".into());
+
+        let mut s = base(
+            &[
+                ("id", id),
+                ("email", email),
+                ("role", role),
+                ("tags", tags),
+            ],
+            &["id"],
+        );
+        s.unique = vec![vec!["email".into()]];
+        s.indexes = vec![vec!["role".into()]];
+        s.check = vec![Check {
+            name: "email_has_at".into(),
+            expr: "email LIKE '%@%'".into(),
+        }];
+        assert!(
+            s.validate_local("t").is_empty(),
+            "unexpected findings: {:?}",
+            codes(&s)
+        );
+    }
+}

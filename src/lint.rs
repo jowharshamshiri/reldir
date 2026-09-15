@@ -354,3 +354,231 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, Row};
+    use crate::schema::{AdditionalFields, Column, Schema};
+    use indexmap::IndexMap;
+    use serde_json::{Map, Value, json};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn column(kind: ColumnType, nullable: bool) -> Column {
+        Column {
+            kind,
+            nullable,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn schema(columns: &[(&str, ColumnType, bool)], primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, kind, nullable) in columns {
+            map.insert((*name).to_string(), column(kind.clone(), *nullable));
+        }
+        Schema {
+            table: "t".into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+            inferred: None,
+        }
+    }
+
+    fn catalog(schema: Schema, rows: &[Value]) -> Catalog {
+        let table = schema.table.clone();
+        let rows: Vec<Row> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let object: Map<String, Value> = value.as_object().unwrap().clone();
+                let raw = crate::canonical::pretty_with_indent(
+                    &crate::canonical::canonical_row(&object, &schema),
+                    2,
+                );
+                Row {
+                    table: table.clone(),
+                    path: PathBuf::from(format!("/tmp/{table}/{index}.json")),
+                    relative: PathBuf::from(format!("{table}/{index}.json")),
+                    value: object,
+                    raw,
+                }
+            })
+            .collect();
+        Catalog {
+            root: PathBuf::from("/tmp"),
+            schemas: BTreeMap::from([(table.clone(), schema)]),
+            rows: BTreeMap::from([(table, rows)]),
+            diagnostics: vec![],
+            warnings: vec![],
+            indentation_width: 2,
+        }
+    }
+
+    fn codes(catalog: &Catalog, descriptions: bool) -> Vec<String> {
+        lint(catalog, &Config::default(), descriptions)
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    /// Section 6 and 13: lint reasons about a declared shape. A schema whose
+    /// primary key does not resolve is already reported by schema validation, so
+    /// lint must decline to analyse that table rather than index a column that
+    /// does not exist.
+    #[test]
+    fn test9999_a_table_whose_primary_key_does_not_resolve_is_not_analysed() {
+        let mut broken = schema(&[("id", ColumnType::String, false)], &["ghost"]);
+        broken.inferred = Some(crate::schema::Inferred {
+            at: "2026-09-14T00:00:00Z".into(),
+            rows: 1,
+            strictness: "balanced".into(),
+            evidence: BTreeMap::new(),
+        });
+        let catalog = catalog(broken, &[json!({"id": "a"})]);
+        // Would otherwise report LINT_SCHEMA_UNREVIEWED; contributes nothing
+        // instead, and above all does not panic.
+        assert!(codes(&catalog, false).is_empty());
+
+        // An empty primary key is equally unanalysable.
+        let empty = schema(&[("id", ColumnType::String, false)], &[]);
+        let catalog = catalog(empty, &[json!({"id": "a"})]);
+        assert!(codes(&catalog, false).is_empty());
+    }
+
+    /// Section 13: a nullable column that is never null can be tightened.
+    #[test]
+    fn test9999_a_nullable_column_that_is_never_null_is_reported() {
+        let s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("maybe", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        let populated = catalog(
+            s.clone(),
+            &[json!({"id": "a", "maybe": "x"}), json!({"id": "b", "maybe": "y"})],
+        );
+        assert!(codes(&populated, false).contains(&"LINT_NULLABLE_NEVER_NULL".to_string()));
+
+        // With a null actually present, the column is correctly nullable.
+        let with_null = catalog(
+            s,
+            &[json!({"id": "a", "maybe": Value::Null}), json!({"id": "b", "maybe": "y"})],
+        );
+        assert!(!codes(&with_null, false).contains(&"LINT_NULLABLE_NEVER_NULL".to_string()));
+    }
+
+    /// Section 13: a string column whose every value is a narrower type should
+    /// be narrowed, and a float column holding only integers likewise.
+    #[test]
+    fn test9999_wider_types_than_the_data_requires_are_reported() {
+        let s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("at", ColumnType::String, false),
+            ],
+            &["id"],
+        );
+        let catalog = catalog(
+            s,
+            &[
+                json!({"id": "a", "at": "2026-09-14T10:00:00Z"}),
+                json!({"id": "b", "at": "2026-09-15T10:00:00Z"}),
+            ],
+        );
+        assert!(codes(&catalog, false).contains(&"LINT_WIDER_TYPE".to_string()));
+
+        let s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("n", ColumnType::Float, false),
+            ],
+            &["id"],
+        );
+        let integral = catalog(s.clone(), &[json!({"id": "a", "n": 1}), json!({"id": "b", "n": 2})]);
+        assert!(codes(&integral, false).contains(&"LINT_WIDER_TYPE".to_string()));
+
+        let fractional = catalog(s, &[json!({"id": "a", "n": 1.5})]);
+        assert!(!codes(&fractional, false).contains(&"LINT_WIDER_TYPE".to_string()));
+    }
+
+    /// Section 13: a column declared but never populated, and a column present
+    /// in only some rows, are both reported so the schema can be corrected.
+    #[test]
+    fn test9999_unpopulated_and_inconsistently_present_columns_are_reported() {
+        let s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("ghost", ColumnType::String, true),
+            ],
+            &["id"],
+        );
+        let never = catalog(s.clone(), &[json!({"id": "a"}), json!({"id": "b"})]);
+        assert!(codes(&never, false).contains(&"LINT_COLUMN_NEVER_POPULATED".to_string()));
+
+        let sometimes = catalog(s, &[json!({"id": "a", "ghost": "x"}), json!({"id": "b"})]);
+        assert!(codes(&sometimes, false).contains(&"LINT_INCONSISTENT_PRESENCE".to_string()));
+    }
+
+    /// Section 13: an inferred schema is unreviewed until accepted, and a schema
+    /// permitting unknown fields is worth flagging.
+    #[test]
+    fn test9999_unreviewed_and_permissive_schemas_are_reported() {
+        let mut s = schema(&[("id", ColumnType::String, false)], &["id"]);
+        s.inferred = Some(crate::schema::Inferred {
+            at: "2026-09-14T00:00:00Z".into(),
+            rows: 1,
+            strictness: "balanced".into(),
+            evidence: BTreeMap::new(),
+        });
+        s.additional_fields = AdditionalFields::Allow;
+        let catalog = catalog(s, &[json!({"id": "a"})]);
+        let found = codes(&catalog, false);
+        assert!(found.contains(&"LINT_SCHEMA_UNREVIEWED".to_string()));
+        assert!(found.contains(&"LINT_ADDITIONAL_FIELDS_ALLOWED".to_string()));
+    }
+
+    /// Section 13: description findings are opt-in, so ordinary runs are not
+    /// noisy with them.
+    #[test]
+    fn test9999_description_findings_are_opt_in() {
+        let s = schema(&[("id", ColumnType::String, false)], &["id"]);
+        let catalog = catalog(s, &[json!({"id": "a"})]);
+        assert!(!codes(&catalog, false).contains(&"LINT_NO_DESCRIPTION".to_string()));
+        assert!(codes(&catalog, true).contains(&"LINT_NO_DESCRIPTION".to_string()));
+    }
+
+    /// Section 13: a uuid primary key without a generator is a suggestion, so
+    /// that new rows get identifiers from the binary rather than by hand.
+    #[test]
+    fn test9999_an_ungenerated_identifier_primary_key_is_reported() {
+        let s = schema(&[("id", ColumnType::Uuid, false)], &["id"]);
+        let catalog = catalog(
+            s,
+            &[json!({"id": "0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"})],
+        );
+        assert!(codes(&catalog, false).contains(&"LINT_PK_NOT_GENERATED".to_string()));
+
+        // A plain string key carries no such expectation.
+        let s = schema(&[("id", ColumnType::String, false)], &["id"]);
+        let catalog = catalog(s, &[json!({"id": "a"})]);
+        assert!(!codes(&catalog, false).contains(&"LINT_PK_NOT_GENERATED".to_string()));
+    }
+}
