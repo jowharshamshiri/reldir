@@ -46,7 +46,7 @@ pub struct Provenance {
 /// a schema still matches what was recorded. Two spellings of this would let a
 /// database disagree with its own history.
 fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
-    let value = serde_json::to_value(schema).map_err(internal)?;
+    let value = crate::schema::semantic::encode_v1(schema);
     let bytes = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
     Ok(canonical::hash_bytes(&bytes))
 }
@@ -97,7 +97,7 @@ pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
     }
     for (table, s) in &c.schemas {
         let rel = format!("schema/{table}.json");
-        let val = serde_json::to_value(s).map_err(internal)?;
+        let val = crate::schema::semantic::encode_v1(s);
         let bytes = serde_json::to_vec(&canonical::normalize(&val)).map_err(internal)?;
         let hash = schema_hash(s)?;
         root.update(rel.as_bytes());
@@ -506,7 +506,7 @@ fn store_objects(c: &Catalog, entries: &BTreeMap<String, ManifestEntry>) -> Resu
     for (t, s) in &c.schemas {
         values.insert(
             format!("schema/{t}.json"),
-            canonical::normalize(&serde_json::to_value(s).map_err(internal)?),
+            canonical::normalize(&crate::schema::semantic::encode_v1(s)),
         );
         for r in &c.rows[t] {
             values.insert(
@@ -1047,48 +1047,51 @@ mod tests {
     /// The logical identity of a schema, frozen.
     ///
     /// A schema's hash is what a revision is recorded against, so it must not
-    /// move when the file format changes. If one of these fails after the JSON
-    /// Schema migration, the serialization has leaked into semantic identity.
+    /// move when the file format changes. These are taken over
+    /// `semantic::encode_v1`, which is the whole point: identity follows the
+    /// relational content, so replacing the on-disk grammar with JSON Schema
+    /// must leave every one of these untouched. A failure here after the
+    /// migration means the serialization has leaked into semantic identity.
     #[test]
     fn test1125_schema_hashes_are_independent_of_the_file_format() {
         const GOLDEN: &[(&str, &str)] = &[
-            ("bool", "cc3953444fc6da20609a4a30d25115e73a5866554961248fe23c318fa0cd1f0a"),
-            ("int", "08c3094a50f73ba9cf8e5244416d8babb38eb3a43729b354d28e83d406c0da87"),
-            ("float", "ec66e6dbf1629a9e6669ca44d0fe86ea59d15a9bd226e5e1c798009f844de5c1"),
-            ("decimal", "4848feb2023da36cd6d27afd76905000e0404afb4c3fd5219c44ee0cae88eb13"),
-            ("string", "e8416591e847834d7c91f27f8500594abad6262c8f816e65ebd92f83617d0527"),
-            ("bytes", "7db5e0ac9294507a3f6568ad0687ae15bf979462e860bebf3bc9bdc664be22ec"),
-            ("date", "e3ea1f666dc3eb3ea26643c16f846c54f13d0d19a3907491ab7fe740ad2b0931"),
-            ("timestamp", "d75a856dae24cce543a51686427b022b6bbe8a15104c189f5548eca46afb2f7d"),
-            ("uuid", "0b3367c750b570d54d65f6970c44cba95830040b9bc3d7a4af98ba480bc949fe"),
-            ("ulid", "ed4660a70664675a52a4613c831b0c8fe32a5f843e4b3a4cd3e2577ebb654c41"),
-            ("json", "4346a285dcc9de59acc942633704bf9fd5f853eb18093f7d19754900fcb2f603"),
-            ("enum", "d95845eb9f1492f31e374e63e58d41f0e49e223cd2f1a1c55079c0cf53f9b309"),
-            ("array_of_decimal", "d5db9d0771ca5f66b3343aa7b73ff8db47941f223e6002671d75b377764933a3"),
-            ("object_with_ulid_property", "82021f39b401975101ba870166e321ccfd32c6fb34593785f2d67f4b4d4dd57d"),
-            ("nullable", "9ec092431fa4a2a5150055348efbcd670a6abdfbebd63e0610236a07728d1d56"),
-            ("default_not_null", "85e8818b1fcd57257b5863f2a6728788113f98b5b325849d46f04a301bea0d46"),
-            ("nullable_and_default", "885b01784138c4eac5c12d75966e79a9db2ee2009eed29d3f868eef8b8909184"),
-            ("generated_uuid", "f970fda239e15e262204e31c815673f87e8c998dcc3eb73a3c1ac4f083fa5690"),
-            ("generated_ulid", "d98250519a93175fdaffd6c05cadc6ee82c390233bad1a5e83f55a13afd85777"),
-            ("generated_now", "f2696cb37eb8d276bf962a4c5522305ff6429b5a75434bcf16efdef52ec3bcc4"),
-            ("generated_sequence", "68134ae7a4a3c9a682848ce1e8eb227152c7366d4ea7fa43d15cf7de89aa1c90"),
-            ("descriptions", "52f4ffcd23393555ec3b8ff18d5c0447c59207e47d9b98932e36ec74c866ffd5"),
-            ("unique", "fea5c1583ede49db44985352d7981a33de376eb51582dc5767e9c06365e78c0a"),
-            ("indexes", "ee774fcd15e3d7fe2343936e6de0be69c5e43b9c68746dc272a0f6c8342e0fca"),
-            ("check", "19068ac92176fd9673867316d8768d1d9dedb573af940c812fbd95365268f64f"),
-            ("storage_filename", "bad6237a75fb4e4e26a4c93cfd40af2a7b9fb37a1aa058b3725bec48264edf67"),
-            ("additional_fields_allow", "2604644dbc1c9a16f02a370de4ab3da907ebbdf32743672634396a9f77eaeb34"),
-            ("composite_primary_key", "79e999568848b32c57ba1825e70dcc53d5dbc3799dc135b52b8623b59db0a097"),
-            ("schema_version_and_format", "fbf32922ab5d62ae411637b146871690d85f31fe142124d50936357825589256"),
-            ("fk_unset_actions", "299d51c8d8c1e9f11887d89327bff06e5e0c3b0adf6274dc64962169e23bc114"),
-            ("fk_restrict", "71267855e073a03f1c3cc1bddb3fdd2a9ea35e1f087dc69257e129fc4aeeb594"),
-            ("fk_cascade", "0f4b51c2b783e90522efe5e72958ba4cbe62f352506b14a7791db49f373e7f60"),
-            ("fk_set_null", "875bb050dbdd0ce1edc0e807361ca76401dfbe5faa361431e0132ba1db71214e"),
-            ("fk_set_default", "b636cfb176e3e12a2322c76f9de7e65d5ab8b9062819136689647d9b56168d5d"),
-            ("fk_no_action", "3a1fcf4ec5835795dd8d16ea1e37886617f7e9577d9026cd2b47c549a4c2a264"),
-            ("column_order_ab", "243c440a0b370685c5d3fae90b79dbd6034b6d4c1497477eaf157eb916a68832"),
-            ("column_order_ba", "243c440a0b370685c5d3fae90b79dbd6034b6d4c1497477eaf157eb916a68832"),
+            ("bool", "0bf55eb68c2708f1a4ad0b6686c189a73fb0f71e8ea21be4e907def78ea5fc44"),
+            ("int", "a939dcce7c26dacdb5cfc1d32420e0a078f8f63c3bc886cd3786a92b73646810"),
+            ("float", "ddadf6eb139973d09dd25eacedcf6c3bbec6ee87df3d8346fe85631fd6296f37"),
+            ("decimal", "f26399f7a7c29ccf35da54e72f2d3b6eb93441428b64739d1373f77e71363d26"),
+            ("string", "bacaecf137c9d46af4532595b9d6d136d67d14fb83991796da4ecb5e65a531ce"),
+            ("bytes", "8280ca26faf8dab8843f167d43d595b44b7eafed2edfc55bebe10eec39d20d34"),
+            ("date", "605663fb2cee57cb3844b92a915d25f3aba9cfe0ea0c32f4133268474babb855"),
+            ("timestamp", "20983e49021d1239d9d8ca8bedbb73e0d2ee6812576c2877082f326ed13b9f54"),
+            ("uuid", "714b623636f681429e72a91fc2e24ca239b9f65553f18e730d76fe2e41c3fc70"),
+            ("ulid", "d78e2bc72249d0b71b8ff7ae7e1a46ff0f70379fab49b2a6f30e9f13e674ca7a"),
+            ("json", "7b18bcd514f76d114189ee328ce59a83a76e0741aa666d2c86a9b3b7dc459364"),
+            ("enum", "4fc4fe783a3d44f354ff6554a86e9df9f4c71574ac59eb52586d0d5c89375314"),
+            ("array_of_decimal", "f84a8ff25795181f16bbfd6740199fdaa1b85cddcd2902dfbba2fd80fbe1344f"),
+            ("object_with_ulid_property", "444980ee96c1f131a9684f3708f08ef8fab54165763f00930d56fd75a798dfeb"),
+            ("nullable", "be3fc5ed17bc06a9a3e0d6d2d98c16451b46d5439febd274192afb2126eb3800"),
+            ("default_not_null", "706ec91ff11e15d5d590052842a077cdfc8aca11c824c2c67483073828ae47ab"),
+            ("nullable_and_default", "10cee2f93793a85a5ab89d51afb45588bc7c376873403c7cda9f3bd82e183288"),
+            ("generated_uuid", "43ea5b01e8a2bb7dbd6c14c0ba7dcdc81bd50f127e6bc45ea5fab975e95bf002"),
+            ("generated_ulid", "b2d142c6febf8227bf61cf7bba1266785a3f79aa9a7234d319d6fab5cea4f1cb"),
+            ("generated_now", "2a4c033cad2310f2ae59815c808d50145b1d5d059ed994a0de20fd74b0d574f5"),
+            ("generated_sequence", "26e3e6b8cef0db3a27abd3eb65f4760ad8a2bc7667278463e00055e6bdb75627"),
+            ("descriptions", "10b4bd0a2fe9620e5e51a8e8e0b4673d8f0a547d4917f80f7dd5d71af5ba4494"),
+            ("unique", "6ce26284c29c46747a81345937b4bc537e3163a45fa229a24047511b4cb11289"),
+            ("indexes", "92bf7233758f91d742f5ae852720e7fcfc3f59b1fbd68f9b9df61f9f10f03a31"),
+            ("check", "4e61b420e65cf6b0a35b6ceb449770f039d6a67dce2f384ede06f51837cd1608"),
+            ("storage_filename", "2c53387a296180351c470dc11f79471b2ebec6c7917a89346ddea40c2540b0aa"),
+            ("additional_fields_allow", "df38fd9bf16cd9108c27f23adf84df9d62d5ca8876c1d780e7496d4307ff391c"),
+            ("composite_primary_key", "121470cfcceecef0f75cbc824d0f2778c4877628860cad456ac22b425c9793f2"),
+            ("schema_version_and_format", "1b63cf55a764d6f0ec9783340577add6d7179ed5a9c48d5322d9568f6458aa49"),
+            ("fk_unset_actions", "8888df83fa328bcfb51d474610539db53e00d5f4fc343dc992b3151267f5f426"),
+            ("fk_restrict", "8888df83fa328bcfb51d474610539db53e00d5f4fc343dc992b3151267f5f426"),
+            ("fk_cascade", "388bc55a325d634c863da9dfef062388a6e7a7fe35a5b263546f007a56a9c829"),
+            ("fk_set_null", "b0cbb20d6ecf9914aa3a3c792a954c655bbb0c33b935efb752f7b8dc9ca250cd"),
+            ("fk_set_default", "7ceebe5a46548fdaae78d3074dea9f9dda6c08c5875251330ec2fc1a3dcb15a2"),
+            ("fk_no_action", "128e213e5c156b9c09f26c262555aa10b37243e938761c8a9bba967dacc77fe2"),
+            ("column_order_ab", "06bfe85c793f5868313e8d2b6326b7873335c11506f962e1e1cf71d08d9c874f"),
+            ("column_order_ba", "21d92c54ff542ff3e6c89132d35f77350c23859a63c2d0145ddd069a85ea6ab5"),
         ];
 
         let fixtures = golden_fixtures();
@@ -1097,7 +1100,12 @@ mod tests {
             .map(|(label, schema)| {
                 (
                     (*label).to_string(),
-                    schema_hash(schema).expect("a schema hashes"),
+                    {
+                        let value = crate::schema::semantic::encode_v1(schema);
+                        let bytes =
+                            serde_json::to_vec(&canonical::normalize(&value)).expect("encodes");
+                        canonical::hash_bytes(&bytes)
+                    },
                 )
             })
             .collect();
@@ -1125,24 +1133,20 @@ mod tests {
         }
     }
 
-    /// Column order is logical state, and today's hash loses it.
+    /// Column order is part of a schema's identity.
     ///
     /// `canonical_row` writes a row's keys in schema column order, so two
     /// schemas differing only in that order write different bytes for the same
-    /// logical row -- `test1003` pins exactly that. But `schema_hash` runs the
-    /// schema through `canonical::normalize`, which sorts object keys, so the
-    /// `columns` ordering is erased before the digest. Two schemas that produce
-    /// different files therefore share one identity, and the state root cannot
-    /// tell them apart.
+    /// logical row -- `test1003` pins exactly that. Identity has to agree with
+    /// what the database actually writes, or the state root cannot distinguish
+    /// two databases whose files genuinely differ.
     ///
-    /// This predates the JSON Schema work and is recorded here because the
-    /// golden table above freezes today's hashes: without this test that table
-    /// would silently ratify the collision as intended behaviour. The fix
-    /// belongs in the semantic encoding, which must carry column order
-    /// explicitly rather than inheriting `normalize`'s key sorting.
+    /// The derived encoding lost this: it rendered `columns` as an object, and
+    /// `normalize` sorts object keys, so the ordering was erased before the
+    /// digest. `semantic::encode_v1` carries the order explicitly, which is the
+    /// one respect in which it departs from what the derive produced.
     #[test]
-    #[should_panic(expected = "column order must change a schema's identity")]
-    fn test1126_column_order_is_lost_from_schema_identity() {
+    fn test1126_column_order_changes_a_schemas_identity() {
         let fixtures = golden_fixtures();
         let find = |name: &str| {
             fixtures
@@ -1166,10 +1170,22 @@ mod tests {
             "the fixtures must write different rows, or they are not a witness"
         );
 
+        let identity = |schema: &crate::schema::Schema| {
+            let value = crate::schema::semantic::encode_v1(schema);
+            canonical::hash_bytes(&serde_json::to_vec(&canonical::normalize(&value)).unwrap())
+        };
         assert_ne!(
-            schema_hash(&ab).unwrap(),
-            schema_hash(&ba).unwrap(),
+            identity(&ab),
+            identity(&ba),
             "column order must change a schema's identity"
+        );
+
+        // An unstated referential action and its written equivalent impose the
+        // same behaviour, so they are one schema with one identity.
+        assert_eq!(
+            identity(&find("fk_unset_actions")),
+            identity(&find("fk_restrict")),
+            "an omitted on_delete is restrict"
         );
     }
 }

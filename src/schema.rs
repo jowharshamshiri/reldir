@@ -1,3 +1,8 @@
+// Identity, kept apart from the file format that carries it. A schema's hash
+// must follow its relational content, not the grammar it happens to be written
+// in, or changing the grammar would rewrite every database's history.
+pub mod semantic;
+
 use crate::diagnostic::{DbError, Diagnostic, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
