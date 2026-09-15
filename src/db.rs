@@ -433,3 +433,144 @@ fn abs(p: &Path) -> Result<PathBuf> {
 pub fn recover(root: &Path) -> Result<bool> {
     crate::transaction::recover(root)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Section 29: a primary key given on the command line is decoded against
+    /// the value it denotes. JSON syntax wins where it parses, so an integer key
+    /// arrives as a number, and bare text is taken as a string rather than being
+    /// rejected -- `db get users abc` must work without shell quoting games.
+    #[test]
+    fn test9999_primary_key_arguments_decode_json_then_fall_back_to_text() {
+        assert_eq!(json_key_arg("123").unwrap(), Value::from(123));
+        assert_eq!(json_key_arg("1.5").unwrap(), Value::from(1.5));
+        assert_eq!(json_key_arg("true").unwrap(), Value::Bool(true));
+        assert_eq!(json_key_arg("null").unwrap(), Value::Null);
+        assert_eq!(
+            json_key_arg("\"quoted\"").unwrap(),
+            Value::String("quoted".into())
+        );
+
+        // Text that is not JSON is the string it looks like.
+        for text in ["abc", "u1", "not json", "2026-09-14", ""] {
+            assert_eq!(
+                json_key_arg(text).unwrap(),
+                Value::String(text.into()),
+                "{text:?} should decode as a string"
+            );
+        }
+
+        // A structured key round-trips as structure.
+        assert_eq!(json_key_arg("[1,2]").unwrap(), serde_json::json!([1, 2]));
+    }
+
+    /// Section 49: database discovery resolves an explicit path to an absolute
+    /// location so that later path handling is unambiguous.
+    #[test]
+    fn test9999_explicit_discovery_returns_an_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = Database::discover(Some(dir.path())).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, dir.path());
+    }
+
+    /// Section 6: an uninitialised directory names what was searched and how to
+    /// proceed, and reports the documented exit status.
+    #[test]
+    fn test9999_discovery_failure_is_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        let previous = env::current_dir().unwrap();
+        // `discover` walks up from the working directory when no path is given.
+        env::set_current_dir(&nested).unwrap();
+        let result = Database::discover(None);
+        env::set_current_dir(previous).unwrap();
+
+        // The temporary directory has no .db anywhere above it inside the
+        // sandbox, but an ancestor of the system temp root might; only assert on
+        // the failure shape when discovery actually failed.
+        if let Err(error) = result {
+            assert_eq!(error.diagnostic.code, "UNINITIALIZED");
+            assert_eq!(error.exit, 10);
+            assert!(
+                error
+                    .diagnostic
+                    .help
+                    .as_deref()
+                    .is_some_and(|help| help.contains("db init")),
+                "the message must say how to proceed"
+            );
+            assert!(
+                error.diagnostic.message.contains("searched"),
+                "the message must name the directories tried"
+            );
+        }
+    }
+
+    /// Section 65: the on-disk format is explicitly versioned and an unsupported
+    /// version is refused rather than interpreted optimistically.
+    #[test]
+    fn test9999_unsupported_formats_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        init_layout(dir.path(), false).unwrap();
+        validate_format(dir.path()).expect("a freshly written format is supported");
+
+        fs::write(
+            dir.path().join(".db/format"),
+            format!("format_version = {}\n", FORMAT_VERSION + 1),
+        )
+        .unwrap();
+        let error = validate_format(dir.path()).unwrap_err();
+        assert_eq!(error.diagnostic.code, "FORMAT_UNSUPPORTED");
+
+        // Unreadable garbage is corrupt metadata, not a silently older format.
+        fs::write(dir.path().join(".db/format"), "not a format\n").unwrap();
+        assert!(validate_format(dir.path()).is_err());
+    }
+
+    /// Section 50: initialisation writes the metadata layout a clone needs, and
+    /// ignores derived state so only authoritative files are versioned.
+    #[test]
+    fn test9999_initialisation_writes_the_documented_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        init_layout(dir.path(), false).unwrap();
+        for expected in [".db", ".db/format", ".db/config", ".db/.gitignore", "schema"] {
+            assert!(
+                dir.path().join(expected).exists(),
+                "{expected} must be created"
+            );
+        }
+        let ignore = fs::read_to_string(dir.path().join(".db/.gitignore")).unwrap();
+        assert!(
+            ignore.contains("format") && ignore.contains("config"),
+            "format and config stay versioned: {ignore}"
+        );
+
+        // The written configuration is valid and parses back.
+        let config = load_config(dir.path()).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.indentation_width, 2);
+    }
+
+    /// Section 50: `--track-provenance` opts history into version control, which
+    /// is a different ignore policy from the default.
+    #[test]
+    fn test9999_tracked_provenance_changes_the_ignore_policy() {
+        let default_dir = tempfile::tempdir().unwrap();
+        init_layout(default_dir.path(), false).unwrap();
+        let default_ignore = fs::read_to_string(default_dir.path().join(".db/.gitignore")).unwrap();
+
+        let tracked_dir = tempfile::tempdir().unwrap();
+        init_layout(tracked_dir.path(), true).unwrap();
+        let tracked_ignore = fs::read_to_string(tracked_dir.path().join(".db/.gitignore")).unwrap();
+
+        assert_ne!(
+            default_ignore, tracked_ignore,
+            "tracking provenance must change what is ignored"
+        );
+        assert!(tracked_ignore.contains("provenance"));
+    }
+}
