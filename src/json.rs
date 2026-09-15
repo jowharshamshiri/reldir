@@ -3,8 +3,19 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Number, Value};
 use std::fmt;
 
+/// Parse one JSON document, rejecting duplicate object keys and trailing
+/// content.
+///
+/// Nesting depth is bounded by the `max_nesting_depth` configuration
+/// (Sections 57 and 61), which callers enforce against the parsed value. The
+/// parser's own recursion limit is therefore disabled: leaving it in place
+/// would impose a hidden ceiling of its own that no configuration could raise,
+/// so a database whose limit is set above it could never be read even though
+/// the limit says it is allowed. Depth remains bounded -- by the documented,
+/// configurable limit rather than by an undocumented constant.
 pub fn parse(bytes: &[u8]) -> serde_json::Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    deserializer.disable_recursion_limit();
     let value = StrictValue::deserialize(&mut deserializer)?.0;
     deserializer.end()?;
     Ok(value)

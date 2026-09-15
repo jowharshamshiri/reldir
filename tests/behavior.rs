@@ -2166,6 +2166,41 @@ fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
     let before = fs::read(root.join("users/u1.json")).unwrap();
     let manifest_before = fs::read(root.join(".db/manifest.json")).unwrap();
 
+    // Section 46: a read-only invocation works from an in-memory observation
+    // and writes no derived state, so any number of them may run at once.
+    let mut handles = vec![];
+    for _ in 0..8 {
+        let root = root.clone();
+        handles.push(std::thread::spawn(move || {
+            db()
+                .args([
+                    "--db",
+                    root.to_str().unwrap(),
+                    "--readonly",
+                    "--format",
+                    "jsonl",
+                    "sql",
+                    "SELECT name FROM users ORDER BY name",
+                ])
+                .output()
+                .unwrap()
+        }));
+    }
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "a read-only reader must never be refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Alice") && stdout.contains("Bob"));
+    }
+
+    // A default invocation may record an externally observed revision and
+    // refresh derived state, so it takes the writer lock. Racing several must
+    // still never corrupt the database: each either answers or is refused with
+    // the documented conflict code, and the answers are always correct.
     let mut handles = vec![];
     for _ in 0..8 {
         let root = root.clone();
@@ -2183,16 +2218,24 @@ fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
                 .unwrap()
         }));
     }
+    let mut answered = 0;
     for handle in handles {
         let output = handle.join().unwrap();
-        assert!(
-            output.status.success(),
-            "a reader failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Alice") && stdout.contains("Bob"));
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if output.status.success() {
+            answered += 1;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("Alice") && stdout.contains("Bob"));
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "a refused writer must report the documented conflict: {stderr}"
+            );
+            assert!(stderr.contains("CONCURRENT_MODIFICATION"), "{stderr}");
+        }
     }
+    assert!(answered >= 1, "at least one invocation must make progress");
     assert_eq!(before, fs::read(root.join("users/u1.json")).unwrap());
     assert_eq!(
         manifest_before,
@@ -2381,8 +2424,11 @@ fn test0045_result_row_limits_are_enforced_not_truncated() {
     .stderr(predicate::str::contains("RESOURCE_LIMIT"));
 }
 
-/// Section 57: governed content is untrusted input. Pathological structures are
-/// refused by a configured limit instead of exhausting the process.
+/// Sections 57 and 61: governed content is untrusted input, and the nesting
+/// limit that bounds it is the configured one. A structure deeper than the
+/// limit is refused as RESOURCE_LIMIT; raising the limit above any parser
+/// ceiling must actually admit the same structure, otherwise the limit is not
+/// configurable in the sense the specification requires.
 #[test]
 fn test0046_pathological_json_is_refused_by_configured_limits() {
     let dir = tempfile::tempdir().unwrap();

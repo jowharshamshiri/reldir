@@ -39,7 +39,7 @@ features = ["derive"]
 version = "1"
 
 [dependencies.serde_json]
-features = ["preserve_order"]
+features = ["preserve_order", "unbounded_depth"]
 version = "1"
 
 [dependencies.uuid]
@@ -55,4 +55,4 @@ description = "A filesystem-native relational JSON database"
 edition = "2024"
 license = "MIT"
 name = "jdb"
-version = "0.27.243"
+version = "0.28.249"
