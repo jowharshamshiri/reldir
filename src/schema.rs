@@ -1,6 +1,8 @@
 // Identity, kept apart from the file format that carries it. A schema's hash
 // must follow its relational content, not the grammar it happens to be written
 // in, or changing the grammar would rewrite every database's history.
+pub mod json_schema;
+pub mod meta;
 pub mod semantic;
 
 use crate::diagnostic::{DbError, Diagnostic, Result};
@@ -43,25 +45,28 @@ pub enum GeneratedKind {
     Sequence,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A column's logical type and constraints.
+///
+/// Deliberately not `Serialize`/`Deserialize`: the file form is JSON Schema,
+/// produced and consumed only by [`json_schema`], and a derive here would be a
+/// second way to write a schema that no one maintains. The compiler enforces
+/// the boundary.
+#[derive(Debug, Clone)]
 pub struct Column {
-    #[serde(rename = "type")]
     pub kind: ColumnType,
-    #[serde(default)]
     pub nullable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated: Option<Generated>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Box<Column>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<IndexMap<String, Column>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Standard JSON Schema annotations carried through untouched.
+    ///
+    /// These describe a schema without constraining an instance, so preserving
+    /// them costs no semantics: a `$comment` a person wrote survives a load and
+    /// a save. They take no part in validation and none in identity.
+    pub annotations: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,12 +118,6 @@ pub struct Storage {
     pub filename: Vec<String>,
 }
 
-fn one() -> u32 {
-    1
-}
-fn reject() -> AdditionalFields {
-    AdditionalFields::Reject
-}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdditionalFields {
@@ -126,30 +125,27 @@ pub enum AdditionalFields {
     Allow,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// One table's relational model.
+///
+/// Not serializable for the same reason as [`Column`]: [`json_schema::encode`]
+/// renders it and [`json_schema::decode`] reads it, and identity comes from
+/// [`semantic::encode_v1`]. Three destinations, each explicit.
+#[derive(Debug, Clone)]
 pub struct Schema {
     pub table: String,
-    #[serde(default = "one")]
     pub schema_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_format: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub primary_key: Vec<String>,
     pub columns: IndexMap<String, Column>,
-    #[serde(default)]
     pub unique: Vec<Vec<String>>,
-    #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
-    #[serde(default)]
     pub check: Vec<Check>,
-    #[serde(default)]
     pub indexes: Vec<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<Storage>,
-    #[serde(default = "reject")]
     pub additional_fields: AdditionalFields,
+    /// Document-level annotations, preserved exactly as [`Column::annotations`].
+    pub annotations: IndexMap<String, Value>,
 }
 
 impl Schema {
@@ -424,9 +420,25 @@ fn valid_column_name(s: &str) -> bool {
     !s.is_empty() && !s.contains('\0')
 }
 
+/// Read a schema from bytes already in hand.
+///
+/// The same two steps as [`load`], for callers that have the document rather
+/// than a path -- so there is still exactly one way a schema is parsed.
+pub fn load_bytes(data: &[u8]) -> Result<Schema> {
+    let document = crate::json::parse(data).map_err(|e| {
+        DbError::from_diag(Diagnostic::error("SCHEMA_INVALID_JSON", e.to_string()), 2)
+    })?;
+    json_schema::decode(&document)
+}
+
+/// Read a schema file.
+///
+/// The only way a schema enters the process. Files are JSON Schema documents in
+/// jdb's dialect, so parsing is two steps -- JSON, then the dialect -- and each
+/// reports its own faults at the place they occur.
 pub fn load(path: &Path) -> Result<Schema> {
     let data = fs::read(path).map_err(|e| DbError::io(path, e))?;
-    crate::json::parse(&data).map_err(|e| {
+    let document = crate::json::parse(&data).map_err(|e| {
         let mut diagnostic = Diagnostic::error("SCHEMA_INVALID_JSON", e.to_string()).at(path);
         diagnostic.location = Some(crate::diagnostic::Location {
             line: e.line(),
@@ -438,99 +450,29 @@ pub fn load(path: &Path) -> Result<Schema> {
             .map(String::from);
         DbError::from_diag(diagnostic, 2)
     })?;
-    let mut de = serde_json::Deserializer::from_slice(&data);
-    // The bound on how deep a document may be is `max_nesting_depth`, enforced
-    // by `json::parse` above. serde's own fixed recursion limit is a second,
-    // invisible bound that no configuration can reach: left on, it refuses a
-    // schema this database itself wrote and already accepted as data.
-    de.disable_recursion_limit();
-    let schema: Schema = serde::Deserialize::deserialize(&mut de).map_err(|e| {
-        let text = e.to_string();
-        let code = if text.contains("unknown field") {
-            "SCHEMA_UNKNOWN_KEY"
-        } else if text.contains("missing field `type`") {
-            "SCHEMA_COLUMN_TYPE_MISSING"
-        } else if text.contains("unknown variant") {
-            "SCHEMA_TYPE_UNKNOWN"
-        } else if text.contains("missing field") {
-            "SCHEMA_MISSING_REQUIRED"
-        } else {
-            "SCHEMA_INVALID_JSON"
-        };
-        let message = if code == "SCHEMA_UNKNOWN_KEY" {
-            nearest_key_message(&text)
-        } else if code == "SCHEMA_MISSING_REQUIRED" {
-            missing_key_message(&text)
-        } else if code == "SCHEMA_COLUMN_TYPE_MISSING" {
-            format!("{text}; type is required for validation, comparison, and canonical hashing")
-        } else {
-            text
-        };
-        let mut d = Diagnostic::error(code, message).at(path);
-        d.location = Some(crate::diagnostic::Location {
-            line: e.line(),
-            column: e.column(),
-        });
-        d.source_line = std::str::from_utf8(&data)
-            .ok()
-            .and_then(|s| s.lines().nth(e.line().saturating_sub(1)))
+    json_schema::decode(&document).map_err(|error| {
+        // The decoder knows what is wrong but not which file it was reading, so
+        // the path is attached here where it is known.
+        let mut diagnostic = *error.diagnostic;
+        if diagnostic.path.is_none() {
+            diagnostic = diagnostic.at(path);
+        }
+        // The decoder names the key at fault; the file is what has line
+        // numbers. Resolving one against the other is what lets a schema error
+        // point at the declaration a reader has to edit.
+        if diagnostic.location.is_none()
+            && let Some(anchor) = diagnostic.field.clone()
+        {
+            diagnostic.location = crate::integrity::locate(&data, &anchor);
+        }
+        diagnostic.source_line = diagnostic
+            .location
+            .as_ref()
+            .and_then(|location| std::str::from_utf8(&data).ok().map(|t| (t, location)))
+            .and_then(|(text, location)| text.lines().nth(location.line.saturating_sub(1)))
             .map(String::from);
-        DbError::from_diag(d, 2)
-    })?;
-    Ok(schema)
-}
-
-fn nearest_key_message(message: &str) -> String {
-    const KEYS: &[&str] = &[
-        "table",
-        "schema_version",
-        "schema_format",
-        "description",
-        "primary_key",
-        "columns",
-        "unique",
-        "foreign_keys",
-        "check",
-        "indexes",
-        "storage",
-        "additional_fields",
-        "type",
-        "nullable",
-        "default",
-        "generated",
-        "values",
-        "items",
-        "properties",
-        "on_delete",
-        "on_update",
-        "references",
-        "filename",
-    ];
-    let Some(unknown) = message
-        .split_once("unknown field `")
-        .and_then(|(_, rest)| rest.split_once('`').map(|(field, _)| field))
-    else {
-        return message.into();
-    };
-    let nearest = KEYS
-        .iter()
-        .min_by_key(|candidate| strsim::levenshtein(unknown, candidate));
-    match nearest {
-        Some(nearest) => format!("{message}; nearest valid key is {nearest:?}"),
-        None => message.into(),
-    }
-}
-
-fn missing_key_message(message: &str) -> String {
-    if message.contains("`table`") {
-        format!("{message}; table is required to identify the relation")
-    } else if message.contains("`primary_key`") {
-        format!("{message}; primary_key is required for row identity and keyed operations")
-    } else if message.contains("`columns`") {
-        format!("{message}; columns is required to define relational attributes")
-    } else {
-        message.into()
-    }
+        DbError::from_diag(diagnostic, 2)
+    })
 }
 
 #[cfg(test)]
@@ -548,6 +490,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 
@@ -569,6 +512,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 

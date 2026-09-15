@@ -80,7 +80,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 .table(table),
                 c,
                 table,
-                "additional_fields",
+                "additionalProperties",
             ));
         }
         for (name, col) in &s.columns {
@@ -477,6 +477,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 
@@ -498,6 +499,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 
@@ -527,7 +529,7 @@ mod tests {
             pinned: BTreeSet::new(),
             schema_sources: BTreeMap::from([(
                 table.clone(),
-                crate::canonical::pretty_with_indent(&serde_json::to_value(&schema).unwrap(), 2),
+                crate::canonical::pretty_with_indent(&crate::schema::json_schema::encode(&schema), 2),
             )]),
             schemas: BTreeMap::from([(table.clone(), schema)]),
             rows: BTreeMap::from([(table, rows)]),

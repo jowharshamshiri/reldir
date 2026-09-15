@@ -414,6 +414,7 @@ fn infer_table(
         indexes: vec![],
         storage: None,
         additional_fields: AdditionalFields::Reject,
+        annotations: Default::default(),
     };
     for r in rows {
         let expected = canonical::filename(&schema, &r.obj);
@@ -630,6 +631,7 @@ fn column(kind: ColumnType, nullable: bool) -> Column {
         items: None,
         properties: None,
         description: None,
+        annotations: Default::default(),
     }
 }
 fn infer_pk(
@@ -690,6 +692,7 @@ fn infer_pk(
                     indexes: vec![],
                     storage: None,
                     additional_fields: AdditionalFields::Reject,
+                    annotations: Default::default(),
                 };
                 canonical::filename(&fake, &r.obj).as_deref() == Some(&format!("{}.json", r.stem))
                     && !value.is_null()

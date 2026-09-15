@@ -158,12 +158,12 @@ fn test0005_sql_delete_executes_declared_cascade_in_one_revision() {
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -210,12 +210,12 @@ fn test0006_direct_primary_key_update_uses_declared_cascade() {
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -283,7 +283,7 @@ fn test0007_sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_out
     pin(
         root,
         "items",
-        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"count":{"type":"int"},"active":{"type":"bool"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-jdb-type":"int"},"active":{"type":"boolean"}},"required":["id","count","active"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count","active"]}}"#,
     );
     fs::write(
         root.join("items/a.json"),
@@ -563,7 +563,7 @@ fn test0013_schema_errors_have_specific_codes_and_locations() {
     pin(
         dir.path(),
         "bad",
-        "{\n  \"table\": \"bad\",\n  \"primary_key\": [\"id\"],\n  \"columns\": {\"id\": {}}\n}\n",
+        "{\n  \"$schema\": \"https://jdb.dev/schema/jdb-1\",\n  \"type\": \"object\",\n  \"properties\": {\"id\": \"string\"},\n  \"x-jdb\": {\"table\": \"bad\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n",
     );
     db().args([
         "--db",
@@ -616,7 +616,7 @@ fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() 
     pin(
         root,
         "items",
-        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string","default":"fixed"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","default":"fixed"}},"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     fs::write(root.join("items/fixed.json"), "{}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -626,7 +626,7 @@ fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() 
     pin(
         root,
         "items",
-        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"unique":[["tag"]]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","tag"],"unique":[["tag"]]}}"#,
     );
     fs::write(root.join("items/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(root.join("items/b.json"), "{\"id\":\"b\"}\n").unwrap();
@@ -647,7 +647,7 @@ fn test0016_check_schema_typechecking_rejects_unknown_identifiers() {
     pin(
         root,
         "items",
-        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"string"},"count":{"type":"int"}},"check":[{"name":"positive","expr":"typo > 0"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-jdb-type":"int"}},"required":["id","count"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count"],"checks":[{"name":"positive","expr":"typo > 0"}]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -709,7 +709,7 @@ fn test0018_decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
     pin(
         root,
         "numbers",
-        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"amount":{"type":"decimal"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"amount":{"type":"string","pattern":"^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$","x-jdb-type":"decimal"}},"required":["id","amount"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","amount"]}}"#,
     );
     fs::write(
         root.join("numbers/a.json"),
@@ -778,7 +778,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     pin(
         root,
         "numbers",
-        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string","default":"10"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string","default":"10"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
     );
     fs::write(root.join("numbers/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(
@@ -809,8 +809,9 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
         serde_json::from_slice(&fs::read(root.join("numbers/a.json")).unwrap()).unwrap();
     let explicit: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("numbers/b.json")).unwrap()).unwrap();
-    assert_eq!(schema["columns"]["score"]["type"], "int");
-    assert_eq!(schema["columns"]["score"]["default"], 10);
+    assert_eq!(schema["properties"]["score"]["type"], "integer");
+    assert_eq!(schema["properties"]["score"]["x-jdb-type"], "int");
+    assert_eq!(schema["properties"]["score"]["default"], 10);
     assert!(omitted.get("score").is_none());
     assert_eq!(explicit["score"], 20);
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -826,7 +827,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     pin(
         failed_root,
         "numbers",
-        r#"{"table":"numbers","primary_key":["id"],"columns":{"id":{"type":"string"},"score":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string"}},"required":["id","score"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
     );
     fs::write(
         failed_root.join("numbers/a.json"),
@@ -945,7 +946,7 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
     pin(
         root,
         "bad",
-        r#"{"table":"bad","primary_key":["id"],"columns":{"id":{"type":"string","values":["x"]}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","x-jdb-type":"int"}},"required":["id"],"x-jdb":{"table":"bad","primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     db().args([
         "--db",
@@ -957,13 +958,13 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
     .assert()
     .code(2)
     .stderr(predicate::str::contains(
-        "values is only valid for enum columns",
+        "does not agree with its type",
     ));
 
     pin(
         root,
         "bad",
-        r#"{"table":"bad","schema_format":999,"primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"bad","schemaVersion":1,"schemaFormat":999,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -982,7 +983,7 @@ fn test0023_primary_key_arguments_are_decoded_against_the_declared_type() {
     pin(
         root,
         "things",
-        r#"{"table":"things","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"things","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
     );
     fs::write(
         root.join("things/123.json"),
@@ -1035,17 +1036,18 @@ fn test0024_inference_derives_foreign_keys_and_rejects_invalid_pk_overrides() {
     .success();
     let posts: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".db/schema/posts.json")).unwrap()).unwrap();
-    assert_eq!(posts["foreign_keys"][0]["columns"][0], "user_id");
-    assert_eq!(posts["foreign_keys"][0]["references"]["table"], "users");
-    assert_eq!(posts["indexes"][0][0], "user_id");
+    let relational = &posts["x-jdb"];
+    assert_eq!(relational["foreignKeys"][0]["columns"][0], "user_id");
+    assert_eq!(relational["foreignKeys"][0]["references"]["table"], "users");
+    assert_eq!(relational["indexes"][0][0], "user_id");
     // Inference records the relationship it found, not a prose account of
     // finding it: the schema is the evidence, and it is checkable.
     assert_eq!(
-        posts["foreign_keys"][0]["references"]["columns"][0], "id",
+        relational["foreignKeys"][0]["references"]["columns"][0], "id",
         "the foreign key names the column it references"
     );
     assert_eq!(
-        posts["foreign_keys"][0]["on_delete"], "restrict",
+        relational["foreignKeys"][0]["onDelete"], "restrict",
         "an inferred foreign key is conservative about deletion"
     );
 
@@ -1182,12 +1184,12 @@ fn test0028_restrict_referential_action_blocks_and_reports_a_referential_violati
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -1235,12 +1237,12 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -1271,7 +1273,7 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"user_id":{"type":"string","nullable":true,"default":"gone"}},"foreign_keys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"on_delete":"set_default","on_update":"restrict"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"],"default":"gone"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_default","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/gone.json"), "{\"id\":\"gone\"}\n").unwrap();
     fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
@@ -1313,43 +1315,43 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
     fs::create_dir(root.join("a")).unwrap();
     fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
 
-    let base = r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#;
+    let base = r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#;
     let cases: Vec<(&str, &str)> = vec![
         (
             "SCHEMA_UNKNOWN_KEY",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"uniqe":[["id"]]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
         ),
         (
             "SCHEMA_PK_NULLABLE",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string","nullable":true}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":["string","null"]}},"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_COLUMN_TYPE_MISSING",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":"string"},"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_TYPE_UNKNOWN",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"nosuchtype"}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"nosuchtype"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_PK_COLUMN_UNKNOWN",
-            r#"{"table":"a","primary_key":["ghost"],"columns":{"id":{"type":"string"}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_DEFAULT_TYPE_MISMATCH",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int","default":"text"}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int","default":"text"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
         ),
         (
             "SCHEMA_TABLE_NAME_MISMATCH",
-            r#"{"table":"other","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"other","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_FK_TARGET_MISSING",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b":{"type":"string"}},"foreign_keys":[{"columns":["b"],"references":{"table":"ghost","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"b":{"type":"string"}},"required":["id","b"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b"],"foreignKeys":[{"columns":["b"],"references":{"table":"ghost","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_CHECK_INVALID",
-            r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"check":[{"name":"c","expr":"ghost > 0"}]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"],"checks":[{"name":"c","expr":"ghost > 0"}]}}"#,
         ),
     ];
     for (code, body) in cases {
@@ -1364,7 +1366,7 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
     pin(
         root,
         "a",
-        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}},"uniqe":[["id"]]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1392,21 +1394,21 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     pin(
         root,
         "a",
-        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
 
     let cases: Vec<(&str, &str)> = vec![
         (
             "SCHEMA_FK_TYPE_MISMATCH",
-            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"int"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"integer","x-jdb-type":"int"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_FK_TARGET_NOT_UNIQUE",
-            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["nope"]},"on_delete":"restrict","on_update":"restrict"}]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["nope"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_FK_ACTION_INVALID",
-            r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}"#,
+            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
         ),
     ];
     for (code, body) in cases {
@@ -1421,12 +1423,12 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     pin(
         root,
         "a",
-        r#"{"table":"a","primary_key":["id"],"columns":{"id":{"type":"string"},"b_id":{"type":"string","nullable":true}},"foreign_keys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"b_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b_id"],"foreignKeys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     pin(
         root,
         "b",
-        r#"{"table":"b","primary_key":["id"],"columns":{"id":{"type":"string"},"a_id":{"type":"string"}},"foreign_keys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"on_delete":"cascade","on_update":"cascade"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1444,7 +1446,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
         .assert()
         .success();
     fs::create_dir(root.join("t")).unwrap();
-    let strict = r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#;
+    let strict = r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#;
     pin(root, "t", strict);
     fs::write(root.join("t/a.json"), "{\"id\":\"a\",\"n\":1}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -1490,7 +1492,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
     pin(
         root,
         "t",
-        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"additional_fields":"allow"}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":true,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1501,7 +1503,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
     pin(
         root,
         "t",
-        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}},"check":[{"name":"pos","expr":"n > 0"}]}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"],"checks":[{"name":"pos","expr":"n > 0"}]}}"#,
     );
     fs::write(root.join("t/h.json"), "{\"id\":\"h\",\"n\":-5}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -1521,7 +1523,7 @@ fn test0033_duplicate_primary_keys_are_rejected_under_a_custom_filename_rule() {
     pin(
         root,
         "t",
-        r#"{"table":"t","primary_key":["id"],"columns":{"id":{"type":"string"},"slug":{"type":"string"}},"unique":[["slug"]],"storage":{"filename":["slug"]}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"slug":{"type":"string"}},"required":["id","slug"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","slug"],"unique":[["slug"]],"filename":["slug"]}}"#,
     );
     fs::write(root.join("t/s1.json"), "{\"id\":\"a\",\"slug\":\"s1\"}\n").unwrap();
     fs::write(root.join("t/s2.json"), "{\"id\":\"a\",\"slug\":\"s2\"}\n").unwrap();
@@ -1661,7 +1663,12 @@ fn test0034_inference_failures_are_specific_and_actionable() {
     ])
     .assert()
     .success()
-    .stdout(predicate::str::contains("\"json\""));
+    // A column jdb will not commit to a narrower type admits any value, which
+    // JSON Schema spells as the empty schema rather than as a type name.
+    .stdout(predicate::function(|stdout: &str| {
+        let document: serde_json::Value = serde_json::from_str(stdout).expect("infer prints JSON");
+        document["properties"]["v"] == serde_json::json!({})
+    }));
     fs::remove_file(structural.join("t/y.json")).unwrap();
     fs::remove_file(structural.join("t/z.json")).unwrap();
 
@@ -1850,7 +1857,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["ghost"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id","name"]}}"#,
     );
 
     // `status` and `check` report violations on stderr and exit INVALID.
@@ -1900,7 +1907,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "posts",
-        r#"{"table":"posts","primary_key":["id"],"columns":{"id":{"type":"string"},"users":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"users":{"type":"string"}},"required":["id","users"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","users"]}}"#,
     );
     for arguments in [vec!["check"], vec!["lint"], vec!["doctor"]] {
         let mut command = db();
@@ -1916,7 +1923,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "users",
-        r#"{"table":"users","primary_key":["id"],"columns":{"id":{"type":"string"},"name":{"type":"string"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -2069,7 +2076,7 @@ fn test0041_concurrent_writers_never_silently_lose_an_update() {
     pin(
         &root,
         "counters",
-        r#"{"table":"counters","primary_key":["id"],"columns":{"id":{"type":"string"},"n":{"type":"int"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"counters","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
     );
     for index in 0..8 {
         fs::write(
@@ -2304,7 +2311,7 @@ fn test0044_many_rows_validate_query_and_mutate_correctly() {
     pin(
         root,
         "events",
-        r#"{"table":"events","primary_key":["id"],"columns":{"id":{"type":"int"},"bucket":{"type":"string"},"n":{"type":"int"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"integer","x-jdb-type":"int"},"bucket":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","bucket","n"],"additionalProperties":false,"x-jdb":{"table":"events","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","bucket","n"]}}"#,
     );
 
     let rows = 2_000usize;
@@ -2384,7 +2391,7 @@ fn test0045_result_row_limits_are_enforced_not_truncated() {
     pin(
         root,
         "items",
-        r#"{"table":"items","primary_key":["id"],"columns":{"id":{"type":"int"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"integer","x-jdb-type":"int"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     for index in 0..25 {
         fs::write(
@@ -2441,7 +2448,7 @@ fn test0046_pathological_json_is_refused_by_configured_limits() {
     pin(
         root,
         "blobs",
-        r#"{"table":"blobs","primary_key":["id"],"columns":{"id":{"type":"string"},"data":{"type":"json"}}}"#,
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"data":{}},"required":["id","data"],"additionalProperties":false,"x-jdb":{"table":"blobs","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","data"]}}"#,
     );
     let deep = format!(
         "{{\"id\":\"a\",\"data\":{}{}}}\n",
@@ -2729,7 +2736,7 @@ fn test0051_shell_answers_dot_commands_and_sql() {
         ".tables must list the table: {stdout}"
     );
     assert!(
-        stdout.contains("\"primary_key\""),
+        stdout.contains("\"primaryKey\""),
         ".describe must print the schema: {stdout}"
     );
     assert!(
@@ -3669,7 +3676,7 @@ fn test0073_every_emitted_diagnostic_code_is_documented() {
         emitted.len()
     );
 
-    let documentation = ["docs/spec.md", "docs/errors.md", "docs/validation.md"]
+    let documentation = ["docs/errors.md", "docs/validation.md", "docs/schemas.md"]
         .iter()
         .map(|path| fs::read_to_string(path).unwrap())
         .collect::<Vec<_>>()

@@ -438,7 +438,12 @@ struct MigrationDocument {
 enum MigrationOperation {
     AddTable {
         table: String,
-        schema: Box<Schema>,
+        /// The table's schema, as a JSON Schema document.
+        ///
+        /// Held as a `Value` and decoded through the codec rather than
+        /// deserialized directly, so a migration file cannot become a second
+        /// way to spell a schema.
+        schema: Box<Value>,
     },
     DropTable {
         table: String,
@@ -888,9 +893,18 @@ fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> R
                 .get(&table)
                 .ok_or_else(|| db.catalog.unknown_table(&table))?;
             if format == Format::Table {
-                println!("{}", serde_json::to_string_pretty(s).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::schema::json_schema::encode(s)).unwrap()
+                );
             } else {
-                output::records(&[serialized_record("schema", s)?], format)?;
+                output::records(
+                    &[serialized_record(
+                        "schema",
+                        &crate::schema::json_schema::encode(s),
+                    )?],
+                    format,
+                )?;
             }
             Ok(0)
         }
@@ -1801,8 +1815,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
         }
         let name = crate::schema_store::working_relative(&t);
         let bytes = canonical::pretty_with_indent(
-            &serde_json::to_value(s)
-                .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?,
+            &crate::schema::json_schema::encode(&s),
             db.config.indentation_width,
         );
         if fs::read(db.root.join(&name)).ok().as_deref() != Some(bytes.as_slice()) {
@@ -2266,9 +2279,18 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
         SchemaCommand::Show { table } => {
             let s = schema_for(db, &table)?;
             if format == Format::Table {
-                println!("{}", serde_json::to_string_pretty(s).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::schema::json_schema::encode(s)).unwrap()
+                );
             } else {
-                output::records(&[serialized_record("schema", s)?], format)?;
+                output::records(
+                    &[serialized_record(
+                        "schema",
+                        &crate::schema::json_schema::encode(s),
+                    )?],
+                    format,
+                )?;
             }
             Ok(0)
         }
@@ -2302,6 +2324,7 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                     items: None,
                     properties: None,
                     description: None,
+                    annotations: Default::default(),
                 },
             );
             let s = Schema {
@@ -2317,13 +2340,14 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 indexes: vec![],
                 storage: None,
                 additional_fields: crate::schema::AdditionalFields::Reject,
+                annotations: Default::default(),
             };
             commit_changes(
                 db,
                 vec![Change::Write {
                     path: crate::schema_store::working_relative(&table).into(),
                     bytes: canonical::pretty_with_indent(
-                        &serde_json::to_value(s).unwrap(),
+                        &crate::schema::json_schema::encode(&s),
                         db.config.indentation_width,
                     ),
                 }],
@@ -2669,11 +2693,11 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
         let Some(table) = authoritative_table(old_path) else {
             continue;
         };
-        let Some(schema) = diff_schema(db, &new, table, working)? else {
+        let Some(primary_key) = diff_primary_key(db, &new, table, working)? else {
             continue;
         };
         let old_value = load_object(db, &old[old_path].hash)?;
-        let old_payload = without_fields(&old_value, &schema.primary_key);
+        let old_payload = without_fields(&old_value, &primary_key);
         let candidates = added_paths
             .iter()
             .filter(|new_path| {
@@ -2688,7 +2712,7 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
                     load_object(db, &new[*new_path].hash)
                 };
                 match value {
-                    Ok(value) if without_fields(&value, &schema.primary_key) == old_payload => {
+                    Ok(value) if without_fields(&value, &primary_key) == old_payload => {
                         Some(Ok(((*new_path).to_string(), value)))
                     }
                     Ok(_) => None,
@@ -2697,8 +2721,8 @@ fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Re
             })
             .collect::<Result<Vec<_>>>()?;
         if let [candidate] = candidates.as_slice() {
-            let old_key = row_key_value(&old_value, &schema);
-            let new_key = row_key_value(&candidate.1, &schema);
+            let old_key = row_key_value(&old_value, &primary_key);
+            let new_key = row_key_value(&candidate.1, &primary_key);
             key_change_targets.insert(candidate.0.clone());
             key_changes.insert(old_path.into(), (candidate.0.clone(), old_key, new_key));
         }
@@ -2764,22 +2788,53 @@ fn authoritative_table(path: &str) -> Option<&str> {
     (!matches!(table, ".db" | "schema")).then_some(table)
 }
 
-fn diff_schema(
+/// The primary key a table had at a revision.
+///
+/// Renaming a file is told apart from rewriting one by comparing rows with
+/// their key fields removed, so the key is all a diff needs from the schema of
+/// the moment. It is also all that can honestly be recovered: stored objects
+/// hold the semantic encoding, which exists to be hashed rather than read back,
+/// and reconstructing a whole `Schema` from it would confuse identity with the
+/// file form.
+fn diff_primary_key(
     db: &Database,
     entries: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
     table: &str,
     working: bool,
-) -> Result<Option<Schema>> {
+) -> Result<Option<Vec<String>>> {
     if working {
-        return Ok(db.catalog.schemas.get(table).cloned());
+        return Ok(db
+            .catalog
+            .schemas
+            .get(table)
+            .map(|schema| schema.primary_key.clone()));
     }
     let Some(entry) = entries.get(&format!("schema/{table}.json")) else {
         return Ok(None);
     };
     let value = load_object(db, &entry.hash)?;
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))
+    let key = value
+        .get("primary_key")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                format!("the stored schema for {table:?} records no primary key"),
+                6,
+            )
+        })?
+        .iter()
+        .map(|name| {
+            name.as_str().map(String::from).ok_or_else(|| {
+                DbError::new(
+                    "INTERNAL_METADATA_CORRUPT",
+                    format!("the stored primary key for {table:?} is not a list of names"),
+                    6,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(key))
 }
 
 fn without_fields(value: &Value, fields: &[String]) -> Value {
@@ -2792,18 +2847,17 @@ fn without_fields(value: &Value, fields: &[String]) -> Value {
     value
 }
 
-fn row_key_value(value: &Value, schema: &Schema) -> Value {
+/// The key values a row carries, as a diff reports them.
+///
+/// Read from the row itself rather than from the schema's defaults: a diff
+/// describes files as they are, and the schema of the moment may not be the one
+/// that wrote a historical row. A key column with no value in the row has no
+/// key value, which is what `null` says here.
+fn row_key_value(value: &Value, primary_key: &[String]) -> Value {
     Value::Array(
-        schema
-            .primary_key
+        primary_key
             .iter()
-            .map(|name| {
-                value
-                    .get(name)
-                    .cloned()
-                    .or_else(|| schema.columns[name].default.clone())
-                    .unwrap_or(Value::Null)
-            })
+            .map(|name| value.get(name).cloned().unwrap_or(Value::Null))
             .collect(),
     )
 }
@@ -2839,8 +2893,7 @@ fn current_object(db: &Database, path: &str) -> Result<Value> {
         .strip_prefix("schema/")
         .and_then(|x| x.strip_suffix(".json"))
     {
-        return serde_json::to_value(&db.catalog.schemas[table])
-            .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6));
+        return Ok(crate::schema::semantic::encode_v1(&db.catalog.schemas[table]));
     }
     let table = path
         .split('/')
@@ -3404,7 +3457,10 @@ fn shell_line(db: &mut Database, query: &str, format: Format, cli: &Cli) -> Resu
     if let Some(table) = query.strip_prefix(".describe ") {
         println!(
             "{}",
-            serde_json::to_string_pretty(schema_for(db, table)?).map_err(|error| {
+            serde_json::to_string_pretty(&crate::schema::json_schema::encode(schema_for(
+                db, table,
+            )?))
+            .map_err(|error| {
                 DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
             })?
         );
@@ -3433,7 +3489,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
     db.require_valid()?;
     match cmd {
         MigrateCommand::AddTable { table, from } => {
-            let mut s = crate::schema::load(&from)?;
+            let s = crate::schema::load(&from)?;
             if s.table != table {
                 return Err(DbError::new(
                     "SCHEMA_TABLE_NAME_MISMATCH",
@@ -3446,7 +3502,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                 vec![Change::Write {
                     path: crate::schema_store::working_relative(&table).into(),
                     bytes: canonical::pretty_with_indent(
-                        &serde_json::to_value(&mut s).unwrap(),
+                        &crate::schema::json_schema::encode(&s),
                         db.config.indentation_width,
                     ),
                 }],
@@ -3494,9 +3550,8 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     .catalog
                     .schemas
                     .get(&name)
-                    .and_then(|s| serde_json::to_value(s).ok());
-                let value = serde_json::to_value(&schema)
-                    .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
+                    .map(crate::schema::json_schema::encode);
+                let value = crate::schema::json_schema::encode(&schema);
                 if old.as_ref() != Some(&value) {
                     changes.push(Change::Write {
                         path: crate::schema_store::working_relative(&name).into(),
@@ -3555,6 +3610,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     items: None,
                     properties: None,
                     description: None,
+                    annotations: Default::default(),
                 },
             );
             rewrite_schema_rows(
@@ -3662,9 +3718,8 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                         }
                     }
                 }
-                if serde_json::to_value(other).ok() != serde_json::to_value(&updated).ok() {
-                    let value = serde_json::to_value(updated)
-                        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
+                let value = crate::schema::json_schema::encode(&updated);
+                if crate::schema::json_schema::encode(other) != value {
                     changes.push(Change::Write {
                         path: crate::schema_store::working_relative(name).into(),
                         bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
@@ -3774,8 +3829,7 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
 }
 fn commit_schema(db: &Database, s: Schema, format: Format, cli: &Cli) -> Result<i32> {
     let table = s.table.clone();
-    let value = serde_json::to_value(s)
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
+    let value = crate::schema::json_schema::encode(&s);
     commit_changes(
         db,
         vec![Change::Write {
@@ -3798,6 +3852,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
     for op in doc.operations {
         match op {
             MigrationOperation::AddTable { table, schema } => {
+                let schema = crate::schema::json_schema::decode(&schema)?;
                 if schemas.contains_key(&table) || schema.table != table {
                     return Err(DbError::new(
                         "SCHEMA_TABLE_NAME_MISMATCH",
@@ -3805,7 +3860,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         2,
                     ));
                 }
-                schemas.insert(table.clone(), *schema);
+                schemas.insert(table.clone(), schema);
                 rows.insert(table, vec![]);
             }
             MigrationOperation::DropTable { table } => {
@@ -3872,6 +3927,7 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         items: None,
                         properties: None,
                         description: None,
+                        annotations: Default::default(),
                     },
                 );
                 for row in rows.get_mut(&table).unwrap() {
@@ -4186,13 +4242,12 @@ fn authoritative_diff(
         }
     }
     for (t, s) in schemas {
-        let value = serde_json::to_value(s)
-            .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
+        let value = crate::schema::json_schema::encode(s);
         if db
             .catalog
             .schemas
             .get(t)
-            .and_then(|x| serde_json::to_value(x).ok())
+            .map(crate::schema::json_schema::encode)
             .as_ref()
             != Some(&value)
         {
@@ -4267,8 +4322,7 @@ fn schema_row_changes<F: Fn(&mut Map<String, Value>) -> Result<()>>(
     let mut changes = vec![Change::Write {
         path: crate::schema_store::working_relative(&table).into(),
         bytes: canonical::pretty_with_indent(
-            &serde_json::to_value(s)
-                .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?,
+            &crate::schema::json_schema::encode(s),
             db.config.indentation_width,
         ),
     }];
@@ -4870,12 +4924,15 @@ fn serialized_record<T: serde::Serialize>(kind: &str, value: &T) -> Result<Map<S
 fn output_schemas<'a>(schemas: impl Iterator<Item = &'a Schema>, format: Format) -> Result<()> {
     if format == Format::Table {
         for schema in schemas {
-            println!("{}", serde_json::to_string_pretty(schema).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::schema::json_schema::encode(schema)).unwrap()
+            );
         }
         return Ok(());
     }
     let records = schemas
-        .map(|schema| serialized_record("schema", schema))
+        .map(|schema| serialized_record("schema", &crate::schema::json_schema::encode(schema)))
         .collect::<Result<Vec<_>>>()?;
     output::records(&records, format)
 }
@@ -5137,6 +5194,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 
@@ -5158,6 +5216,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 

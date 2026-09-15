@@ -257,6 +257,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 

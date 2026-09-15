@@ -158,8 +158,7 @@ pub fn load_pin(root: &Path, table: &str) -> Result<Option<Schema>> {
 /// manifest hashes it. One rendering, so that a pin and the working copy taken
 /// from it compare equal byte for byte.
 pub fn canonical_bytes(schema: &Schema, indentation_width: usize) -> Result<Vec<u8>> {
-    let value = serde_json::to_value(schema)
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
+    let value = schema::json_schema::encode(schema);
     Ok(canonical::pretty_with_indent(&value, indentation_width))
 }
 
@@ -169,10 +168,8 @@ pub fn canonical_bytes(schema: &Schema, indentation_width: usize) -> Result<Vec<
 /// key order -- neither of which changes what the schema says -- is not
 /// mistaken for divergence.
 pub fn equivalent(left: &Schema, right: &Schema) -> Result<bool> {
-    let left = serde_json::to_value(left)
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
-    let right = serde_json::to_value(right)
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
+    let left = schema::json_schema::encode(left);
+    let right = schema::json_schema::encode(right);
     Ok(canonical::normalize(&left) == canonical::normalize(&right))
 }
 
@@ -206,6 +203,7 @@ mod tests {
                 properties: None,
                 generated: None,
                 default: None,
+                annotations: Default::default(),
             },
         );
         Schema {
@@ -221,6 +219,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 
@@ -276,8 +275,8 @@ mod tests {
         let narrow = canonical_bytes(&left, 2).unwrap();
         let wide = canonical_bytes(&left, 4).unwrap();
         assert_ne!(narrow, wide);
-        let from_narrow: Schema = serde_json::from_slice(&narrow).unwrap();
-        let from_wide: Schema = serde_json::from_slice(&wide).unwrap();
+        let from_narrow = schema::load_bytes(&narrow).unwrap();
+        let from_wide = schema::load_bytes(&wide).unwrap();
         assert!(equivalent(&from_narrow, &from_wide).unwrap());
     }
 

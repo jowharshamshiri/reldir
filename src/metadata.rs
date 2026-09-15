@@ -810,6 +810,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 
@@ -831,6 +832,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 

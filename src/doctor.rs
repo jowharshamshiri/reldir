@@ -348,8 +348,8 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
     }
     let mut out = vec![];
     for (t, s) in schemas {
-        let old = serde_json::to_value(&db.catalog.schemas[&t]).unwrap();
-        let new = serde_json::to_value(&s).unwrap();
+        let old = crate::schema::json_schema::encode(&db.catalog.schemas[&t]);
+        let new = crate::schema::json_schema::encode(&s);
         if old != new {
             out.push(Change::Write {
                 path: PathBuf::from(crate::schema_store::working_relative(&t)),
@@ -703,6 +703,7 @@ mod tests {
             items: None,
             properties: None,
             description: None,
+            annotations: Default::default(),
         }
     }
 
@@ -724,6 +725,7 @@ mod tests {
             indexes: vec![],
             storage: None,
             additional_fields: AdditionalFields::Reject,
+            annotations: Default::default(),
         }
     }
 
