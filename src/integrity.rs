@@ -319,11 +319,19 @@ mod tests {
     #[test]
     fn test9999_absent_and_null_are_distinct_faults() {
         let s = schema(
-            &[("id", ColumnType::String, false), ("n", ColumnType::Int, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("n", ColumnType::Int, false),
+            ],
             &["id"],
         );
         let mut out = vec![];
-        validate_row(&s, &body(&[("id", json!("a"))]), &PathBuf::from("t/a.json"), &mut out);
+        validate_row(
+            &s,
+            &body(&[("id", json!("a"))]),
+            &PathBuf::from("t/a.json"),
+            &mut out,
+        );
         assert_eq!(codes(&out), vec!["ROW_MISSING_FIELD"]);
 
         let mut out = vec![];
@@ -337,18 +345,30 @@ mod tests {
 
         // A nullable column accepts both absence and an explicit null.
         let s = schema(
-            &[("id", ColumnType::String, false), ("n", ColumnType::Int, true)],
+            &[
+                ("id", ColumnType::String, false),
+                ("n", ColumnType::Int, true),
+            ],
             &["id"],
         );
         let mut out = vec![];
-        validate_row(&s, &body(&[("id", json!("a"))]), &PathBuf::from("t/a.json"), &mut out);
+        validate_row(
+            &s,
+            &body(&[("id", json!("a"))]),
+            &PathBuf::from("t/a.json"),
+            &mut out,
+        );
         validate_row(
             &s,
             &body(&[("id", json!("a")), ("n", Value::Null)]),
             &PathBuf::from("t/a.json"),
             &mut out,
         );
-        assert!(out.is_empty(), "nullable column accepts null: {:?}", codes(&out));
+        assert!(
+            out.is_empty(),
+            "nullable column accepts null: {:?}",
+            codes(&out)
+        );
     }
 
     /// Section 10: a default satisfies a NOT NULL column that the row omits, so
@@ -356,12 +376,20 @@ mod tests {
     #[test]
     fn test9999_a_default_satisfies_an_omitted_not_null_column() {
         let mut s = schema(
-            &[("id", ColumnType::String, false), ("tag", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("tag", ColumnType::String, false),
+            ],
             &["id"],
         );
         s.columns.get_mut("tag").unwrap().default = Some(json!("fallback"));
         let mut out = vec![];
-        validate_row(&s, &body(&[("id", json!("a"))]), &PathBuf::from("t/a.json"), &mut out);
+        validate_row(
+            &s,
+            &body(&[("id", json!("a"))]),
+            &PathBuf::from("t/a.json"),
+            &mut out,
+        );
         assert!(out.is_empty(), "{:?}", codes(&out));
     }
 
@@ -389,7 +417,10 @@ mod tests {
     #[test]
     fn test9999_normalisation_collisions_are_rejected_at_every_depth() {
         let s = schema(
-            &[("id", ColumnType::String, false), ("data", ColumnType::Json, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("data", ColumnType::Json, false),
+            ],
             &["id"],
         );
 
@@ -436,14 +467,26 @@ mod tests {
         let columns = vec!["a".to_string(), "b".to_string()];
 
         // ("ab","c") and ("a","bc") must not collide.
-        let left = key(&body(&[("a", json!("ab")), ("b", json!("c"))]), &columns, &s);
-        let right = key(&body(&[("a", json!("a")), ("b", json!("bc"))]), &columns, &s);
+        let left = key(
+            &body(&[("a", json!("ab")), ("b", json!("c"))]),
+            &columns,
+            &s,
+        );
+        let right = key(
+            &body(&[("a", json!("a")), ("b", json!("bc"))]),
+            &columns,
+            &s,
+        );
         assert!(left.is_some() && right.is_some());
         assert_ne!(left, right, "composite keys must not be ambiguous");
 
         // A null component means the row participates in no key.
         assert_eq!(
-            key(&body(&[("a", json!("a")), ("b", Value::Null)]), &columns, &s),
+            key(
+                &body(&[("a", json!("a")), ("b", Value::Null)]),
+                &columns,
+                &s
+            ),
             None
         );
         // An absent component with no default behaves the same way.
@@ -455,13 +498,20 @@ mod tests {
     #[test]
     fn test9999_defaults_participate_in_key_identity() {
         let mut s = schema(
-            &[("id", ColumnType::String, false), ("tag", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("tag", ColumnType::String, false),
+            ],
             &["id"],
         );
         s.columns.get_mut("tag").unwrap().default = Some(json!("same"));
         let columns = vec!["tag".to_string()];
         let omitted = key(&body(&[("id", json!("a"))]), &columns, &s);
-        let explicit = key(&body(&[("id", json!("b")), ("tag", json!("same"))]), &columns, &s);
+        let explicit = key(
+            &body(&[("id", json!("b")), ("tag", json!("same"))]),
+            &columns,
+            &s,
+        );
         assert_eq!(omitted, explicit, "a default is a logical value");
     }
 
@@ -470,7 +520,10 @@ mod tests {
     #[test]
     fn test9999_filename_columns_default_to_the_primary_key() {
         let mut s = schema(
-            &[("id", ColumnType::String, false), ("slug", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("slug", ColumnType::String, false),
+            ],
             &["id"],
         );
         assert_eq!(s.filename_columns(), ["id".to_string()]);

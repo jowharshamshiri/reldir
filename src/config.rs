@@ -197,8 +197,10 @@ mod tests {
     /// nothing.
     #[test]
     fn test9999_invalid_ignore_globs_are_rejected() {
-        let mut config = Config::default();
-        config.ignore = vec!["[unclosed".into()];
+        let mut config = Config {
+            ignore: vec!["[unclosed".into()],
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.ignore_set().is_err());
 
@@ -223,9 +225,11 @@ mod tests {
     /// an unset override leaves the stored value untouched.
     #[test]
     fn test9999_overrides_replace_only_what_they_specify() {
-        let mut config = Config::default();
-        config.max_result_rows = 500;
-        config.timeout_seconds = Some(30);
+        let mut config = Config {
+            max_result_rows: 500,
+            timeout_seconds: Some(30),
+            ..Default::default()
+        };
 
         config.apply_overrides(&ResourceOverrides {
             max_json_file_size: Some(4096),

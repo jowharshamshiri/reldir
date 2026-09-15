@@ -473,14 +473,20 @@ mod tests {
         );
         let populated = catalog_with(
             s.clone(),
-            &[json!({"id": "a", "maybe": "x"}), json!({"id": "b", "maybe": "y"})],
+            &[
+                json!({"id": "a", "maybe": "x"}),
+                json!({"id": "b", "maybe": "y"}),
+            ],
         );
         assert!(codes(&populated, false).contains(&"LINT_NULLABLE_NEVER_NULL".to_string()));
 
         // With a null actually present, the column is correctly nullable.
         let with_null = catalog_with(
             s,
-            &[json!({"id": "a", "maybe": Value::Null}), json!({"id": "b", "maybe": "y"})],
+            &[
+                json!({"id": "a", "maybe": Value::Null}),
+                json!({"id": "b", "maybe": "y"}),
+            ],
         );
         assert!(!codes(&with_null, false).contains(&"LINT_NULLABLE_NEVER_NULL".to_string()));
     }
@@ -512,7 +518,10 @@ mod tests {
             ],
             &["id"],
         );
-        let integral = catalog_with(s.clone(), &[json!({"id": "a", "n": 1}), json!({"id": "b", "n": 2})]);
+        let integral = catalog_with(
+            s.clone(),
+            &[json!({"id": "a", "n": 1}), json!({"id": "b", "n": 2})],
+        );
         assert!(codes(&integral, false).contains(&"LINT_WIDER_TYPE".to_string()));
 
         let fractional = catalog_with(s, &[json!({"id": "a", "n": 1.5})]);
@@ -570,10 +579,7 @@ mod tests {
     #[test]
     fn test9999_an_ungenerated_identifier_primary_key_is_reported() {
         let s = schema(&[("id", ColumnType::Uuid, false)], &["id"]);
-        let catalog = catalog_with(
-            s,
-            &[json!({"id": "0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"})],
-        );
+        let catalog = catalog_with(s, &[json!({"id": "0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e"})]);
         assert!(codes(&catalog, false).contains(&"LINT_PK_NOT_GENERATED".to_string()));
 
         // A plain string key carries no such expectation.

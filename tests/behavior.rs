@@ -2172,18 +2172,17 @@ fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
     for _ in 0..8 {
         let root = root.clone();
         handles.push(std::thread::spawn(move || {
-            db()
-                .args([
-                    "--db",
-                    root.to_str().unwrap(),
-                    "--readonly",
-                    "--format",
-                    "jsonl",
-                    "sql",
-                    "SELECT name FROM users ORDER BY name",
-                ])
-                .output()
-                .unwrap()
+            db().args([
+                "--db",
+                root.to_str().unwrap(),
+                "--readonly",
+                "--format",
+                "jsonl",
+                "sql",
+                "SELECT name FROM users ORDER BY name",
+            ])
+            .output()
+            .unwrap()
         }));
     }
     for handle in handles {
@@ -2205,17 +2204,16 @@ fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
     for _ in 0..8 {
         let root = root.clone();
         handles.push(std::thread::spawn(move || {
-            db()
-                .args([
-                    "--db",
-                    root.to_str().unwrap(),
-                    "--format",
-                    "jsonl",
-                    "sql",
-                    "SELECT name FROM users ORDER BY name",
-                ])
-                .output()
-                .unwrap()
+            db().args([
+                "--db",
+                root.to_str().unwrap(),
+                "--format",
+                "jsonl",
+                "sql",
+                "SELECT name FROM users ORDER BY name",
+            ])
+            .output()
+            .unwrap()
         }));
     }
     let mut answered = 0;
@@ -2473,4 +2471,264 @@ fn test0046_pathological_json_is_refused_by_configured_limits() {
     ])
     .assert()
     .success();
+}
+
+/// Section 29: `export` writes every documented encoding, and the sqlite
+/// encoding produces a database another tool can actually open and read.
+#[test]
+fn test0047_export_emits_every_documented_encoding() {
+    let dir = adopted();
+    let root = dir.path();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "csv",
+        "export",
+        "users",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("id,name")
+            .and(predicate::str::contains("Alice"))
+            .and(predicate::str::contains("Bob")),
+    );
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "jsonl",
+        "export",
+        "users",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"kind\":\"row\""));
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "json",
+        "export",
+        "users",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"name\""));
+
+    // sqlite is a file encoding, so it requires a destination rather than
+    // writing a binary database to a terminal.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "sqlite",
+        "export",
+        "users",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("--out"));
+
+    let out = root.join("export.db");
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "sqlite",
+        "export",
+        "users",
+        "--out",
+        out.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(out.exists(), "the sqlite export must produce a file");
+    // A real SQLite database begins with its documented header, so the file is
+    // usable by other tools rather than merely present.
+    let header = fs::read(&out).unwrap();
+    assert!(
+        header.starts_with(b"SQLite format 3\0"),
+        "exported file is not a SQLite database"
+    );
+}
+
+/// Section 29: `import` is transactional and accepts both documented input
+/// encodings; invalid input is rejected as a whole rather than partly applied.
+#[test]
+fn test0048_import_is_transactional_across_input_encodings() {
+    let dir = adopted();
+    let root = dir.path();
+
+    let jsonl = root.join("more.jsonl");
+    fs::write(&jsonl, "{\"id\":\"u3\",\"name\":\"Carol\"}\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "import",
+        "users",
+        "--from",
+        jsonl.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("users/u3.json"));
+    assert!(root.join("users/u3.json").exists());
+
+    let csv = root.join("more.csv");
+    fs::write(&csv, "id,name\nu4,Dave\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "import",
+        "users",
+        "--from",
+        csv.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
+    assert!(root.join("users/u4.json").exists());
+
+    // A batch containing one invalid row commits nothing: the valid row in the
+    // same file must not appear.
+    let bad = root.join("bad.jsonl");
+    fs::write(
+        &bad,
+        "{\"id\":\"u5\",\"name\":\"Eve\"}\n{\"id\":\"u6\",\"name\":4}\n",
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "import",
+        "users",
+        "--from",
+        bad.to_str().unwrap(),
+    ])
+    .assert()
+    .failure();
+    assert!(
+        !root.join("users/u5.json").exists(),
+        "a rejected import must not leave a partially applied batch"
+    );
+    assert!(!root.join("users/u6.json").exists());
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Sections 35, 36, 64 and 66: derived state is rebuildable on demand, the
+/// planner explains its choices, and the format command reports the current
+/// version rather than silently upgrading.
+#[test]
+fn test0049_derived_state_planning_and_format_commands_operate() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+
+    // Derived state rebuilds are always available and never change row data.
+    db().args(["--db", root, "--format", "table", "analyze"])
+        .assert()
+        .success();
+    db().args(["--db", root, "--format", "table", "reindex"])
+        .assert()
+        .success();
+    assert!(dir.path().join(".db/indexes").is_dir());
+    assert!(dir.path().join(".db/statistics").is_dir());
+
+    // Section 64: the plan names the statement and reports measured rows when
+    // analysis is requested.
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "jsonl",
+        "sql",
+        "--explain-analyze",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("\"kind\":\"query_plan\"")
+            .and(predicate::str::contains("actual_rows"))
+            .and(predicate::str::contains("physical_plan")),
+    );
+
+    // `db explain` is the same plan without execution.
+    db().args([
+        "--db",
+        root,
+        "--format",
+        "jsonl",
+        "explain",
+        "SELECT * FROM users",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"kind\":\"query_plan\""));
+
+    // Section 66: format 1 is current, so upgrading is a no-op that says so.
+    db().args(["--db", root, "--format", "table", "upgrade-format"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("format 1"));
+}
+
+/// Section 49: completions are generated for every documented shell.
+#[test]
+fn test0050_completions_are_generated_for_every_documented_shell() {
+    for (shell, marker) in [
+        ("bash", "_db"),
+        ("zsh", "#compdef"),
+        ("fish", "complete"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        db().args(["completions", shell])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(marker));
+    }
+    db().args(["completions", "nonesuch"]).assert().failure();
+}
+
+/// Section 29: the shell is a working REPL over the same relational layer,
+/// answering its documented dot-commands and ordinary SQL.
+#[test]
+fn test0051_shell_answers_dot_commands_and_sql() {
+    let dir = adopted();
+    let root = dir.path().to_str().unwrap();
+    let output = db()
+        .args(["--db", root, "--format", "table", "shell"])
+        .write_stdin(".tables\n.describe users\nSELECT name FROM users ORDER BY name;\n.quit\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "shell failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("users"),
+        ".tables must list the table: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"primary_key\""),
+        ".describe must print the schema: {stdout}"
+    );
+    assert!(
+        stdout.contains("Alice") && stdout.contains("Bob"),
+        "SQL must execute in the shell: {stdout}"
+    );
 }

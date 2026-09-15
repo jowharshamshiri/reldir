@@ -236,9 +236,18 @@ mod tests {
         assert_eq!(value["fixes"][1], "FIX_ORPHAN_DELETE_ROW");
 
         // Absent optional members are omitted entirely.
-        let minimal = serde_json::to_value(Diagnostic::error("UNKNOWN_TABLE", "no such table"))
-            .unwrap();
-        for absent in ["table", "path", "location", "field", "constraint", "expected", "observed", "help"] {
+        let minimal =
+            serde_json::to_value(Diagnostic::error("UNKNOWN_TABLE", "no such table")).unwrap();
+        for absent in [
+            "table",
+            "path",
+            "location",
+            "field",
+            "constraint",
+            "expected",
+            "observed",
+            "help",
+        ] {
             assert!(
                 minimal.get(absent).is_none(),
                 "{absent} must be omitted when unset"
@@ -259,7 +268,10 @@ mod tests {
             (Diagnostic::suggestion("C", "m"), "suggestion"),
             (Diagnostic::info("C", "m"), "info"),
         ] {
-            assert_eq!(serde_json::to_value(&diagnostic).unwrap()["severity"], expected);
+            assert_eq!(
+                serde_json::to_value(&diagnostic).unwrap()["severity"],
+                expected
+            );
         }
     }
 
@@ -278,7 +290,10 @@ mod tests {
             5
         );
         for code in ["FORMAT_UNSUPPORTED", "INTERNAL_METADATA_CORRUPT"] {
-            assert_eq!(exit_code_for_diagnostics(&[Diagnostic::error(code, "m")]), 6);
+            assert_eq!(
+                exit_code_for_diagnostics(&[Diagnostic::error(code, "m")]),
+                6
+            );
         }
 
         // Precedence holds when several faults are present at once.

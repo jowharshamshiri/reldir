@@ -537,7 +537,13 @@ mod tests {
     fn test9999_initialisation_writes_the_documented_layout() {
         let dir = tempfile::tempdir().unwrap();
         init_layout(dir.path(), false).unwrap();
-        for expected in [".db", ".db/format", ".db/config", ".db/.gitignore", "schema"] {
+        for expected in [
+            ".db",
+            ".db/format",
+            ".db/config",
+            ".db/.gitignore",
+            "schema",
+        ] {
             assert!(
                 dir.path().join(expected).exists(),
                 "{expected} must be created"

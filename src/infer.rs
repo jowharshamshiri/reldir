@@ -221,11 +221,15 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
         paths.push(e.map_err(|e| DbError::io(&dir, e))?.path())
     }
     paths.sort();
+    // Section 49: inference reads every row of the table, so it reports the
+    // same scan progress an observation does.
+    let mut progress = crate::output::Progress::new("inferring", paths.len());
     let mut rows = vec![];
     let ignores = config
         .ignore_set()
         .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error, 6))?;
     for p in paths {
+        progress.advance();
         let rel = p.strip_prefix(root).unwrap().to_path_buf();
         if ignores.is_match(&rel)
             || p.file_name()
@@ -777,7 +781,13 @@ mod tests {
     }
 
     fn infer(items: &[Value], nullable: bool, strictness: Strictness) -> Result<Column> {
-        infer_column("c", &values(items), nullable, strictness, &Config::default())
+        infer_column(
+            "c",
+            &values(items),
+            nullable,
+            strictness,
+            &Config::default(),
+        )
     }
 
     /// Section 12: the type ladder picks the narrowest type every observed value
@@ -879,22 +889,12 @@ mod tests {
     /// row, so a single row cannot fix the element type for the rest.
     #[test]
     fn test9999_array_items_are_inferred_across_all_rows() {
-        let column = infer(
-            &[json!([1, 2]), json!([3])],
-            false,
-            Strictness::Balanced,
-        )
-        .unwrap();
+        let column = infer(&[json!([1, 2]), json!([3])], false, Strictness::Balanced).unwrap();
         assert_eq!(column.kind, ColumnType::Array);
         assert_eq!(column.items.unwrap().kind, ColumnType::Int);
 
         // A conflicting element across rows is still a conflict.
-        let error = infer(
-            &[json!([1]), json!(["text"])],
-            false,
-            Strictness::Balanced,
-        )
-        .unwrap_err();
+        let error = infer(&[json!([1]), json!(["text"])], false, Strictness::Balanced).unwrap_err();
         assert_eq!(error.diagnostic.code, "INFER_TYPE_CONFLICT");
     }
 

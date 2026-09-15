@@ -739,7 +739,10 @@ mod tests {
         // Conversions that would lose or invent information are refused, so no
         // fix is offered and doctor classifies the violation as manual instead.
         assert_eq!(lossless_coerce(&json!(1.5), &column(ColumnType::Int)), None);
-        assert_eq!(lossless_coerce(&json!("01"), &column(ColumnType::Int)), None);
+        assert_eq!(
+            lossless_coerce(&json!("01"), &column(ColumnType::Int)),
+            None
+        );
         assert_eq!(
             lossless_coerce(&json!("yes"), &column(ColumnType::Bool)),
             None

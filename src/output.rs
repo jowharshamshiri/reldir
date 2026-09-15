@@ -19,7 +19,8 @@ pub struct Presentation {
     /// Suppress informational stdout and progress. Diagnostics, machine-readable
     /// output, and exit codes are never suppressed.
     pub quiet: bool,
-    /// Emit progress for operations that exceed one second (Section 49).
+    /// Report progress from the first file scanned rather than waiting out the
+    /// threshold that keeps short operations silent (Section 49).
     pub verbose: bool,
 }
 
@@ -61,6 +62,74 @@ pub fn notice(text: &str) {
 pub fn notice_stderr(text: &str) {
     if !presentation().quiet {
         eprintln!("{text}");
+    }
+}
+
+/// Progress reporting for an operation that walks many files.
+///
+/// Section 49: an operation expected to exceed one second on a TTY shows a
+/// progress line (files scanned / total) on stderr. Nothing is emitted before
+/// that threshold, so a fast command stays silent, and nothing is ever emitted
+/// off a terminal or under `--quiet`, so machine-readable output and captured
+/// stderr are byte-for-byte unaffected.
+///
+/// The reporter owns its own threshold and its own cleanup: the line is erased
+/// when it is dropped, including on an early return or a panic, so a partial
+/// progress line can never be left behind on the user's terminal.
+pub struct Progress {
+    label: &'static str,
+    total: usize,
+    scanned: usize,
+    started: std::time::Instant,
+    active: bool,
+    enabled: bool,
+    immediate: bool,
+}
+
+/// An operation must run longer than this before it is worth reporting.
+const PROGRESS_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Progress {
+    pub fn new(label: &'static str, total: usize) -> Self {
+        let settings = presentation();
+        Self {
+            label,
+            total,
+            scanned: 0,
+            started: std::time::Instant::now(),
+            active: false,
+            enabled: !settings.quiet && io::stderr().is_terminal(),
+            // `--verbose` asks to see the operation's progress, so it reports
+            // from the first file rather than waiting out the threshold that
+            // keeps short commands silent.
+            immediate: settings.verbose,
+        }
+    }
+
+    /// Record one more scanned file, drawing or refreshing the line once the
+    /// operation has run long enough to deserve one.
+    pub fn advance(&mut self) {
+        self.scanned += 1;
+        if !self.enabled || (!self.immediate && self.started.elapsed() < PROGRESS_AFTER) {
+            return;
+        }
+        self.active = true;
+        // A carriage return keeps the report on one refreshed line rather than
+        // scrolling the terminal.
+        eprint!(
+            "\r\u{1b}[2K{}: {} / {} files scanned",
+            self.label, self.scanned, self.total
+        );
+        let _ = io::stderr().flush();
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        if self.active {
+            eprint!("\r\u{1b}[2K");
+            let _ = io::stderr().flush();
+        }
     }
 }
 
@@ -388,6 +457,30 @@ mod tests {
                 "no styling may be emitted when colour is off, got {piece:?}"
             );
         }
+    }
+
+    /// Section 49: progress is a terminal affordance. Redirected stderr must
+    /// stay byte-for-byte clean, because machine consumers and the diagnostic
+    /// contract read it; a progress line leaking into a pipe would corrupt both.
+    #[test]
+    fn test9999_progress_is_silent_off_a_terminal() {
+        set_presentation(Presentation {
+            color: false,
+            quiet: false,
+            verbose: true,
+        });
+        // Tests never own a terminal, so even a verbose reporter that advances
+        // past its threshold must emit nothing and must claim nothing to clean
+        // up when dropped.
+        let mut progress = Progress::new("scanning", 3);
+        for _ in 0..3 {
+            progress.advance();
+        }
+        assert!(
+            !progress.active,
+            "a reporter must never draw when stderr is not a terminal"
+        );
+        assert_eq!(progress.scanned, 3, "counting continues regardless");
     }
 
     /// Format parsing accepts exactly the documented encodings (Section 60) and

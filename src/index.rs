@@ -328,7 +328,10 @@ mod tests {
         );
         let first = expected(&c);
         let second = expected(&c);
-        assert_eq!(first.keys().collect::<Vec<_>>(), second.keys().collect::<Vec<_>>());
+        assert_eq!(
+            first.keys().collect::<Vec<_>>(),
+            second.keys().collect::<Vec<_>>()
+        );
         for (path, index) in &first {
             assert_eq!(&second[path], index);
         }

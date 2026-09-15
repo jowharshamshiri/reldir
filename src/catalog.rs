@@ -176,7 +176,12 @@ impl Catalog {
                 continue;
             }
             let mut names = BTreeSet::new();
-            for path in read_dir_sorted(&dir)? {
+            let entries = read_dir_sorted(&dir)?;
+            // Section 49: a scan that outlasts a second reports its progress on
+            // a terminal. The reporter is inert off-TTY and under --quiet.
+            let mut progress = crate::output::Progress::new("scanning", entries.len());
+            for path in entries {
+                progress.advance();
                 let rel = path.strip_prefix(root).unwrap().to_path_buf();
                 let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
                 if ignores.is_match(&rel) || ignores.is_match(name) {
@@ -607,10 +612,8 @@ mod tests {
     }
 
     fn cross(schemas: Vec<Schema>) -> Vec<String> {
-        let map: BTreeMap<String, Schema> = schemas
-            .into_iter()
-            .map(|s| (s.table.clone(), s))
-            .collect();
+        let map: BTreeMap<String, Schema> =
+            schemas.into_iter().map(|s| (s.table.clone(), s)).collect();
         let mut out = vec![];
         validate_cross(&map, &mut out);
         out.into_iter().map(|d| d.code).collect()
@@ -626,7 +629,10 @@ mod tests {
     fn test9999_foreign_keys_must_reference_a_real_unique_target() {
         let mut child = schema(
             "b",
-            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("a_id", ColumnType::String, false),
+            ],
             &["id"],
         );
         child.foreign_keys = vec![foreign_key(&["a_id"], "ghost", &["id"])];
@@ -645,19 +651,21 @@ mod tests {
         // A target that exists but is neither a primary key nor unique.
         let mut wide = schema(
             "a",
-            &[("id", ColumnType::String, false), ("label", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("label", ColumnType::String, false),
+            ],
             &["id"],
         );
         child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["label"])];
         assert!(
-            cross(vec![wide.clone(), child.clone()]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
+            cross(vec![wide.clone(), child.clone()])
+                .contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
         );
 
         // Declaring that target unique makes the same foreign key legitimate.
         wide.unique = vec![vec!["label".into()]];
-        assert!(
-            !cross(vec![wide, child]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
-        );
+        assert!(!cross(vec![wide, child]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into()));
     }
 
     /// Section 11: referencing and referenced column types must be identical, so
@@ -666,7 +674,10 @@ mod tests {
     fn test9999_foreign_key_column_types_must_match_exactly() {
         let mut child = schema(
             "b",
-            &[("id", ColumnType::String, false), ("a_id", ColumnType::Int, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("a_id", ColumnType::Int, false),
+            ],
             &["id"],
         );
         child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
@@ -675,7 +686,10 @@ mod tests {
         // The same types agree.
         let mut ok = schema(
             "b",
-            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("a_id", ColumnType::String, false),
+            ],
             &["id"],
         );
         ok.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
@@ -706,7 +720,10 @@ mod tests {
         // A repeated column on the referencing side.
         let mut composite = schema(
             "a",
-            &[("p", ColumnType::String, false), ("q", ColumnType::String, false)],
+            &[
+                ("p", ColumnType::String, false),
+                ("q", ColumnType::String, false),
+            ],
             &["p", "q"],
         );
         composite.table = "a".into();
@@ -720,7 +737,10 @@ mod tests {
     fn test9999_referential_actions_require_columns_that_can_hold_them() {
         let mut child = schema(
             "b",
-            &[("id", ColumnType::String, false), ("a_id", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("a_id", ColumnType::String, false),
+            ],
             &["id"],
         );
         let mut fk = foreign_key(&["a_id"], "a", &["id"]);
@@ -749,12 +769,18 @@ mod tests {
         let cyclic = |action: Action| {
             let mut a = schema(
                 "a",
-                &[("id", ColumnType::String, false), ("b_id", ColumnType::String, true)],
+                &[
+                    ("id", ColumnType::String, false),
+                    ("b_id", ColumnType::String, true),
+                ],
                 &["id"],
             );
             let mut b = schema(
                 "b",
-                &[("id", ColumnType::String, false), ("a_id", ColumnType::String, true)],
+                &[
+                    ("id", ColumnType::String, false),
+                    ("a_id", ColumnType::String, true),
+                ],
                 &["id"],
             );
             let mut to_b = foreign_key(&["b_id"], "b", &["id"]);
@@ -774,7 +800,10 @@ mod tests {
         // A self-referencing cascade is a cycle of length one.
         let mut self_ref = schema(
             "a",
-            &[("id", ColumnType::String, false), ("parent", ColumnType::String, true)],
+            &[
+                ("id", ColumnType::String, false),
+                ("parent", ColumnType::String, true),
+            ],
             &["id"],
         );
         let mut fk = foreign_key(&["parent"], "a", &["id"]);
@@ -837,7 +866,10 @@ mod tests {
     fn test9999_filename_columns_track_the_storage_declaration() {
         let mut s = schema(
             "t",
-            &[("id", ColumnType::String, false), ("slug", ColumnType::String, false)],
+            &[
+                ("id", ColumnType::String, false),
+                ("slug", ColumnType::String, false),
+            ],
             &["id"],
         );
         assert_eq!(s.filename_columns(), ["id".to_string()]);

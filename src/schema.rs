@@ -597,8 +597,20 @@ mod tests {
             assert!(valid_name(accepted), "{accepted} should be a valid name");
         }
         for rejected in [
-            "", "Users", "1users", "_users", "user-items", "user.items", "üsers", "con", "prn",
-            "aux", "nul", "com1", "lpt9", ".hidden",
+            "",
+            "Users",
+            "1users",
+            "_users",
+            "user-items",
+            "user.items",
+            "üsers",
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "lpt9",
+            ".hidden",
         ] {
             assert!(!valid_name(rejected), "{rejected:?} must be rejected");
         }
@@ -617,8 +629,11 @@ mod tests {
     #[test]
     fn test9999_table_must_equal_the_file_stem() {
         let s = base(&[("id", column(ColumnType::String))], &["id"]);
-        assert!(s.validate_local("t").iter().all(|d| d.code
-            != "SCHEMA_TABLE_NAME_MISMATCH"));
+        assert!(
+            s.validate_local("t")
+                .iter()
+                .all(|d| d.code != "SCHEMA_TABLE_NAME_MISMATCH")
+        );
         assert!(
             s.validate_local("other")
                 .iter()
@@ -707,28 +722,49 @@ mod tests {
     fn test9999_type_specific_members_are_strict() {
         // enum requires values; values are meaningless elsewhere.
         let mut enumeration = column(ColumnType::Enum);
-        let s = base(&[("id", column(ColumnType::String)), ("e", enumeration.clone())], &["id"]);
+        let s = base(
+            &[
+                ("id", column(ColumnType::String)),
+                ("e", enumeration.clone()),
+            ],
+            &["id"],
+        );
         assert!(codes(&s).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
 
         enumeration.values = Some(vec!["a".into(), "a".into()]);
-        let s = base(&[("id", column(ColumnType::String)), ("e", enumeration.clone())], &["id"]);
+        let s = base(
+            &[
+                ("id", column(ColumnType::String)),
+                ("e", enumeration.clone()),
+            ],
+            &["id"],
+        );
         assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
 
         let mut misplaced = column(ColumnType::String);
         misplaced.values = Some(vec!["a".into()]);
-        let s = base(&[("id", column(ColumnType::String)), ("v", misplaced)], &["id"]);
+        let s = base(
+            &[("id", column(ColumnType::String)), ("v", misplaced)],
+            &["id"],
+        );
         assert!(codes(&s).contains(&"SCHEMA_UNKNOWN_KEY".to_string()));
 
         // array requires items; items are meaningless elsewhere.
         let s = base(
-            &[("id", column(ColumnType::String)), ("a", column(ColumnType::Array))],
+            &[
+                ("id", column(ColumnType::String)),
+                ("a", column(ColumnType::Array)),
+            ],
             &["id"],
         );
         assert!(codes(&s).contains(&"SCHEMA_MISSING_REQUIRED".to_string()));
 
         let mut with_items = column(ColumnType::String);
         with_items.items = Some(Box::new(column(ColumnType::Int)));
-        let s = base(&[("id", column(ColumnType::String)), ("v", with_items)], &["id"]);
+        let s = base(
+            &[("id", column(ColumnType::String)), ("v", with_items)],
+            &["id"],
+        );
         assert!(codes(&s).contains(&"SCHEMA_UNKNOWN_KEY".to_string()));
 
         // a default must satisfy its own column type.
@@ -788,7 +824,10 @@ mod tests {
         properties.insert("n".to_string(), property);
         let mut object = column(ColumnType::Object);
         object.properties = Some(properties);
-        let s = base(&[("id", column(ColumnType::String)), ("o", object)], &["id"]);
+        let s = base(
+            &[("id", column(ColumnType::String)), ("o", object)],
+            &["id"],
+        );
         assert!(codes(&s).contains(&"SCHEMA_DEFAULT_TYPE_MISMATCH".to_string()));
     }
 
@@ -839,12 +878,7 @@ mod tests {
         email.description = Some("contact address".into());
 
         let mut s = base(
-            &[
-                ("id", id),
-                ("email", email),
-                ("role", role),
-                ("tags", tags),
-            ],
+            &[("id", id), ("email", email), ("role", role), ("tags", tags)],
             &["id"],
         );
         s.unique = vec![vec!["email".into()]];
