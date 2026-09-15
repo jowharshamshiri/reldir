@@ -123,7 +123,7 @@ pub fn lossless_convert(value: &Value, target: &Column) -> Option<Value> {
     matches_column(&converted, target).then_some(converted)
 }
 
-pub fn canonical_decimal(text: &str) -> bool {
+fn canonical_decimal(text: &str) -> bool {
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     if unsigned.is_empty() || text.starts_with('+') || text == "-0" {
         return false;

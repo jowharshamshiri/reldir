@@ -88,7 +88,7 @@ pub fn validate(c: &Catalog) -> Vec<Diagnostic> {
     out
 }
 
-pub fn validate_row(
+fn validate_row(
     s: &Schema,
     row: &Map<String, Value>,
     path: &std::path::Path,

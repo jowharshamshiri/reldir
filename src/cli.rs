@@ -5120,3 +5120,115 @@ fn completions(shell: &str) -> Result<i32> {
     clap_complete::generate(shell, &mut Cli::command(), "db", &mut io::stdout());
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{AdditionalFields, Column, ColumnType};
+    use indexmap::IndexMap;
+
+    fn column(kind: ColumnType) -> Column {
+        Column {
+            kind,
+            nullable: false,
+            default: None,
+            generated: None,
+            values: None,
+            items: None,
+            properties: None,
+            description: None,
+        }
+    }
+
+    fn schema(columns: &[(&str, ColumnType)], primary_key: &[&str]) -> Schema {
+        let mut map = IndexMap::new();
+        for (name, kind) in columns {
+            map.insert((*name).to_string(), column(kind.clone()));
+        }
+        Schema {
+            table: "t".into(),
+            schema_version: 1,
+            schema_format: None,
+            description: None,
+            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
+            columns: map,
+            unique: vec![],
+            foreign_keys: vec![],
+            check: vec![],
+            indexes: vec![],
+            storage: None,
+            additional_fields: AdditionalFields::Reject,
+        }
+    }
+
+    /// Section 29: a key given on the command line is decoded against the type
+    /// the schema declares for it, not against whatever JSON syntax it happens
+    /// to resemble. `db get things 123` must find the row whose key is the
+    /// string `"123"` when that is what the column says, and the row whose key
+    /// is the number `123` when it says that instead -- without the user
+    /// quoting anything to defeat their shell.
+    #[test]
+    fn test1114_a_primary_key_argument_is_decoded_against_its_declared_type() {
+        let numeric = schema(&[("id", ColumnType::Int)], &["id"]);
+        assert_eq!(
+            key_values("123", &numeric).unwrap(),
+            vec![Value::from(123)],
+            "an int column takes the number"
+        );
+
+        let textual = schema(&[("id", ColumnType::String)], &["id"]);
+        assert_eq!(
+            key_values("123", &textual).unwrap(),
+            vec![Value::String("123".into())],
+            "a string column takes the same argument as text"
+        );
+        assert_eq!(
+            key_values("abc", &textual).unwrap(),
+            vec![Value::String("abc".into())],
+            "bare text needs no quoting"
+        );
+        assert_eq!(
+            key_values("true", &textual).unwrap(),
+            vec![Value::String("true".into())],
+            "JSON-looking text is still text where the column says so"
+        );
+    }
+
+    /// A key that cannot be the declared type is refused rather than coerced:
+    /// silently widening it would look up a row that does not exist and report
+    /// it missing, which hides the real mistake.
+    #[test]
+    fn test1115_a_key_that_cannot_match_its_column_is_refused() {
+        let numeric = schema(&[("id", ColumnType::Int)], &["id"]);
+        let error = key_values("not-a-number", &numeric)
+            .expect_err("text cannot be an int key");
+        assert_eq!(error.diagnostic.code, "TYPE_MISMATCH");
+        assert_eq!(error.exit, 4);
+    }
+
+    /// A composite key is supplied as a JSON array, checked component by
+    /// component: arity first, then each declared type.
+    #[test]
+    fn test1116_composite_keys_are_arrays_checked_against_each_column() {
+        let composite = schema(
+            &[("a", ColumnType::String), ("b", ColumnType::Int)],
+            &["a", "b"],
+        );
+        assert_eq!(
+            key_values(r#"["x",7]"#, &composite).unwrap(),
+            vec![Value::String("x".into()), Value::from(7)]
+        );
+
+        let not_an_array = key_values("x", &composite).expect_err("must be an array");
+        assert_eq!(not_an_array.diagnostic.code, "USAGE");
+
+        let wrong_arity = key_values(r#"["x"]"#, &composite).expect_err("arity is checked");
+        assert_eq!(wrong_arity.diagnostic.code, "USAGE");
+        assert!(wrong_arity.diagnostic.message.contains('2'));
+
+        let wrong_type =
+            key_values(r#"["x","seven"]"#, &composite).expect_err("each component is typed");
+        assert_eq!(wrong_type.diagnostic.code, "TYPE_MISMATCH");
+        assert!(wrong_type.diagnostic.message.contains('b'));
+    }
+}

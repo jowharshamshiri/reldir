@@ -7,7 +7,6 @@ use crate::{
     metadata::{self, Manifest},
 };
 use fs2::FileExt;
-use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -465,11 +464,6 @@ pub fn init_empty(root: &Path, track_provenance: bool) -> Result<()> {
     crate::index::rebuild(root, &c)?;
     Ok(())
 }
-pub fn json_key_arg(text: &str) -> Result<Value> {
-    serde_json::from_str(text)
-        .or_else(|_| Ok(Value::String(text.into())))
-        .map_err(|_: serde_json::Error| DbError::usage("invalid key"))
-}
 pub fn recover(root: &Path) -> Result<bool> {
     crate::transaction::recover(root)
 }
@@ -477,34 +471,6 @@ pub fn recover(root: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Section 29: a primary key given on the command line is decoded against
-    /// the value it denotes. JSON syntax wins where it parses, so an integer key
-    /// arrives as a number, and bare text is taken as a string rather than being
-    /// rejected -- `db get users abc` must work without shell quoting games.
-    #[test]
-    fn test1021_primary_key_arguments_decode_json_then_fall_back_to_text() {
-        assert_eq!(json_key_arg("123").unwrap(), Value::from(123));
-        assert_eq!(json_key_arg("1.5").unwrap(), Value::from(1.5));
-        assert_eq!(json_key_arg("true").unwrap(), Value::Bool(true));
-        assert_eq!(json_key_arg("null").unwrap(), Value::Null);
-        assert_eq!(
-            json_key_arg("\"quoted\"").unwrap(),
-            Value::String("quoted".into())
-        );
-
-        // Text that is not JSON is the string it looks like.
-        for text in ["abc", "u1", "not json", "2026-09-14", ""] {
-            assert_eq!(
-                json_key_arg(text).unwrap(),
-                Value::String(text.into()),
-                "{text:?} should decode as a string"
-            );
-        }
-
-        // A structured key round-trips as structure.
-        assert_eq!(json_key_arg("[1,2]").unwrap(), serde_json::json!([1, 2]));
-    }
 
     /// Root resolution never walks upward from a path the user named: operating
     /// on a different database than the one they pointed at would be a surprise

@@ -1380,7 +1380,7 @@ mod tests {
     /// through as SQLite wrote it instead of carrying advice about a table
     /// nobody named.
     #[test]
-    fn test1106_the_missing_table_is_read_from_sqlites_own_message() {
+    fn test1117_the_missing_table_is_read_from_sqlites_own_message() {
         assert_eq!(missing_table("no such table: users"), Some("users"));
         assert_eq!(missing_table("no such table: main.users"), Some("users"));
         assert_eq!(
@@ -1398,7 +1398,7 @@ mod tests {
     /// ungoverned directory says how to govern it; one that does not leaves the
     /// error exactly as it was, because there is nothing on disk to infer from.
     #[test]
-    fn test1107_only_an_ungoverned_directory_earns_inference_advice() {
+    fn test1118_only_an_ungoverned_directory_earns_inference_advice() {
         let mut catalog = Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec!["posts".into()],
@@ -1434,7 +1434,7 @@ mod tests {
     /// Enrichment is scoped to the one code it explains. A different failure
     /// carrying a similar message must not acquire advice about inference.
     #[test]
-    fn test1108_other_errors_are_passed_through_untouched() {
+    fn test1119_other_errors_are_passed_through_untouched() {
         let catalog = Catalog {
             root: PathBuf::from("/tmp"),
             ungoverned: vec!["posts".into()],

@@ -228,7 +228,7 @@ mod tests {
     /// the working schema is metadata, the pin is a file the user keeps in
     /// version control beside their data.
     #[test]
-    fn test1109_working_schemas_and_pins_occupy_separate_locations() {
+    fn test1120_working_schemas_and_pins_occupy_separate_locations() {
         let root = Path::new("/db");
         assert_eq!(
             working_path(root, "users"),
@@ -242,7 +242,7 @@ mod tests {
     /// Provenance records pins, never working schemas: the working copy is
     /// derived, so recording it would make a rebuild look like a change.
     #[test]
-    fn test1110_only_pins_have_a_recorded_relative_path() {
+    fn test1121_only_pins_have_a_recorded_relative_path() {
         assert_eq!(pin_relative("users"), "schema/users.json");
         assert!(is_pin_relative("schema/users.json"));
 
@@ -260,7 +260,7 @@ mod tests {
     /// Equivalence is about what the schema says, not how it was written. A pin
     /// re-serialized at a different indentation still fixes the same schema.
     #[test]
-    fn test1111_equivalence_ignores_formatting_but_not_meaning() {
+    fn test1122_equivalence_ignores_formatting_but_not_meaning() {
         let left = schema("users");
         let mut right = schema("users");
         assert!(equivalent(&left, &right).unwrap());
@@ -284,7 +284,7 @@ mod tests {
     /// An absent `schema/` means nothing is pinned, which is the ordinary state
     /// of a database nobody has pinned yet -- not a fault.
     #[test]
-    fn test1112_an_absent_pin_directory_means_nothing_is_pinned() {
+    fn test1123_an_absent_pin_directory_means_nothing_is_pinned() {
         let directory = tempfile::tempdir().unwrap();
         assert!(pinned_tables(directory.path()).unwrap().is_empty());
         assert!(load_pin(directory.path(), "users").unwrap().is_none());
@@ -309,7 +309,7 @@ mod tests {
     /// database whose pin directory is a regular file is not one jdb can
     /// interpret, and guessing would mean ignoring a declaration the user made.
     #[test]
-    fn test1113_a_pin_directory_that_is_not_a_directory_is_refused() {
+    fn test1124_a_pin_directory_that_is_not_a_directory_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("schema"), b"not a directory").unwrap();
         let error = pinned_tables(directory.path()).expect_err("must refuse");
