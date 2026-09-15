@@ -3614,3 +3614,72 @@ fn test0072_a_schema_change_applies_only_while_every_row_stays_valid() {
         "a refused migration leaves every row untouched"
     );
 }
+
+/// Section 75: the catalogue is a contract, so a code the binary can emit and
+/// no document names is a gap in that contract rather than a documentation
+/// chore. Checked here so adding a code without writing it down fails the
+/// suite, instead of waiting for someone to notice.
+#[test]
+fn test0073_every_emitted_diagnostic_code_is_documented() {
+    let mut emitted = std::collections::BTreeSet::new();
+    let mut sources = vec![];
+    let mut stack = vec![std::path::PathBuf::from("src")];
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|value| value == "rs") {
+                sources.push(fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    // Codes are written as the first argument of a diagnostic constructor, so
+    // the constructor name is what identifies one.
+    for text in &sources {
+        // Every helper that ultimately names a code, including the ones that
+        // wrap `new` -- a scan that knew only the outermost constructors would
+        // miss whatever a convenience method hard-codes inside itself.
+        for constructor in [
+            "DbError::new(",
+            "Diagnostic::error(",
+            "Diagnostic::warning(",
+            "Self::new(",
+        ] {
+            for (index, _) in text.match_indices(constructor) {
+                let rest = &text[index + constructor.len()..];
+                let Some(start) = rest.find('"') else { continue };
+                let Some(end) = rest[start + 1..].find('"') else {
+                    continue;
+                };
+                let code = &rest[start + 1..start + 1 + end];
+                if !code.is_empty()
+                    && code
+                        .chars()
+                        .all(|character| character.is_ascii_uppercase() || character == '_')
+                {
+                    emitted.insert(code.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        emitted.len() > 40,
+        "the scan found only {} codes, so it is not finding them",
+        emitted.len()
+    );
+
+    let documentation = ["docs/spec.md", "docs/errors.md", "docs/validation.md"]
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let undocumented: Vec<_> = emitted
+        .iter()
+        .filter(|code| !documentation.contains(code.as_str()))
+        .collect();
+    assert!(
+        undocumented.is_empty(),
+        "these codes are emitted but documented nowhere: {undocumented:?}"
+    );
+}

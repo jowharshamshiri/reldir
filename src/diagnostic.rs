@@ -151,9 +151,6 @@ impl DbError {
     pub fn usage(message: impl Into<String>) -> Self {
         Self::new("USAGE", message, 1)
     }
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new("DATABASE_INVALID", message, 2)
-    }
     pub fn io(path: &std::path::Path, e: std::io::Error) -> Self {
         Self::from_diag(Diagnostic::error("IO_ERROR", e.to_string()).at(path), 6)
     }
@@ -311,7 +308,18 @@ mod tests {
     fn test1029_error_constructors_carry_their_exit_status() {
         assert_eq!(DbError::usage("bad flag").exit_code(), 1);
         assert_eq!(DbError::usage("bad flag").diagnostic.code, "USAGE");
-        assert_eq!(DbError::invalid("bad state").exit_code(), 2);
         assert_eq!(DbError::new("QUERY_UNSUPPORTED", "m", 4).exit_code(), 4);
+        // `io` names the file rather than only the failure, so a reader is
+        // never left guessing which path could not be read.
+        let io = DbError::io(
+            std::path::Path::new("users/u1.json"),
+            std::io::Error::other("denied"),
+        );
+        assert_eq!(io.exit_code(), 6);
+        assert_eq!(io.diagnostic.code, "IO_ERROR");
+        assert_eq!(
+            io.diagnostic.path.as_deref(),
+            Some(std::path::Path::new("users/u1.json"))
+        );
     }
 }
