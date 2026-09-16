@@ -66,7 +66,10 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
 ## Install
 
 ```sh
-cargo install --path . --locked
+cargo install reldir
 ```
+
+Published on [crates.io](https://crates.io/crates/reldir). To build from a
+checkout instead, `cargo install --path . --locked`.
 
 A single self-contained `reldir` executable. No daemon, no server, no sidecar.

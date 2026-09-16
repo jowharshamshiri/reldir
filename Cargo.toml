@@ -56,8 +56,14 @@ assert_cmd = "2"
 predicates = "3"
 
 [package]
+categories = ["command-line-utilities", "database-implementations"]
 description = "A filesystem-native relational JSON database"
+documentation = "https://jowharshamshiri.github.io/reldir/"
 edition = "2024"
+homepage = "https://jowharshamshiri.github.io/reldir/"
+keywords = ["database", "json", "sql", "filesystem", "schema"]
 license = "MIT"
 name = "reldir"
+readme = "README.md"
+repository = "https://github.com/jowharshamshiri/reldir"
 version = "0.83.696"

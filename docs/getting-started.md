@@ -7,10 +7,17 @@ title: Getting started
 ## Install
 
 ```sh
+cargo install reldir
+```
+
+`reldir` is published on [crates.io](https://crates.io/crates/reldir). To build
+from a checkout instead:
+
+```sh
 cargo install --path . --locked
 ```
 
-This produces a single `reldir` executable.
+Either way you get a single `reldir` executable.
 
 ## Adopt a directory you already have
 

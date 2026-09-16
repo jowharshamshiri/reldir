@@ -8,7 +8,7 @@ as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
 integrity, answers SQL, and records how the state changed, without taking
 ownership of your bytes.
 
-📖 **[Documentation](https://jowharshamshiri.github.io/reldir/)**
+📦 **[crates.io](https://crates.io/crates/reldir)** &nbsp;·&nbsp; 📖 **[Documentation](https://jowharshamshiri.github.io/reldir/)**
 
 ```console
 $ ls ./data
@@ -54,6 +54,12 @@ external edits are adopted as new revisions. Invalid ones are reported with the
 file, line, and column.
 
 ## Install
+
+```sh
+cargo install reldir
+```
+
+Or build from a checkout:
 
 ```sh
 cargo install --path . --locked
