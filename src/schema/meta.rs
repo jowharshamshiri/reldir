@@ -422,6 +422,59 @@ mod tests {
         }
     }
 
+    /// The example the documentation publishes is a schema jdb accepts.
+    ///
+    /// `docs/schemas.md` prints a worked example, and it is the first thing
+    /// anyone writing a schema by hand will copy. An illustration that would
+    /// not load is worse than none, so it is decoded and validated here
+    /// exactly as a schema file would be.
+    ///
+    /// It also must not omit a relational keyword the tests exercise: the two
+    /// documents serve different purposes and their columns differ on purpose,
+    /// but a keyword covered by the fixture and missing from the illustration
+    /// means the format grew somewhere a reader cannot see it.
+    #[test]
+    fn test1144_the_documented_example_is_the_dialect_the_tests_exercise() {
+        let published = std::fs::read_to_string("docs/schemas.md")
+            .expect("the schema documentation is part of the repository");
+        let block = published
+            .split("```json")
+            .filter_map(|rest| rest.split("```").next())
+            .find(|body| body.contains("\"x-jdb\""))
+            .expect("the documentation publishes a worked example");
+        let documented: Value =
+            serde_json::from_str(block).expect("the published example is valid JSON");
+
+        // It must be a schema jdb would accept, not merely valid JSON.
+        let decoded = crate::schema::json_schema::decode(&documented)
+            .expect("the published example must decode");
+        let validator = validator().expect("the dialect compiles");
+        let errors: Vec<String> = validator
+            .iter_errors(&documented)
+            .map(|error| format!("{error} at {}", error.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "the published example must conform: {errors:?}");
+
+        // And it must exercise the same surface the fixture does, so that a
+        // keyword gaining coverage here does not silently leave the docs behind.
+        let fixture = users();
+        let keys = |document: &Value| -> Vec<String> {
+            document["x-jdb"]
+                .as_object()
+                .expect("x-jdb is an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        for key in keys(&fixture) {
+            assert!(
+                keys(&documented).contains(&key),
+                "the documentation omits {key:?}, which the tests exercise"
+            );
+        }
+        assert_eq!(decoded.table, "users");
+    }
+
     /// Neither validator may be the permissive one.
     ///
     /// `test1141` fixes one direction: the dialect never refuses what the codec
