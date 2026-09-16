@@ -154,25 +154,37 @@ fn validate_row(
                 .table(&s.table)
                 .field(name),
             ),
-            Some(v) if !value::matches_column(v, col) => out.push(
-                Diagnostic::error(
+            Some(v) if !value::matches_column(v, col) => {
+                // A pattern is part of what the column admits, so a value that
+                // satisfies the type but not the pattern would otherwise report
+                // a type it plainly has.
+                let missed_pattern = col
+                    .pattern
+                    .as_ref()
+                    .filter(|pattern| v.is_string() && !value::matches_pattern(v, pattern));
+                let diagnostic = Diagnostic::error(
                     "TYPE_MISMATCH",
-                    // A pattern is part of what the column admits, so a value
-                    // that satisfies the type but not the pattern would
-                    // otherwise report a type it plainly has.
-                    match &col.pattern {
-                        Some(pattern) if v.is_string() && !value::matches_pattern(v, pattern) => {
-                            format!("field {name:?} does not match pattern {pattern:?}")
-                        }
-                        _ => format!("field {name:?} does not match type {:?}", col.kind),
+                    match missed_pattern {
+                        Some(pattern) => format!("field {name:?} does not match pattern {pattern:?}"),
+                        None => format!("field {name:?} does not match type {:?}", col.kind),
                     },
                 )
                 .at(path)
                 .table(&s.table)
                 .field(name)
-                .observed(crate::canonical::compact(v))
-                .fix("FIX_COERCE_VALUE"),
-            ),
+                .observed(crate::canonical::compact(v));
+                // A coercion converts between representations of a value, so it
+                // can answer a type miss. It can never answer a pattern miss:
+                // the value already has the declared type, and no lossless
+                // conversion turns one string into a different string. Offering
+                // the fix anyway would name a remedy that selects nothing --
+                // doctor already classes this as manual, and the diagnostic
+                // must say the same thing.
+                out.push(match missed_pattern {
+                    Some(_) => diagnostic,
+                    None => diagnostic.fix("FIX_COERCE_VALUE"),
+                });
+            }
             _ => {}
         }
     }
@@ -467,6 +479,77 @@ mod tests {
         let mut out = vec![];
         validate_row(&s, &in_array, &PathBuf::from("t/a.json"), &mut out);
         assert!(codes(&out).contains(&"TYPE_MISMATCH"));
+    }
+
+    /// A diagnostic must not name a fix that cannot answer it.
+    ///
+    /// `FIX_COERCE_VALUE` converts between representations of a value, which
+    /// can answer a type miss -- `"42"` into `42`. It can never answer a
+    /// pattern miss: the value already has the declared type, and no lossless
+    /// conversion turns one string into a different string. Doctor classes a
+    /// pattern miss as manual and `--only FIX_COERCE_VALUE` selects nothing, so
+    /// a diagnostic advertising the fix would send a reader after a remedy that
+    /// does not exist.
+    #[test]
+    fn test1153_a_pattern_miss_advertises_no_coercion() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("slug", ColumnType::String, false),
+                ("n", ColumnType::Int, false),
+            ],
+            &["id"],
+        );
+        s.columns.get_mut("slug").unwrap().pattern = Some("^[a-z-]+$".into());
+
+        // A value of the right type that misses the pattern.
+        let mut out = vec![];
+        validate_row(
+            &s,
+            &body(&[
+                ("id", json!("a")),
+                ("slug", json!("Not A Slug")),
+                ("n", json!(1)),
+            ]),
+            &PathBuf::from("t/a.json"),
+            &mut out,
+        );
+        let mismatch = out
+            .iter()
+            .find(|d| d.code == "TYPE_MISMATCH")
+            .expect("a pattern miss is a TYPE_MISMATCH");
+        assert!(
+            mismatch.message.contains("pattern"),
+            "the message must name the pattern: {}",
+            mismatch.message
+        );
+        assert!(
+            mismatch.fixes.is_empty(),
+            "a pattern miss has no coercion, so it must advertise none: {:?}",
+            mismatch.fixes
+        );
+
+        // A genuine type miss still offers the coercion that can answer it.
+        let mut out = vec![];
+        validate_row(
+            &s,
+            &body(&[
+                ("id", json!("a")),
+                ("slug", json!("fine-slug")),
+                ("n", json!("7")),
+            ]),
+            &PathBuf::from("t/a.json"),
+            &mut out,
+        );
+        let mismatch = out
+            .iter()
+            .find(|d| d.code == "TYPE_MISMATCH")
+            .expect("a type miss is a TYPE_MISMATCH");
+        assert!(
+            mismatch.fixes.iter().any(|f| f == "FIX_COERCE_VALUE"),
+            "a type miss must still name the fix that answers it: {:?}",
+            mismatch.fixes
+        );
     }
 
     /// Section 16: a key is the canonical rendering of its columns in order, so
