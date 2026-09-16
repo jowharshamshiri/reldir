@@ -4164,3 +4164,187 @@ fn test0074_every_test_ordinal_is_unique() {
         repeated.join("\n  ")
     );
 }
+
+/// A pin whose working schema directory is gone is reconstructed before the
+/// question is answered.
+///
+/// Deleting all of `.db/` was already handled: the format marker goes with it,
+/// so the next command bootstraps and copies every pin into place. The gap was
+/// narrower and quieter. With `.db/format` intact but `.db/schema/` missing --
+/// a partial delete, a `.gitignore` that excluded the schema directory, a clone
+/// that never carried it -- nothing bootstrapped, and `tables_needing_schema`
+/// excludes any table that has a pin, so establishment found no work to do.
+/// `check` then answered `0 tables, 0 rows` with 21 declarations sitting in
+/// `schema/`. Zero is not a cautious answer there, it is a false one.
+#[test]
+fn test0080_a_pin_rebuilds_a_missing_working_schema_directory() {
+    let dir = adopted();
+    let root = dir.path();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "schema", "pin", "users"])
+        .assert()
+        .success();
+    assert!(root.join("schema/users.json").is_file(), "the pin exists");
+    let declared = fs::read(root.join("schema/users.json")).unwrap();
+
+    // `.db/` stays, so this is not a bootstrap. Only the working schemas go.
+    fs::remove_dir_all(root.join(".db/schema")).unwrap();
+    assert!(root.join(".db/format").is_file(), "the database still exists");
+
+    // The real count, not zero.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 rows"));
+
+    // Reconstructed from the declaration, not inferred afresh: the bytes are
+    // the user's own.
+    assert_eq!(
+        fs::read(root.join(".db/schema/users.json")).unwrap(),
+        declared,
+        "the working schema must be the pin, not a re-derivation of it"
+    );
+
+    // And a query answers over the reconstructed model.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "sql", "SELECT id FROM users ORDER BY id"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("u1"));
+}
+
+/// A read-only command answers the same question without writing.
+///
+/// `--readonly` promises to leave the folder untouched, so it reconstructs the
+/// declared schema in memory rather than writing it. Inferring one instead
+/// would answer with a different schema than the one the user wrote, and
+/// answering zero would be false in the way `test0080` describes.
+#[test]
+fn test0081_readonly_reconstructs_a_pinned_schema_without_writing() {
+    let dir = adopted();
+    let root = dir.path();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "schema", "pin", "users"])
+        .assert()
+        .success();
+    fs::remove_dir_all(root.join(".db/schema")).unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "table",
+        "sql",
+        "SELECT id FROM users ORDER BY id",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("u1"));
+
+    assert!(
+        !root.join(".db/schema").exists(),
+        "--readonly must not write the working schema it reconstructed"
+    );
+}
+
+/// A pattern in a pinned schema is enforced against the rows.
+///
+/// A corpus adopted into jdb carried `pattern` on every id and every reference.
+/// jdb accepted the keyword, discarded it, and reported the database valid
+/// while none of those constraints were checked. A schema that states a
+/// constraint the database does not apply is worse than one that refuses to
+/// load.
+#[test]
+fn test0082_a_declared_pattern_is_enforced_against_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("blocks")).unwrap();
+    fs::write(
+        root.join("blocks/ok.json"),
+        "{\"id\":\"ok\",\"slug\":\"valid-slug\",\"refs\":[\"obj-1\"]}\n",
+    )
+    .unwrap();
+    pin(
+        root,
+        "blocks",
+        r#"{
+  "$schema": "https://jdb.dev/schema/jdb-1",
+  "type": "object",
+  "properties": {
+    "id":   { "type": "string" },
+    "slug": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,63}$" },
+    "refs": { "type": "array", "items": { "type": "string", "pattern": "^obj-[0-9]+$" } }
+  },
+  "required": ["id", "slug", "refs"],
+  "additionalProperties": false,
+  "x-jdb": {
+    "table": "blocks",
+    "primaryKey": ["id"],
+    "columnOrder": ["id", "slug", "refs"]
+  }
+}
+"#,
+    );
+
+    db().args(["--format", "table", "init", root.to_str().unwrap(), "--adopt"])
+        .assert()
+        .success();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // A value that satisfies the type but misses the pattern is a violation,
+    // and the message names the pattern rather than the type the value plainly
+    // has.
+    fs::write(
+        root.join("blocks/bad.json"),
+        "{\"id\":\"bad\",\"slug\":\"Not A Slug\",\"refs\":[\"obj-2\"]}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TYPE_MISMATCH"))
+        .stderr(predicate::str::contains("pattern"));
+
+    // The same at array-element depth, where no column name of its own exists.
+    fs::remove_file(root.join("blocks/bad.json")).unwrap();
+    fs::write(
+        root.join("blocks/deep.json"),
+        "{\"id\":\"deep\",\"slug\":\"fine-slug\",\"refs\":[\"objective-9\"]}\n",
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("TYPE_MISMATCH"));
+}
+
+/// A pattern jdb cannot compile is refused when the schema loads, naming the
+/// column, rather than being accepted and then never matching.
+#[test]
+fn test0083_an_uncompilable_pattern_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("t")).unwrap();
+    fs::write(root.join("t/a.json"), "{\"id\":\"a\"}\n").unwrap();
+    pin(
+        root,
+        "t",
+        r#"{
+  "$schema": "https://jdb.dev/schema/jdb-1",
+  "type": "object",
+  "properties": { "id": { "type": "string", "pattern": "(a)\\1" } },
+  "required": ["id"],
+  "additionalProperties": false,
+  "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] }
+}
+"#,
+    );
+
+    db().args(["--format", "table", "init", root.to_str().unwrap(), "--adopt"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("SCHEMA_CHECK_INVALID"))
+        .stderr(predicate::str::contains("id"));
+}

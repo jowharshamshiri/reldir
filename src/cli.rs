@@ -692,9 +692,17 @@ pub fn run(cli: Cli) -> Result<i32> {
             let cannot_write = settings.readonly || cli.dry_run;
             let establishes_on_demand = matches!(command, Command::Shell);
             let answers_ephemerally = !cli.no_auto && (cannot_write || establishes_on_demand);
-            let mut db = if observation.format == crate::state::FormatState::Absent
-                && answers_ephemerally
-            {
+            // Absent metadata is not the only way to arrive needing a model
+            // that is not on disk. A database whose `.db/schema/` is gone while
+            // its pins remain has declarations but nothing to read them from,
+            // and a writer reconstructs them; an invocation that cannot write
+            // owes the same answer without leaving the file behind. Testing
+            // only for absent metadata sent that case to the ordinary open,
+            // where the catalog found no schemas and the query failed with
+            // UNKNOWN_TABLE for a table the user had declared.
+            let model_is_not_on_disk = observation.format == crate::state::FormatState::Absent
+                || !observation.pins_needing_working_copy()?.is_empty();
+            let mut db = if model_is_not_on_disk && answers_ephemerally {
                 let schemas = crate::state::ephemeral_schemas(&observation, &resource_overrides)?;
                 Database::ephemeral(root, schemas, &resource_overrides)?
             } else {
@@ -2335,6 +2343,8 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                     values: None,
                     items: None,
                     properties: None,
+                    pattern: None,
+                    additional_properties: true,
                     description: None,
                     annotations: Default::default(),
                 },
@@ -3867,6 +3877,8 @@ fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Res
                     values: None,
                     items: None,
                     properties: None,
+                    pattern: None,
+                    additional_properties: true,
                     description: None,
                     annotations: Default::default(),
                 },
@@ -4184,6 +4196,8 @@ fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Resul
                         values: None,
                         items: None,
                         properties: None,
+                        pattern: None,
+                        additional_properties: true,
                         description: None,
                         annotations: Default::default(),
                     },
@@ -5472,6 +5486,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: Default::default(),
         }

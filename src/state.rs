@@ -109,6 +109,29 @@ impl Observation {
             .cloned()
             .collect()
     }
+
+    /// Pinned tables to rebuild a working schema for, when there is no working
+    /// schema directory at all.
+    ///
+    /// A pin is a declaration the user owns; the working schema is the file
+    /// every subsystem actually reads. Deleting `.db/` is documented as safe
+    /// precisely because the pin can rebuild it, so pins beside an absent
+    /// `.db/schema/` are a missing prerequisite rather than tables that do not
+    /// exist. Answering "0 tables" there would be a false report.
+    ///
+    /// Scoped deliberately to that case. A pin appearing beside a *populated*
+    /// `.db/schema/` is ordinary adoption, which the catalog already performs:
+    /// it loads the declaration, validates it as strictly as a working schema,
+    /// and reports any disagreement against the pin's own path. Reconstructing
+    /// there would copy the declaration in before the catalog ever saw it,
+    /// relocating every diagnostic to `.db/schema/` and making establishment a
+    /// second adopter of pins -- two sources of truth for one fact.
+    pub fn pins_needing_working_copy(&self) -> Result<Vec<String>> {
+        if crate::schema_store::working_dir(&self.root).exists() {
+            return Ok(vec![]);
+        }
+        Ok(self.topology.declared_tables.clone())
+    }
 }
 
 /// What a command needs before it can run.
@@ -156,6 +179,11 @@ pub enum Transition {
     /// recorded history would be indistinguishable from one that had nothing to
     /// drop.
     RebuiltMetadata(Vec<String>),
+    /// Rebuilt a working schema from the pin that declares it.
+    ///
+    /// Distinct from `InferredSchemas`: nothing was guessed from the rows. The
+    /// user's own declaration was copied to where the runtime reads it.
+    RestoredSchemas(Vec<String>),
 }
 
 impl Transition {
@@ -170,6 +198,9 @@ impl Transition {
             }
             Self::RebuiltMetadata(discarded) => {
                 format!("rebuilt unreadable metadata, discarding {}", discarded.join(", "))
+            }
+            Self::RestoredSchemas(tables) => {
+                format!("restored working schemas from pins for {}", tables.join(", "))
             }
         }
     }
@@ -194,6 +225,11 @@ impl Transition {
                 "would rebuild unreadable metadata, discarding {}",
                 discarded.join(", ")
             ),
+            Self::RestoredSchemas(tables) => tables
+                .iter()
+                .map(|table| format!("would restore .db/schema/{table}.json from its pin"))
+                .collect::<Vec<_>>()
+                .join("; "),
         }
     }
 
@@ -203,6 +239,7 @@ impl Transition {
             Self::Bootstrapped => "bootstrapped",
             Self::InferredSchemas(_) => "schemas_inferred",
             Self::RebuiltMetadata(_) => "metadata_rebuilt",
+            Self::RestoredSchemas(_) => "schemas_restored",
         }
     }
 }
@@ -674,6 +711,11 @@ fn establish_inner(
         )?
     };
 
+    // Computed before the plan is returned so that `plan` and `establish`
+    // report the same work: a plan that omitted reconstruction would promise a
+    // read the following establish would have to perform a write to keep.
+    let pins_to_reconstruct = observation.pins_needing_working_copy()?;
+
     let mut transitions = vec![];
     if bootstrapping {
         transitions.push(Transition::Bootstrapped);
@@ -682,6 +724,9 @@ fn establish_inner(
         transitions.push(Transition::InferredSchemas(
             inferred.keys().cloned().collect(),
         ));
+    }
+    if !bootstrapping && !pins_to_reconstruct.is_empty() {
+        transitions.push(Transition::RestoredSchemas(pins_to_reconstruct.clone()));
     }
 
     if !execute {
@@ -698,21 +743,23 @@ fn establish_inner(
         crate::schema_store::write_working(&observation.root, schema, config.indentation_width)?;
     }
 
-    if bootstrapping {
-        // A pinned table is not inferred -- its schema is declared -- but it
-        // still needs a working copy, because that is the file every subsystem
-        // reads. This belongs to establishment alone: doing it on every
-        // invocation would have each concurrent command rewrite the same file
-        // outside the writer lock, turning a read into a write and racing every
-        // other reader for it.
-        for table in crate::schema_store::pinned_tables(&observation.root)? {
-            if let Some(pinned) = crate::schema_store::load_pin(&observation.root, &table)? {
-                crate::schema_store::write_working(
-                    &observation.root,
-                    &pinned,
-                    config.indentation_width,
-                )?;
-            }
+    // A pinned table is not inferred -- its schema is declared -- but it still
+    // needs a working copy, because that is the file every subsystem reads.
+    //
+    // Only the pins whose working copy is missing are written. Rewriting every
+    // pin on every invocation would have each concurrent command rewrite the
+    // same bytes outside the writer lock, turning a read into a write; but
+    // refusing to write any outside bootstrap left `rm -rf .db` unrecoverable
+    // in place, with `check` reporting zero tables while the declarations sat
+    // in `schema/`. Reconstruction is establishment satisfying a prerequisite,
+    // which is what establishment is for.
+    for table in pins_to_reconstruct {
+        if let Some(pinned) = crate::schema_store::load_pin(&observation.root, &table)? {
+            crate::schema_store::write_working(
+                &observation.root,
+                &pinned,
+                config.indentation_width,
+            )?;
         }
     }
 
@@ -757,7 +804,12 @@ pub fn ephemeral_schemas(
     overrides: &crate::config::ResourceOverrides,
 ) -> Result<BTreeMap<String, Schema>> {
     let missing = observation.tables_needing_schema();
-    if missing.is_empty() {
+    // A pin whose working copy is absent is reconstructed in memory rather
+    // than inferred: its schema is declared, so guessing one from the rows
+    // would answer with a different schema than the one the user wrote. This
+    // is the read-only half of what establishment does by writing the file.
+    let pinned = observation.pins_needing_working_copy()?;
+    if missing.is_empty() && pinned.is_empty() {
         return Ok(BTreeMap::new());
     }
     let mut config = Config::default();
@@ -765,15 +817,25 @@ pub fn ephemeral_schemas(
     config
         .validate()
         .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-    let references = crate::catalog::Catalog::observe(&observation.root, &config)?;
-    infer::infer_all_with_references(
-        &observation.root,
-        &missing,
-        infer::Strictness::Balanced,
-        &config,
-        None,
-        Some(&references),
-    )
+
+    let mut out = BTreeMap::new();
+    for table in pinned {
+        if let Some(schema) = crate::schema_store::load_pin(&observation.root, &table)? {
+            out.insert(table, schema);
+        }
+    }
+    if !missing.is_empty() {
+        let references = crate::catalog::Catalog::observe(&observation.root, &config)?;
+        out.extend(infer::infer_all_with_references(
+            &observation.root,
+            &missing,
+            infer::Strictness::Balanced,
+            &config,
+            None,
+            Some(&references),
+        )?);
+    }
+    Ok(out)
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {

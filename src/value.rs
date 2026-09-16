@@ -8,6 +8,20 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
     if v.is_null() {
         return c.nullable;
     }
+    // A pattern constrains string values wherever they appear. Checking it here
+    // rather than per column type means it reaches array elements and nested
+    // properties too, because this function is what recurses into them.
+    //
+    // An uncompilable pattern cannot reject a value here: `validate_column`
+    // refuses such a schema outright, so reaching this point with one would
+    // mean validating rows against a schema that was never accepted. Treating
+    // it as unsatisfiable instead would fail every row of an already-rejected
+    // schema, reporting the symptom in place of the cause.
+    if let Some(pattern) = &c.pattern
+        && !matches_pattern(v, pattern)
+    {
+        return false;
+    }
     match c.kind {
         ColumnType::Bool => v.is_boolean(),
         ColumnType::Int => v.as_i64().is_some() && v.as_f64().is_none_or(|n| n.fract() == 0.0),
@@ -38,6 +52,16 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
                 .is_some_and(|i| a.iter().all(|v| matches_column(v, i)))
         }),
         ColumnType::Object => v.as_object().is_some_and(|o| {
+            // A closed object rejects members it does not declare. At the root
+            // the same question is `Schema::additional_fields`, which names each
+            // offending key as ROW_UNKNOWN_FIELD; here the object is a value, so
+            // carrying an undeclared member is simply not matching the column.
+            if !c.additional_properties
+                && let Some(p) = c.properties.as_ref()
+                && o.keys().any(|key| !p.contains_key(key))
+            {
+                return false;
+            }
             c.properties.as_ref().is_none_or(|p| {
                 p.iter()
                     .all(|(n, c)| o.get(n).map_or(c.nullable, |v| matches_column(v, c)))
@@ -45,6 +69,61 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
         }),
         ColumnType::Json => true,
     }
+}
+
+/// Whether a value satisfies a column's pattern.
+///
+/// A pattern constrains strings, so a non-string value is unconstrained by it
+/// and is judged by its type alone. An uncompilable pattern cannot reject
+/// anything: [`crate::schema::validate_column`] refuses such a schema outright
+/// with `SCHEMA_CHECK_INVALID`, so a row is never judged against one. Failing
+/// rows here instead would report every row of a broken schema rather than the
+/// one thing that is actually wrong.
+///
+/// Shared with `integrity` so a diagnostic can say whether it was the pattern
+/// or the type that a value missed, using the same judgment that rejected it.
+pub fn matches_pattern(v: &Value, pattern: &str) -> bool {
+    let Some(text) = v.as_str() else {
+        return true;
+    };
+    match compiled(pattern) {
+        Some(regex) => regex.is_match(text),
+        None => true,
+    }
+}
+
+/// One compiled automaton per distinct pattern, for the life of the process.
+///
+/// Validation walks every value of every row, so compiling on each call made
+/// the cost of a pattern proportional to the corpus rather than to the schema:
+/// a 1,109-row database with 153 declared patterns took twice as long to check
+/// as the same database with the patterns stripped out. A schema has a fixed,
+/// small set of patterns and they never change while a command runs, so the
+/// compile belongs to the pattern, not to the value being judged.
+///
+/// Keyed by source text rather than by column so that the same pattern written
+/// on twenty columns compiles once, which is the shape a real corpus has: one
+/// id spelling repeated across every table that references it.
+fn compiled(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<regex::Regex>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    // A poisoned lock means another thread panicked mid-insert. The map holds
+    // only derived values, so the contents remain sound and are recovered
+    // rather than turning an unrelated panic into this one.
+    let mut map = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = map.get(pattern) {
+        return entry.clone();
+    }
+    // A failed compile is cached too: `validate_column` has already reported it
+    // as SCHEMA_CHECK_INVALID, and retrying the same doomed compile for every
+    // value would pay the cost repeatedly to reach the same answer.
+    let entry = regex::Regex::new(pattern).ok().map(Arc::new);
+    map.insert(pattern.to_string(), entry.clone());
+    entry
 }
 
 /// Convert a value only when the target representation preserves its logical
@@ -245,6 +324,7 @@ pub fn generate(c: &Column, sequence: i64) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::schema::{Column, ColumnType};
+    use indexmap::IndexMap;
     use serde_json::json;
 
     fn column(kind: ColumnType) -> Column {
@@ -256,6 +336,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: Default::default(),
         }
@@ -393,6 +475,92 @@ mod tests {
         assert!(!matches_column(&Value::Null, &nullable));
         nullable.nullable = true;
         assert!(matches_column(&Value::Null, &nullable));
+    }
+
+    /// A `pattern` is a constraint on which rows are valid, so a value that
+    /// satisfies the type but not the pattern does not match the column.
+    ///
+    /// It is checked wherever a string appears, not only at the top level: a
+    /// corpus whose ids are patterned usually carries those same ids inside
+    /// arrays of references and inside nested objects, and a pattern enforced
+    /// at depth 0 but ignored at depth 1 would be worse than one uniformly
+    /// unsupported, because the schema would read as though it applied.
+    #[test]
+    fn test1148_patterns_constrain_strings_at_every_depth() {
+        let mut slug = column(ColumnType::String);
+        slug.pattern = Some("^[a-z][a-z0-9-]{2,63}$".into());
+        assert!(matches_column(&json!("valid-slug"), &slug));
+        assert!(
+            !matches_column(&json!("Not A Slug"), &slug),
+            "a string that misses the pattern must not match the column"
+        );
+
+        // An array's elements are judged by `items`, which carries its own
+        // pattern.
+        let mut element = column(ColumnType::String);
+        element.pattern = Some("^obj-[0-9]+$".into());
+        let mut refs = column(ColumnType::Array);
+        refs.items = Some(Box::new(element));
+        assert!(matches_column(&json!(["obj-1", "obj-22"]), &refs));
+        assert!(
+            !matches_column(&json!(["obj-1", "objective-3"]), &refs),
+            "one element missing the pattern must fail the whole array"
+        );
+
+        // A nested property is judged by its own subschema, likewise.
+        let mut inner = column(ColumnType::String);
+        inner.pattern = Some("^v[0-9]+$".into());
+        let mut properties = IndexMap::new();
+        properties.insert("version".to_string(), inner);
+        let mut meta = column(ColumnType::Object);
+        meta.properties = Some(properties);
+        assert!(matches_column(&json!({"version": "v2"}), &meta));
+        assert!(
+            !matches_column(&json!({"version": "2"}), &meta),
+            "a nested property missing its pattern must fail the object"
+        );
+
+        // A pattern constrains strings. A non-string value is judged by its
+        // type, which is the only thing a pattern could not have decided.
+        let mut number = column(ColumnType::Int);
+        number.pattern = Some("^[0-9]+$".into());
+        assert!(
+            matches_column(&json!(7), &number),
+            "a pattern must not reject a value it cannot describe"
+        );
+
+        // Unanchored patterns match anywhere, as they do in JSON Schema.
+        let mut loose = column(ColumnType::String);
+        loose.pattern = Some("abc".into());
+        assert!(matches_column(&json!("xxabcxx"), &loose));
+        assert!(!matches_column(&json!("xxabxx"), &loose));
+    }
+
+    /// A closed object rejects members it does not declare.
+    ///
+    /// At the root the same question is `Schema::additional_fields`, which
+    /// names each offending key as ROW_UNKNOWN_FIELD. One level down there was
+    /// no equivalent, so a schema could say `additionalProperties: false` on a
+    /// nested object and have it mean nothing.
+    #[test]
+    fn test1149_a_closed_nested_object_rejects_undeclared_members() {
+        let mut properties = IndexMap::new();
+        properties.insert("source".to_string(), column(ColumnType::String));
+        let mut meta = column(ColumnType::Object);
+        meta.properties = Some(properties);
+
+        // Open is JSON Schema's default, and stays the default here.
+        assert!(
+            matches_column(&json!({"source": "a", "extra": 1}), &meta),
+            "an open object admits undeclared members"
+        );
+
+        meta.additional_properties = false;
+        assert!(matches_column(&json!({"source": "a"}), &meta));
+        assert!(
+            !matches_column(&json!({"source": "a", "extra": 1}), &meta),
+            "a closed object must reject a member it does not declare"
+        );
     }
 
     /// Section 15: timestamps are normalised to UTC for their canonical textual

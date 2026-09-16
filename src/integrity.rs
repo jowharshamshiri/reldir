@@ -157,7 +157,15 @@ fn validate_row(
             Some(v) if !value::matches_column(v, col) => out.push(
                 Diagnostic::error(
                     "TYPE_MISMATCH",
-                    format!("field {name:?} does not match type {:?}", col.kind),
+                    // A pattern is part of what the column admits, so a value
+                    // that satisfies the type but not the pattern would
+                    // otherwise report a type it plainly has.
+                    match &col.pattern {
+                        Some(pattern) if v.is_string() && !value::matches_pattern(v, pattern) => {
+                            format!("field {name:?} does not match pattern {pattern:?}")
+                        }
+                        _ => format!("field {name:?} does not match type {:?}", col.kind),
+                    },
                 )
                 .at(path)
                 .table(&s.table)
@@ -281,6 +289,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: Default::default(),
         }

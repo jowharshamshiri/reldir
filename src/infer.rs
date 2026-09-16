@@ -630,6 +630,11 @@ fn column(kind: ColumnType, nullable: bool) -> Column {
         values: None,
         items: None,
         properties: None,
+        // Inference reports the shape it observed. A pattern is a claim about
+        // values never sampled, so guessing one from the rows present would
+        // invent a constraint the corpus never stated.
+        pattern: None,
+        additional_properties: true,
         description: None,
         annotations: Default::default(),
     }

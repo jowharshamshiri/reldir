@@ -320,6 +320,19 @@ fn encode_column(column: &Column) -> Value {
         ColumnType::Json => {}
     }
 
+    // A user pattern is emitted after the type's own, and for decimal and ulid
+    // it replaces it: two `pattern` keywords cannot coexist in one subschema,
+    // and the narrower of the two is the one a row must satisfy. jdb keeps
+    // enforcing the type regardless, because the type is not spelled by the
+    // pattern -- `matches_column` checks both.
+    if let Some(pattern) = &column.pattern {
+        out.insert("pattern".into(), Value::String(pattern.clone()));
+    }
+    // Emitted only when closed, because open is JSON Schema's default and
+    // writing it out would add a keyword that says nothing.
+    if !column.additional_properties && column.kind == ColumnType::Object {
+        out.insert("additionalProperties".into(), Value::Bool(false));
+    }
     if let Some(tag) = tag {
         out.insert(TYPE_TAG.into(), Value::String(tag.into()));
     }
@@ -346,6 +359,28 @@ fn typename(name: &str, nullable: bool) -> Value {
 
 const DECIMAL_PATTERN: &str = r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?$";
 const ULID_PATTERN: &str = "^[0-7][0-9A-HJKMNP-TV-Z]{25}$";
+
+/// The pattern a *person* wrote, as opposed to the one jdb emits for a type.
+///
+/// `decimal` and `ulid` are strings whose admissible values JSON Schema can
+/// only describe with a `pattern`, so [`encode_column`] writes one. Reading it
+/// straight back would turn jdb's own spelling of a type into a user
+/// constraint: it would then be part of the schema's identity, and a decimal
+/// column would hash differently depending on whether its schema had made a
+/// round trip through disk. A pattern equal to the type's canonical one is
+/// therefore the type restating itself, and carries no further constraint.
+fn user_pattern(object: &Map<String, Value>, kind: &ColumnType) -> Option<String> {
+    let pattern = object.get("pattern").and_then(Value::as_str)?;
+    let canonical = match kind {
+        ColumnType::Decimal => Some(DECIMAL_PATTERN),
+        ColumnType::Ulid => Some(ULID_PATTERN),
+        _ => None,
+    };
+    if canonical == Some(pattern) {
+        return None;
+    }
+    Some(pattern.to_string())
+}
 
 fn strings(values: &[String]) -> Value {
     Value::Array(values.iter().map(|v| Value::String(v.clone())).collect())
@@ -816,6 +851,10 @@ fn decode_column(
         None => nullable || (!required && default.is_none() && generated.is_none()),
     };
 
+    // Read before the literal takes ownership of `kind`: which pattern counts
+    // as the user's depends on which type is restating itself.
+    let pattern = user_pattern(object, &kind);
+
     Ok(Column {
         kind,
         nullable,
@@ -824,6 +863,13 @@ fn decode_column(
         values,
         items,
         properties,
+        pattern,
+        // JSON Schema's own default is that an object admits undeclared
+        // members, so silence means open. Only an explicit `false` closes it.
+        additional_properties: object
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         description: object
             .get("description")
             .and_then(Value::as_str)
@@ -1017,6 +1063,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: IndexMap::new(),
         }
@@ -1086,6 +1134,30 @@ mod tests {
         let mut object = col(ColumnType::Object);
         object.properties = Some(properties);
         out.push(("object_with_properties", object));
+
+        // A pattern is a constraint the document must carry through a round
+        // trip: losing it would silently widen what the schema accepts.
+        let mut patterned = col(ColumnType::String);
+        patterned.pattern = Some("^[a-z][a-z0-9._-]{2,127}$".into());
+        out.push(("patterned", patterned));
+
+        // Nested, where the pattern has no column name of its own.
+        let mut patterned_element = col(ColumnType::String);
+        patterned_element.pattern = Some("^obj-[0-9]+$".into());
+        let mut patterned_array = col(ColumnType::Array);
+        patterned_array.items = Some(Box::new(patterned_element));
+        out.push(("array_of_patterned_string", patterned_array));
+
+        // A decimal already carries a pattern of jdb's own. Round-tripping it
+        // must not turn the type's spelling into a user constraint.
+        out.push(("decimal_keeps_its_own_pattern", col(ColumnType::Decimal)));
+
+        let mut closed_properties = IndexMap::new();
+        closed_properties.insert("source".to_string(), col(ColumnType::String));
+        let mut closed = col(ColumnType::Object);
+        closed.properties = Some(closed_properties);
+        closed.additional_properties = false;
+        out.push(("closed_object", closed));
 
         let mut nullable = col(ColumnType::String);
         nullable.nullable = true;
@@ -1164,6 +1236,79 @@ mod tests {
                 serde_json::to_string_pretty(&document).unwrap()
             );
         }
+    }
+
+    /// A pattern is part of what a schema *is*, and jdb's own type patterns are
+    /// not.
+    ///
+    /// Two schemas differing only by a user pattern accept different rows, so
+    /// they must not share an identity. But `decimal` and `ulid` are written
+    /// with a `pattern` because that is how JSON Schema spells what those types
+    /// admit; reading that one back as a user constraint would make a decimal
+    /// column hash differently after a round trip through disk than before it.
+    #[test]
+    fn test1152_a_pattern_is_part_of_identity_but_a_types_own_spelling_is_not() {
+        let plain = table(vec![
+            ("id", col(ColumnType::String)),
+            ("v", col(ColumnType::String)),
+        ]);
+        let mut patterned_column = col(ColumnType::String);
+        patterned_column.pattern = Some("^[a-z]+$".into());
+        let patterned = table(vec![
+            ("id", col(ColumnType::String)),
+            ("v", patterned_column),
+        ]);
+        assert_ne!(
+            crate::schema::semantic::encode_v1(&plain),
+            crate::schema::semantic::encode_v1(&patterned),
+            "a pattern changes which rows are valid, so it must change identity"
+        );
+
+        // Two different patterns are two different schemas.
+        let mut other_column = col(ColumnType::String);
+        other_column.pattern = Some("^[A-Z]+$".into());
+        let other = table(vec![("id", col(ColumnType::String)), ("v", other_column)]);
+        assert_ne!(
+            crate::schema::semantic::encode_v1(&patterned),
+            crate::schema::semantic::encode_v1(&other),
+        );
+
+        // Closing an object rejects rows an open one accepts.
+        let mut properties = IndexMap::new();
+        properties.insert("source".to_string(), col(ColumnType::String));
+        let mut open_column = col(ColumnType::Object);
+        open_column.properties = Some(properties.clone());
+        let mut closed_column = col(ColumnType::Object);
+        closed_column.properties = Some(properties);
+        closed_column.additional_properties = false;
+        assert_ne!(
+            crate::schema::semantic::encode_v1(&table(vec![
+                ("id", col(ColumnType::String)),
+                ("v", open_column)
+            ])),
+            crate::schema::semantic::encode_v1(&table(vec![
+                ("id", col(ColumnType::String)),
+                ("v", closed_column)
+            ])),
+            "a closed object admits fewer rows than an open one"
+        );
+
+        // The round trip a decimal makes through disk must not change what it
+        // is, even though the document it passes through carries a pattern.
+        let decimal = table(vec![
+            ("id", col(ColumnType::String)),
+            ("v", col(ColumnType::Decimal)),
+        ]);
+        let after = decode(&encode(&decimal)).expect("a decimal round-trips");
+        assert_eq!(
+            after.columns["v"].pattern, None,
+            "the type's own pattern is the type restating itself, not a user constraint"
+        );
+        assert_eq!(
+            crate::schema::semantic::encode_v1(&decimal),
+            crate::schema::semantic::encode_v1(&after),
+            "a decimal's identity must survive a round trip through the file form"
+        );
     }
 
     /// Relational facts survive too, including the ones JSON Schema has no
@@ -1359,6 +1504,117 @@ mod tests {
             let error = decode(&nested)
                 .expect_err(&format!("{keyword} must be refused inside a column"));
             assert_eq!(error.diagnostic.code, "SCHEMA_UNSUPPORTED_KEYWORD");
+        }
+    }
+
+    /// The invariant whose absence let `pattern` be advertised and ignored.
+    ///
+    /// `reject_unsupported` refuses any keyword absent from `COLUMN_SEMANTIC`,
+    /// so adding a name to that list is what makes a keyword *accepted*. It is
+    /// not what makes it *enforced*: `pattern` sat in the list for as long as
+    /// the codec existed while `decode_column` never read it, so a schema could
+    /// state a constraint the database silently did not apply.
+    ///
+    /// Every keyword the codec accepts must therefore leave a trace in the
+    /// model. A keyword that changes nothing a decoded `Column` can report is
+    /// one that has been swallowed.
+    #[test]
+    fn test1147_every_accepted_column_keyword_reaches_the_model() {
+        // What each keyword is worth saying, and a column whose decoded model
+        // must differ once the keyword is present. `type`, `x-jdb-type` and
+        // `format`/`contentEncoding` decide the kind; the rest decide what the
+        // kind admits.
+        /// A keyword, a subschema using it, and what the decoded column must
+        /// then report.
+        type Probe = (&'static str, Value, Box<dyn Fn(&Column) -> bool>);
+
+        let probes: Vec<Probe> = vec![
+            (
+                "type",
+                json!({"type": "boolean"}),
+                Box::new(|c: &Column| c.kind == ColumnType::Bool),
+            ),
+            (
+                "properties",
+                json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+                Box::new(|c: &Column| c.properties.is_some()),
+            ),
+            (
+                "required",
+                json!({}),
+                Box::new(|c: &Column| c.nullable),
+            ),
+            (
+                "additionalProperties",
+                json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                Box::new(|c: &Column| !c.additional_properties),
+            ),
+            (
+                "items",
+                json!({"type": "array", "items": {"type": "string"}}),
+                Box::new(|c: &Column| c.items.is_some()),
+            ),
+            (
+                "enum",
+                json!({"type": "string", "enum": ["a"]}),
+                Box::new(|c: &Column| c.values.is_some() && c.kind == ColumnType::Enum),
+            ),
+            (
+                "default",
+                json!({"type": "string", "default": "x"}),
+                Box::new(|c: &Column| c.default.is_some()),
+            ),
+            (
+                "description",
+                json!({"type": "string", "description": "d"}),
+                Box::new(|c: &Column| c.description.is_some()),
+            ),
+            (
+                "format",
+                json!({"type": "string", "format": "uuid"}),
+                Box::new(|c: &Column| c.kind == ColumnType::Uuid),
+            ),
+            (
+                "pattern",
+                json!({"type": "string", "pattern": "^a$"}),
+                Box::new(|c: &Column| c.pattern.as_deref() == Some("^a$")),
+            ),
+            (
+                "contentEncoding",
+                json!({"type": "string", "contentEncoding": "base64"}),
+                Box::new(|c: &Column| c.kind == ColumnType::Bytes),
+            ),
+            (
+                TYPE_TAG,
+                json!({"type": "integer", TYPE_TAG: "int"}),
+                Box::new(|c: &Column| c.kind == ColumnType::Int),
+            ),
+        ];
+
+        for keyword in COLUMN_SEMANTIC {
+            let probe = probes
+                .iter()
+                .find(|(name, _, _)| name == keyword)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{keyword:?} is accepted inside a column but this test does not say what \
+                         reading it looks like; a keyword with no observable effect on the model \
+                         is one the codec silently discards"
+                    )
+                });
+            let (_, subschema, reaches_model) = probe;
+
+            let mut document = encode(&table(vec![("id", col(ColumnType::String))]));
+            document["properties"]["c"] = subschema.clone();
+            document["x-jdb"]["columnOrder"] = json!(["id", "c"]);
+
+            let schema = decode(&document)
+                .unwrap_or_else(|error| panic!("{keyword} must decode: {}", error.diagnostic.message));
+            assert!(
+                reaches_model(&schema.columns["c"]),
+                "{keyword:?} is accepted but left no trace in the decoded column, so a schema \
+                 could state it while the database ignored it"
+            );
         }
     }
 

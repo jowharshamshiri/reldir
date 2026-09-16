@@ -112,6 +112,17 @@ fn encode_column(column: &Column) -> Value {
             .collect();
         out.insert("properties".into(), Value::Array(entries));
     }
+    // A pattern decides which rows a column admits, so two schemas differing
+    // only by one are not the same schema and must not share an identity.
+    if let Some(pattern) = &column.pattern {
+        out.insert("pattern".into(), Value::String(pattern.clone()));
+    }
+    // Likewise: closing an object rejects rows an open one accepts. Only the
+    // closed case is encoded, so a schema that never mentions the keyword keeps
+    // the identity it had before the keyword existed.
+    if !column.additional_properties {
+        out.insert("additionalProperties".into(), Value::Bool(false));
+    }
     if let Some(description) = &column.description {
         out.insert("description".into(), Value::String(description.clone()));
     }

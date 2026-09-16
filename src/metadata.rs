@@ -809,6 +809,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: Default::default(),
         }
@@ -973,6 +975,35 @@ mod tests {
         permissive.additional_fields = AdditionalFields::Allow;
         out.push(("additional_fields_allow", permissive));
 
+        // A pattern decides which rows a column admits, so it must be part of
+        // what the schema *is*. Without these fixtures the identity change
+        // would be untested: no other fixture carries a user pattern, and jdb's
+        // own decimal and ulid patterns are deliberately excluded from identity.
+        let mut patterned_column = col(ColumnType::String);
+        patterned_column.pattern = Some("^[a-z][a-z0-9._-]{2,127}$".into());
+        out.push((
+            "patterned",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", patterned_column)],
+                &["id"],
+            ),
+        ));
+
+        let mut closed_properties = IndexMap::new();
+        closed_properties.insert("source".to_string(), col(ColumnType::String));
+        let mut closed_column = col(ColumnType::Object);
+        closed_column.properties = Some(closed_properties);
+        closed_column.additional_properties = false;
+        out.push((
+            "closed_nested_object",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", closed_column)],
+                &["id"],
+            ),
+        ));
+
         let mut composite = table(
             "t",
             vec![("a", col(ColumnType::String)), ("b", col(ColumnType::String))],
@@ -1084,6 +1115,13 @@ mod tests {
             ("check", "4e61b420e65cf6b0a35b6ceb449770f039d6a67dce2f384ede06f51837cd1608"),
             ("storage_filename", "2c53387a296180351c470dc11f79471b2ebec6c7917a89346ddea40c2540b0aa"),
             ("additional_fields_allow", "df38fd9bf16cd9108c27f23adf84df9d62d5ca8876c1d780e7496d4307ff391c"),
+            // A pattern and a closed object each decide which rows a schema
+            // admits, so each earns an identity of its own. Every hash above
+            // and below is unchanged: jdb's own decimal and ulid patterns are
+            // excluded from identity, so adding the keyword moved nothing that
+            // already existed.
+            ("patterned", "7f486b0cab18379e768dff0063a3b0d16d4945e5514fac53cdc07c6fc75f9a9c"),
+            ("closed_nested_object", "5352c322653b2cc854c596064fdab7bbbb1b5d5f4fcef4ff56d3e78948d70fe3"),
             ("composite_primary_key", "121470cfcceecef0f75cbc824d0f2778c4877628860cad456ac22b425c9793f2"),
             ("schema_version_and_format", "1b63cf55a764d6f0ec9783340577add6d7179ed5a9c48d5322d9568f6458aa49"),
             ("fk_unset_actions", "8888df83fa328bcfb51d474610539db53e00d5f4fc343dc992b3151267f5f426"),

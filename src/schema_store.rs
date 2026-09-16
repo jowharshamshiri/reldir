@@ -201,6 +201,8 @@ mod tests {
                 values: None,
                 items: None,
                 properties: None,
+                pattern: None,
+                additional_properties: true,
                 generated: None,
                 default: None,
                 annotations: Default::default(),

@@ -60,6 +60,21 @@ pub struct Column {
     pub values: Option<Vec<String>>,
     pub items: Option<Box<Column>>,
     pub properties: Option<IndexMap<String, Column>>,
+    /// A regular expression every string value must match.
+    ///
+    /// Held as its source text rather than a compiled `Regex` because a column
+    /// is cloned, compared, and hashed, and a compiled automaton is none of
+    /// those things. Compilation is checked once when the schema is validated,
+    /// so an uncompilable pattern is a schema error rather than a surprise at
+    /// row-validation time.
+    pub pattern: Option<String>,
+    /// Whether an object value may carry keys its `properties` do not declare.
+    ///
+    /// JSON Schema's own default is `true`. The root of a document has the same
+    /// question answered by [`Schema::additional_fields`], which reports
+    /// `ROW_UNKNOWN_FIELD` per key; here the answer belongs to the value, so it
+    /// is part of whether the value matches its column at all.
+    pub additional_properties: bool,
     pub description: Option<String>,
     /// Standard JSON Schema annotations carried through untouched.
     ///
@@ -353,6 +368,30 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: properties is only valid for object columns"),
         ));
     }
+    // A pattern that does not compile is a malformed schema, caught once here
+    // rather than per row. jdb matches with the `regex` crate, whose syntax is
+    // ECMA-262 without backreferences or lookaround; a pattern using those is
+    // refused by name instead of silently never matching.
+    if let Some(pattern) = &c.pattern {
+        if c.kind != ColumnType::String && c.kind != ColumnType::Enum {
+            out.push(Diagnostic::error(
+                "SCHEMA_UNKNOWN_KEY",
+                format!("{table}.{name}: pattern is only valid for string columns"),
+            ));
+        }
+        if let Err(error) = regex::Regex::new(pattern) {
+            out.push(Diagnostic::error(
+                "SCHEMA_CHECK_INVALID",
+                format!("{table}.{name}: pattern {pattern:?} is not a valid regular expression: {error}"),
+            ));
+        }
+    }
+    if !c.additional_properties && c.kind != ColumnType::Object {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: additionalProperties is only valid for object columns"),
+        ));
+    }
     if let Some(default) = &c.default
         && !crate::value::matches_column(default, c)
     {
@@ -489,6 +528,8 @@ mod tests {
             values: None,
             items: None,
             properties: None,
+            pattern: None,
+            additional_properties: true,
             description: None,
             annotations: Default::default(),
         }
@@ -522,6 +563,96 @@ mod tests {
             .into_iter()
             .map(|d| d.code)
             .collect()
+    }
+
+    /// A pattern jdb cannot compile is a malformed schema, not a constraint
+    /// that silently never matches.
+    ///
+    /// The failure has to land when the schema is validated. Deferring it to
+    /// row validation would report every row of the table as mismatched, naming
+    /// the data rather than the one thing that is actually wrong; and treating
+    /// an uncompilable pattern as vacuously satisfied would accept a document
+    /// that claims a constraint the database does not apply, which is the
+    /// defect this whole keyword was added to end.
+    #[test]
+    fn test1150_an_uncompilable_pattern_is_refused_when_the_schema_is_checked() {
+        let mut broken = column(ColumnType::String);
+        // A backreference: valid ECMA-262, outside what `regex` compiles.
+        broken.pattern = Some(r"(a)\1".into());
+        let schema = base(
+            &[("id", column(ColumnType::String)), ("v", broken)],
+            &["id"],
+        );
+        let found = codes(&schema);
+        assert!(
+            found.contains(&"SCHEMA_CHECK_INVALID".to_string()),
+            "an uncompilable pattern must be refused by name, got {found:?}"
+        );
+        let message = schema
+            .validate_local("t")
+            .into_iter()
+            .find(|d| d.code == "SCHEMA_CHECK_INVALID")
+            .expect("the diagnostic exists")
+            .message;
+        assert!(
+            message.contains("v"),
+            "the message must name the column: {message}"
+        );
+
+        // A compilable one is accepted, so the check discriminates rather than
+        // refusing patterns as a class.
+        let mut fine = column(ColumnType::String);
+        fine.pattern = Some("^[a-z]+$".into());
+        assert!(
+            !codes(&base(
+                &[("id", column(ColumnType::String)), ("v", fine)],
+                &["id"]
+            ))
+            .contains(&"SCHEMA_CHECK_INVALID".to_string()),
+            "a valid pattern must not be refused"
+        );
+    }
+
+    /// A member meaningless for its column's type is refused, as `items` and
+    /// `properties` already are. A pattern cannot constrain a boolean, and a
+    /// document that states one is asking for something jdb will not do.
+    #[test]
+    fn test1151_type_specific_members_include_the_new_ones() {
+        let mut patterned_bool = column(ColumnType::Bool);
+        patterned_bool.pattern = Some("^x$".into());
+        assert!(
+            codes(&base(
+                &[("id", column(ColumnType::String)), ("v", patterned_bool)],
+                &["id"]
+            ))
+            .contains(&"SCHEMA_UNKNOWN_KEY".to_string()),
+            "pattern on a non-string column must be refused"
+        );
+
+        let mut closed_string = column(ColumnType::String);
+        closed_string.additional_properties = false;
+        assert!(
+            codes(&base(
+                &[("id", column(ColumnType::String)), ("v", closed_string)],
+                &["id"]
+            ))
+            .contains(&"SCHEMA_UNKNOWN_KEY".to_string()),
+            "additionalProperties on a non-object column must be refused"
+        );
+
+        // An enum is a string with a fixed set, so a pattern over it is
+        // meaningful and must not be refused.
+        let mut patterned_enum = column(ColumnType::Enum);
+        patterned_enum.values = Some(vec!["aa".into(), "ab".into()]);
+        patterned_enum.pattern = Some("^a".into());
+        assert!(
+            !codes(&base(
+                &[("id", column(ColumnType::String)), ("v", patterned_enum)],
+                &["id"]
+            ))
+            .contains(&"SCHEMA_UNKNOWN_KEY".to_string()),
+            "a pattern over an enum's strings is meaningful"
+        );
     }
 
     /// Section 9: table names are a restricted lowercase identifier, must not be
