@@ -425,7 +425,7 @@ pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
     fs::create_dir_all(root).map_err(|e| DbError::io(root, e))?;
     fs::create_dir(root.join(".db")).map_err(|e| DbError::io(&root.join(".db"), e))?;
     // `schema/` is the user's pin directory and is created only when they pin
-    // something. jdb's own schemas live in `.db/schema`, which it always needs.
+    // something. reldir's own schemas live in `.db/schema`, which it always needs.
     for d in [
         "provenance",
         "indexes",

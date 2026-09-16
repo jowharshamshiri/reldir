@@ -34,7 +34,7 @@ Inference writes one working schema per table into `.db/schema/`:
 
 ```json
 {
-  "$schema": "https://jdb.dev/schema/jdb-1",
+  "$schema": "https://reldir.dev/schema/reldir-1",
   "type": "object",
   "properties": {
     "id":   { "type": "string" },
@@ -42,7 +42,7 @@ Inference writes one working schema per table into `.db/schema/`:
   },
   "required": ["id", "name"],
   "additionalProperties": false,
-  "x-jdb": {
+  "x-reldir": {
     "table": "users",
     "schemaVersion": 1,
     "primaryKey": ["id"],
@@ -86,16 +86,16 @@ picks it up:
 ```console
 $ mkdir -p schema && cat > schema/books.json <<'JSON'
 {
-  "$schema": "https://jdb.dev/schema/jdb-1",
+  "$schema": "https://reldir.dev/schema/reldir-1",
   "type": "object",
   "properties": {
     "id":    { "type": "string" },
     "title": { "type": "string" },
-    "year":  { "type": "integer", "x-jdb-type": "int" }
+    "year":  { "type": "integer", "x-reldir-type": "int" }
   },
   "required": ["id", "title", "year"],
   "additionalProperties": false,
-  "x-jdb": {
+  "x-reldir": {
     "table": "books",
     "primaryKey": ["id"],
     "columnOrder": ["id", "title", "year"]
@@ -116,7 +116,7 @@ Dune
 `properties` declares the columns with standard JSON Schema keywords.
 `required` lists the columns a row cannot omit, which is a question of presence
 rather than nullability: a nullable column is written `"type": ["string",
-"null"]`. `x-jdb` carries what JSON Schema has no keyword for: which table this
+"null"]`. `x-reldir` carries what JSON Schema has no keyword for: which table this
 is, its primary key, and the order columns are written in.
 
 `db schema new <table>` scaffolds one to edit, and `db schema dialect` writes out

@@ -338,8 +338,8 @@ enum SchemaCommand {
     )]
     Validate,
     #[command(
-        about = "Print the JSON Schema dialect jdb accepts",
-        after_help = "Example: db schema dialect > jdb-1.json"
+        about = "Print the JSON Schema dialect reldir accepts",
+        after_help = "Example: db schema dialect > reldir-1.json"
     )]
     Dialect,
 }
@@ -1219,7 +1219,7 @@ fn cmd_inspect(path: Option<PathBuf>, format: Format) -> Result<i32> {
 /// A pinned table is never inferred: the pin is the user's declaration, and
 /// inferring over it would produce a working copy that contradicts the very
 /// file meant to fix it. Adoption therefore counts a pin as an existing schema
-/// exactly as it counts jdb's own working copy.
+/// exactly as it counts reldir's own working copy.
 fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<String>> {
     let mut out = crate::schema_store::pinned_tables(root)?;
     let dir = crate::schema_store::working_dir(root);
@@ -1813,7 +1813,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
     }
     let mut changes = vec![];
     for (t, s) in schemas {
-        // Re-inference replaces the working schema, which jdb owns. A pinned
+        // Re-inference replaces the working schema, which reldir owns. A pinned
         // table is refused: the pin is the user's declaration, and silently
         // diverging from it would break the equality the pin exists to assert.
         if db.catalog.pinned.contains(&t) {
@@ -2379,7 +2379,7 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
             )
         }
         SchemaCommand::Pin { table, overwrite } => {
-            // Pinning declares the schema jdb derived: it copies the working
+            // Pinning declares the schema reldir derived: it copies the working
             // copy into `schema/`, where it survives `.db` being deleted and is
             // carried by version control.
             let working = schema_for(db, &table)?.clone();
@@ -2400,7 +2400,7 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                 }
                 // A pin already exists and says something else. Replacing it
                 // discards a declaration the user wrote, which is theirs to
-                // authorize -- unlike the working copy, which jdb rebuilds from
+                // authorize -- unlike the working copy, which reldir rebuilds from
                 // the pin without asking because it owns it.
                 if !overwrite {
                     return Err(DbError::from_diag(
@@ -2946,9 +2946,9 @@ fn current_object(db: &Database, path: &str) -> Result<Value> {
 }
 /// One column's definition, spelled the way the schema file spells it.
 ///
-/// The stored form is the semantic encoding, which names jdb's types directly
+/// The stored form is the semantic encoding, which names reldir's types directly
 /// and carries `nullable` as a flag. A schema file says neither: it says
-/// `"type": "integer"` with an `x-jdb-type` tag, and expresses nullability as a
+/// `"type": "integer"` with an `x-reldir-type` tag, and expresses nullability as a
 /// union with `"null"`. Reporting a change in the reader's own vocabulary is the
 /// difference between a diff they can act on and one they have to translate.
 fn as_dialect(definition: &Value) -> Value {
@@ -3006,7 +3006,7 @@ fn as_dialect(definition: &Value) -> Value {
         out.insert(key.into(), value);
     }
     if let Some(tag) = tag {
-        out.insert("x-jdb-type".into(), Value::String(tag.into()));
+        out.insert("x-reldir-type".into(), Value::String(tag.into()));
     }
     if let Some(values) = object.get("values") {
         out.insert("enum".into(), values.clone());
@@ -3074,7 +3074,7 @@ fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> 
     let before = columns(old);
     let after = columns(new);
 
-    // Generators live under `x-jdb.generated` in a schema file, keyed by column,
+    // Generators live under `x-reldir.generated` in a schema file, keyed by column,
     // so a change to one is reported as the table fact it is rather than as a
     // property of the column subschema.
     let generators = |entries: &[(String, Value)]| -> Value {
@@ -3146,7 +3146,7 @@ fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> 
     }
 
     // `storage` wraps its column list in an object; the dialect writes
-    // `x-jdb.filename` as the list itself, so the wrapper is unwrapped rather
+    // `x-reldir.filename` as the list itself, so the wrapper is unwrapped rather
     // than shown as a shape that appears in no file.
     let filename = |value: &Value| -> Value {
         value
@@ -4645,7 +4645,7 @@ fn commit_changes(
     }
     // An operation that rewrites a pinned table's working schema rewrites its
     // pin in the same transaction. The pin exists to fix the working schema, so
-    // letting jdb's own work move one without the other would manufacture the
+    // letting reldir's own work move one without the other would manufacture the
     // divergence the pin is meant to rule out -- and would do it atomically
     // enough that the user could never see which side moved.
     let changes = pair_pinned_schema_writes(db, changes)?;
@@ -4799,7 +4799,7 @@ fn print_prefixed_content(prefix: char, value: &Value) {
 ///
 /// A change plan names working schemas; for every pinned table it touches, the
 /// same bytes are written to the pin. Deletions propagate too: dropping a table
-/// removes its declaration along with jdb's copy of it.
+/// removes its declaration along with reldir's copy of it.
 fn pair_pinned_schema_writes(db: &Database, changes: Vec<Change>) -> Result<Vec<Change>> {
     let mut paired = Vec::with_capacity(changes.len());
     for change in changes {
@@ -5520,7 +5520,7 @@ mod tests {
 
     /// Every relational key a schema can carry is visible in a diff.
     ///
-    /// `x-jdb` has a closed key set, and a change to any of them changes what
+    /// `x-reldir` has a closed key set, and a change to any of them changes what
     /// the database enforces. A key the codec accepts but the diff never
     /// mentions would let a constraint appear or vanish with the diff reporting
     /// nothing at all -- the quietest possible failure, and the one a reader is
@@ -5601,7 +5601,7 @@ mod tests {
     /// A schema change is described in the words the schema file uses.
     ///
     /// `schema_diff` reads the semantic encoding, because that is what revision
-    /// objects hold -- but that form names jdb's types directly, carries
+    /// objects hold -- but that form names reldir's types directly, carries
     /// nullability as a flag, and lists columns as pairs. None of that appears
     /// in a file anyone edits. Every branch of the mapping is checked here
     /// rather than through the CLI, because a wrong spelling in a branch that
@@ -5637,15 +5637,15 @@ mod tests {
             json!("base64")
         );
 
-        // The tag appears only where no standard keyword distinguishes two jdb
+        // The tag appears only where no standard keyword distinguishes two reldir
         // types, and it agrees with what the codec writes to disk.
-        assert_eq!(dialect(ColumnType::Int, false)["x-jdb-type"], json!("int"));
+        assert_eq!(dialect(ColumnType::Int, false)["x-reldir-type"], json!("int"));
         assert_eq!(
-            dialect(ColumnType::Decimal, false)["x-jdb-type"],
+            dialect(ColumnType::Decimal, false)["x-reldir-type"],
             json!("decimal")
         );
-        assert_eq!(dialect(ColumnType::Ulid, false)["x-jdb-type"], json!("ulid"));
-        assert!(dialect(ColumnType::String, false).get("x-jdb-type").is_none());
+        assert_eq!(dialect(ColumnType::Ulid, false)["x-reldir-type"], json!("ulid"));
+        assert!(dialect(ColumnType::String, false).get("x-reldir-type").is_none());
 
         // A column admitting any value is the empty schema, not a type name.
         assert_eq!(dialect(ColumnType::Json, false), json!({}));
@@ -5681,11 +5681,11 @@ mod tests {
                 for internal in ["\"bool\"", "\"int\"", "\"decimal\"", "\"ulid\"", "\"json\""] {
                     assert!(
                         !text.contains(&format!("\"type\":{internal}")),
-                        "{kind:?}: jdb's own type names must not reach a reader: {text}"
+                        "{kind:?}: reldir's own type names must not reach a reader: {text}"
                     );
                 }
                 assert!(
-                    !text.contains("x-jdb-generated"),
+                    !text.contains("x-reldir-generated"),
                     "{kind:?}: generators are a table fact, not a column keyword"
                 );
             }
@@ -5701,7 +5701,7 @@ mod tests {
         let rendered =
             as_dialect(&crate::schema::semantic::encode_v1(&with_array)["columns"][1][1]);
         assert_eq!(rendered["type"], json!("array"));
-        assert_eq!(rendered["items"]["x-jdb-type"], json!("decimal"));
+        assert_eq!(rendered["items"]["x-reldir-type"], json!("decimal"));
         assert_eq!(rendered["items"]["type"], json!(["string", "null"]));
 
         // An enum is a string constrained by `enum`, as a schema file spells it.

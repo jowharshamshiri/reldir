@@ -25,7 +25,7 @@ fn analyzable(schema: &crate::schema::Schema) -> bool {
 /// points at a position that was guessed (Section 75).
 fn in_schema(diagnostic: Diagnostic, c: &Catalog, table: &str, anchor: &str) -> Diagnostic {
     // A finding is resolved by editing the working schema, which is the file
-    // jdb maintains; pinning afterwards is a separate, deliberate act.
+    // reldir maintains; pinning afterwards is a separate, deliberate act.
     let mut diagnostic = diagnostic.at(crate::schema_store::working_relative(table));
     if let Some(source) = c.schema_sources.get(table) {
         diagnostic.location = crate::integrity::locate(source, anchor);
@@ -60,7 +60,7 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                 Diagnostic::warning(
                     "LINT_SCHEMA_UNPINNED",
                     format!(
-                        "schema {table:?} is maintained by jdb and is not pinned; \
+                        "schema {table:?} is maintained by reldir and is not pinned; \
                          deleting .db discards any refinement inference cannot re-derive"
                     ),
                 )
@@ -711,7 +711,7 @@ mod tests {
         assert!(codes(&sometimes, false).contains(&"LINT_INCONSISTENT_PRESENCE".to_string()));
     }
 
-    /// Section 13: a schema jdb maintains is worth pinning, and a schema
+    /// Section 13: a schema reldir maintains is worth pinning, and a schema
     /// permitting unknown fields is worth flagging.
     #[test]
     fn test1064_unpinned_and_permissive_schemas_are_reported() {

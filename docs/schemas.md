@@ -19,8 +19,8 @@ Windows reserved device names.
 
 ## The schema language
 
-A schema is a [JSON Schema 2020-12](https://json-schema.org/) document in jdb's
-own dialect, identified by `"$schema": "https://jdb.dev/schema/jdb-1"`. Ordinary
+A schema is a [JSON Schema 2020-12](https://json-schema.org/) document in reldir's
+own dialect, identified by `"$schema": "https://reldir.dev/schema/reldir-1"`. Ordinary
 JSON Schema tooling can read it.
 
 That URI names the dialect; it is not fetched, and nothing is served there yet.
@@ -28,7 +28,7 @@ The dialect itself is compiled into the binary, so to get editor completion,
 write it out and point your editor at the local copy:
 
 ```sh
-db schema dialect > .jdb-dialect.json
+db schema dialect > .reldir-dialect.json
 ```
 
 In VS Code, for example, associate it with your schema files:
@@ -37,20 +37,20 @@ In VS Code, for example, associate it with your schema files:
 {
   "json.schemas": [
     { "fileMatch": ["schema/*.json", ".db/schema/*.json"],
-      "url": "./.jdb-dialect.json" }
+      "url": "./.reldir-dialect.json" }
   ]
 }
 ```
 
-jdb does not accept arbitrary JSON Schema. A document that says `oneOf`
-requests a semantics jdb has no relational meaning for, and ignoring it would let
+reldir does not accept arbitrary JSON Schema. A document that says `oneOf`
+requests a semantics reldir has no relational meaning for, and ignoring it would let
 the file and the database disagree about which rows are valid. The dialect
 therefore declares a `$vocabulary` of its own, marked required, so a conforming
 reader learns that it cannot fully process the document without understanding
-jdb's keywords.
+reldir's keywords.
 
-Valid JSON Schema content that does not alter jdb's semantics is preserved.
-Content that would alter semantics jdb cannot represent is rejected by name with
+Valid JSON Schema content that does not alter reldir's semantics is preserved.
+Content that would alter semantics reldir cannot represent is rejected by name with
 `SCHEMA_UNSUPPORTED_KEYWORD`.
 
 ### What a document says
@@ -60,7 +60,7 @@ Standard keywords describe the columns: `type`, `properties`, `items`, `enum`,
 `contentEncoding`, and `description`.
 
 Everything relational that JSON Schema has no keyword for lives under one
-extension key, `x-jdb`:
+extension key, `x-reldir`:
 
 | Key | Meaning |
 |---|---|
@@ -111,7 +111,7 @@ and this governs what the elements point at.
 
 Where the relationship deserves enforcement rather than inspection, give the
 edges their own table with a composite primary key of the two sides, and declare
-a foreign key on each. That is the form jdb enforces transactionally, including
+a foreign key on each. That is the form reldir enforces transactionally, including
 referential actions.
 
 ### Nullability and presence
@@ -132,24 +132,24 @@ null, but a row need not carry it.
 ### Types
 
 Standard keywords carry the type where they can. Where they cannot distinguish
-two jdb types, the subschema is tagged with `x-jdb-type`: jdb's `int` is lexical
+two reldir types, the subschema is tagged with `x-reldir-type`: reldir's `int` is lexical
 where JSON Schema's `integer` is mathematical, and `decimal` and `ulid` are
 strings with application semantics. The tag sits on the subschema it describes,
 so it works at any depth. An `array` of `decimal` has no column name by which a
 document-level map could key it.
 
-| jdb type | JSON Schema |
+| reldir type | JSON Schema |
 |---|---|
 | `bool` | `{"type": "boolean"}` |
-| `int` | `{"type": "integer", "x-jdb-type": "int"}` |
+| `int` | `{"type": "integer", "x-reldir-type": "int"}` |
 | `float` | `{"type": "number"}` |
-| `decimal` | `{"type": "string", "pattern": …, "x-jdb-type": "decimal"}` |
+| `decimal` | `{"type": "string", "pattern": …, "x-reldir-type": "decimal"}` |
 | `string` | `{"type": "string"}` |
 | `bytes` | `{"type": "string", "contentEncoding": "base64"}` |
 | `date` | `{"type": "string", "format": "date"}` |
 | `timestamp` | `{"type": "string", "format": "date-time"}` |
 | `uuid` | `{"type": "string", "format": "uuid"}` |
-| `ulid` | `{"type": "string", "pattern": …, "x-jdb-type": "ulid"}` |
+| `ulid` | `{"type": "string", "pattern": …, "x-reldir-type": "ulid"}` |
 | `enum` | `{"type": "string", "enum": [...]}` |
 | `array` | `{"type": "array", "items": {...}}` |
 | `object` | `{"type": "object", "properties": {...}}` |
@@ -157,12 +157,12 @@ document-level map could key it.
 
 In 2020-12 `format` is an annotation unless the format-assertion vocabulary is
 enabled, which this dialect does not enable. A generic validator therefore
-understands the structure of a jdb schema and checks its shape; jdb remains the
+understands the structure of a reldir schema and checks its shape; reldir remains the
 authority on what a `uuid`, `ulid`, `decimal`, or `timestamp` actually admits.
 
 ### Patterns
 
-`pattern` constrains a string value, and jdb enforces it. It applies wherever a
+`pattern` constrains a string value, and reldir enforces it. It applies wherever a
 string appears — a column, an array's elements, a nested property:
 
 ```json
@@ -177,7 +177,7 @@ message names the pattern it missed rather than the type it already has.
 
 Patterns are matched with Rust's `regex`, which is ECMA-262 syntax without
 backreferences or lookaround, and which matches in time linear in the subject.
-A pattern jdb cannot compile is refused when the schema is validated, with
+A pattern reldir cannot compile is refused when the schema is validated, with
 `SCHEMA_CHECK_INVALID` naming the column — never accepted and then quietly
 unenforced.
 
@@ -189,7 +189,7 @@ A pattern decides which rows a schema admits, so it is part of what that schema
 
 `decimal` and `ulid` are the exception, and only because they are written with a
 `pattern` to begin with: that is how JSON Schema spells what those types admit.
-jdb reads that one back as the type restating itself rather than as a further
+reldir reads that one back as the type restating itself rather than as a further
 constraint, so a `decimal` column has the same identity before and after its
 schema makes a round trip through disk.
 
@@ -220,7 +220,7 @@ a database's hash.
 
 ```json
 {
-  "$schema": "https://jdb.dev/schema/jdb-1",
+  "$schema": "https://reldir.dev/schema/reldir-1",
   "type": "object",
   "properties": {
     "id":      { "type": "string", "format": "uuid" },
@@ -231,7 +231,7 @@ a database's hash.
   },
   "required": ["id", "email"],
   "additionalProperties": false,
-  "x-jdb": {
+  "x-reldir": {
     "table": "users",
     "schemaVersion": 1,
     "primaryKey": ["id"],
@@ -320,7 +320,7 @@ A blocked `restrict` is reported as `FOREIGN_KEY_VIOLATION` and changes nothing.
 
 ## Custom file naming
 
-`x-jdb.filename` may name non-primary-key columns, a `slug` for example, as
+`x-reldir.filename` may name non-primary-key columns, a `slug` for example, as
 long as those columns are covered by a unique constraint and are `NOT NULL`:
 
 ```json

@@ -247,7 +247,7 @@ fn validate_prospective(
     // transaction.
     let parent = std::env::temp_dir();
     let temp = tempfile::Builder::new()
-        .prefix("jdb-prospective-")
+        .prefix("reldir-prospective-")
         .tempdir_in(&parent)
         .map_err(|e| DbError::io(&parent, e))?;
     let shadow = temp.path();
@@ -434,7 +434,7 @@ fn apply_journal(root: &Path, dir: &Path, j: &Journal) -> Result<()> {
             if let Some(p) = target.parent() {
                 fs::create_dir_all(p).map_err(|e| DbError::io(p, e))?
             }
-            let temp = target.with_extension(format!("jdb-tmp-{}", j.id));
+            let temp = target.with_extension(format!("reldir-tmp-{}", j.id));
             fs::copy(&source, &temp).map_err(|e| DbError::io(&temp, e))?;
             fs::File::open(&temp)
                 .and_then(|f| f.sync_all())

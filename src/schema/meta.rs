@@ -1,28 +1,28 @@
-//! The JDB dialect of JSON Schema 2020-12.
+//! The RELDIR dialect of JSON Schema 2020-12.
 //!
-//! jdb's schemas are JSON Schema documents, but jdb does not accept arbitrary
-//! JSON Schema: a document that says `oneOf` is asking for a semantics jdb has
+//! reldir's schemas are JSON Schema documents, but reldir does not accept arbitrary
+//! JSON Schema: a document that says `oneOf` is asking for a semantics reldir has
 //! no relational meaning for, and quietly ignoring it would make the file and
 //! the database disagree. So the accepted surface is a dialect -- 2020-12 plus
-//! one vocabulary of jdb's own -- and it is declared as such rather than merely
+//! one vocabulary of reldir's own -- and it is declared as such rather than merely
 //! documented.
 //!
 //! Declaring `$vocabulary` is what makes the restriction honest. A conforming
 //! implementation reading one of these documents learns that
-//! `https://jdb.dev/vocab/jdb-1` is required, and therefore that it cannot
-//! fully process the schema without understanding jdb's keywords. Without that
-//! declaration a generic validator would silently ignore `x-jdb` and conclude a
-//! schema was satisfied when jdb's own rules were never checked.
+//! `https://reldir.dev/vocab/reldir-1` is required, and therefore that it cannot
+//! fully process the schema without understanding reldir's keywords. Without that
+//! declaration a generic validator would silently ignore `x-reldir` and conclude a
+//! schema was satisfied when reldir's own rules were never checked.
 //!
 //! The URI is an identifier, not a location. This binary never fetches it: the
-//! meta-schema is compiled in below and registered offline. jdb should also
+//! meta-schema is compiled in below and registered offline. reldir should also
 //! serve it at that address so editors can complete these documents, but
 //! nothing here depends on the network.
 //!
 //! One caveat the documentation must not overstate: in 2020-12 `format` is an
 //! annotation unless the format-assertion vocabulary is enabled, which this
 //! dialect does not enable. A generic validator therefore understands the
-//! structure of a jdb schema and checks its shape, while jdb remains the
+//! structure of a reldir schema and checks its shape, while reldir remains the
 //! authority on what a `uuid`, `ulid`, `decimal`, or `timestamp` actually
 //! admits.
 
@@ -30,31 +30,31 @@ use crate::diagnostic::{DbError, Result};
 use serde_json::Value;
 use std::sync::OnceLock;
 
-/// The dialect's identifier, and the value of `$schema` in every jdb schema.
-pub const DIALECT_URI: &str = "https://jdb.dev/schema/jdb-1";
+/// The dialect's identifier, and the value of `$schema` in every reldir schema.
+pub const DIALECT_URI: &str = "https://reldir.dev/schema/reldir-1";
 
-/// The vocabulary that carries jdb's relational keywords.
-pub const VOCABULARY_URI: &str = "https://jdb.dev/vocab/jdb-1";
+/// The vocabulary that carries reldir's relational keywords.
+pub const VOCABULARY_URI: &str = "https://reldir.dev/vocab/reldir-1";
 
 /// The namespace holding every relational fact that JSON Schema has no keyword
 /// for. One object, so that a reader can see at a glance which parts of a
-/// document are jdb's and which are standard.
-pub const EXTENSION: &str = "x-jdb";
+/// document are reldir's and which are standard.
+pub const EXTENSION: &str = "x-reldir";
 
 /// The per-subschema type tag.
 ///
-/// Used only where a standard keyword cannot distinguish two jdb types: jdb's
+/// Used only where a standard keyword cannot distinguish two reldir types: reldir's
 /// `int` is lexical where JSON Schema's `integer` is mathematical, and
 /// `decimal` and `ulid` are strings carrying application semantics. It sits on
 /// the subschema it describes rather than in a root-level map, so it works at
 /// any nesting depth -- `array<decimal>` has no name to key such a map by.
-pub const TYPE_TAG: &str = "x-jdb-type";
+pub const TYPE_TAG: &str = "x-reldir-type";
 
 /// The meta-schema, compiled in.
 ///
-/// It describes the shape of `x-jdb` and constrains the standard keywords to
+/// It describes the shape of `x-reldir` and constrains the standard keywords to
 /// the subset the codec accepts. It is deliberately not a complete description
-/// of every rule jdb enforces: cross-schema facts such as foreign-key targets
+/// of every rule reldir enforces: cross-schema facts such as foreign-key targets
 /// cannot be expressed in a single document, and `json_schema::decode` reports
 /// those with their own diagnostics.
 pub fn meta_schema() -> &'static Value {
@@ -70,13 +70,13 @@ pub fn meta_schema() -> &'static Value {
                 "https://json-schema.org/draft/2020-12/vocab/meta-data": true,
                 "https://json-schema.org/draft/2020-12/vocab/format-annotation": true,
                 "https://json-schema.org/draft/2020-12/vocab/content": true,
-                // Required: a reader that does not understand jdb's relational
+                // Required: a reader that does not understand reldir's relational
                 // keywords cannot claim to have processed the document.
-                "https://jdb.dev/vocab/jdb-1": true,
+                "https://reldir.dev/vocab/reldir-1": true,
             },
-            "title": "jdb table schema",
+            "title": "reldir table schema",
             "type": "object",
-            "required": ["type", "properties", "x-jdb"],
+            "required": ["type", "properties", "x-reldir"],
             "properties": {
                 "$schema": { "const": DIALECT_URI },
                 "type": { "const": "object" },
@@ -89,7 +89,7 @@ pub fn meta_schema() -> &'static Value {
                 },
                 "required": { "type": "array", "items": { "type": "string" } },
                 "additionalProperties": { "type": "boolean" },
-                "x-jdb": { "$ref": "#/$defs/extension" },
+                "x-reldir": { "$ref": "#/$defs/extension" },
             },
             "$defs": {
                 // One column. Recursive through `items` and `properties`,
@@ -108,8 +108,8 @@ pub fn meta_schema() -> &'static Value {
                             ],
                         },
                         // Present only where a standard keyword cannot tell two
-                        // jdb types apart.
-                        "x-jdb-type": { "enum": ["int", "decimal", "ulid"] },
+                        // reldir types apart.
+                        "x-reldir-type": { "enum": ["int", "decimal", "ulid"] },
                         "format": { "type": "string" },
                         "pattern": { "type": "string" },
                         "contentEncoding": { "type": "string" },
@@ -123,7 +123,7 @@ pub fn meta_schema() -> &'static Value {
                         },
                         "required": { "type": "array", "items": { "type": "string" } },
                         "additionalProperties": { "type": "boolean" },
-                        "x-jdb-column-order": { "type": "array", "items": { "type": "string" } },
+                        "x-reldir-column-order": { "type": "array", "items": { "type": "string" } },
                         // Standard annotations carry no relational meaning and
                         // are preserved verbatim rather than rejected.
                         "title": { "type": "string" },
@@ -228,7 +228,7 @@ pub fn validator() -> Result<&'static jsonschema::Validator> {
         Ok(validator) => Ok(validator),
         Err(error) => Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("the bundled jdb dialect is not a valid meta-schema: {error}"),
+            format!("the bundled reldir dialect is not a valid meta-schema: {error}"),
             6,
         )),
     }
@@ -249,7 +249,7 @@ mod tests {
     use serde_json::json;
 
     /// A document in the shape the codec emits, used to check that the dialect
-    /// accepts what jdb actually writes.
+    /// accepts what reldir actually writes.
     fn users() -> Value {
         json!({
             "$schema": DIALECT_URI,
@@ -261,12 +261,12 @@ mod tests {
                 "team_id": { "type": ["string", "null"], "format": "uuid" },
                 "amounts": {
                     "type": "array",
-                    "items": { "type": "string", "x-jdb-type": "decimal", "pattern": "^-?[0-9]+$" },
+                    "items": { "type": "string", "x-reldir-type": "decimal", "pattern": "^-?[0-9]+$" },
                 },
             },
             "required": ["id", "email", "amounts"],
             "additionalProperties": false,
-            "x-jdb": {
+            "x-reldir": {
                 "table": "users",
                 "schemaVersion": 1,
                 "primaryKey": ["id"],
@@ -285,14 +285,14 @@ mod tests {
         })
     }
 
-    /// The dialect describes the documents jdb writes.
+    /// The dialect describes the documents reldir writes.
     ///
     /// A meta-schema that compiles is not thereby correct: it has to accept a
     /// real schema and reject a malformed one. Without both halves a later
     /// codec test would be calibrated against a broken dialect and would
     /// confirm whatever the dialect happened to say.
     #[test]
-    fn test1128_the_dialect_accepts_a_schema_jdb_would_write() {
+    fn test1128_the_dialect_accepts_a_schema_reldir_would_write() {
         let validator = validator().expect("the bundled dialect compiles");
         let document = users();
         let errors: Vec<String> = validator
@@ -311,19 +311,19 @@ mod tests {
     fn test1129_the_dialect_rejects_documents_that_cannot_describe_a_table() {
         let validator = validator().expect("the bundled dialect compiles");
 
-        // Without `x-jdb` there is no table, no primary key, no column order:
+        // Without `x-reldir` there is no table, no primary key, no column order:
         // valid JSON Schema, but not a relation.
         let mut missing_extension = users();
-        missing_extension.as_object_mut().unwrap().remove("x-jdb");
+        missing_extension.as_object_mut().unwrap().remove("x-reldir");
         assert!(
             !validator.is_valid(&missing_extension),
-            "a document with no x-jdb names no table"
+            "a document with no x-reldir names no table"
         );
 
         // Column order is logical state, so a document that omits it does not
         // determine the bytes its rows would be written in.
         let mut no_order = users();
-        no_order["x-jdb"]
+        no_order["x-reldir"]
             .as_object_mut()
             .unwrap()
             .remove("columnOrder");
@@ -332,20 +332,20 @@ mod tests {
             "columnOrder is required: rows are written in it"
         );
 
-        // An unknown key inside `x-jdb` is a relational claim jdb has no
+        // An unknown key inside `x-reldir` is a relational claim reldir has no
         // meaning for, and silently ignoring it would let the file and the
         // database disagree.
         let mut unknown = users();
-        unknown["x-jdb"]["cascadeEverything"] = json!(true);
+        unknown["x-reldir"]["cascadeEverything"] = json!(true);
         assert!(
             !validator.is_valid(&unknown),
-            "unknown x-jdb keys must be refused, not ignored"
+            "unknown x-reldir keys must be refused, not ignored"
         );
 
         // Referential actions are a closed set; anything else has no defined
         // behaviour.
         let mut bad_action = users();
-        bad_action["x-jdb"]["foreignKeys"][0]["onDelete"] = json!("explode");
+        bad_action["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode");
         assert!(
             !validator.is_valid(&bad_action),
             "an undefined referential action must be refused"
@@ -364,7 +364,7 @@ mod tests {
     ///
     /// `decode` and the bundled meta-schema are independent judgements of the
     /// same question, and a document the dialect accepts but the codec refuses
-    /// -- or the reverse -- means one of them is lying about what a jdb schema
+    /// -- or the reverse -- means one of them is lying about what a reldir schema
     /// is. The meta-schema may legitimately be more permissive, because
     /// cross-schema facts cannot be expressed in one document; it must never be
     /// more *restrictive* than the codec.
@@ -379,7 +379,7 @@ mod tests {
                 "properties": { "id": { "type": "string" } },
                 "required": ["id"],
                 "additionalProperties": false,
-                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
+                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
             })),
             ("nested array of decimal", json!({
                 "$schema": DIALECT_URI,
@@ -388,11 +388,11 @@ mod tests {
                     "id": { "type": "string" },
                     "v": { "type": "array", "items": {
                         "type": "array", "items": {
-                            "type": "string", "x-jdb-type": "decimal" } } },
+                            "type": "string", "x-reldir-type": "decimal" } } },
                 },
                 "required": ["id", "v"],
                 "additionalProperties": false,
-                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id", "v"] },
+                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id", "v"] },
             })),
             ("annotations at depth", json!({
                 "$schema": DIALECT_URI,
@@ -403,7 +403,7 @@ mod tests {
                 },
                 "required": ["id"],
                 "additionalProperties": false,
-                "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
+                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
             })),
         ] {
             let decoded = crate::schema::json_schema::decode(&document);
@@ -422,7 +422,7 @@ mod tests {
         }
     }
 
-    /// The example the documentation publishes is a schema jdb accepts.
+    /// The example the documentation publishes is a schema reldir accepts.
     ///
     /// `docs/schemas.md` prints a worked example, and it is the first thing
     /// anyone writing a schema by hand will copy. An illustration that would
@@ -440,12 +440,12 @@ mod tests {
         let block = published
             .split("```json")
             .filter_map(|rest| rest.split("```").next())
-            .find(|body| body.contains("\"x-jdb\""))
+            .find(|body| body.contains("\"x-reldir\""))
             .expect("the documentation publishes a worked example");
         let documented: Value =
             serde_json::from_str(block).expect("the published example is valid JSON");
 
-        // It must be a schema jdb would accept, not merely valid JSON.
+        // It must be a schema reldir would accept, not merely valid JSON.
         let decoded = crate::schema::json_schema::decode(&documented)
             .expect("the published example must decode");
         let validator = validator().expect("the dialect compiles");
@@ -459,9 +459,9 @@ mod tests {
         // keyword gaining coverage here does not silently leave the docs behind.
         let fixture = users();
         let keys = |document: &Value| -> Vec<String> {
-            document["x-jdb"]
+            document["x-reldir"]
                 .as_object()
-                .expect("x-jdb is an object")
+                .expect("x-reldir is an object")
                 .keys()
                 .cloned()
                 .collect()
@@ -485,24 +485,24 @@ mod tests {
     fn test1143_the_codec_never_accepts_what_the_dialect_refuses() {
         let validator = validator().expect("the dialect compiles");
         let refused = [
-            ("no x-jdb", {
+            ("no x-reldir", {
                 let mut d = users();
-                d.as_object_mut().unwrap().remove("x-jdb");
+                d.as_object_mut().unwrap().remove("x-reldir");
                 d
             }),
             ("no columnOrder", {
                 let mut d = users();
-                d["x-jdb"].as_object_mut().unwrap().remove("columnOrder");
+                d["x-reldir"].as_object_mut().unwrap().remove("columnOrder");
                 d
             }),
-            ("unknown x-jdb key", {
+            ("unknown x-reldir key", {
                 let mut d = users();
-                d["x-jdb"]["cascadeEverything"] = json!(true);
+                d["x-reldir"]["cascadeEverything"] = json!(true);
                 d
             }),
             ("undefined referential action", {
                 let mut d = users();
-                d["x-jdb"]["foreignKeys"][0]["onDelete"] = json!("explode");
+                d["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode");
                 d
             }),
             ("root is not an object", {
@@ -525,8 +525,8 @@ mod tests {
 
     /// The dialect declares its own vocabulary as required, which is what tells
     /// a generic validator that it cannot fully process these documents on its
-    /// own. Without the declaration `x-jdb` would look like an ignorable
-    /// extension and a schema could be reported satisfied while none of jdb's
+    /// own. Without the declaration `x-reldir` would look like an ignorable
+    /// extension and a schema could be reported satisfied while none of reldir's
     /// rules had been checked.
     #[test]
     fn test1130_the_dialect_declares_its_vocabulary_as_required() {
@@ -536,7 +536,7 @@ mod tests {
         assert_eq!(
             vocabularies.get(VOCABULARY_URI),
             Some(&json!(true)),
-            "jdb's own vocabulary must be declared required"
+            "reldir's own vocabulary must be declared required"
         );
         assert_eq!(meta_schema()["$id"], json!(DIALECT_URI));
     }

@@ -1,12 +1,12 @@
 ---
-title: jdb
+title: reldir
 ---
 
-# jdb
+# reldir
 
 **A relational database that lives in a directory of JSON files.**
 
-`jdb` turns an ordinary folder into a validated relational database. Rows stay
+`reldir` turns an ordinary folder into a validated relational database. Rows stay
 as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
 `db` binary governs their interpretation: it enforces schemas, checks referential
 integrity, answers SQL, and records how the state changed, without taking
@@ -31,7 +31,7 @@ $ db sql 'SELECT name FROM users ORDER BY name'
 ## The idea
 
 The directory is a legitimate interface to the database. You, your editor, a
-script, an agent, or `git merge` may all change it. `jdb` does not require that
+script, an agent, or `git merge` may all change it. `reldir` does not require that
 it wrote every byte, only that what it observes at the boundary of each operation
 forms a valid relational database.
 

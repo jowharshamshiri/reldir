@@ -126,5 +126,5 @@ db --readonly check --format json     # exits 2 on INVALID
 db --readonly check --strict          # also exits 7 on lint findings
 ```
 
-Merge conflicts are a Git concern. `jdb` reports the result as `INVALID` with
+Merge conflicts are a Git concern. `reldir` reports the result as `INVALID` with
 `INVALID_JSON` on conflict markers, and `doctor` classifies them as `manual`.

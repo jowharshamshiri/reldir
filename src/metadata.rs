@@ -54,7 +54,7 @@ fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
 pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
     let mut entries = BTreeMap::new();
     let mut root = Sha256::new();
-    root.update(format!("jdb-state-v{}\0", FORMAT_VERSION));
+    root.update(format!("reldir-state-v{}\0", FORMAT_VERSION));
     let format_path = c.root.join(".db/format");
     if format_path.exists() {
         let bytes = fs::read(&format_path).map_err(|e| DbError::io(&format_path, e))?;
@@ -977,7 +977,7 @@ mod tests {
 
         // A pattern decides which rows a column admits, so it must be part of
         // what the schema *is*. Without these fixtures the identity change
-        // would be untested: no other fixture carries a user pattern, and jdb's
+        // would be untested: no other fixture carries a user pattern, and reldir's
         // own decimal and ulid patterns are deliberately excluded from identity.
         let mut patterned_column = col(ColumnType::String);
         patterned_column.pattern = Some("^[a-z][a-z0-9._-]{2,127}$".into());
@@ -1117,7 +1117,7 @@ mod tests {
             ("additional_fields_allow", "df38fd9bf16cd9108c27f23adf84df9d62d5ca8876c1d780e7496d4307ff391c"),
             // A pattern and a closed object each decide which rows a schema
             // admits, so each earns an identity of its own. Every hash above
-            // and below is unchanged: jdb's own decimal and ulid patterns are
+            // and below is unchanged: reldir's own decimal and ulid patterns are
             // excluded from identity, so adding the keyword moved nothing that
             // already existed.
             ("patterned", "7f486b0cab18379e768dff0063a3b0d16d4945e5514fac53cdc07c6fc75f9a9c"),

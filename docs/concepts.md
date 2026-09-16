@@ -45,7 +45,7 @@ deterministic rule, so a row always has exactly one correct path:
 <table>/<filename-key>.json
 ```
 
-The filename key comes from the `x-jdb.filename` columns (the primary key by
+The filename key comes from the `x-reldir.filename` columns (the primary key by
 default). Each value is rendered canonically and percent-encoded for every byte
 outside `[A-Za-z0-9._-]`; multiple columns are joined with `,`. A leading `.` is
 encoded, so a row can never become a hidden file, and `/` can never appear, so a
@@ -86,13 +86,13 @@ validate the resulting database
         └── no ───> INVALID + diagnostics
 ```
 
-`jdb` judges only the state it observes when invoked. A directory that is
+`reldir` judges only the state it observes when invoked. A directory that is
 temporarily inconsistent midway through a multi-file edit is not a problem as
 long as no command runs at that moment. If one does, it reports the
 inconsistency rather than assuming more edits are coming.
 
 If you externally delete a parent row whose foreign key says `onDelete: cascade`,
-`jdb` does **not** perform the cascade afterwards. The observed state is valid
+`reldir` does **not** perform the cascade afterwards. The observed state is valid
 only if the dependent changes are already present. This avoids reading an
 incomplete edit as transactional intent. `doctor` can offer the cascade as a data
 fix.
@@ -107,7 +107,7 @@ Three separate questions, deliberately kept apart:
 | What state transitions have been observed? | **Provenance**: `log`, `show` |
 | How does the binary safely perform multi-file writes? | **Transactions** |
 
-A state can be valid even though `jdb` did not produce it. Provenance records
+A state can be valid even though `reldir` did not produce it. Provenance records
 *how* a state appeared (`internal`, `external`, `recovery`, `repair`,
 `migration`, `import`, or `snapshot_restore`). It never claims to know who made an
 external change, because that information is not available.
@@ -122,7 +122,7 @@ Canonicalisation fixes: row keys in schema column order, nested object keys
 lexicographically, NFC strings, shortest round-trip numbers, `-0` normalised to
 `0`, UTC timestamps, two-space indentation, and a trailing newline.
 
-`jdb` will not rewrite your files merely to canonicalise them. Only
+`reldir` will not rewrite your files merely to canonicalise them. Only
 `doctor --fix --only FIX_CANONICALIZE --allow-data` does that, and only on request.
 
 A schema's identity follows what it *says*, not how it is written. The hash is
@@ -134,7 +134,7 @@ describe different bytes.
 
 ## Determinism
 
-Given identical rows, identical schemas, and the same format version, `jdb`
+Given identical rows, identical schemas, and the same format version, `reldir`
 derives the same logical state, the same root hash, the same inferred schemas,
 and the same lint findings, on any machine and in any order.
 

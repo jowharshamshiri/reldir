@@ -1,14 +1,14 @@
-# jdb
+# reldir
 
 **A relational database that lives in a directory of JSON files.**
 
-`jdb` turns an ordinary folder into a validated relational database. Rows stay
+`reldir` turns an ordinary folder into a validated relational database. Rows stay
 as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
 `db` binary governs their interpretation: it enforces schemas, checks referential
 integrity, answers SQL, and records how the state changed, without taking
 ownership of your bytes.
 
-📖 **[Documentation](https://jowharshamshiri.github.io/jdb/)**
+📖 **[Documentation](https://jowharshamshiri.github.io/reldir/)**
 
 ```console
 $ ls ./data
@@ -34,7 +34,7 @@ A folder of JSON files is transparent, diffable, and editable by any tool, but
 nothing stops a typo from becoming invisible state. A database enforces
 integrity, but the data is no longer readable on disk.
 
-`jdb` keeps the filesystem authoritative and legible, and reports precisely when
+`reldir` keeps the filesystem authoritative and legible, and reports precisely when
 it stops being a valid database:
 
 ```console
@@ -49,7 +49,7 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
 ```
 
 Anything may edit the directory: you, your editor, a script, an agent, or `git
-merge`. `jdb` judges the state it observes at each operation boundary. Valid
+merge`. `reldir` judges the state it observes at each operation boundary. Valid
 external edits are adopted as new revisions. Invalid ones are reported with the
 file, line, and column.
 
@@ -89,16 +89,16 @@ db sql 'SELECT * FROM users LIMIT 10'
 
 | Guide | |
 |---|---|
-| [Getting started](https://jowharshamshiri.github.io/jdb/getting-started) | Adopt a directory and run your first queries |
-| [Concepts](https://jowharshamshiri.github.io/jdb/concepts) | The model: validity, external edits, provenance |
-| [Schemas](https://jowharshamshiri.github.io/jdb/schemas) | The JSON Schema dialect, writing one by hand, types, constraints |
-| [CLI reference](https://jowharshamshiri.github.io/jdb/cli) | Every command and flag |
-| [SQL](https://jowharshamshiri.github.io/jdb/sql) | The supported subset |
-| [Validation](https://jowharshamshiri.github.io/jdb/validation) | `check`, `lint`, and `doctor` |
-| [Transactions](https://jowharshamshiri.github.io/jdb/transactions) | Safety, recovery, concurrency |
-| [Configuration](https://jowharshamshiri.github.io/jdb/configuration) | `.db/config` and resource limits |
-| [Errors](https://jowharshamshiri.github.io/jdb/errors) | Error and exit code catalogue |
-| [On-disk format](https://jowharshamshiri.github.io/jdb/format-v1) | Format version 1 |
+| [Getting started](https://jowharshamshiri.github.io/reldir/getting-started) | Adopt a directory and run your first queries |
+| [Concepts](https://jowharshamshiri.github.io/reldir/concepts) | The model: validity, external edits, provenance |
+| [Schemas](https://jowharshamshiri.github.io/reldir/schemas) | The JSON Schema dialect, writing one by hand, types, constraints |
+| [CLI reference](https://jowharshamshiri.github.io/reldir/cli) | Every command and flag |
+| [SQL](https://jowharshamshiri.github.io/reldir/sql) | The supported subset |
+| [Validation](https://jowharshamshiri.github.io/reldir/validation) | `check`, `lint`, and `doctor` |
+| [Transactions](https://jowharshamshiri.github.io/reldir/transactions) | Safety, recovery, concurrency |
+| [Configuration](https://jowharshamshiri.github.io/reldir/configuration) | `.db/config` and resource limits |
+| [Errors](https://jowharshamshiri.github.io/reldir/errors) | Error and exit code catalogue |
+| [On-disk format](https://jowharshamshiri.github.io/reldir/format-v1) | Format version 1 |
 
 ## Development
 

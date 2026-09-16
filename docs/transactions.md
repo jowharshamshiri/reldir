@@ -4,7 +4,7 @@ title: Transactions
 
 # Transactions and safety
 
-Every change `jdb` makes is transactional. A failed or interrupted write never
+Every change `reldir` makes is transactional. A failed or interrupted write never
 leaves a partially committed logical state.
 
 ## The write sequence

@@ -351,7 +351,7 @@ fn enforce_query_workspace(catalog: &Catalog, text: &str, limits: &QueryLimits) 
 
 fn load(c: &Catalog, enforce: bool) -> Result<Connection> {
     let conn = Connection::open_in_memory().map_err(query_err)?;
-    conn.create_collation("JDB_DECIMAL", |left, right| {
+    conn.create_collation("RELDIR_DECIMAL", |left, right| {
         match crate::value::compare_decimal(left, right) {
             Some(ordering) => ordering,
             // Invalid decimal text cannot occur in a valid catalog. Retaining a
@@ -828,7 +828,7 @@ fn decode_declared(v: Value, declared: Option<&str>) -> Result<Value> {
         return Ok(v);
     }
     match declared {
-        Some("JDB_BLOB_BOOL") => match v.as_i64() {
+        Some("RELDIR_BLOB_BOOL") => match v.as_i64() {
             Some(0) => Ok(Value::Bool(false)),
             Some(1) => Ok(Value::Bool(true)),
             _ => Err(DbError::new(
@@ -837,7 +837,7 @@ fn decode_declared(v: Value, declared: Option<&str>) -> Result<Value> {
                 4,
             )),
         },
-        Some(kind @ ("JDB_BLOB_ARRAY" | "JDB_BLOB_OBJECT" | "JDB_BLOB_JSON")) => {
+        Some(kind @ ("RELDIR_BLOB_ARRAY" | "RELDIR_BLOB_OBJECT" | "RELDIR_BLOB_JSON")) => {
             let text = v.as_str().ok_or_else(|| {
                 DbError::new(
                     "QUERY_TYPE_ERROR",
@@ -853,8 +853,8 @@ fn decode_declared(v: Value, declared: Option<&str>) -> Result<Value> {
                 )
             })?;
             let correct_shape = match kind {
-                "JDB_BLOB_ARRAY" => decoded.is_array(),
-                "JDB_BLOB_OBJECT" => decoded.is_object(),
+                "RELDIR_BLOB_ARRAY" => decoded.is_array(),
+                "RELDIR_BLOB_OBJECT" => decoded.is_object(),
                 _ => true,
             };
             if correct_shape {
@@ -874,21 +874,21 @@ fn sqlite_type(kind: &ColumnType) -> &'static str {
     match kind {
         // BLOB affinity deliberately preserves the storage class supplied by
         // SQL and bound parameters. SQLite's numeric/text affinities otherwise
-        // coerce values silently before jdb can enforce its strict type system.
-        ColumnType::Bool => "JDB_BLOB_BOOL",
-        ColumnType::Int => "JDB_BLOB_I64",
-        ColumnType::Float => "JDB_BLOB_F64",
-        ColumnType::Decimal => "JDB_BLOB_DECIMAL COLLATE JDB_DECIMAL",
-        ColumnType::String => "JDB_BLOB_STRING",
-        ColumnType::Bytes => "JDB_BLOB_BYTES",
-        ColumnType::Date => "JDB_BLOB_DATE",
-        ColumnType::Timestamp => "JDB_BLOB_TIMESTAMP",
-        ColumnType::Uuid => "JDB_BLOB_UUID",
-        ColumnType::Ulid => "JDB_BLOB_ULID",
-        ColumnType::Enum => "JDB_BLOB_ENUM",
-        ColumnType::Array => "JDB_BLOB_ARRAY",
-        ColumnType::Object => "JDB_BLOB_OBJECT",
-        ColumnType::Json => "JDB_BLOB_JSON",
+        // coerce values silently before reldir can enforce its strict type system.
+        ColumnType::Bool => "RELDIR_BLOB_BOOL",
+        ColumnType::Int => "RELDIR_BLOB_I64",
+        ColumnType::Float => "RELDIR_BLOB_F64",
+        ColumnType::Decimal => "RELDIR_BLOB_DECIMAL COLLATE RELDIR_DECIMAL",
+        ColumnType::String => "RELDIR_BLOB_STRING",
+        ColumnType::Bytes => "RELDIR_BLOB_BYTES",
+        ColumnType::Date => "RELDIR_BLOB_DATE",
+        ColumnType::Timestamp => "RELDIR_BLOB_TIMESTAMP",
+        ColumnType::Uuid => "RELDIR_BLOB_UUID",
+        ColumnType::Ulid => "RELDIR_BLOB_ULID",
+        ColumnType::Enum => "RELDIR_BLOB_ENUM",
+        ColumnType::Array => "RELDIR_BLOB_ARRAY",
+        ColumnType::Object => "RELDIR_BLOB_OBJECT",
+        ColumnType::Json => "RELDIR_BLOB_JSON",
     }
 }
 fn sql_literal(value: &SqlValue) -> String {
@@ -912,7 +912,7 @@ pub fn index_name(table: &str, columns: &[String]) -> String {
         identity.push(';');
     }
     format!(
-        "jdb_{table}_{}",
+        "reldir_{table}_{}",
         &crate::canonical::hash_bytes(identity.as_bytes())[..12]
     )
 }

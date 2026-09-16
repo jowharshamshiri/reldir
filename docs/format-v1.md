@@ -2,7 +2,7 @@
 title: On-disk format
 ---
 
-# jdb on-disk format 1
+# reldir on-disk format 1
 
 This document fixes the representation emitted and accepted by format version 1.
 
@@ -47,7 +47,7 @@ UTC RFC 3339. Binary writes use the `.db/config` `indentation_width` (two spaces
 default) and one trailing newline. Because configuration is authoritative, clones
 of the same state retain identical output formatting.
 
-The state root is SHA-256 over `jdb-state-v1\0`, the canonical format/config entries,
+The state root is SHA-256 over `reldir-state-v1\0`, the canonical format/config entries,
 then (in lexicographic table and primary-key order) each normalized relative path,
 a NUL byte, and the lowercase hex SHA-256 of the canonical row, or of the schema's
 semantic encoding. Formatting-only row or configuration changes do not alter the
@@ -88,7 +88,7 @@ journal fails with `TRANSACTION_INCOMPLETE`; it is never guessed through.
 
 Format 1 readers reject every other format number with `FORMAT_UNSUPPORTED`.
 Schema dialect changes that alter interpretation require a new format or an
-explicit `x-jdb.schemaFormat`. `db upgrade-format` is a no-op only when format 1 is
+explicit `x-reldir.schemaFormat`. `db upgrade-format` is a no-op only when format 1 is
 already current; no implicit forward interpretation occurs.
 
 ## SQL subset

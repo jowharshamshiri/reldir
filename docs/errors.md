@@ -92,10 +92,10 @@ Optional members are omitted rather than emitted as `null`.
 | `SCHEMA_NOT_PINNED` | `db schema restore` found no pin to rebuild from |
 | `SCHEMA_PINNED` | inference would diverge from a pinned declaration |
 | `SCHEMA_INVALID_JSON` | a schema file is not valid JSON |
-| `SCHEMA_MISSING_REQUIRED` | a required member is absent: `x-jdb`, `x-jdb.table`, `x-jdb.primaryKey`, `x-jdb.columnOrder`, or `properties` |
-| `SCHEMA_UNKNOWN_KEY` | unrecognised `x-jdb` key, or a column member meaningless for its type; the message names the nearest valid key |
-| `SCHEMA_UNSUPPORTED_KEYWORD` | a JSON Schema keyword outside the jdb dialect, which would change which rows are valid |
-| `SCHEMA_TABLE_NAME_MISMATCH` | `x-jdb.table` does not equal the file stem |
+| `SCHEMA_MISSING_REQUIRED` | a required member is absent: `x-reldir`, `x-reldir.table`, `x-reldir.primaryKey`, `x-reldir.columnOrder`, or `properties` |
+| `SCHEMA_UNKNOWN_KEY` | unrecognised `x-reldir` key, or a column member meaningless for its type; the message names the nearest valid key |
+| `SCHEMA_UNSUPPORTED_KEYWORD` | a JSON Schema keyword outside the reldir dialect, which would change which rows are valid |
+| `SCHEMA_TABLE_NAME_MISMATCH` | `x-reldir.table` does not equal the file stem |
 | `SCHEMA_INVALID_TABLE_NAME` | table name breaks the naming rule |
 | `SCHEMA_COLUMN_TYPE_MISSING` | a column is not a subschema object |
 | `SCHEMA_TYPE_UNKNOWN` | unrecognised column type |
@@ -103,7 +103,7 @@ Optional members are omitted rather than emitted as `null`.
 | `SCHEMA_PK_COLUMN_UNKNOWN` | the primary key names an unknown or repeated column |
 | `SCHEMA_PK_NULLABLE` | a primary-key column is declared nullable |
 | `SCHEMA_DEFAULT_TYPE_MISMATCH` | a default or generator does not match its column |
-| `SCHEMA_FILENAME_NOT_UNIQUE` | `x-jdb.filename` is not a NOT NULL unique key |
+| `SCHEMA_FILENAME_NOT_UNIQUE` | `x-reldir.filename` is not a NOT NULL unique key |
 | `SCHEMA_CHECK_INVALID` | a check has no name, no expression, or is not boolean; or a `pattern` is not a valid regular expression |
 
 ## Schema semantics

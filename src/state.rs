@@ -327,7 +327,7 @@ fn holds_recognizable_schema(root: &Path) -> Result<bool> {
             continue;
         };
         // The dialect's own identifier is the discriminator. A directory of
-        // ordinary JSON Schema documents is not a database root, and since jdb's
+        // ordinary JSON Schema documents is not a database root, and since reldir's
         // schemas *are* JSON Schema documents, only the declared dialect tells
         // the two apart.
         let speaks_the_dialect = object.get("$schema").and_then(|s| s.as_str())
@@ -860,7 +860,7 @@ mod tests {
 
     fn schema_json(table: &str) -> String {
         format!(
-            r#"{{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{{"id":{{"type":"string"}}}},"required":["id"],"x-jdb":{{"table":"{table}","primaryKey":["id"],"columnOrder":["id"]}}}}"#
+            r#"{{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{{"id":{{"type":"string"}}}},"required":["id"],"x-reldir":{{"table":"{table}","primaryKey":["id"],"columnOrder":["id"]}}}}"#
         )
     }
 
@@ -920,9 +920,9 @@ mod tests {
     }
 
     /// A directory named `schema` only re-roots discovery when it actually
-    /// holds jdb's schemas.
+    /// holds reldir's schemas.
     ///
-    /// This is sharper than it used to be. jdb's schemas are themselves JSON
+    /// This is sharper than it used to be. reldir's schemas are themselves JSON
     /// Schema documents, so "looks like a schema" no longer distinguishes a
     /// database from any project that keeps its API contracts in `schema/`.
     /// The dialect's own identifier is what separates them, which is precisely
@@ -940,7 +940,7 @@ mod tests {
         );
 
         // An ordinary JSON Schema document is the case that matters now: it has
-        // `properties` and a `$schema`, and is still not a jdb table.
+        // `properties` and a `$schema`, and is still not a reldir table.
         let foreign = tempfile::tempdir().unwrap();
         write(
             &foreign.path().join("schema/users.json"),
@@ -948,7 +948,7 @@ mod tests {
         );
         assert!(
             !holds_recognizable_schema(foreign.path()).unwrap(),
-            "a JSON Schema document in another dialect is not a jdb schema"
+            "a JSON Schema document in another dialect is not a reldir schema"
         );
 
         // A file whose `table` disagrees with its name is not a schema either.
@@ -1044,7 +1044,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         // Deliberately non-canonical formatting, so any rewrite is detectable.
-        let handwritten = "{\n    \"$schema\": \"https://jdb.dev/schema/jdb-1\",\n    \"type\": \"object\",\n    \"properties\": {\"id\": {\"type\": \"string\"}},\n    \"required\": [\"id\"],\n    \"x-jdb\": {\"table\": \"users\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n";
+        let handwritten = "{\n    \"$schema\": \"https://reldir.dev/schema/reldir-1\",\n    \"type\": \"object\",\n    \"properties\": {\"id\": {\"type\": \"string\"}},\n    \"required\": [\"id\"],\n    \"x-reldir\": {\"table\": \"users\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n";
         write(&root.join("schema/users.json"), handwritten);
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
         write(&root.join("posts/p1.json"), "{\"id\":\"p1\"}\n");

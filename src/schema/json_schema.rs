@@ -1,27 +1,27 @@
 //! The only door between a schema file and the relational model.
 //!
-//! Schemas are stored as JSON Schema 2020-12 documents in jdb's dialect (see
-//! [`super::meta`]). Everything inside jdb works on [`Schema`]; nothing else
+//! Schemas are stored as JSON Schema 2020-12 documents in reldir's dialect (see
+//! [`super::meta`]). Everything inside reldir works on [`Schema`]; nothing else
 //! reads or writes the file form. `encode` renders a schema, `decode` reads
 //! one, and they are inverse:
 //!
 //! ```text
-//! decode(encode(s)) == s                  for every schema jdb can hold
-//! encode(decode(d)) == canonical(d)       for every document jdb accepts
+//! decode(encode(s)) == s                  for every schema reldir can hold
+//! encode(decode(d)) == canonical(d)       for every document reldir accepts
 //! ```
 //!
 //! The second law is deliberately weaker than byte equality. An ordinary JSON
 //! tool may reindent a schema or reorder its members without changing what it
-//! says, and jdb accepts that: `decode` is tolerant of layout, `encode` emits
+//! says, and reldir accepts that: `decode` is tolerant of layout, `encode` emits
 //! one canonical form. What `decode` is *not* tolerant of is meaning it cannot
 //! represent. A document using `oneOf` or `patternProperties` is valid JSON
-//! Schema describing a constraint jdb has no relational equivalent for, so it
+//! Schema describing a constraint reldir has no relational equivalent for, so it
 //! is refused with `SCHEMA_UNSUPPORTED_KEYWORD` rather than silently ignored --
 //! ignoring it would let the file and the database disagree about what is
 //! valid.
 //!
 //! The governing rule for anything else: if valid JSON Schema content does not
-//! alter jdb's semantics, preserve it; if it would alter semantics jdb cannot
+//! alter reldir's semantics, preserve it; if it would alter semantics reldir cannot
 //! represent, reject it. Annotations such as `$comment` and `examples` fall on
 //! the first side and survive a round trip untouched.
 
@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 /// Standard keywords that carry no relational meaning.
 ///
 /// These are annotations in JSON Schema's own terms: they describe a schema
-/// without constraining an instance. jdb keeps them verbatim so that a schema
+/// without constraining an instance. reldir keeps them verbatim so that a schema
 /// written by a person, or by a tool, does not lose its commentary on the way
 /// through -- but they take no part in validation and no part in identity.
 const PRESERVED_ANNOTATIONS: &[&str] = &["title", "$comment", "examples", "readOnly", "deprecated"];
@@ -74,7 +74,7 @@ const COLUMN_SEMANTIC: &[&str] = &[
 /// Key order is chosen rather than sorted. Diagnostics locate a finding by
 /// searching the schema's bytes for the first occurrence of a quoted name
 /// (`integrity::locate`), and a column name appears in `properties`, in
-/// `required`, and in `x-jdb.columnOrder`. Emitting `properties` first means a
+/// `required`, and in `x-reldir.columnOrder`. Emitting `properties` first means a
 /// diagnostic about a column points at the column's definition rather than at
 /// a bare string in a list.
 pub fn encode(schema: &Schema) -> Value {
@@ -224,8 +224,8 @@ fn encode_foreign_key(key: &ForeignKey) -> Value {
 /// One column as a subschema.
 ///
 /// Standard keywords describe the value wherever they can, so that a generic
-/// validator understands the shape. `x-jdb-type` is added only where no
-/// standard keyword distinguishes two jdb types: `int` is lexical where JSON
+/// validator understands the shape. `x-reldir-type` is added only where no
+/// standard keyword distinguishes two reldir types: `int` is lexical where JSON
 /// Schema's `integer` is mathematical, and `decimal` and `ulid` are strings
 /// carrying application semantics. The tag sits on the subschema it describes,
 /// so it works at any depth -- an `array<decimal>` has no column name to key a
@@ -305,7 +305,7 @@ fn encode_column(column: &Column) -> Value {
                 // Nested property order is logical state for the same reason
                 // the top level's is.
                 out.insert(
-                    "x-jdb-column-order".into(),
+                    "x-reldir-column-order".into(),
                     Value::Array(
                         properties
                             .keys()
@@ -322,7 +322,7 @@ fn encode_column(column: &Column) -> Value {
 
     // A user pattern is emitted after the type's own, and for decimal and ulid
     // it replaces it: two `pattern` keywords cannot coexist in one subschema,
-    // and the narrower of the two is the one a row must satisfy. jdb keeps
+    // and the narrower of the two is the one a row must satisfy. reldir keeps
     // enforcing the type regardless, because the type is not spelled by the
     // pattern -- `matches_column` checks both.
     if let Some(pattern) = &column.pattern {
@@ -360,11 +360,11 @@ fn typename(name: &str, nullable: bool) -> Value {
 const DECIMAL_PATTERN: &str = r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?$";
 const ULID_PATTERN: &str = "^[0-7][0-9A-HJKMNP-TV-Z]{25}$";
 
-/// The pattern a *person* wrote, as opposed to the one jdb emits for a type.
+/// The pattern a *person* wrote, as opposed to the one reldir emits for a type.
 ///
 /// `decimal` and `ulid` are strings whose admissible values JSON Schema can
 /// only describe with a `pattern`, so [`encode_column`] writes one. Reading it
-/// straight back would turn jdb's own spelling of a type into a user
+/// straight back would turn reldir's own spelling of a type into a user
 /// constraint: it would then be part of the schema's identity, and a decimal
 /// column would hash differently depending on whether its schema had made a
 /// round trip through disk. A pattern equal to the type's canonical one is
@@ -490,7 +490,7 @@ fn bad_at(code: &str, anchor: &str, message: impl Into<String>) -> DbError {
 /// Read a JSON Schema document as a schema.
 ///
 /// Tolerant of layout, strict about meaning: any keyword that would change what
-/// counts as a valid row, and that jdb cannot represent, is refused by name.
+/// counts as a valid row, and that reldir cannot represent, is refused by name.
 pub fn decode(document: &Value) -> Result<Schema> {
     let root = document.as_object().ok_or_else(|| {
         bad(
@@ -510,7 +510,7 @@ pub fn decode(document: &Value) -> Result<Schema> {
     reject_unsupported(root, ROOT_SEMANTIC, "schema")?;
 
     // A table is an object of named columns. A document declaring any other
-    // root type describes a shape jdb has no relational meaning for, and
+    // root type describes a shape reldir has no relational meaning for, and
     // reading its `properties` anyway would govern a table the file never
     // claimed to describe.
     match root.get("type") {
@@ -768,7 +768,7 @@ fn decode_checks(value: Option<&Value>) -> Result<Vec<Check>> {
 /// One column subschema.
 ///
 /// `required` and `generated` arrive from the root, because JSON Schema states
-/// presence at the object level and jdb's generators are a table-level fact.
+/// presence at the object level and reldir's generators are a table-level fact.
 fn decode_column(
     value: &Value,
     name: &str,
@@ -800,8 +800,8 @@ fn decode_column(
                 .and_then(Value::as_array)
                 .map(|values| values.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            let order = match object.get("x-jdb-column-order") {
-                Some(value) => column_order(Some(value), nested, "x-jdb-column-order")?,
+            let order = match object.get("x-reldir-column-order") {
+                Some(value) => column_order(Some(value), nested, "x-reldir-column-order")?,
                 None => nested.keys().cloned().collect(),
             };
             let mut map = IndexMap::new();
@@ -841,7 +841,7 @@ fn decode_column(
     // every defaulted NOT NULL column nullable on the next load.
     //
     // A column with no declared type is the exception, and the only one. It is
-    // the empty schema -- jdb's `json` -- which admits any value including
+    // the empty schema -- reldir's `json` -- which admits any value including
     // null, so there is no union to carry the flag. For those, absence from
     // `required` is the only statement the document makes about whether a row
     // may leave the column out, and it is what `integrity` reads back when it
@@ -910,12 +910,12 @@ fn read_type(object: &Map<String, Value>, name: &str) -> Result<(Option<String>,
     }
 }
 
-/// Which jdb type a subschema describes.
+/// Which reldir type a subschema describes.
 ///
 /// The tag decides where it is present, because it exists precisely for the
 /// cases a standard keyword cannot express. Otherwise the standard keywords
 /// decide, and an unrecognised combination is refused rather than guessed at:
-/// a column whose type jdb cannot name is one it cannot validate, compare, or
+/// a column whose type reldir cannot name is one it cannot validate, compare, or
 /// hash.
 fn column_kind(
     type_name: Option<&str>,
@@ -958,7 +958,7 @@ fn column_kind(
                 Some("uuid") => Ok(ColumnType::Uuid),
                 Some(other) => Err(bad(
                     "SCHEMA_TYPE_UNKNOWN",
-                    format!("column {name:?}: format {other:?} names no jdb type"),
+                    format!("column {name:?}: format {other:?} names no reldir type"),
                 )),
                 None => Ok(ColumnType::String),
             }
@@ -966,7 +966,7 @@ fn column_kind(
         other => Err(bad_at(
             "SCHEMA_TYPE_UNKNOWN",
             name,
-            format!("column {name:?}: type {other:?} names no jdb type"),
+            format!("column {name:?}: type {other:?} names no reldir type"),
         )),
     }
 }
@@ -975,28 +975,28 @@ fn column_kind(
 ///
 /// A keyword this codec does not consume is either an annotation, which is
 /// preserved untouched, or an assertion that would change which rows are valid.
-/// jdb cannot enforce the latter, and a schema whose file claims a constraint
+/// reldir cannot enforce the latter, and a schema whose file claims a constraint
 /// the database does not apply is worse than one that refuses to load.
 fn reject_unsupported(object: &Map<String, Value>, semantic: &[&str], where_: &str) -> Result<()> {
     for key in object.keys() {
         if semantic.contains(&key.as_str()) || PRESERVED_ANNOTATIONS.contains(&key.as_str()) {
             continue;
         }
-        if key == "x-jdb-column-order" {
+        if key == "x-reldir-column-order" {
             continue;
         }
         return Err(bad(
             "SCHEMA_UNSUPPORTED_KEYWORD",
             format!(
-                "{where_}: {key:?} is not part of the jdb dialect; it would change which rows are \
-                 valid in a way jdb cannot enforce"
+                "{where_}: {key:?} is not part of the reldir dialect; it would change which rows are \
+                 valid in a way reldir cannot enforce"
             ),
         ));
     }
     Ok(())
 }
 
-/// The keys `x-jdb` accepts.
+/// The keys `x-reldir` accepts.
 const EXTENSION_KEYS: &[&str] = &[
     "table",
     "schemaVersion",
@@ -1013,7 +1013,7 @@ const EXTENSION_KEYS: &[&str] = &[
 
 /// Refuse an unrecognised relational key, and say what was probably meant.
 ///
-/// `x-jdb` has a closed key set, so a key that is not in it is a mistake rather
+/// `x-reldir` has a closed key set, so a key that is not in it is a mistake rather
 /// than an extension -- and a mistake with an obvious intent, since `"uniqe"` is
 /// one edit away from `"unique"`. Naming the nearest key turns a rejection into
 /// a correction; silently ignoring the key would leave the constraint the author
@@ -1148,7 +1148,7 @@ mod tests {
         patterned_array.items = Some(Box::new(patterned_element));
         out.push(("array_of_patterned_string", patterned_array));
 
-        // A decimal already carries a pattern of jdb's own. Round-tripping it
+        // A decimal already carries a pattern of reldir's own. Round-tripping it
         // must not turn the type's spelling into a user constraint.
         out.push(("decimal_keeps_its_own_pattern", col(ColumnType::Decimal)));
 
@@ -1216,7 +1216,7 @@ mod tests {
         );
     }
 
-    /// `decode(encode(s)) == s`, for every column shape jdb can hold.
+    /// `decode(encode(s)) == s`, for every column shape reldir can hold.
     ///
     /// This is the law that makes the format change safe: if a schema does not
     /// survive a trip through the file form, then writing it and reading it
@@ -1238,7 +1238,7 @@ mod tests {
         }
     }
 
-    /// A pattern is part of what a schema *is*, and jdb's own type patterns are
+    /// A pattern is part of what a schema *is*, and reldir's own type patterns are
     /// not.
     ///
     /// Two schemas differing only by a user pattern accept different rows, so
@@ -1358,9 +1358,9 @@ mod tests {
         );
         // The vocabulary carries what JSON Schema cannot say.
         let document = encode(&schema);
-        assert_eq!(document["x-jdb"]["foreignKeys"][0]["onDelete"], json!("set_null"));
-        assert_eq!(document["x-jdb"]["filename"], json!(["email"]));
-        assert_eq!(document["x-jdb"]["generated"]["id"], json!("ulid"));
+        assert_eq!(document["x-reldir"]["foreignKeys"][0]["onDelete"], json!("set_null"));
+        assert_eq!(document["x-reldir"]["filename"], json!(["email"]));
+        assert_eq!(document["x-reldir"]["generated"]["id"], json!("ulid"));
         assert_eq!(document["additionalProperties"], json!(true));
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
     /// The bundled meta-schema already rejects these, so a codec that accepted
     /// them would make the two validators disagree -- with the codec, the one
     /// that actually governs data, being the permissive one. Each case here is
-    /// a statement the file makes that jdb would otherwise silently discard.
+    /// a statement the file makes that reldir would otherwise silently discard.
     #[test]
     fn test1142_documents_that_do_not_describe_a_table_are_refused() {
         let base = table(vec![("id", col(ColumnType::String))]);
@@ -1462,7 +1462,7 @@ mod tests {
         // A generator for a column that does not exist is a declaration the
         // database would otherwise drop on the floor.
         let mut stray = encode(&base);
-        stray["x-jdb"]["generated"] = json!({ "ghost": "uuid" });
+        stray["x-reldir"]["generated"] = json!({ "ghost": "uuid" });
         let error = decode(&stray).expect_err("a generator must name a real column");
         assert_eq!(error.diagnostic.code, "SCHEMA_COLUMN_UNKNOWN");
         assert!(
@@ -1472,7 +1472,7 @@ mod tests {
         );
     }
 
-    /// Valid JSON Schema that jdb has no relational meaning for is refused by
+    /// Valid JSON Schema that reldir has no relational meaning for is refused by
     /// name, never ignored. Ignoring it would leave the file claiming a
     /// constraint the database does not enforce.
     #[test]
@@ -1521,7 +1521,7 @@ mod tests {
     #[test]
     fn test1147_every_accepted_column_keyword_reaches_the_model() {
         // What each keyword is worth saying, and a column whose decoded model
-        // must differ once the keyword is present. `type`, `x-jdb-type` and
+        // must differ once the keyword is present. `type`, `x-reldir-type` and
         // `format`/`contentEncoding` decide the kind; the rest decide what the
         // kind admits.
         /// A keyword, a subschema using it, and what the decoded column must
@@ -1606,7 +1606,7 @@ mod tests {
 
             let mut document = encode(&table(vec![("id", col(ColumnType::String))]));
             document["properties"]["c"] = subschema.clone();
-            document["x-jdb"]["columnOrder"] = json!(["id", "c"]);
+            document["x-reldir"]["columnOrder"] = json!(["id", "c"]);
 
             let schema = decode(&document)
                 .unwrap_or_else(|error| panic!("{keyword} must decode: {}", error.diagnostic.message));

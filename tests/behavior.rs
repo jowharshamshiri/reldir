@@ -8,7 +8,7 @@ fn db() -> Command {
 
 /// Declare a pinned schema.
 ///
-/// `schema/` is the user's pin directory: jdb never creates it, so a fixture
+/// `schema/` is the user's pin directory: reldir never creates it, so a fixture
 /// that declares a schema creates it the way a user would.
 fn pin(root: impl AsRef<std::path::Path>, table: &str, body: &str) {
     let root = root.as_ref();
@@ -158,12 +158,12 @@ fn test0005_sql_delete_executes_declared_cascade_in_one_revision() {
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -210,12 +210,12 @@ fn test0006_direct_primary_key_update_uses_declared_cascade() {
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -283,7 +283,7 @@ fn test0007_sql_dml_rejects_silent_storage_class_coercion_and_preserves_bool_out
     pin(
         root,
         "items",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-jdb-type":"int"},"active":{"type":"boolean"}},"required":["id","count","active"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count","active"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-reldir-type":"int"},"active":{"type":"boolean"}},"required":["id","count","active"],"additionalProperties":false,"x-reldir":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count","active"]}}"#,
     );
     fs::write(
         root.join("items/a.json"),
@@ -555,7 +555,7 @@ fn test0012_declarative_migration_is_atomic_across_schema_and_rows() {
 /// A migration file carries a schema, and that schema is a JSON Schema document
 /// like any other -- not a second grammar maintained alongside the first.
 ///
-/// `add_table` used to embed jdb's own schema shape inside migration files,
+/// `add_table` used to embed reldir's own schema shape inside migration files,
 /// which made the migration format a parallel way to spell a schema: a change
 /// to the dialect would have left it behind, silently accepting documents the
 /// rest of the binary had stopped understanding. It now goes through the same
@@ -568,7 +568,7 @@ fn test0075_migrations_carry_schemas_in_the_dialect_and_refuse_any_other() {
     let accepted = root.join("add-tags.json");
     fs::write(
         &accepted,
-        r#"{"operations":[{"op":"add_table","table":"tags","schema":{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["id","label"],"additionalProperties":false,"x-jdb":{"table":"tags","primaryKey":["id"],"columnOrder":["id","label"]}}}]}"#,
+        r#"{"operations":[{"op":"add_table","table":"tags","schema":{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"}},"required":["id","label"],"additionalProperties":false,"x-reldir":{"table":"tags","primaryKey":["id"],"columnOrder":["id","label"]}}}]}"#,
     )
     .unwrap();
     db().args([
@@ -587,9 +587,9 @@ fn test0075_migrations_carry_schemas_in_the_dialect_and_refuse_any_other() {
     // same bytes the codec would have produced for a hand-written pin.
     let written: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".db/schema/tags.json")).unwrap()).unwrap();
-    assert_eq!(written["$schema"], "https://jdb.dev/schema/jdb-1");
-    assert_eq!(written["x-jdb"]["table"], "tags");
-    assert_eq!(written["x-jdb"]["columnOrder"][1], "label");
+    assert_eq!(written["$schema"], "https://reldir.dev/schema/reldir-1");
+    assert_eq!(written["x-reldir"]["table"], "tags");
+    assert_eq!(written["x-reldir"]["columnOrder"][1], "label");
     assert_eq!(written["properties"]["label"]["type"], "string");
 
     // The old grammar is refused by name rather than quietly accepted through a
@@ -672,7 +672,7 @@ fn test0076_schema_changes_are_reported_semantically() {
             .and(predicate::str::contains("\"type\":\"boolean\""))
             .and(predicate::str::contains("\"default\":true"))
             // None of the internal encoding may reach the reader: neither the
-            // document keys the hash is taken over, nor `nullable`, nor jdb's
+            // document keys the hash is taken over, nor `nullable`, nor reldir's
             // own type names, appear in any schema file.
             .and(predicate::str::contains("\"primary_key\"").not())
             .and(predicate::str::contains("additional_fields").not())
@@ -749,7 +749,7 @@ fn test0077_doctor_pins_an_unpinned_schema_and_never_replaces_a_declaration() {
     let pin = root.join("schema/u.json");
     let mut declared: serde_json::Value =
         serde_json::from_slice(&fs::read(&pin).unwrap()).unwrap();
-    declared["x-jdb"]["indexes"] = serde_json::json!([["id"]]);
+    declared["x-reldir"]["indexes"] = serde_json::json!([["id"]]);
     fs::write(&pin, serde_json::to_vec_pretty(&declared).unwrap()).unwrap();
 
     // The plan offers the fix for the table that has no pin. The plan is the
@@ -786,7 +786,7 @@ fn test0077_doctor_pins_an_unpinned_schema_and_never_replaces_a_declaration() {
     let after: serde_json::Value =
         serde_json::from_slice(&fs::read(&pin).unwrap()).unwrap();
     assert_eq!(
-        after["x-jdb"]["indexes"],
+        after["x-reldir"]["indexes"],
         serde_json::json!([["id"]]),
         "an existing pin is a declaration doctor must not overwrite"
     );
@@ -825,7 +825,7 @@ fn test0078_a_fix_selected_by_its_printed_id_is_applied() {
     fs::create_dir_all(root.join("schema")).unwrap();
     fs::write(
         root.join("schema/t.json"),
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","format":"uuid"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string","format":"uuid"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
     )
     .unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "status"])
@@ -855,7 +855,7 @@ fn test0078_a_fix_selected_by_its_printed_id_is_applied() {
     let schema: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".db/schema/t.json")).unwrap()).unwrap();
     assert_eq!(
-        schema["x-jdb"]["generated"]["id"], "uuid",
+        schema["x-reldir"]["generated"]["id"], "uuid",
         "the fix named by the plan must be the fix that ran"
     );
 }
@@ -900,31 +900,31 @@ fn test0079_the_dialect_is_available_before_a_database_exists() {
     let document = rendered.remove(0);
 
     // It is the meta-schema, not a report about the directory.
-    assert_eq!(document["$id"], "https://jdb.dev/schema/jdb-1");
+    assert_eq!(document["$id"], "https://reldir.dev/schema/reldir-1");
     assert_eq!(
         document["$schema"], "https://json-schema.org/draft/2020-12/schema",
         "the dialect is itself a 2020-12 document"
     );
     assert_eq!(
-        document["$vocabulary"]["https://jdb.dev/vocab/jdb-1"],
+        document["$vocabulary"]["https://reldir.dev/vocab/reldir-1"],
         serde_json::json!(true),
-        "it must declare jdb's vocabulary as required"
+        "it must declare reldir's vocabulary as required"
     );
     assert!(
         !root.join(".db").exists(),
         "asking what the binary accepts must not establish a database"
     );
 
-    // And it describes the schemas jdb actually writes: the document the
+    // And it describes the schemas reldir actually writes: the document the
     // dialect validates is the one `encode` produces.
-    let validator = jdb::schema::meta::validator().expect("the dialect compiles");
+    let validator = reldir::schema::meta::validator().expect("the dialect compiles");
     let schema: serde_json::Value = serde_json::from_str(
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
     )
     .unwrap();
     assert!(
         validator.is_valid(&schema),
-        "the emitted dialect must accept a schema jdb would write"
+        "the emitted dialect must accept a schema reldir would write"
     );
 }
 
@@ -939,7 +939,7 @@ fn test0013_schema_errors_have_specific_codes_and_locations() {
     pin(
         dir.path(),
         "bad",
-        "{\n  \"$schema\": \"https://jdb.dev/schema/jdb-1\",\n  \"type\": \"object\",\n  \"properties\": {\"id\": \"string\"},\n  \"x-jdb\": {\"table\": \"bad\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n",
+        "{\n  \"$schema\": \"https://reldir.dev/schema/reldir-1\",\n  \"type\": \"object\",\n  \"properties\": {\"id\": \"string\"},\n  \"x-reldir\": {\"table\": \"bad\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n",
     );
     db().args([
         "--db",
@@ -992,7 +992,7 @@ fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() 
     pin(
         root,
         "items",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","default":"fixed"}},"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string","default":"fixed"}},"additionalProperties":false,"x-reldir":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     fs::write(root.join("items/fixed.json"), "{}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -1002,7 +1002,7 @@ fn test0015_defaults_participate_in_identity_and_uniqueness_as_logical_values() 
     pin(
         root,
         "items",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","tag"],"unique":[["tag"]]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"tag":{"type":"string","default":"same"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","tag"],"unique":[["tag"]]}}"#,
     );
     fs::write(root.join("items/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(root.join("items/b.json"), "{\"id\":\"b\"}\n").unwrap();
@@ -1023,7 +1023,7 @@ fn test0016_check_schema_typechecking_rejects_unknown_identifiers() {
     pin(
         root,
         "items",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-jdb-type":"int"}},"required":["id","count"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count"],"checks":[{"name":"positive","expr":"typo > 0"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"count":{"type":"integer","x-reldir-type":"int"}},"required":["id","count"],"additionalProperties":false,"x-reldir":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","count"],"checks":[{"name":"positive","expr":"typo > 0"}]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1085,7 +1085,7 @@ fn test0018_decimal_ordering_is_arbitrary_precision_and_gc_retains_history() {
     pin(
         root,
         "numbers",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"amount":{"type":"string","pattern":"^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$","x-jdb-type":"decimal"}},"required":["id","amount"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","amount"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"amount":{"type":"string","pattern":"^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$","x-reldir-type":"decimal"}},"required":["id","amount"],"additionalProperties":false,"x-reldir":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","amount"]}}"#,
     );
     fs::write(
         root.join("numbers/a.json"),
@@ -1154,7 +1154,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     pin(
         root,
         "numbers",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string","default":"10"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string","default":"10"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
     );
     fs::write(root.join("numbers/a.json"), "{\"id\":\"a\"}\n").unwrap();
     fs::write(
@@ -1186,7 +1186,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     let explicit: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("numbers/b.json")).unwrap()).unwrap();
     assert_eq!(schema["properties"]["score"]["type"], "integer");
-    assert_eq!(schema["properties"]["score"]["x-jdb-type"], "int");
+    assert_eq!(schema["properties"]["score"]["x-reldir-type"], "int");
     assert_eq!(schema["properties"]["score"]["default"], 10);
     assert!(omitted.get("score").is_none());
     assert_eq!(explicit["score"], 20);
@@ -1203,7 +1203,7 @@ fn test0019_change_type_is_lossless_atomic_and_preserves_omitted_defaults() {
     pin(
         failed_root,
         "numbers",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string"}},"required":["id","score"],"additionalProperties":false,"x-jdb":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"score":{"type":"string"}},"required":["id","score"],"additionalProperties":false,"x-reldir":{"table":"numbers","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","score"]}}"#,
     );
     fs::write(
         failed_root.join("numbers/a.json"),
@@ -1322,7 +1322,7 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
     pin(
         root,
         "bad",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","x-jdb-type":"int"}},"required":["id"],"x-jdb":{"table":"bad","primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string","x-reldir-type":"int"}},"required":["id"],"x-reldir":{"table":"bad","primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     db().args([
         "--db",
@@ -1340,7 +1340,7 @@ fn test0022_schema_type_specific_members_are_strict_and_format_errors_are_exit_s
     pin(
         root,
         "bad",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"bad","schemaVersion":1,"schemaFormat":999,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"bad","schemaVersion":1,"schemaFormat":999,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1359,7 +1359,7 @@ fn test0023_primary_key_arguments_are_decoded_against_the_declared_type() {
     pin(
         root,
         "things",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"things","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-reldir":{"table":"things","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
     );
     fs::write(
         root.join("things/123.json"),
@@ -1412,7 +1412,7 @@ fn test0024_inference_derives_foreign_keys_and_rejects_invalid_pk_overrides() {
     .success();
     let posts: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join(".db/schema/posts.json")).unwrap()).unwrap();
-    let relational = &posts["x-jdb"];
+    let relational = &posts["x-reldir"];
     assert_eq!(relational["foreignKeys"][0]["columns"][0], "user_id");
     assert_eq!(relational["foreignKeys"][0]["references"]["table"], "users");
     assert_eq!(relational["indexes"][0][0], "user_id");
@@ -1560,12 +1560,12 @@ fn test0028_restrict_referential_action_blocks_and_reports_a_referential_violati
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":"string"}},"required":["id","user_id"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -1613,12 +1613,12 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/u1.json"), "{\"id\":\"u1\"}\n").unwrap();
     fs::write(
@@ -1649,7 +1649,7 @@ fn test0029_set_null_and_set_default_actions_rewrite_dependents_in_one_revision(
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"],"default":"gone"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_default","onUpdate":"restrict"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"user_id":{"type":["string","null"],"default":"gone"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","user_id"],"foreignKeys":[{"columns":["user_id"],"references":{"table":"users","columns":["id"]},"onDelete":"set_default","onUpdate":"restrict"}]}}"#,
     );
     fs::write(root.join("users/gone.json"), "{\"id\":\"gone\"}\n").unwrap();
     fs::write(root.join("users/u2.json"), "{\"id\":\"u2\"}\n").unwrap();
@@ -1691,43 +1691,43 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
     fs::create_dir(root.join("a")).unwrap();
     fs::write(root.join("a/a1.json"), "{\"id\":\"a1\"}\n").unwrap();
 
-    let base = r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#;
+    let base = r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#;
     let cases: Vec<(&str, &str)> = vec![
         (
             "SCHEMA_UNKNOWN_KEY",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-reldir":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
         ),
         (
             "SCHEMA_PK_NULLABLE",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":["string","null"]}},"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":["string","null"]}},"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_COLUMN_TYPE_MISSING",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":"string"},"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":"string"},"x-reldir":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_TYPE_UNKNOWN",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"nosuchtype"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"nosuchtype"}},"required":["id"],"x-reldir":{"table":"a","primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_PK_COLUMN_UNKNOWN",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_DEFAULT_TYPE_MISMATCH",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int","default":"text"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int","default":"text"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
         ),
         (
             "SCHEMA_TABLE_NAME_MISMATCH",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"other","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"other","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
         ),
         (
             "SCHEMA_FK_TARGET_MISSING",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"b":{"type":"string"}},"required":["id","b"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b"],"foreignKeys":[{"columns":["b"],"references":{"table":"ghost","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"b":{"type":"string"}},"required":["id","b"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b"],"foreignKeys":[{"columns":["b"],"references":{"table":"ghost","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_CHECK_INVALID",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"],"checks":[{"name":"c","expr":"ghost > 0"}]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"],"checks":[{"name":"c","expr":"ghost > 0"}]}}"#,
         ),
     ];
     for (code, body) in cases {
@@ -1742,7 +1742,7 @@ fn test0030_schema_grammar_and_semantic_rules_have_dedicated_codes() {
     pin(
         root,
         "a",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-jdb":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"x-reldir":{"table":"a","primaryKey":["id"],"columnOrder":["id"],"uniqe":[["id"]]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1770,21 +1770,21 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     pin(
         root,
         "a",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
 
     let cases: Vec<(&str, &str)> = vec![
         (
             "SCHEMA_FK_TYPE_MISMATCH",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"integer","x-jdb-type":"int"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"integer","x-reldir-type":"int"}},"required":["id","a_id"],"additionalProperties":false,"x-reldir":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_FK_TARGET_NOT_UNIQUE",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["nope"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-reldir":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["nope"]},"onDelete":"restrict","onUpdate":"restrict"}]}}"#,
         ),
         (
             "SCHEMA_FK_ACTION_INVALID",
-            r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
+            r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-reldir":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"set_null","onUpdate":"restrict"}]}}"#,
         ),
     ];
     for (code, body) in cases {
@@ -1799,12 +1799,12 @@ fn test0031_cross_schema_foreign_key_rules_are_enforced() {
     pin(
         root,
         "a",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"b_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b_id"],"foreignKeys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"b_id":{"type":["string","null"]}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"a","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","b_id"],"foreignKeys":[{"columns":["b_id"],"references":{"table":"b","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     pin(
         root,
         "b",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-jdb":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"a_id":{"type":"string"}},"required":["id","a_id"],"additionalProperties":false,"x-reldir":{"table":"b","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","a_id"],"foreignKeys":[{"columns":["a_id"],"references":{"table":"a","columns":["id"]},"onDelete":"cascade","onUpdate":"cascade"}]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1822,7 +1822,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
         .assert()
         .success();
     fs::create_dir(root.join("t")).unwrap();
-    let strict = r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#;
+    let strict = r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-reldir":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#;
     pin(root, "t", strict);
     fs::write(root.join("t/a.json"), "{\"id\":\"a\",\"n\":1}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -1868,7 +1868,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
     pin(
         root,
         "t",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":true,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int"}},"required":["id","n"],"additionalProperties":true,"x-reldir":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -1879,7 +1879,7 @@ fn test0032_row_structural_and_relational_violations_have_dedicated_codes() {
     pin(
         root,
         "t",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"],"checks":[{"name":"pos","expr":"n > 0"}]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-reldir":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"],"checks":[{"name":"pos","expr":"n > 0"}]}}"#,
     );
     fs::write(root.join("t/h.json"), "{\"id\":\"h\",\"n\":-5}\n").unwrap();
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
@@ -1899,7 +1899,7 @@ fn test0033_duplicate_primary_keys_are_rejected_under_a_custom_filename_rule() {
     pin(
         root,
         "t",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"slug":{"type":"string"}},"required":["id","slug"],"additionalProperties":false,"x-jdb":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","slug"],"unique":[["slug"]],"filename":["slug"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"slug":{"type":"string"}},"required":["id","slug"],"additionalProperties":false,"x-reldir":{"table":"t","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","slug"],"unique":[["slug"]],"filename":["slug"]}}"#,
     );
     fs::write(root.join("t/s1.json"), "{\"id\":\"a\",\"slug\":\"s1\"}\n").unwrap();
     fs::write(root.join("t/s2.json"), "{\"id\":\"a\",\"slug\":\"s2\"}\n").unwrap();
@@ -2039,7 +2039,7 @@ fn test0034_inference_failures_are_specific_and_actionable() {
     ])
     .assert()
     .success()
-    // A column jdb will not commit to a narrower type admits any value, which
+    // A column reldir will not commit to a narrower type admits any value, which
     // JSON Schema spells as the empty schema rather than as a type name.
     .stdout(predicate::function(|stdout: &str| {
         let document: serde_json::Value = serde_json::from_str(stdout).expect("infer prints JSON");
@@ -2233,7 +2233,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id","name"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["ghost"],"columnOrder":["id","name"]}}"#,
     );
 
     // `status` and `check` report violations on stderr and exit INVALID.
@@ -2283,7 +2283,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "posts",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"users":{"type":"string"}},"required":["id","users"],"additionalProperties":false,"x-jdb":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","users"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"users":{"type":"string"}},"required":["id","users"],"additionalProperties":false,"x-reldir":{"table":"posts","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","users"]}}"#,
     );
     for arguments in [vec!["check"], vec!["lint"], vec!["doctor"]] {
         let mut command = db();
@@ -2299,7 +2299,7 @@ fn test0038_unresolvable_primary_key_is_reported_not_crashed_on() {
     pin(
         root,
         "users",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-jdb":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false,"x-reldir":{"table":"users","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","name"]}}"#,
     );
     db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
         .assert()
@@ -2452,7 +2452,7 @@ fn test0041_concurrent_writers_never_silently_lose_an_update() {
     pin(
         &root,
         "counters",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-jdb":{"table":"counters","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int"}},"required":["id","n"],"additionalProperties":false,"x-reldir":{"table":"counters","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","n"]}}"#,
     );
     for index in 0..8 {
         fs::write(
@@ -2687,7 +2687,7 @@ fn test0044_many_rows_validate_query_and_mutate_correctly() {
     pin(
         root,
         "events",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"integer","x-jdb-type":"int"},"bucket":{"type":"string"},"n":{"type":"integer","x-jdb-type":"int"}},"required":["id","bucket","n"],"additionalProperties":false,"x-jdb":{"table":"events","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","bucket","n"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"integer","x-reldir-type":"int"},"bucket":{"type":"string"},"n":{"type":"integer","x-reldir-type":"int"}},"required":["id","bucket","n"],"additionalProperties":false,"x-reldir":{"table":"events","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","bucket","n"]}}"#,
     );
 
     let rows = 2_000usize;
@@ -2767,7 +2767,7 @@ fn test0045_result_row_limits_are_enforced_not_truncated() {
     pin(
         root,
         "items",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"integer","x-jdb-type":"int"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"integer","x-reldir-type":"int"}},"required":["id"],"additionalProperties":false,"x-reldir":{"table":"items","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id"]}}"#,
     );
     for index in 0..25 {
         fs::write(
@@ -2824,7 +2824,7 @@ fn test0046_pathological_json_is_refused_by_configured_limits() {
     pin(
         root,
         "blobs",
-        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"},"data":{}},"required":["id","data"],"additionalProperties":false,"x-jdb":{"table":"blobs","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","data"]}}"#,
+        r#"{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{"id":{"type":"string"},"data":{}},"required":["id","data"],"additionalProperties":false,"x-reldir":{"table":"blobs","schemaVersion":1,"primaryKey":["id"],"columnOrder":["id","data"]}}"#,
     );
     let deep = format!(
         "{{\"id\":\"a\",\"data\":{}{}}}\n",
@@ -4249,8 +4249,8 @@ fn test0081_readonly_reconstructs_a_pinned_schema_without_writing() {
 
 /// A pattern in a pinned schema is enforced against the rows.
 ///
-/// A corpus adopted into jdb carried `pattern` on every id and every reference.
-/// jdb accepted the keyword, discarded it, and reported the database valid
+/// A corpus adopted into reldir carried `pattern` on every id and every reference.
+/// reldir accepted the keyword, discarded it, and reported the database valid
 /// while none of those constraints were checked. A schema that states a
 /// constraint the database does not apply is worse than one that refuses to
 /// load.
@@ -4268,7 +4268,7 @@ fn test0082_a_declared_pattern_is_enforced_against_rows() {
         root,
         "blocks",
         r#"{
-  "$schema": "https://jdb.dev/schema/jdb-1",
+  "$schema": "https://reldir.dev/schema/reldir-1",
   "type": "object",
   "properties": {
     "id":   { "type": "string" },
@@ -4277,7 +4277,7 @@ fn test0082_a_declared_pattern_is_enforced_against_rows() {
   },
   "required": ["id", "slug", "refs"],
   "additionalProperties": false,
-  "x-jdb": {
+  "x-reldir": {
     "table": "blocks",
     "primaryKey": ["id"],
     "columnOrder": ["id", "slug", "refs"]
@@ -4320,7 +4320,7 @@ fn test0082_a_declared_pattern_is_enforced_against_rows() {
         .stderr(predicate::str::contains("TYPE_MISMATCH"));
 }
 
-/// A pattern jdb cannot compile is refused when the schema loads, naming the
+/// A pattern reldir cannot compile is refused when the schema loads, naming the
 /// column, rather than being accepted and then never matching.
 #[test]
 fn test0083_an_uncompilable_pattern_is_refused_by_name() {
@@ -4332,12 +4332,12 @@ fn test0083_an_uncompilable_pattern_is_refused_by_name() {
         root,
         "t",
         r#"{
-  "$schema": "https://jdb.dev/schema/jdb-1",
+  "$schema": "https://reldir.dev/schema/reldir-1",
   "type": "object",
   "properties": { "id": { "type": "string", "pattern": "(a)\\1" } },
   "required": ["id"],
   "additionalProperties": false,
-  "x-jdb": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] }
+  "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] }
 }
 "#,
     );

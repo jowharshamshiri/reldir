@@ -233,12 +233,12 @@ impl Catalog {
                 Err(e) => c.diagnostics.push(*e.diagnostic),
             }
         }
-        // A pin is the declaration; the working copy is jdb's. When they
+        // A pin is the declaration; the working copy is reldir's. When they
         // disagree the pin governs, and the working copy -- derived state, like
         // an index -- is rebuilt from it. That is what makes `schema/` worth
         // keeping in version control and `.db/` safe to delete.
         //
-        // There is deliberately no arbitration over which side moved. jdb only
+        // There is deliberately no arbitration over which side moved. reldir only
         // ever writes a working copy equal to the pin or to what it inferred,
         // so a disagreement always resolves the same way, and the manifest --
         // the only witness that could tell them apart -- goes stale the moment
@@ -418,7 +418,7 @@ impl Catalog {
                         .at(rel.clone())
                         .table(table)
                         .expected(expected.unwrap_or_else(|| {
-                            "a filename derived from non-null x-jdb.filename columns".into()
+                            "a filename derived from non-null x-reldir.filename columns".into()
                         }))
                         .observed(name)
                         .fix("FIX_RENAME_TO_IDENTITY"),

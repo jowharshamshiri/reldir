@@ -203,13 +203,13 @@ impl Schema {
         if self.primary_key.is_empty() {
             out.push(Diagnostic::error(
                 "SCHEMA_MISSING_REQUIRED",
-                "x-jdb.primaryKey must be a non-empty array",
+                "x-reldir.primaryKey must be a non-empty array",
             ));
         }
         if self.primary_key.iter().collect::<BTreeSet<_>>().len() != self.primary_key.len() {
             out.push(Diagnostic::error(
                 "SCHEMA_PK_COLUMN_UNKNOWN",
-                "x-jdb.primaryKey must not repeat a column",
+                "x-reldir.primaryKey must not repeat a column",
             ));
         }
         if self.columns.is_empty() {
@@ -286,7 +286,7 @@ impl Schema {
         {
             out.push(Diagnostic::error(
                 "SCHEMA_FILENAME_NOT_UNIQUE",
-                "x-jdb.filename must be a NOT NULL primary key or unique constraint",
+                "x-reldir.filename must be a NOT NULL primary key or unique constraint",
             ));
         }
         let mut check_names = BTreeSet::new();
@@ -369,7 +369,7 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
         ));
     }
     // A pattern that does not compile is a malformed schema, caught once here
-    // rather than per row. jdb matches with the `regex` crate, whose syntax is
+    // rather than per row. reldir matches with the `regex` crate, whose syntax is
     // ECMA-262 without backreferences or lookaround; a pattern using those is
     // refused by name instead of silently never matching.
     if let Some(pattern) = &c.pattern {
@@ -473,7 +473,7 @@ pub fn load_bytes(data: &[u8]) -> Result<Schema> {
 /// Read a schema file.
 ///
 /// The only way a schema enters the process. Files are JSON Schema documents in
-/// jdb's dialect, so parsing is two steps -- JSON, then the dialect -- and each
+/// reldir's dialect, so parsing is two steps -- JSON, then the dialect -- and each
 /// reports its own faults at the place they occur.
 pub fn load(path: &Path) -> Result<Schema> {
     let data = fs::read(path).map_err(|e| DbError::io(path, e))?;
@@ -565,7 +565,7 @@ mod tests {
             .collect()
     }
 
-    /// A pattern jdb cannot compile is a malformed schema, not a constraint
+    /// A pattern reldir cannot compile is a malformed schema, not a constraint
     /// that silently never matches.
     ///
     /// The failure has to land when the schema is validated. Deferring it to
@@ -615,7 +615,7 @@ mod tests {
 
     /// A member meaningless for its column's type is refused, as `items` and
     /// `properties` already are. A pattern cannot constrain a boolean, and a
-    /// document that states one is asking for something jdb will not do.
+    /// document that states one is asking for something reldir will not do.
     #[test]
     fn test1151_type_specific_members_include_the_new_ones() {
         let mut patterned_bool = column(ColumnType::Bool);

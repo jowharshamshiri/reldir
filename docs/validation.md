@@ -148,5 +148,5 @@ closer than every other candidate. Doctor does not resolve a tie.
   confirmed them.
 - In `--format json` mode, `--yes` is required to apply.
 
-Automatic repair applies only to rebuildable derived state. `jdb` never
+Automatic repair applies only to rebuildable derived state. `reldir` never
 rewrites your JSON without confirmation because it violates a schema.

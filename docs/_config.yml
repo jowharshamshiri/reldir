@@ -2,10 +2,10 @@
 #
 # Pages is configured to serve the /docs folder on the default branch.
 
-title: jdb
+title: reldir
 description: A relational database that lives in a directory of JSON files.
 theme: jekyll-theme-primer
 
-# Relative permalinks keep the generated URLs stable under the /jdb/ project
+# Relative permalinks keep the generated URLs stable under the /reldir/ project
 # path that Pages serves a project site from.
 permalink: pretty

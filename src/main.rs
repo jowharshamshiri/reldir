@@ -1,7 +1,7 @@
 use clap::Parser;
 
 fn main() {
-    let cli = match jdb::cli::Cli::try_parse() {
+    let cli = match reldir::cli::Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
@@ -18,7 +18,7 @@ fn main() {
         }
     };
     let machine = cli.machine_error_format().map(String::from);
-    match jdb::cli::run(cli) {
+    match reldir::cli::run(cli) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             if machine.is_some() {

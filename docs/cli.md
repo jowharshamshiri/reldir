@@ -135,7 +135,7 @@ db schema new users         # scaffold a minimal valid schema
 db schema pin users         # declare the working schema in schema/
 db schema restore users     # rebuild the working schema from its pin
 db schema validate
-db schema dialect           # print the JSON Schema dialect jdb accepts
+db schema dialect           # print the JSON Schema dialect reldir accepts
 ```
 
 `infer` never writes without `--write` and never overwrites an existing schema.

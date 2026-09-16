@@ -3,12 +3,12 @@
 //! A database has one working schema per table and may have a pin for it.
 //!
 //! The working schema lives in `.db/schema/<table>.json`. It is what every
-//! other subsystem validates against, queries through, and reports on. jdb owns
+//! other subsystem validates against, queries through, and reports on. reldir owns
 //! it: inference writes it, maintenance updates it, and deleting `.db/`
 //! discards it exactly as it discards an index, because it can be rebuilt.
 //!
 //! The pin lives in `schema/<table>.json`. It is optional, and it is the user's
-//! declaration rather than jdb's derivation: a schema they wrote, or one they
+//! declaration rather than reldir's derivation: a schema they wrote, or one they
 //! promoted from inference with `db schema pin`. A pinned table's working
 //! schema is copied from the pin instead of inferred from data, so pinning is
 //! how a refinement inference could never re-derive -- an enum, a check, a
@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The directory holding working schemas, which jdb maintains.
+/// The directory holding working schemas, which reldir maintains.
 pub fn working_dir(root: &Path) -> PathBuf {
     root.join(".db/schema")
 }
@@ -67,7 +67,7 @@ pub fn pin_relative(table: &str) -> String {
 ///
 /// Distinct from [`is_pin_relative`] because `.db/schema/x.json` also ends in
 /// `schema/x.json`: a prefix test that did not know the difference would count
-/// jdb's own copy as the user's declaration.
+/// reldir's own copy as the user's declaration.
 fn is_working_relative(path: &str) -> bool {
     path.starts_with(".db/schema/") && path.ends_with(".json")
 }
@@ -94,7 +94,7 @@ pub fn is_pin_relative(path: &str) -> bool {
 pub fn write_working(root: &Path, schema: &Schema, indentation_width: usize) -> Result<()> {
     let directory = working_dir(root);
     fs::create_dir_all(&directory).map_err(|error| DbError::io(&directory, error))?;
-    // One serialization for both locations. A schema jdb writes must read back
+    // One serialization for both locations. A schema reldir writes must read back
     // exactly as the pin it came from would: two renderings of the same
     // declaration differ in nesting and byte length, so a limit one form passes
     // the other can fail.
@@ -249,7 +249,7 @@ mod tests {
 
         // Working schemas live under `.db/` and are not manifest paths. The
         // two spellings share a suffix, so a prefix test that did not know the
-        // difference would record jdb's own copy as the user's declaration.
+        // difference would record reldir's own copy as the user's declaration.
         assert_eq!(working_relative("users"), ".db/schema/users.json");
         assert!(!is_pin_relative(".db/schema/users.json"));
         assert!(is_schema_relative(".db/schema/users.json"));
@@ -307,7 +307,7 @@ mod tests {
     }
 
     /// A file where `schema/` should be is refused rather than read around: a
-    /// database whose pin directory is a regular file is not one jdb can
+    /// database whose pin directory is a regular file is not one reldir can
     /// interpret, and guessing would mean ignoring a declaration the user made.
     #[test]
     fn test1124_a_pin_directory_that_is_not_a_directory_is_refused() {

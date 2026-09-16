@@ -59,7 +59,7 @@ pub fn encode_v1(schema: &Schema) -> Value {
 
     // The remaining collections are ordered by the user and carry that order as
     // written: a reordered `unique` list is the same set of constraints, but it
-    // is also what the file says, and jdb does not reorder it on the way to
+    // is also what the file says, and reldir does not reorder it on the way to
     // disk. Encoding them as given keeps identity agreeing with the artifact.
     out.insert("unique".into(), string_lists(&schema.unique));
     out.insert(
