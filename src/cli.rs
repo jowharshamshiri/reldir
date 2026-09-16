@@ -3085,12 +3085,17 @@ fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> 
                 Value::Null,
                 as_dialect(definition),
             )),
-            Some((_, previous)) if previous != definition => out.push(change(
-                "column_changed",
-                name.clone(),
-                as_dialect(previous),
-                as_dialect(definition),
-            )),
+            Some((_, previous)) if previous != definition => {
+                // Some differences in the semantic form are not differences in
+                // the column's own declaration: a generator is a table fact,
+                // reported under `generated` rather than inside the subschema.
+                // Emitting a row whose two sides render identically would show
+                // a reader a change they cannot see and cannot act on.
+                let (before, after) = (as_dialect(previous), as_dialect(definition));
+                if before != after {
+                    out.push(change("column_changed", name.clone(), before, after));
+                }
+            }
             Some(_) => {}
         }
     }
@@ -3118,6 +3123,26 @@ fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> 
         ));
     }
 
+    // `storage` wraps its column list in an object; the dialect writes
+    // `x-jdb.filename` as the list itself, so the wrapper is unwrapped rather
+    // than shown as a shape that appears in no file.
+    let filename = |value: &Value| -> Value {
+        value
+            .get("filename")
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let filename_before = filename(old.get("storage").unwrap_or(&Value::Null));
+    let filename_after = filename(new.get("storage").unwrap_or(&Value::Null));
+    if filename_before != filename_after {
+        out.push(change(
+            "schema_change",
+            "filename".into(),
+            filename_before,
+            filename_after,
+        ));
+    }
+
     // Everything else a schema says, reported under the name it is written by.
     for (key, label) in [
         ("primary_key", "primaryKey"),
@@ -3125,7 +3150,6 @@ fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> 
         ("indexes", "indexes"),
         ("foreign_keys", "foreignKeys"),
         ("check", "checks"),
-        ("storage", "filename"),
         ("additional_fields", "additionalProperties"),
         ("schema_version", "schemaVersion"),
         ("schema_format", "schemaFormat"),
@@ -5440,6 +5464,89 @@ mod tests {
             storage: None,
             additional_fields: AdditionalFields::Reject,
             annotations: Default::default(),
+        }
+    }
+
+    /// One deliberate change to a schema, as the coverage table below names it.
+    type SchemaEdit = Box<dyn Fn(&mut Schema)>;
+
+    /// Every relational key a schema can carry is visible in a diff.
+    ///
+    /// `x-jdb` has a closed key set, and a change to any of them changes what
+    /// the database enforces. A key the codec accepts but the diff never
+    /// mentions would let a constraint appear or vanish with the diff reporting
+    /// nothing at all -- the quietest possible failure, and the one a reader is
+    /// least able to catch.
+    #[test]
+    fn test1145_every_relational_key_is_reported_when_it_changes() {
+        // `table` is excluded deliberately: a schema whose table disagrees with
+        // its filename is refused outright, so it cannot differ across two
+        // revisions of the same file.
+        let semantic = |build: &dyn Fn(&mut Schema)| {
+            let mut s = schema(&[("id", ColumnType::String)], &["id"]);
+            build(&mut s);
+            crate::schema::semantic::encode_v1(&s)
+        };
+        let unchanged = semantic(&|_| {});
+
+        let cases: Vec<(&str, SchemaEdit)> = vec![
+            ("primaryKey", Box::new(|s: &mut Schema| {
+                s.columns.insert("alt".into(), column(ColumnType::String));
+                s.primary_key = vec!["alt".into()];
+            })),
+            ("columnOrder", Box::new(|s: &mut Schema| {
+                s.columns.insert("alt".into(), column(ColumnType::String));
+                s.columns.swap_indices(0, 1);
+            })),
+            ("unique", Box::new(|s: &mut Schema| s.unique = vec![vec!["id".into()]])),
+            ("indexes", Box::new(|s: &mut Schema| s.indexes = vec![vec!["id".into()]])),
+            ("foreignKeys", Box::new(|s: &mut Schema| {
+                s.foreign_keys = vec![crate::schema::ForeignKey {
+                    columns: vec!["id".into()],
+                    references: crate::schema::Reference {
+                        table: "other".into(),
+                        columns: vec!["id".into()],
+                    },
+                    on_delete: None,
+                    on_update: None,
+                }];
+            })),
+            ("checks", Box::new(|s: &mut Schema| {
+                s.check = vec![crate::schema::Check {
+                    name: "c".into(),
+                    expr: "id IS NOT NULL".into(),
+                }];
+            })),
+            ("generated", Box::new(|s: &mut Schema| {
+                s.columns["id"].kind = ColumnType::Ulid;
+                s.columns["id"].generated = Some(crate::schema::Generated {
+                    kind: crate::schema::GeneratedKind::Ulid,
+                });
+            })),
+            ("filename", Box::new(|s: &mut Schema| {
+                s.storage = Some(crate::schema::Storage { filename: vec!["id".into()] });
+            })),
+            ("schemaVersion", Box::new(|s: &mut Schema| s.schema_version = 7)),
+            ("schemaFormat", Box::new(|s: &mut Schema| {
+                s.schema_format = Some(crate::FORMAT_VERSION)
+            })),
+            ("additionalProperties", Box::new(|s: &mut Schema| {
+                s.additional_fields = AdditionalFields::Allow
+            })),
+        ];
+
+        for (key, build) in cases {
+            let changed = semantic(&*build);
+            let rows = schema_diff("schema/t.json", &unchanged, &changed);
+            assert!(
+                !rows.is_empty(),
+                "{key}: a change to it must be reported, not passed over in silence"
+            );
+            let rendered = serde_json::to_string(&rows).unwrap();
+            assert!(
+                !rendered.contains("\"nullable\""),
+                "{key}: the internal encoding must not reach the reader: {rendered}"
+            );
         }
     }
 
