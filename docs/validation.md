@@ -15,9 +15,9 @@ Three commands, three jobs:
 ## check
 
 ```sh
-db check                # full validation
+reldir check                # full validation
 db --readonly check     # validate, mutate no data
-db check --strict       # lint findings also fail
+reldir check --strict       # lint findings also fail
 ```
 
 A full check validates directory structure, schema syntax and semantics, every
@@ -26,12 +26,12 @@ foreign keys, `CHECK` constraints, path rules, indexes, provenance consistency,
 transaction recovery state, manifest consistency, and the canonical state hash.
 
 ```console
-$ db check
+$ reldir check
 VALID: 2 tables, 5 rows, 0 violations, 3 lint findings ({"info": 1, "suggestion": 2}), 4 ms
 ```
 
 Indexes may be repaired automatically because they are derived, and `check`
-reports when it did so. `db --readonly check --format json` is the documented CI
+reports when it did so. `reldir --readonly check --format json` is the documented CI
 and pre-commit entry point: it exits `2` on `INVALID` and, with `--strict`, `7`
 on lint findings.
 
@@ -73,13 +73,13 @@ that should be an open `string`.
 `doctor` unifies `check` and `lint` and attaches fixes.
 
 ```sh
-db doctor                       # diagnose; print a plan; change nothing
-db doctor --fix                 # apply schema and layout fixes
-db doctor --fix --allow-data    # also apply fixes that rewrite row files
-db doctor --only <CODE|FIX_ID>  # restrict to one category or fix
-db doctor --explain <FIX_ID>    # what it does, what it touches, why it is safe
-db doctor --dry-run             # show the exact diffs
-db doctor --yes                 # non-interactive confirmation
+reldir doctor                       # diagnose; print a plan; change nothing
+reldir doctor --fix                 # apply schema and layout fixes
+reldir doctor --fix --allow-data    # also apply fixes that rewrite row files
+reldir doctor --only <CODE|FIX_ID>  # restrict to one category or fix
+reldir doctor --explain <FIX_ID>    # what it does, what it touches, why it is safe
+reldir doctor --dry-run             # show the exact diffs
+reldir doctor --yes                 # non-interactive confirmation
 ```
 
 ### Fix classes
@@ -93,7 +93,7 @@ db doctor --yes                 # non-interactive confirmation
 | `manual` | nothing | never | doctor explains what you must decide |
 
 ```console
-$ db doctor
+$ reldir doctor
 Doctor plan:
   layout (1):
     FIX_RENAME_TO_IDENTITY  rename users/moved.json to u1.json

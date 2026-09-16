@@ -41,7 +41,7 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
    = expected: existing users.id
    = observed: "missing"
    = fixes: FIX_ORPHAN_SET_NULL, FIX_ORPHAN_DELETE_ROW
-   = help: run `db doctor` for fix options
+   = help: run `reldir doctor` for fix options
 ```
 
 Machine output carries the same information, one object per diagnostic:
@@ -88,8 +88,8 @@ Optional members are omitted rather than emitted as `null`.
 
 | Code | Meaning |
 |---|---|
-| `SCHEMA_ALREADY_PINNED` | `db schema pin` would replace a different declaration; pass `--overwrite` |
-| `SCHEMA_NOT_PINNED` | `db schema restore` found no pin to rebuild from |
+| `SCHEMA_ALREADY_PINNED` | `reldir schema pin` would replace a different declaration; pass `--overwrite` |
+| `SCHEMA_NOT_PINNED` | `reldir schema restore` found no pin to rebuild from |
 | `SCHEMA_PINNED` | inference would diverge from a pinned declaration |
 | `SCHEMA_INVALID_JSON` | a schema file is not valid JSON |
 | `SCHEMA_MISSING_REQUIRED` | a required member is absent: `x-reldir`, `x-reldir.table`, `x-reldir.primaryKey`, `x-reldir.columnOrder`, or `properties` |

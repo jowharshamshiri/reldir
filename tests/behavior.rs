@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use std::fs;
 
 fn db() -> Command {
-    Command::cargo_bin("db").unwrap()
+    Command::cargo_bin("reldir").unwrap()
 }
 
 /// Declare a pinned schema.

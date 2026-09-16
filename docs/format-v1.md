@@ -88,7 +88,7 @@ journal fails with `TRANSACTION_INCOMPLETE`; it is never guessed through.
 
 Format 1 readers reject every other format number with `FORMAT_UNSUPPORTED`.
 Schema dialect changes that alter interpretation require a new format or an
-explicit `x-reldir.schemaFormat`. `db upgrade-format` is a no-op only when format 1 is
+explicit `x-reldir.schemaFormat`. `reldir upgrade-format` is a no-op only when format 1 is
 already current; no implicit forward interpretation occurs.
 
 ## SQL subset
@@ -96,7 +96,7 @@ already current; no implicit forward interpretation occurs.
 The SQL frontend accepts one statement and supports `SELECT`, `INSERT`, `UPDATE`,
 `DELETE`, `WHERE`, inner/left joins, grouping, `HAVING`, ordering, limit/offset,
 distinct, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, and SQLite-style scalar expressions.
-`EXPLAIN QUERY PLAN` powers `db explain` and `db sql --explain`. JSON parameters are
+`EXPLAIN QUERY PLAN` powers `reldir explain` and `reldir sql --explain`. JSON parameters are
 bound separately from SQL text. The ephemeral SQLite engine keeps temporary storage
 in memory; `max_query_memory` bounds its loaded relational workspace and
 `max_sort_memory` bounds queries requiring sorting, while temporary-disk use is
@@ -104,7 +104,7 @@ therefore zero.
 
 ## Declarative migrations
 
-`db migrate apply` accepts an object with one required `operations` array. Each
+`reldir migrate apply` accepts an object with one required `operations` array. Each
 operation has an `op` discriminator and the same fields as its CLI counterpart:
 `add_table` (whose embedded `schema` is itself a JSON Schema document), `drop_table`,
 `rename_table`, `add_column`, `drop_column`, `rename_column`, `change_type`,

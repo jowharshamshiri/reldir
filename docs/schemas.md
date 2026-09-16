@@ -28,7 +28,7 @@ The dialect itself is compiled into the binary, so to get editor completion,
 write it out and point your editor at the local copy:
 
 ```sh
-db schema dialect > .reldir-dialect.json
+reldir schema dialect > .reldir-dialect.json
 ```
 
 In VS Code, for example, associate it with your schema files:
@@ -105,7 +105,7 @@ FROM blocks b, json_each(b.objective_refs) e
 WHERE e.value NOT IN (SELECT id FROM objectives);
 ```
 
-An empty result means every element resolves. Run it in `db check`'s company
+An empty result means every element resolves. Run it in `reldir check`'s company
 rather than in place of it: the schema still governs the array's element type,
 and this governs what the elements point at.
 
@@ -310,7 +310,7 @@ both `onDelete` and `onUpdate`. Binary-performed mutations execute them
 transactionally and list every row a cascade touched:
 
 ```console
-$ db delete users u1
+$ reldir delete users u1
 changed 2 path(s); revision 2
   posts/p1.json
   users/u1.json
@@ -330,11 +330,11 @@ long as those columns are covered by a unique constraint and are `NOT NULL`:
 ## Managing schemas
 
 ```sh
-db schema show users        # print a schema
-db schema new users         # scaffold a minimal valid schema
-db schema pin users         # declare the working schema in schema/
-db schema restore users     # rebuild the working schema from its pin
-db schema validate          # validate every schema
+reldir schema show users        # print a schema
+reldir schema new users         # scaffold a minimal valid schema
+reldir schema pin users         # declare the working schema in schema/
+reldir schema restore users     # rebuild the working schema from its pin
+reldir schema validate          # validate every schema
 ```
 
 Schema changes are first-class database changes. See [migrations](cli#migrate) for

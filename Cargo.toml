@@ -1,5 +1,5 @@
 [[bin]]
-name = "db"
+name = "reldir"
 path = "src/main.rs"
 
 [dependencies]
@@ -60,4 +60,4 @@ description = "A filesystem-native relational JSON database"
 edition = "2024"
 license = "MIT"
 name = "reldir"
-version = "0.77.614"
+version = "0.78.649"

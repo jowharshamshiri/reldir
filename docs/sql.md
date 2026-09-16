@@ -30,7 +30,7 @@ differently than written.
 ## Queries
 
 ```console
-$ db sql 'SELECT u.name, count(*) AS n
+$ reldir sql 'SELECT u.name, count(*) AS n
           FROM users u JOIN posts p ON p.user_id = u.id
           GROUP BY u.name ORDER BY n DESC LIMIT 3'
  name  | n
@@ -44,7 +44,7 @@ $ db sql 'SELECT u.name, count(*) AS n
 Off a terminal the same query emits JSON Lines, one object per row:
 
 ```console
-$ db sql 'SELECT name FROM users ORDER BY name' | head -2
+$ reldir sql 'SELECT name FROM users ORDER BY name' | head -2
 {"name":"Alice","kind":"row"}
 {"name":"Bob","kind":"row"}
 ```
@@ -55,7 +55,7 @@ SQLite's JSON functions are available, which is how a column holding an array of
 references is checked. `json_each` expands one row per element:
 
 ```console
-$ db sql 'SELECT b.id, e.value
+$ reldir sql 'SELECT b.id, e.value
           FROM blocks b, json_each(b.objective_refs) e
           WHERE e.value NOT IN (SELECT id FROM objectives)'
 (0 rows)
@@ -71,9 +71,9 @@ Parameters are JSON literals, typed by the column they bind to, and are always
 kept separate from the SQL text:
 
 ```sh
-db sql 'SELECT * FROM users WHERE id = ?'    --param '"u1"'
-db sql 'SELECT * FROM users WHERE id = :id'  --param id='"u1"'
-db sql 'SELECT * FROM items WHERE n > ?'     --param 42
+reldir sql 'SELECT * FROM users WHERE id = ?'    --param '"u1"'
+reldir sql 'SELECT * FROM users WHERE id = :id'  --param id='"u1"'
+reldir sql 'SELECT * FROM items WHERE n > ?'     --param 42
 ```
 
 Because a parameter is a JSON literal, `'"2"'` is the string `2` and `2` is the
@@ -83,15 +83,15 @@ not a silent conversion.
 ## Mutations
 
 ```sh
-db sql "UPDATE users SET name = 'Robert' WHERE id = 'u2'"
-db sql "INSERT INTO users (id, name) VALUES ('u3', 'Carol')"
-db sql "DELETE FROM users WHERE id = 'u3'"
+reldir sql "UPDATE users SET name = 'Robert' WHERE id = 'u2'"
+reldir sql "INSERT INTO users (id, name) VALUES ('u3', 'Carol')"
+reldir sql "DELETE FROM users WHERE id = 'u3'"
 ```
 
 Every mutation reports the files it changed:
 
 ```console
-$ db sql "DELETE FROM users WHERE id = 'u1'"
+$ reldir sql "DELETE FROM users WHERE id = 'u1'"
 changed 2 path(s); revision 4
   posts/p1.json
   users/u1.json
@@ -104,7 +104,7 @@ whole statement and changes nothing.
 ## Explain
 
 ```console
-$ db sql --explain-analyze 'SELECT * FROM users' --format jsonl
+$ reldir sql --explain-analyze 'SELECT * FROM users' --format jsonl
 {"kind":"query_plan","logical_plan":"SELECT * FROM users",
  "physical_plan":[{"detail":"SCAN users"}],
  "selected_indexes":[],"rejected_indexes":[],
@@ -113,7 +113,7 @@ $ db sql --explain-analyze 'SELECT * FROM users' --format jsonl
 
 The plan reports the logical and physical plans, which indexes were chosen,
 which were rejected and why, and estimated rows. With `--explain-analyze` it also
-reports measured rows and elapsed time. `db explain '<sql>'` produces the same
+reports measured rows and elapsed time. `reldir explain '<sql>'` produces the same
 plan without executing the query.
 
 Query correctness never depends on an index being present: indexes are derived
@@ -122,7 +122,7 @@ acceleration, and deleting them changes performance, not answers.
 ## Interactive shell
 
 ```console
-$ db shell
+$ reldir shell
 .tables
 users posts
 .describe users

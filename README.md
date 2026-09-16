@@ -4,7 +4,7 @@
 
 `reldir` turns an ordinary folder into a validated relational database. Rows stay
 as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
-`db` binary governs their interpretation: it enforces schemas, checks referential
+`reldir` binary governs their interpretation: it enforces schemas, checks referential
 integrity, answers SQL, and records how the state changed, without taking
 ownership of your bytes.
 
@@ -14,11 +14,11 @@ ownership of your bytes.
 $ ls ./data
 users/  posts/  comments/
 
-$ db init ./data --adopt
+$ reldir init ./data --adopt
 Scanned 3 directories, 1204 JSON files.
 VALID   revision 1   root 6e41f2…
 
-$ db sql 'SELECT u.name, count(*) AS n
+$ reldir sql 'SELECT u.name, count(*) AS n
           FROM users u JOIN posts p ON p.user_id = u.id
           GROUP BY u.name ORDER BY n DESC LIMIT 3'
  name  | n
@@ -39,13 +39,13 @@ it stops being a valid database:
 
 ```console
 $ echo '{"id":"019...","user_id":"nobody","title":"x"}' > posts/broken.json
-$ db status
+$ reldir status
 INVALID   revision 1   (1 external change, 1 violation)
 
 error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
   --> posts/broken.json:1:24
    = constraint: posts.user_id -> users.id
-   = help: run `db doctor` for fix options
+   = help: run `reldir doctor` for fix options
 ```
 
 Anything may edit the directory: you, your editor, a script, an agent, or `git
@@ -60,17 +60,17 @@ cargo install --path . --locked
 ```
 
 Requires a recent stable Rust toolchain (edition 2024). The result is a single
-self-contained `db` executable, with no daemon, server, or runtime
+self-contained `reldir` executable, with no daemon, server, or runtime
 dependencies.
 
 ## Try it
 
 ```sh
-db init ./data --adopt     # infer schemas from existing JSON and adopt them
-db check                   # full validation
-db lint                    # how the schemas could be stronger
-db doctor                  # diagnose problems and propose fixes
-db sql 'SELECT * FROM users LIMIT 10'
+reldir init ./data --adopt     # infer schemas from existing JSON and adopt them
+reldir check                   # full validation
+reldir lint                    # how the schemas could be stronger
+reldir doctor                  # diagnose problems and propose fixes
+reldir sql 'SELECT * FROM users LIMIT 10'
 ```
 
 ## What you get

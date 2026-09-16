@@ -27,10 +27,10 @@ use std::{
 
 #[derive(Parser, Clone)]
 #[command(
-    name = "db",
+    name = "reldir",
     version,
     about = "Filesystem-native relational JSON database",
-    // `db 'SELECT ...'` runs the query and bare `db` opens the shell, so the
+    // `reldir 'SELECT ...'` runs the query and bare `reldir` opens the shell, so
     // subcommand is optional and a leading positional that is not a subcommand
     // name is captured as SQL. Global flags must remain usable alongside a
     // subcommand, so the positional only negates the requirement -- it never
@@ -298,7 +298,7 @@ enum Command {
     Shell,
     #[command(
         about = "Generate shell completions",
-        after_help = "Example: db completions zsh"
+        after_help = "Example: reldir completions zsh"
     )]
     Completions { shell: String },
     #[command(
@@ -3651,7 +3651,7 @@ fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
             .map_err(|error| DbError::io(&history, std::io::Error::other(error)))?;
     }
     loop {
-        match editor.readline("db> ") {
+        match editor.readline("reldir> ") {
             Ok(line) => {
                 let query = line.trim();
                 if query.is_empty() {
@@ -5466,7 +5466,7 @@ fn completions(shell: &str) -> Result<i32> {
     let shell: clap_complete::Shell = shell
         .parse()
         .map_err(|_| DbError::usage("shell must be bash, zsh, fish, elvish, or powershell"))?;
-    clap_complete::generate(shell, &mut Cli::command(), "db", &mut io::stdout());
+    clap_complete::generate(shell, &mut Cli::command(), "reldir", &mut io::stdout());
     Ok(0)
 }
 

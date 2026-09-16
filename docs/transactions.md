@@ -41,14 +41,14 @@ recoverable.
 ## Recovery
 
 ```sh
-db recover
+reldir recover
 ```
 
 Recovery normally happens automatically when it is unambiguous and safe, and
 prints a one-line notice when it does:
 
 ```console
-$ db status
+$ reldir status
 recovered an interrupted committed transaction
 VALID   revision 3   root 71ab3c9d   external changes: none
 ```
@@ -116,10 +116,10 @@ through the CLI both succeed.
 ## Snapshots
 
 ```sh
-db snapshot create before-import
-db snapshot list
-db snapshot restore before-import
-db snapshot delete before-import
+reldir snapshot create before-import
+reldir snapshot list
+reldir snapshot restore before-import
+reldir snapshot delete before-import
 ```
 
 A snapshot preserves the logical database state. Restoration is transactional and
@@ -132,8 +132,8 @@ Indexes, statistics, and the manifest can always be deleted and rebuilt from the
 authoritative files:
 
 ```sh
-db reindex
-db analyze
+reldir reindex
+reldir analyze
 ```
 
 A corrupt or stale index never makes valid JSON unrecoverable, and changes only

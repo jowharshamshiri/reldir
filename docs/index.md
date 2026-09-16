@@ -8,7 +8,7 @@ title: reldir
 
 `reldir` turns an ordinary folder into a validated relational database. Rows stay
 as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
-`db` binary governs their interpretation: it enforces schemas, checks referential
+`reldir` binary governs their interpretation: it enforces schemas, checks referential
 integrity, answers SQL, and records how the state changed, without taking
 ownership of your bytes.
 
@@ -16,11 +16,11 @@ ownership of your bytes.
 $ ls ./data
 users/  posts/  comments/
 
-$ db init ./data --adopt
+$ reldir init ./data --adopt
 Scanned 3 directories, 1204 JSON files.
 VALID   revision 1   root 6e41f2…
 
-$ db sql 'SELECT name FROM users ORDER BY name'
+$ reldir sql 'SELECT name FROM users ORDER BY name'
  name
 -------
  Alice
@@ -41,13 +41,13 @@ When the state is valid, the changes are adopted as a new revision. When it is
 not, you get a precise diagnostic and a path back:
 
 ```console
-$ db status
+$ reldir status
 INVALID   revision 1   (1 external change, 1 violation)
 
 error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
   --> posts/broken.json:1:24
    = constraint: posts.user_id -> users.id
-   = help: run `db doctor` for fix options
+   = help: run `reldir doctor` for fix options
 ```
 
 ## Guides
@@ -69,4 +69,4 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
 cargo install --path . --locked
 ```
 
-A single self-contained `db` executable. No daemon, no server, no sidecar.
+A single self-contained `reldir` executable. No daemon, no server, no sidecar.

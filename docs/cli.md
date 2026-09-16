@@ -16,7 +16,7 @@ redirected. Every JSON record carries a `"kind"` field, which makes the machine
 output a stable contract.
 
 Two commands emit a document rather than records, so they ignore `--format` and
-carry no `"kind"`: `db completions` writes a shell script, and `db schema
+carry no `"kind"`: `reldir completions` writes a shell script, and `reldir schema
 dialect` writes the JSON Schema dialect. Both are artifacts you save to a file,
 and a wrapper key would corrupt them.
 
@@ -54,13 +54,13 @@ Resource limits may also be overridden per invocation. See
 
 ## Setting up
 
-### `db init`
+### `reldir init`
 
 ```sh
-db init ./data                      # empty database
-db init ./data --adopt              # infer schemas for existing table directories
-db init ./data --adopt --dry-run
-db init ./data --track-provenance   # keep provenance in version control
+reldir init ./data                      # empty database
+reldir init ./data --adopt              # infer schemas for existing table directories
+reldir init ./data --adopt --dry-run
+reldir init ./data --track-provenance   # keep provenance in version control
 ```
 
 Creates `.db/`, `.db/format`, `.db/config`, `.db/.gitignore`, and `.db/schema/`. It does not create `schema/`: that is the pin directory, made when you first pin a schema.
@@ -71,10 +71,10 @@ anything fails, the whole command fails and writes nothing.
 
 Running `init` where `.db/` already exists fails with `ALREADY_INITIALIZED`.
 
-### `db inspect`
+### `reldir inspect`
 
 ```sh
-db inspect            # describe a directory, initialised or not
+reldir inspect            # describe a directory, initialised or not
 ```
 
 Useful before adopting, and on read-only or damaged directories.
@@ -82,23 +82,23 @@ Useful before adopting, and on read-only or damaged directories.
 ## Looking at data
 
 ```sh
-db tables                     # list tables with row counts
-db describe users             # print a table's schema
-db get users u1               # one row by primary key
-db list users --where "name = 'Bob'" --order name --limit 10
+reldir tables                     # list tables with row counts
+reldir describe users             # print a table's schema
+reldir get users u1               # one row by primary key
+reldir list users --where "name = 'Bob'" --order name --limit 10
 ```
 
-The primary key argument is decoded against its declared type: `db get things 123`
+The primary key argument is decoded against its declared type: `reldir get things 123`
 finds the row whose key is the string `"123"` when the column is a `string`, and
 the number `123` when it is an `int`.
 
 ## Changing data
 
 ```sh
-db insert users '{"id":"u3","name":"Carol"}'
-db insert users --from rows.json      # one object or an array; - for stdin
-db update users u3 '{"name":"Caroline"}'
-db delete users u3
+reldir insert users '{"id":"u3","name":"Carol"}'
+reldir insert users --from rows.json      # one object or an array; - for stdin
+reldir update users u3 '{"name":"Caroline"}'
+reldir delete users u3
 ```
 
 `update` takes a patch object: only the keys you supply change.
@@ -106,13 +106,13 @@ db delete users u3
 ## SQL
 
 ```sh
-db sql 'SELECT * FROM users LIMIT 10'
-db sql 'SELECT * FROM users WHERE id = ?' --param '"u1"'
-db sql 'SELECT * FROM users WHERE id = :id' --param id='"u1"'
-db sql --explain 'SELECT ...'
-db sql --explain-analyze 'SELECT ...'
-db explain 'SELECT ...'
-db shell                              # interactive REPL
+reldir sql 'SELECT * FROM users LIMIT 10'
+reldir sql 'SELECT * FROM users WHERE id = ?' --param '"u1"'
+reldir sql 'SELECT * FROM users WHERE id = :id' --param id='"u1"'
+reldir sql --explain 'SELECT ...'
+reldir sql --explain-analyze 'SELECT ...'
+reldir explain 'SELECT ...'
+reldir shell                              # interactive REPL
 ```
 
 See [SQL](sql) for the supported subset.
@@ -123,43 +123,43 @@ in addition to SQL.
 ## Schemas
 
 ```sh
-db infer                    # print proposed schemas for tables lacking one
-db infer users              # one table
-db infer users --write      # write .db/schema/users.json
-db infer --all --write      # re-infer every unpinned table
-db infer --strictness strict|balanced|loose
-db infer users --pk id      # choose or compose the primary key: --pk a,b
+reldir infer                    # print proposed schemas for tables lacking one
+reldir infer users              # one table
+reldir infer users --write      # write .db/schema/users.json
+reldir infer --all --write      # re-infer every unpinned table
+reldir infer --strictness strict|balanced|loose
+reldir infer users --pk id      # choose or compose the primary key: --pk a,b
 
-db schema show users
-db schema new users         # scaffold a minimal valid schema
-db schema pin users         # declare the working schema in schema/
-db schema restore users     # rebuild the working schema from its pin
-db schema validate
-db schema dialect           # print the JSON Schema dialect reldir accepts
+reldir schema show users
+reldir schema new users         # scaffold a minimal valid schema
+reldir schema pin users         # declare the working schema in schema/
+reldir schema restore users     # rebuild the working schema from its pin
+reldir schema validate
+reldir schema dialect           # print the JSON Schema dialect reldir accepts
 ```
 
 `infer` never writes without `--write` and never overwrites an existing schema.
 
 Schemas are [JSON Schema 2020-12](schemas) documents, so everything these
-commands print or write is one. `db schema dialect` emits the dialect itself,
+commands print or write is one. `reldir schema dialect` emits the dialect itself,
 which is what an editor needs to complete a schema you write by hand.
 
 ## Validation and repair
 
 ```sh
-db status                   # validity, revision, external changes
-db check                    # full validation
+reldir status                   # validity, revision, external changes
+reldir check                    # full validation
 db --readonly check         # validate and mutate no data
-db check --strict           # lint findings also fail
-db lint                     # how schemas could be stronger
-db lint --strict            # exit non-zero on any finding
-db lint --descriptions      # include missing-description suggestions
-db doctor                   # diagnose and print a fix plan
-db doctor --fix             # apply derived, schema, and layout fixes
-db doctor --fix --allow-data
-db doctor --only <CODE|FIX_ID>
-db doctor --explain <FIX_ID>
-db doctor --no-snapshot
+reldir check --strict           # lint findings also fail
+reldir lint                     # how schemas could be stronger
+reldir lint --strict            # exit non-zero on any finding
+reldir lint --descriptions      # include missing-description suggestions
+reldir doctor                   # diagnose and print a fix plan
+reldir doctor --fix             # apply derived, schema, and layout fixes
+reldir doctor --fix --allow-data
+reldir doctor --only <CODE|FIX_ID>
+reldir doctor --explain <FIX_ID>
+reldir doctor --no-snapshot
 ```
 
 See [Validation](validation) for the workflow.
@@ -167,12 +167,12 @@ See [Validation](validation) for the workflow.
 ## History
 
 ```sh
-db diff                     # working state vs the last recorded revision
-db diff 1 2                 # between two revisions
-db diff users               # one table
-db diff --schema            # schema changes only
-db log                      # revision history
-db show 2                   # one revision
+reldir diff                     # working state vs the last recorded revision
+reldir diff 1 2                 # between two revisions
+reldir diff users               # one table
+reldir diff --schema            # schema changes only
+reldir log                      # revision history
+reldir show 2                   # one revision
 ```
 
 Diff is semantic: it reports field changes with old and new typed values, row
@@ -185,10 +185,10 @@ rather than a textual difference between two files.
 ## Import and export
 
 ```sh
-db export users                          # to stdout in the selected format
-db export users --format csv
-db export users --format sqlite --out users.db
-db import users --from rows.jsonl        # .jsonl or .csv
+reldir export users                          # to stdout in the selected format
+reldir export users --format csv
+reldir export users --format sqlite --out users.db
+reldir import users --from rows.jsonl        # .jsonl or .csv
 ```
 
 Import is transactional: invalid input is rejected as a whole, leaving nothing
@@ -197,13 +197,13 @@ partially applied. The `sqlite` export encoding requires `--out`.
 ## Maintenance
 
 ```sh
-db reindex                  # rebuild indexes
-db analyze                  # rebuild query statistics
-db recover                  # resolve interrupted transactions
-db gc                       # reclaim unneeded internal state
-db gc --dry-run
-db upgrade-format
-db completions bash|zsh|fish|powershell
+reldir reindex                  # rebuild indexes
+reldir analyze                  # rebuild query statistics
+reldir recover                  # resolve interrupted transactions
+reldir gc                       # reclaim unneeded internal state
+reldir gc --dry-run
+reldir upgrade-format
+reldir completions bash|zsh|fish|powershell
 ```
 
 Indexes and statistics are derived state: deleting them is always safe.
@@ -211,10 +211,10 @@ Indexes and statistics are derived state: deleting them is always safe.
 ## Snapshots
 
 ```sh
-db snapshot create before-import
-db snapshot list
-db snapshot restore before-import
-db snapshot delete before-import
+reldir snapshot create before-import
+reldir snapshot list
+reldir snapshot restore before-import
+reldir snapshot delete before-import
 ```
 
 Restoration is transactional and records provenance with origin
@@ -223,16 +223,16 @@ Restoration is transactional and records provenance with origin
 ## Migrations
 
 ```sh
-db migrate add-table t --from schema.json
-db migrate drop-table t
-db migrate rename-table t new
-db migrate add-column t c --type bool --default true [--nullable]
-db migrate drop-column t c
-db migrate rename-column t c new
-db migrate change-type t c int [--using <sql-expr>]
-db migrate add-constraint / drop-constraint
-db migrate add-index / drop-index
-db migrate apply migration.json
+reldir migrate add-table t --from schema.json
+reldir migrate drop-table t
+reldir migrate rename-table t new
+reldir migrate add-column t c --type bool --default true [--nullable]
+reldir migrate drop-column t c
+reldir migrate rename-column t c new
+reldir migrate change-type t c int [--using <sql-expr>]
+reldir migrate add-constraint / drop-constraint
+reldir migrate add-index / drop-index
+reldir migrate apply migration.json
 ```
 
 Migrations are transactional and support `--dry-run`, which reports how many row

@@ -10,7 +10,7 @@ title: Getting started
 cargo install --path . --locked
 ```
 
-This produces a single `db` executable.
+This produces a single `reldir` executable.
 
 ## Adopt a directory you already have
 
@@ -21,7 +21,7 @@ validates everything, and records the initial revision:
 $ ls ./data
 users/  posts/
 
-$ db init ./data --adopt
+$ reldir init ./data --adopt
 Scanned 2 directories, 5 JSON files.
 VALID   revision 1   root a8a1104e
 ```
@@ -54,27 +54,27 @@ Inference writes one working schema per table into `.db/schema/`:
 That schema lives under `.db/`, so deleting `.db/` discards it and the next
 command re-infers it. While a table is unpinned, `status`, `check`, and `lint`
 report `LINT_SCHEMA_UNPINNED`, because any refinement you make by hand would be
-lost. `db schema pin <table>` copies it to `schema/`, where it becomes a
+lost. `reldir schema pin <table>` copies it to `schema/`, where it becomes a
 declaration you own and keep in version control.
 
 ## Start empty instead
 
 ```sh
-db init ./data
+reldir init ./data
 ```
 
 This creates `.db/` and nothing else. Nothing is governed until a schema
-exists, so `db check` reports `0 tables, 0 rows`. That is not an error; it means
-no table is under governance yet. Add schemas with `db schema new <table>`, or
+exists, so `reldir check` reports `0 tables, 0 rows`. That is not an error; it means
+no table is under governance yet. Add schemas with `reldir schema new <table>`, or
 point inference at a directory:
 
 ```sh
-db infer users            # print a proposed schema
-db infer users --write    # write .db/schema/users.json
-db infer --write          # write a schema for every table that lacks one
+reldir infer users            # print a proposed schema
+reldir infer users --write    # write .db/schema/users.json
+reldir infer --write          # write a schema for every table that lacks one
 ```
 
-`db infer` never writes without `--write`, and never overwrites an existing
+`reldir infer` never writes without `--write`, and never overwrites an existing
 schema.
 
 ## Write a schema yourself
@@ -103,10 +103,10 @@ $ mkdir -p schema && cat > schema/books.json <<'JSON'
 }
 JSON
 
-$ db status
+$ reldir status
 VALID   revision 2   root b119300e   external changes: accepted
 
-$ db sql 'SELECT title FROM books'
+$ reldir sql 'SELECT title FROM books'
 title
 -----
 Dune
@@ -119,14 +119,14 @@ rather than nullability: a nullable column is written `"type": ["string",
 "null"]`. `x-reldir` carries what JSON Schema has no keyword for: which table this
 is, its primary key, and the order columns are written in.
 
-`db schema new <table>` scaffolds one to edit, and `db schema dialect` writes out
+`reldir schema new <table>` scaffolds one to edit, and `reldir schema dialect` writes out
 the dialect so your editor can complete it. [Schemas](schemas) documents every
 keyword.
 
 ## Query
 
 ```console
-$ db sql 'SELECT * FROM users ORDER BY id'
+$ reldir sql 'SELECT * FROM users ORDER BY id'
 id | name
 ---+------
 u1 | Alice
@@ -138,7 +138,7 @@ Output is a table on a terminal and JSON Lines when redirected, so piping into
 other tools just works:
 
 ```console
-$ db sql 'SELECT * FROM users ORDER BY id' | head -1
+$ reldir sql 'SELECT * FROM users ORDER BY id' | head -1
 {"id":"u1","name":"Alice","kind":"row"}
 ```
 
@@ -150,17 +150,17 @@ Through SQL, or through the equivalent CRUD commands. Both go through the same
 validation and transaction machinery:
 
 ```sh
-db insert users '{"id":"u3","name":"Carol"}'
-db update users u3 '{"name":"Caroline"}'
-db delete users u3
+reldir insert users '{"id":"u3","name":"Carol"}'
+reldir update users u3 '{"name":"Caroline"}'
+reldir delete users u3
 
-db sql "UPDATE users SET name = 'Rob' WHERE id = 'u2'"
+reldir sql "UPDATE users SET name = 'Rob' WHERE id = 'u2'"
 ```
 
 Every mutation prints the files it touched and the new revision:
 
 ```console
-$ db update users u1 '{"name":"Alicia"}'
+$ reldir update users u1 '{"name":"Alicia"}'
 changed 1 path(s); revision 2
   users/u1.json
 ```
@@ -174,7 +174,7 @@ happened:
 
 ```console
 $ echo '{"id":"u9","name":"Zoe"}' > users/u9.json
-$ db status
+$ reldir status
 VALID   revision 3   root 71ab3c9d   external changes: accepted
 changed:
   A users/u9.json
@@ -187,7 +187,7 @@ and nothing is adopted:
 
 ```console
 $ echo '{"id":"u8","name":4}' > users/u8.json
-$ db check
+$ reldir check
 error[TYPE_MISMATCH]: field "name" does not match type String
   --> users/u8.json:1:24
 ```

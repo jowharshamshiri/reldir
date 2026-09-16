@@ -9,7 +9,7 @@ every clone reads the same settings, so formatting and limits are reproducible.
 
 ## Defaults
 
-`db init` writes this file:
+`reldir init` writes this file:
 
 ```json
 {
@@ -99,7 +99,7 @@ not become invisible state.
 
 ## Version control
 
-`db init` writes `.db/.gitignore`:
+`reldir init` writes `.db/.gitignore`:
 
 ```text
 *
@@ -111,7 +111,7 @@ not become invisible state.
 the database. The manifest, indexes, statistics, snapshots, and transaction
 staging are not, because they are derived or ephemeral.
 
-Provenance is per-clone by default. Use `db init --track-provenance` to version
+Provenance is per-clone by default. Use `reldir init --track-provenance` to version
 history as well, which also retains the content-addressed objects it references so
 a clone keeps a complete, verifiable history.
 
