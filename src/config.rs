@@ -145,19 +145,41 @@ impl Config {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
-        let invalid = self.indentation_width == 0
-            || self.max_json_file_size == 0
-            || self.max_nesting_depth == 0
-            || self.max_result_rows == 0
-            || self.max_query_memory == 0
-            || self.max_sort_memory == 0
-            || self.max_temporary_disk == 0
-            || self.max_transaction_size == 0
-            || self.timeout_seconds == Some(0);
-        if invalid {
-            Err("indentation and resource limits must be greater than zero".into())
+        // Naming the offending key matters more here than anywhere else in the
+        // configuration: nine settings share this rule, and a message that
+        // listed them all left a reader to guess which one they had set to
+        // zero -- and told someone who passed `--timeout 0` about indentation.
+        let zero: Option<&str> = if self.indentation_width == 0 {
+            Some("indentation_width")
+        } else if self.max_json_file_size == 0 {
+            Some("max_json_file_size")
+        } else if self.max_nesting_depth == 0 {
+            Some("max_nesting_depth")
+        } else if self.max_result_rows == 0 {
+            Some("max_result_rows")
+        } else if self.max_query_memory == 0 {
+            Some("max_query_memory")
+        } else if self.max_sort_memory == 0 {
+            Some("max_sort_memory")
+        } else if self.max_temporary_disk == 0 {
+            Some("max_temporary_disk")
+        } else if self.max_transaction_size == 0 {
+            Some("max_transaction_size")
+        } else if self.timeout_seconds == Some(0) {
+            // Zero is not "no timeout" -- that is `null` -- so it would mean a
+            // query that must finish in no time at all.
+            Some("timeout_seconds")
         } else {
-            self.ignore_set().map(|_| ())
+            None
+        };
+        match zero {
+            // Only the timeout has a "none" spelling, so only it gets told
+            // about one. The others simply have no valid zero.
+            Some("timeout_seconds") => Err(
+                "timeout_seconds must be greater than zero; use null for no timeout".into(),
+            ),
+            Some(key) => Err(format!("{key} must be greater than zero")),
+            None => self.ignore_set().map(|_| ()),
         }
     }
 }
@@ -190,6 +212,30 @@ mod tests {
             );
         }
         assert!(Config::default().validate().is_ok());
+
+        // Nine settings share this rule, so the message has to say which one
+        // was set to zero. It used to name them collectively -- and told
+        // someone who passed `--timeout 0` about indentation width, which is
+        // the one thing they had not touched.
+        for (key, mutate) in [
+            ("indentation_width", (|c: &mut Config| c.indentation_width = 0) as fn(&mut Config)),
+            ("max_json_file_size", |c: &mut Config| c.max_json_file_size = 0),
+            ("max_nesting_depth", |c: &mut Config| c.max_nesting_depth = 0),
+            ("max_result_rows", |c: &mut Config| c.max_result_rows = 0),
+            ("max_query_memory", |c: &mut Config| c.max_query_memory = 0),
+            ("max_sort_memory", |c: &mut Config| c.max_sort_memory = 0),
+            ("max_temporary_disk", |c: &mut Config| c.max_temporary_disk = 0),
+            ("max_transaction_size", |c: &mut Config| c.max_transaction_size = 0),
+            ("timeout_seconds", |c: &mut Config| c.timeout_seconds = Some(0)),
+        ] {
+            let mut config = Config::default();
+            mutate(&mut config);
+            let message = config.validate().expect_err("a zero limit is rejected");
+            assert!(
+                message.contains(key),
+                "the message must name the setting at fault; {key} produced {message:?}"
+            );
+        }
     }
 
     /// Section 54: the ignore list is a glob set; an unparsable pattern is an
