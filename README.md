@@ -2,11 +2,11 @@
 
 **A relational database that lives in a directory of JSON files.**
 
-`jdb` turns an ordinary folder into a validated relational database. Your rows stay
-as human-readable JSON files that you can read, edit, `grep`, and commit to Git.
-The `db` binary governs their interpretation: it enforces schemas, checks
-referential integrity, answers SQL, and records how the state changed — without
-ever taking ownership of your bytes.
+`jdb` turns an ordinary folder into a validated relational database. Rows stay
+as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
+`db` binary governs their interpretation: it enforces schemas, checks referential
+integrity, answers SQL, and records how the state changed, without taking
+ownership of your bytes.
 
 📖 **[Documentation](https://jowharshamshiri.github.io/jdb/)**
 
@@ -30,13 +30,12 @@ $ db sql 'SELECT u.name, count(*) AS n
 
 ## Why
 
-Most databases make you choose between *readable* and *relational*. A folder of
-JSON files is transparent, diffable, and editable by any tool — but nothing stops
-a typo from silently becoming invisible state. A real database enforces integrity
-— but your data disappears into an opaque file.
+A folder of JSON files is transparent, diffable, and editable by any tool, but
+nothing stops a typo from becoming invisible state. A database enforces
+integrity, but the data is no longer readable on disk.
 
-`jdb` refuses the tradeoff. The filesystem stays authoritative and legible, and the
-binary tells you, precisely, when it stops being a valid database:
+`jdb` keeps the filesystem authoritative and legible, and reports precisely when
+it stops being a valid database:
 
 ```console
 $ echo '{"id":"019...","user_id":"nobody","title":"x"}' > posts/broken.json
@@ -49,10 +48,10 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
    = help: run `db doctor` for fix options
 ```
 
-Anything may edit the directory — you, your editor, a script, an agent, `git
+Anything may edit the directory: you, your editor, a script, an agent, or `git
 merge`. `jdb` judges the state it observes at each operation boundary. Valid
-external edits are adopted as legitimate new revisions; invalid ones are reported
-with the file, line, and column.
+external edits are adopted as new revisions. Invalid ones are reported with the
+file, line, and column.
 
 ## Install
 
@@ -61,7 +60,8 @@ cargo install --path . --locked
 ```
 
 Requires a recent stable Rust toolchain (edition 2024). The result is a single
-self-contained `db` executable — no daemon, no server, no runtime dependencies.
+self-contained `db` executable, with no daemon, server, or runtime
+dependencies.
 
 ## Try it
 
@@ -75,15 +75,15 @@ db sql 'SELECT * FROM users LIMIT 10'
 
 ## What you get
 
-- **JSON files as rows** — one object per file, in canonical, diff-friendly formatting
-- **Schemas as JSON Schema** — 2020-12 documents in a declared dialect, maintained in `.db/schema/` and pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
+- **JSON files as rows**: one object per file, in canonical, diff-friendly formatting
+- **Schemas as JSON Schema**: 2020-12 documents in a declared dialect, maintained in `.db/schema/` and pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
 - **Schema inference** that bootstraps the strictest schema your data supports
-- **SQL** — `SELECT`/`INSERT`/`UPDATE`/`DELETE`, joins, grouping, aggregates, `EXPLAIN`
-- **Referential integrity** — primary keys, unique, foreign keys, `CHECK`, cascade actions
+- **SQL**: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, joins, grouping, aggregates, `EXPLAIN`
+- **Referential integrity**: primary keys, unique, foreign keys, `CHECK`, cascade actions
 - **Transactional writes** with a crash-recoverable journal
-- **Provenance** — every accepted state transition is recorded, including external edits
+- **Provenance**: every accepted state transition is recorded, including external edits
 - **Compiler-style diagnostics** with stable error codes and exit codes
-- **Git-native** — CI-friendly validation, stable formatting, no lockfile churn
+- **Git-native**: CI-friendly validation, stable formatting, no lockfile churn
 
 ## Documentation
 
@@ -110,4 +110,4 @@ cargo clippy --all-targets
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
