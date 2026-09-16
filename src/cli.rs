@@ -5147,6 +5147,7 @@ fn doctor_fix_matches(only: Option<&str>, fix: &str) -> bool {
                 | ("LINT_FK_CANDIDATE", "FIX_ADD_FK")
                 | ("LINT_CHECK_CANDIDATE", "FIX_ADD_CHECK")
                 | ("LINT_FK_NO_INDEX", "FIX_ADD_INDEX")
+                | ("LINT_PK_NOT_GENERATED", "FIX_ADD_GENERATOR")
                 | ("LINT_NON_CANONICAL_FORMATTING", "FIX_CANONICALIZE")
         )
 }

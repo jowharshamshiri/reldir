@@ -356,7 +356,8 @@ pub fn lint(c: &Catalog, config: &Config, descriptions: bool) -> Vec<Diagnostic>
                     format!("{table} primary key has no generator"),
                 )
                 .table(table)
-                .field(s.primary_key.join(",")),
+                .field(s.primary_key.join(","))
+                .fix("FIX_ADD_GENERATOR"),
                 c,
                 table,
                 &s.primary_key[0],
@@ -466,6 +467,65 @@ mod tests {
     use serde_json::{Map, Value, json};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
+
+    /// A finding that names a remedy must carry the id of that remedy.
+    ///
+    /// `doctor --only <FIX_ID>` selects findings by their attached fix id, so a
+    /// lint that documents a fix and forgets to attach it becomes a fix the
+    /// plan advertises and `--fix` silently declines to apply.
+    /// `LINT_PK_NOT_GENERATED` did exactly that: it was documented as the
+    /// source of `FIX_ADD_GENERATOR`, attached nothing, and so could never be
+    /// selected by the id anyone would read off the plan.
+    ///
+    /// The documentation is the contract, so it is the reference: every fix the
+    /// fix table attributes to a lint must be attached where that lint is
+    /// raised.
+    #[test]
+    fn test1146_every_documented_fix_is_attached_where_its_finding_is_raised() {
+        let documentation = std::fs::read_to_string("docs/validation.md")
+            .expect("the validation documentation is part of the repository");
+        let source = std::fs::read_to_string("src/lint.rs").expect("this file is readable");
+
+        // Rows read `| `FIX_ID` | class | `LINT_CODE` |`, which is the only
+        // place the pairing is stated for a reader.
+        let mut promised = Vec::new();
+        for line in documentation.lines() {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            if cells.len() < 5 || !cells[1].starts_with("`FIX_") {
+                continue;
+            }
+            let fix = cells[1].trim_matches('`');
+            // The source cell may carry a qualifier after the code -- "…, opt-in
+            // only" -- so take the first backtick-quoted token rather than the
+            // whole cell.
+            let from = cells[3]
+                .split('`')
+                .nth(1)
+                .unwrap_or_default();
+            if from.starts_with("LINT_") {
+                promised.push((fix.to_string(), from.to_string()));
+            }
+        }
+        assert!(
+            promised.len() >= 8,
+            "the fix table should pair most fixes with a lint; found {}",
+            promised.len()
+        );
+
+        for (fix, code) in promised {
+            // The finding is raised with its code, then chained with the
+            // attributes that describe it; the fix id must be among them.
+            let raised = source
+                .find(&format!("\"{code}\","))
+                .unwrap_or_else(|| panic!("{code} is documented but never raised"));
+            let following = &source[raised..(raised + 700).min(source.len())];
+            assert!(
+                following.contains(&format!(".fix(\"{fix}\")")),
+                "{code} is documented as the source of {fix} but does not attach it, \
+                 so `doctor --only {fix}` would select nothing"
+            );
+        }
+    }
 
     fn column(kind: ColumnType, nullable: bool) -> Column {
         Column {

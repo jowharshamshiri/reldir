@@ -711,6 +711,155 @@ fn test0076_schema_changes_are_reported_semantically() {
     );
 }
 
+/// A fix doctor lists is a fix doctor applies.
+///
+/// `FIX_PIN_SCHEMA` was advertised by the plan, documented in the fix table,
+/// and implemented by nothing: `--fix` printed it and then reported no
+/// applicable automatic fixes. A plan that names a remedy it will not perform
+/// is worse than one that stays silent, because the reader acts on it.
+///
+/// Pinning copies the working schema into `schema/`, so the fix can only ever
+/// create a declaration. Replacing one discards something a person wrote and
+/// stays an explicit `db schema pin --overwrite`.
+#[test]
+fn test0077_doctor_pins_an_unpinned_schema_and_never_replaces_a_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("t")).unwrap();
+    fs::create_dir(root.join("u")).unwrap();
+    fs::write(root.join("t/a.json"), "{\"id\":\"a\"}\n").unwrap();
+    fs::write(root.join("u/b.json"), "{\"id\":\"b\"}\n").unwrap();
+    db().args(["--format", "table", "init", root.to_str().unwrap(), "--adopt"])
+        .assert()
+        .success();
+
+    // `u` is pinned by hand and then edited, so the declaration says something
+    // the working copy does not.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "schema",
+        "pin",
+        "u",
+    ])
+    .assert()
+    .success();
+    let pin = root.join("schema/u.json");
+    let mut declared: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pin).unwrap()).unwrap();
+    declared["x-jdb"]["indexes"] = serde_json::json!([["id"]]);
+    fs::write(&pin, serde_json::to_vec_pretty(&declared).unwrap()).unwrap();
+
+    // The plan offers the fix for the table that has no pin. The plan is the
+    // command's answer, so it goes to stdout; lint findings are notices and go
+    // to stderr, which is why the two assertions here read different streams.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "doctor"])
+        .assert()
+        .stdout(predicate::str::contains("FIX_PIN_SCHEMA"));
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "doctor",
+        "--fix",
+        "--yes",
+        "--no-snapshot",
+        "--only",
+        "FIX_PIN_SCHEMA",
+    ])
+    .assert()
+    .success();
+
+    // The unpinned table gained a declaration, byte-identical to what it
+    // derived, so pinning cannot itself change what the database enforces.
+    assert_eq!(
+        fs::read(root.join("schema/t.json")).unwrap(),
+        fs::read(root.join(".db/schema/t.json")).unwrap(),
+        "the pin must be the working schema, not a re-rendering of it"
+    );
+
+    // The declaration someone wrote is untouched.
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pin).unwrap()).unwrap();
+    assert_eq!(
+        after["x-jdb"]["indexes"],
+        serde_json::json!([["id"]]),
+        "an existing pin is a declaration doctor must not overwrite"
+    );
+
+    // And the finding it answered is gone.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "lint"])
+        .assert()
+        .stderr(predicate::str::contains("LINT_SCHEMA_UNPINNED").not());
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// A fix selected by the id the plan prints is the fix that runs.
+///
+/// `doctor` filters findings by their attached fix id, so `--only
+/// FIX_ADD_GENERATOR` reached nothing while a bare `--fix` applied it: the
+/// finding named the remedy in the plan and carried no id to select it by. A
+/// reader who copies an id off the plan must get the fix that id names.
+#[test]
+fn test0078_a_fix_selected_by_its_printed_id_is_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("t")).unwrap();
+    for i in 0..25 {
+        let id = format!("0192f0{i:02}-0000-7000-8000-000000000000");
+        fs::write(
+            root.join(format!("t/{id}.json")),
+            format!("{{\"id\":\"{id}\"}}\n"),
+        )
+        .unwrap();
+    }
+    db().args(["--format", "table", "init", root.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::create_dir_all(root.join("schema")).unwrap();
+    fs::write(
+        root.join("schema/t.json"),
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string","format":"uuid"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
+    )
+    .unwrap();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "status"])
+        .assert()
+        .success();
+
+    // The plan names the remedy, so that id is what a reader will pass.
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "doctor"])
+        .assert()
+        .stdout(predicate::str::contains("FIX_ADD_GENERATOR"));
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "doctor",
+        "--fix",
+        "--yes",
+        "--no-snapshot",
+        "--only",
+        "FIX_ADD_GENERATOR",
+    ])
+    .assert()
+    .success();
+
+    let schema: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".db/schema/t.json")).unwrap()).unwrap();
+    assert_eq!(
+        schema["x-jdb"]["generated"]["id"], "uuid",
+        "the fix named by the plan must be the fix that ran"
+    );
+}
+
 #[test]
 fn test0013_schema_errors_have_specific_codes_and_locations() {
     let dir = tempfile::tempdir().unwrap();

@@ -152,13 +152,19 @@ pub fn plan(db: &Database) -> Vec<Fix> {
             | "LINT_FK_CANDIDATE"
             | "LINT_CHECK_CANDIDATE"
             | "LINT_PK_NOT_GENERATED" => {
+                // Named exhaustively rather than through a wildcard: a
+                // seventh code added to the arm above would otherwise be
+                // labelled FIX_ADD_GENERATOR and offer the wrong remedy.
                 let id = match d.code.as_str() {
                     "LINT_WIDER_TYPE" => "FIX_NARROW_TYPE",
                     "LINT_ENUM_CANDIDATE" => "FIX_ADD_ENUM",
                     "LINT_UNIQUE_CANDIDATE" => "FIX_ADD_UNIQUE",
                     "LINT_FK_CANDIDATE" => "FIX_ADD_FK",
                     "LINT_CHECK_CANDIDATE" => "FIX_ADD_CHECK",
-                    _ => "FIX_ADD_GENERATOR",
+                    "LINT_PK_NOT_GENERATED" => "FIX_ADD_GENERATOR",
+                    other => unreachable!(
+                        "{other} reaches the schema-fix arm without a fix id; add one"
+                    ),
                 };
                 out.push(Fix {
                     id: id.into(),
@@ -360,8 +366,42 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
     Ok(out)
 }
 
+/// Promote unpinned working schemas into declarations.
+///
+/// `LINT_SCHEMA_UNPINNED` says a table's schema exists only under `.db/`, where
+/// deleting the directory discards any refinement inference cannot re-derive.
+/// The remedy is to copy it to `schema/`, which is what `db schema pin` does --
+/// so the fix performs that copy rather than editing the schema, which is why
+/// it lives here and not in the lint-driven rewriting above.
+///
+/// A table that already has a pin never raises the finding, so this can only
+/// ever create a declaration, never replace one. Replacing a pin discards
+/// something a person wrote and stays an explicit `db schema pin --overwrite`.
+fn pin_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> {
+    let mut out = vec![];
+    for d in lint::lint(&db.catalog, &db.config, false) {
+        if d.code != "LINT_SCHEMA_UNPINNED"
+            || !only.is_none_or(|x| x == d.code || d.fixes.iter().any(|f| f == x))
+        {
+            continue;
+        }
+        let Some(table) = d.table.as_ref() else {
+            continue;
+        };
+        let Some(schema) = db.catalog.schemas.get(table) else {
+            continue;
+        };
+        out.push(Change::Write {
+            path: PathBuf::from(crate::schema_store::pin_relative(table)),
+            bytes: crate::schema_store::canonical_bytes(schema, db.config.indentation_width)?,
+        });
+    }
+    Ok(out)
+}
+
 pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Result<Vec<Change>> {
     let mut out = schema_changes(db, only)?;
+    out.extend(pin_changes(db, only)?);
     if allow_data && only == Some("FIX_CANONICALIZE") {
         for (table, rows) in &db.catalog.rows {
             let s = &db.catalog.schemas[table];
