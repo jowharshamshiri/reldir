@@ -91,7 +91,7 @@ db sql 'SELECT * FROM users LIMIT 10'
 |---|---|
 | [Getting started](https://jowharshamshiri.github.io/jdb/getting-started) | Adopt a directory and run your first queries |
 | [Concepts](https://jowharshamshiri.github.io/jdb/concepts) | The model: validity, external edits, provenance |
-| [Schemas](https://jowharshamshiri.github.io/jdb/schemas) | The JSON Schema dialect, types, constraints |
+| [Schemas](https://jowharshamshiri.github.io/jdb/schemas) | The JSON Schema dialect, writing one by hand, types, constraints |
 | [CLI reference](https://jowharshamshiri.github.io/jdb/cli) | Every command and flag |
 | [SQL](https://jowharshamshiri.github.io/jdb/sql) | The supported subset |
 | [Validation](https://jowharshamshiri.github.io/jdb/validation) | `check`, `lint`, and `doctor` |

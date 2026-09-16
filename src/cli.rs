@@ -337,6 +337,11 @@ enum SchemaCommand {
         after_help = "Example: db schema validate"
     )]
     Validate,
+    #[command(
+        about = "Print the JSON Schema dialect jdb accepts",
+        after_help = "Example: db schema dialect > jdb-1.json"
+    )]
+    Dialect,
 }
 #[derive(Subcommand, Clone)]
 enum SnapshotCommand {
@@ -579,6 +584,11 @@ pub fn run(cli: Cli) -> Result<i32> {
         ),
         Command::Inspect { path } => cmd_inspect(path.or(cli.db), format),
         Command::Completions { shell } => completions(&shell),
+        // The dialect describes what this binary accepts, not what any
+        // directory contains, so it answers before a database is resolved --
+        // otherwise `db schema dialect > dialect.json`, which the
+        // documentation tells people to run, captures a status record instead.
+        Command::Schema(SchemaCommand::Dialect) => dialect(format),
         Command::Infer {
             table,
             write,
@@ -2295,6 +2305,8 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
             Ok(0)
         }
         SchemaCommand::Validate => check(db, format, false),
+        // Answered before a database is resolved; see the early dispatch.
+        SchemaCommand::Dialect => unreachable!(),
         SchemaCommand::New { table } => {
             if !crate::schema::valid_name(&table) {
                 return Err(DbError::new(
@@ -5417,6 +5429,25 @@ fn changes_from_snapshot(db: &Database, src: &Path) -> Result<Vec<Change>> {
     }
     Ok(changes)
 }
+/// Print the JSON Schema dialect this binary accepts.
+///
+/// The `$schema` URI in every schema names the dialect; nothing fetches it, and
+/// nothing is served there. Emitting the bundled document is what lets an editor
+/// complete a schema written by hand, so it must work in any directory --
+/// including one that is not a database yet, which is exactly where someone
+/// sets their editor up.
+fn dialect(_format: Format) -> Result<i32> {
+    // Printed verbatim in every format. The record framing the other commands
+    // use would add a `kind` key, and this document's identity is its content:
+    // an editor pointed at a copy carrying an extra top-level property would
+    // treat that property as part of the dialect.
+    println!(
+        "{}",
+        serde_json::to_string_pretty(crate::schema::meta::meta_schema()).unwrap()
+    );
+    Ok(0)
+}
+
 fn completions(shell: &str) -> Result<i32> {
     let shell: clap_complete::Shell = shell
         .parse()

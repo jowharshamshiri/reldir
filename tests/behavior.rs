@@ -860,6 +860,74 @@ fn test0078_a_fix_selected_by_its_printed_id_is_applied() {
     );
 }
 
+/// The documentation tells a reader to run `db schema dialect > file` before
+/// they have a database, so that is where it has to work.
+///
+/// The dialect describes what the binary accepts, not what a directory
+/// contains. Dispatching it like an ordinary schema command meant an empty
+/// directory answered with a status record, and anyone following the setup
+/// instructions captured `no tables, no data` into the file they pointed their
+/// editor at.
+#[test]
+fn test0079_the_dialect_is_available_before_a_database_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // The documented instruction redirects to a file, and redirecting selects
+    // `jsonl` by default -- which is how the record framing used to add a
+    // `kind` key to the document an editor would then read as dialect content.
+    // So every format must yield the same document, verbatim.
+    let mut rendered = Vec::new();
+    for format in ["table", "json", "jsonl"] {
+        let printed = db()
+            .args(["--db", root.to_str().unwrap(), "--format", format, "schema", "dialect"])
+            .assert()
+            .success();
+        let text = String::from_utf8(printed.get_output().stdout.clone()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("--format {format} must print one JSON document: {error}"));
+        assert!(
+            parsed.get("kind").is_none(),
+            "--format {format} added a wrapper key to the dialect: {}",
+            &text[..text.len().min(120)]
+        );
+        rendered.push(parsed);
+    }
+    assert!(
+        rendered.windows(2).all(|pair| pair[0] == pair[1]),
+        "the dialect is one document; it must not vary by output format"
+    );
+    let document = rendered.remove(0);
+
+    // It is the meta-schema, not a report about the directory.
+    assert_eq!(document["$id"], "https://jdb.dev/schema/jdb-1");
+    assert_eq!(
+        document["$schema"], "https://json-schema.org/draft/2020-12/schema",
+        "the dialect is itself a 2020-12 document"
+    );
+    assert_eq!(
+        document["$vocabulary"]["https://jdb.dev/vocab/jdb-1"],
+        serde_json::json!(true),
+        "it must declare jdb's vocabulary as required"
+    );
+    assert!(
+        !root.join(".db").exists(),
+        "asking what the binary accepts must not establish a database"
+    );
+
+    // And it describes the schemas jdb actually writes: the document the
+    // dialect validates is the one `encode` produces.
+    let validator = jdb::schema::meta::validator().expect("the dialect compiles");
+    let schema: serde_json::Value = serde_json::from_str(
+        r#"{"$schema":"https://jdb.dev/schema/jdb-1","type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false,"x-jdb":{"table":"t","primaryKey":["id"],"columnOrder":["id"]}}"#,
+    )
+    .unwrap();
+    assert!(
+        validator.is_valid(&schema),
+        "the emitted dialect must accept a schema jdb would write"
+    );
+}
+
 #[test]
 fn test0013_schema_errors_have_specific_codes_and_locations() {
     let dir = tempfile::tempdir().unwrap();
