@@ -179,7 +179,7 @@ impl Database {
                     "TRANSACTION_INCOMPLETE",
                     "pending transaction requires recovery; no-write mode left it untouched",
                 )
-                .help("run `db recover` with write access"),
+                .help("run `reldir recover` with write access"),
             );
         }
         let mut manifest_rebuild = false;
@@ -291,7 +291,7 @@ pub fn validate_format(root: &Path) -> Result<()> {
                     format!("{} has no .db metadata", root.display()),
                 )
                 .help(format!(
-                    "run `db init {}` or `db init {} --adopt`",
+                    "run `reldir init {}` or `reldir init {} --adopt`",
                     root.display(),
                     root.display()
                 )),

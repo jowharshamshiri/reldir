@@ -290,7 +290,7 @@ pub fn records(rows: &[Map<String, Value>], format: Format) -> Result<()> {
         Format::Table => table(rows),
         Format::Sqlite => {
             return Err(DbError::usage(
-                "sqlite output requires `db export --out <path>`",
+                "sqlite output requires `reldir export --out <path>`",
             ));
         }
     }

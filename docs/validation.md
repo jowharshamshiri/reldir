@@ -16,7 +16,7 @@ Three commands, three jobs:
 
 ```sh
 reldir check                # full validation
-db --readonly check     # validate, mutate no data
+reldir --readonly check     # validate, mutate no data
 reldir check --strict       # lint findings also fail
 ```
 

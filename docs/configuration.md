@@ -63,10 +63,10 @@ Every limit can be overridden for a single command, which is useful for one-off
 imports and for exploring a database you do not control:
 
 ```sh
-db --max-result-rows 50 sql 'SELECT * FROM events'
-db --max-nesting-depth 512 check
-db --max-json-file-size 100000000 import blobs --from big.jsonl
-db --timeout 30 sql 'SELECT ...'
+reldir --max-result-rows 50 sql 'SELECT * FROM events'
+reldir --max-nesting-depth 512 check
+reldir --max-json-file-size 100000000 import blobs --from big.jsonl
+reldir --timeout 30 sql 'SELECT ...'
 ```
 
 | Flag |
@@ -122,8 +122,8 @@ transition and rebuilds derived state. This works with nothing in `.db/` beyond
 For CI:
 
 ```sh
-db --readonly check --format json     # exits 2 on INVALID
-db --readonly check --strict          # also exits 7 on lint findings
+reldir --readonly check --format json     # exits 2 on INVALID
+reldir --readonly check --strict          # also exits 7 on lint findings
 ```
 
 Merge conflicts are a Git concern. `reldir` reports the result as `INVALID` with

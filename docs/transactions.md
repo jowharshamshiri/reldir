@@ -73,7 +73,7 @@ The model is multiple concurrent readers, one binary-managed writer.
 nothing: no derived state, no provenance. Any number may run at once.
 
 ```sh
-db --readonly sql 'SELECT * FROM users'
+reldir --readonly sql 'SELECT * FROM users'
 ```
 
 Read-only mode is selected automatically when `.db/` is not writable, and

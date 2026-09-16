@@ -9,7 +9,7 @@
 //!
 //! The pin lives in `schema/<table>.json`. It is optional, and it is the user's
 //! declaration rather than reldir's derivation: a schema they wrote, or one they
-//! promoted from inference with `db schema pin`. A pinned table's working
+//! promoted from inference with `reldir schema pin`. A pinned table's working
 //! schema is copied from the pin instead of inferred from data, so pinning is
 //! how a refinement inference could never re-derive -- an enum, a check, a
 //! foreign key whose column name breaks the convention -- survives `rm -rf

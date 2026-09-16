@@ -105,7 +105,7 @@ impl Cli {
 enum Command {
     #[command(
         about = "Initialize a database",
-        after_help = "Example: db init ./data --adopt"
+        after_help = "Example: reldir init ./data --adopt"
     )]
     Init {
         path: Option<PathBuf>,
@@ -114,16 +114,16 @@ enum Command {
         #[arg(long)]
         track_provenance: bool,
     },
-    #[command(about = "Show validity and changes", after_help = "Example: db status")]
+    #[command(about = "Show validity and changes", after_help = "Example: reldir status")]
     Status,
     #[command(
         about = "Inspect a directory without adoption",
-        after_help = "Example: db inspect ./data"
+        after_help = "Example: reldir inspect ./data"
     )]
     Inspect { path: Option<PathBuf> },
     #[command(
         about = "Fully validate the database",
-        after_help = "Example: db --readonly check"
+        after_help = "Example: reldir --readonly check"
     )]
     Check {
         #[arg(long)]
@@ -131,7 +131,7 @@ enum Command {
     },
     #[command(
         about = "Infer explicit schemas",
-        after_help = "Example: db infer users --write"
+        after_help = "Example: reldir infer users --write"
     )]
     Infer {
         table: Option<String>,
@@ -146,7 +146,7 @@ enum Command {
     },
     #[command(
         about = "Report schema strengthening opportunities",
-        after_help = "Example: db lint --strict"
+        after_help = "Example: reldir lint --strict"
     )]
     Lint {
         table: Option<String>,
@@ -157,7 +157,7 @@ enum Command {
     },
     #[command(
         about = "Diagnose and repair",
-        after_help = "Example: db doctor --fix --yes"
+        after_help = "Example: reldir doctor --fix --yes"
     )]
     Doctor {
         #[arg(long)]
@@ -171,18 +171,18 @@ enum Command {
         #[arg(long)]
         no_snapshot: bool,
     },
-    #[command(about = "List tables", after_help = "Example: db tables")]
+    #[command(about = "List tables", after_help = "Example: reldir tables")]
     Tables,
-    #[command(about = "Describe a table", after_help = "Example: db describe users")]
+    #[command(about = "Describe a table", after_help = "Example: reldir describe users")]
     Describe { table: String },
     #[command(
         about = "Get a row by primary key",
-        after_help = "Example: db get users abc"
+        after_help = "Example: reldir get users abc"
     )]
     Get { table: String, key: String },
     #[command(
         about = "List table rows",
-        after_help = "Example: db list users --limit 10"
+        after_help = "Example: reldir list users --limit 10"
     )]
     List {
         table: String,
@@ -195,7 +195,7 @@ enum Command {
     },
     #[command(
         about = "Insert rows",
-        after_help = "Example: db insert users '{\"id\":\"abc\"}'"
+        after_help = "Example: reldir insert users '{\"id\":\"abc\"}'"
     )]
     Insert {
         table: String,
@@ -205,18 +205,18 @@ enum Command {
     },
     #[command(
         about = "Patch one row",
-        after_help = "Example: db update users abc '{\"name\":\"Alice\"}'"
+        after_help = "Example: reldir update users abc '{\"name\":\"Alice\"}'"
     )]
     Update {
         table: String,
         key: String,
         patch: String,
     },
-    #[command(about = "Delete one row", after_help = "Example: db delete users abc")]
+    #[command(about = "Delete one row", after_help = "Example: reldir delete users abc")]
     Delete { table: String, key: String },
     #[command(
         about = "Execute SQL",
-        after_help = "Example: db sql 'SELECT * FROM users'"
+        after_help = "Example: reldir sql 'SELECT * FROM users'"
     )]
     Sql {
         sql: String,
@@ -229,18 +229,18 @@ enum Command {
     },
     #[command(
         about = "Explain SQL",
-        after_help = "Example: db explain 'SELECT * FROM users'"
+        after_help = "Example: reldir explain 'SELECT * FROM users'"
     )]
     Explain { sql: String },
     #[command(
         subcommand,
         about = "Manage schemas",
-        after_help = "Example: db schema show users"
+        after_help = "Example: reldir schema show users"
     )]
     Schema(SchemaCommand),
     #[command(
         about = "Export a table",
-        after_help = "Example: db export users --format csv --out users.csv"
+        after_help = "Example: reldir export users --format csv --out users.csv"
     )]
     Export {
         table: String,
@@ -249,51 +249,51 @@ enum Command {
     },
     #[command(
         about = "Import rows transactionally",
-        after_help = "Example: db import users --from users.jsonl"
+        after_help = "Example: reldir import users --from users.jsonl"
     )]
     Import {
         table: String,
         #[arg(long)]
         from: PathBuf,
     },
-    #[command(about = "Show semantic changes", after_help = "Example: db diff")]
+    #[command(about = "Show semantic changes", after_help = "Example: reldir diff")]
     Diff {
         args: Vec<String>,
         #[arg(long)]
         schema: bool,
     },
-    #[command(about = "Show revision history", after_help = "Example: db log")]
+    #[command(about = "Show revision history", after_help = "Example: reldir log")]
     Log,
-    #[command(about = "Show a revision", after_help = "Example: db show 1")]
+    #[command(about = "Show a revision", after_help = "Example: reldir show 1")]
     Show { revision: u64 },
     #[command(
         subcommand,
         about = "Manage snapshots",
-        after_help = "Example: db snapshot list"
+        after_help = "Example: reldir snapshot list"
     )]
     Snapshot(SnapshotCommand),
     #[command(
         about = "Recover interrupted transactions",
-        after_help = "Example: db recover"
+        after_help = "Example: reldir recover"
     )]
     Recover,
-    #[command(about = "Rebuild indexes", after_help = "Example: db reindex")]
+    #[command(about = "Rebuild indexes", after_help = "Example: reldir reindex")]
     Reindex,
-    #[command(about = "Rebuild query statistics", after_help = "Example: db analyze")]
+    #[command(about = "Rebuild query statistics", after_help = "Example: reldir analyze")]
     Analyze,
     #[command(
         about = "Collect unneeded internal state",
-        after_help = "Example: db gc --dry-run"
+        after_help = "Example: reldir gc --dry-run"
     )]
     Gc,
     #[command(
         about = "Upgrade the on-disk format",
-        after_help = "Example: db upgrade-format"
+        after_help = "Example: reldir upgrade-format"
     )]
     UpgradeFormat,
     #[command(
         about = "Run an interactive SQL shell",
-        after_help = "Example: db shell"
+        after_help = "Example: reldir shell"
     )]
     Shell,
     #[command(
@@ -304,22 +304,22 @@ enum Command {
     #[command(
         subcommand,
         about = "Apply schema migrations",
-        after_help = "Example: db migrate apply migration.json"
+        after_help = "Example: reldir migrate apply migration.json"
     )]
     Migrate(MigrateCommand),
 }
 #[derive(Subcommand, Clone)]
 enum SchemaCommand {
-    #[command(about = "Show a schema", after_help = "Example: db schema show users")]
+    #[command(about = "Show a schema", after_help = "Example: reldir schema show users")]
     Show { table: String },
     #[command(
         about = "Create a minimal schema",
-        after_help = "Example: db schema new users"
+        after_help = "Example: reldir schema new users"
     )]
     New { table: String },
     #[command(
         about = "Pin the working schema so it survives .db being rebuilt",
-        after_help = "Example: db schema pin users"
+        after_help = "Example: reldir schema pin users"
     )]
     Pin {
         table: String,
@@ -329,45 +329,45 @@ enum SchemaCommand {
     },
     #[command(
         about = "Rebuild the working schema from its pin",
-        after_help = "Example: db schema restore users"
+        after_help = "Example: reldir schema restore users"
     )]
     Restore { table: String },
     #[command(
         about = "Validate all schemas",
-        after_help = "Example: db schema validate"
+        after_help = "Example: reldir schema validate"
     )]
     Validate,
     #[command(
         about = "Print the JSON Schema dialect reldir accepts",
-        after_help = "Example: db schema dialect > reldir-1.json"
+        after_help = "Example: reldir schema dialect > reldir-1.json"
     )]
     Dialect,
 }
 #[derive(Subcommand, Clone)]
 enum SnapshotCommand {
-    #[command(after_help = "Example: db snapshot create before-import")]
+    #[command(after_help = "Example: reldir snapshot create before-import")]
     Create { name: String },
-    #[command(after_help = "Example: db snapshot list")]
+    #[command(after_help = "Example: reldir snapshot list")]
     List,
-    #[command(after_help = "Example: db snapshot restore before-import --yes")]
+    #[command(after_help = "Example: reldir snapshot restore before-import --yes")]
     Restore { name: String },
-    #[command(after_help = "Example: db snapshot delete before-import --yes")]
+    #[command(after_help = "Example: reldir snapshot delete before-import --yes")]
     Delete { name: String },
 }
 #[derive(Subcommand, Clone)]
 enum MigrateCommand {
-    #[command(after_help = "Example: db migrate add-table users --from users-schema.json")]
+    #[command(after_help = "Example: reldir migrate add-table users --from users-schema.json")]
     AddTable {
         table: String,
         #[arg(long)]
         from: PathBuf,
     },
-    #[command(after_help = "Example: db migrate drop-table users --dry-run")]
+    #[command(after_help = "Example: reldir migrate drop-table users --dry-run")]
     DropTable { table: String },
-    #[command(after_help = "Example: db migrate rename-table users people")]
+    #[command(after_help = "Example: reldir migrate rename-table users people")]
     RenameTable { table: String, new: String },
     #[command(
-        after_help = "Example: db migrate add-column users active --type bool --default true"
+        after_help = "Example: reldir migrate add-column users active --type bool --default true"
     )]
     AddColumn {
         table: String,
@@ -379,15 +379,15 @@ enum MigrateCommand {
         #[arg(long)]
         default: Option<String>,
     },
-    #[command(after_help = "Example: db migrate drop-column users legacy_name")]
+    #[command(after_help = "Example: reldir migrate drop-column users legacy_name")]
     DropColumn { table: String, column: String },
-    #[command(after_help = "Example: db migrate rename-column users name display_name")]
+    #[command(after_help = "Example: reldir migrate rename-column users name display_name")]
     RenameColumn {
         table: String,
         column: String,
         new: String,
     },
-    #[command(after_help = "Example: db migrate change-type users score float")]
+    #[command(after_help = "Example: reldir migrate change-type users score float")]
     ChangeType {
         table: String,
         column: String,
@@ -396,24 +396,24 @@ enum MigrateCommand {
         using: Option<String>,
     },
     #[command(
-        after_help = "Example: db migrate add-constraint users '{\"kind\":\"unique\",\"columns\":[\"email\"]}'"
+        after_help = "Example: reldir migrate add-constraint users '{\"kind\":\"unique\",\"columns\":[\"email\"]}'"
     )]
     AddConstraint { table: String, definition: String },
-    #[command(after_help = "Example: db migrate drop-constraint users unique_email")]
+    #[command(after_help = "Example: reldir migrate drop-constraint users unique_email")]
     DropConstraint { table: String, name: String },
-    #[command(after_help = "Example: db migrate add-index users email")]
+    #[command(after_help = "Example: reldir migrate add-index users email")]
     AddIndex {
         table: String,
         #[arg(value_delimiter = ',')]
         columns: Vec<String>,
     },
-    #[command(after_help = "Example: db migrate drop-index users email")]
+    #[command(after_help = "Example: reldir migrate drop-index users email")]
     DropIndex {
         table: String,
         #[arg(value_delimiter = ',')]
         columns: Vec<String>,
     },
-    #[command(after_help = "Example: db migrate apply migration.json")]
+    #[command(after_help = "Example: reldir migrate apply migration.json")]
     Apply { file: PathBuf },
 }
 
@@ -586,7 +586,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Completions { shell } => completions(&shell),
         // The dialect describes what this binary accepts, not what any
         // directory contains, so it answers before a database is resolved --
-        // otherwise `db schema dialect > dialect.json`, which the
+        // otherwise `reldir schema dialect > dialect.json`, which the
         // documentation tells people to run, captures a status record instead.
         Command::Schema(SchemaCommand::Dialect) => dialect(format),
         Command::Infer {
@@ -1465,7 +1465,7 @@ fn status(db: &Database, format: Format) -> Result<i32> {
     if !db.diagnostics.is_empty() {
         output::diagnostics(&db.diagnostics, format);
         eprintln!(
-            "INVALID   revision {}   ({} external changes, {} violations)\nrun `db doctor` for fix options",
+            "INVALID   revision {}   ({} external changes, {} violations)\nrun `reldir doctor` for fix options",
             db.manifest.as_ref().map_or(0, |m| m.revision),
             db.external_changes.len(),
             db.diagnostics.len()
@@ -1498,7 +1498,7 @@ fn status(db: &Database, format: Format) -> Result<i32> {
         let findings = crate::lint::lint(&db.catalog, &db.config, false);
         if !findings.is_empty() {
             output::notice(&format!(
-                "lint: {} findings (run `db lint`)",
+                "lint: {} findings (run `reldir lint`)",
                 findings.len()
             ));
         }
@@ -1739,7 +1739,7 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
                 format,
                 snapshot,
                 &format!(
-                    "created snapshot {name}; restore with `db snapshot restore {name} --yes`"
+                    "created snapshot {name}; restore with `reldir snapshot restore {name} --yes`"
                 ),
             )?;
         } else {
@@ -1825,7 +1825,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
                 .at(crate::schema_store::pin_relative(&t))
                 .table(&t)
                 .help(format!(
-                    "edit schema/{t}.json and run `db schema restore {t}`, \
+                    "edit schema/{t}.json and run `reldir schema restore {t}`, \
                      or unpin by deleting it"
                 )),
                 1,
@@ -2438,7 +2438,7 @@ fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> R
                         format!("{table} has no pinned schema to restore from"),
                     )
                     .table(&table)
-                    .help(format!("run `db schema pin {table}` to create one")),
+                    .help(format!("run `reldir schema pin {table}` to create one")),
                     1,
                 ));
             };
@@ -3040,7 +3040,7 @@ fn as_dialect(definition: &Value) -> Value {
 /// because identity is taken over it. Printing it verbatim would show a reader
 /// a shape that appears in no file they can edit -- snake_case keys and columns
 /// as pairs -- so the change is reported in the terms the schema is written in
-/// instead. `db diff` promises semantic changes, and for a schema the semantics
+/// instead. `reldir diff` promises semantic changes, and for a schema the semantics
 /// are its columns and constraints, not its serialization.
 fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> {
     let mut out = vec![];
@@ -5716,7 +5716,7 @@ mod tests {
 
     /// Section 29: a key given on the command line is decoded against the type
     /// the schema declares for it, not against whatever JSON syntax it happens
-    /// to resemble. `db get things 123` must find the row whose key is the
+    /// to resemble. `reldir get things 123` must find the row whose key is the
     /// string `"123"` when that is what the column says, and the row whose key
     /// is the number `123` when it says that instead -- without the user
     /// quoting anything to defeat their shell.

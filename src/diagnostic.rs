@@ -219,7 +219,7 @@ mod tests {
             .observed("\"missing\"")
             .fix("FIX_ORPHAN_SET_NULL")
             .fix("FIX_ORPHAN_DELETE_ROW")
-            .help("run `db doctor`");
+            .help("run `reldir doctor`");
         let value = serde_json::to_value(&diagnostic).unwrap();
 
         assert_eq!(value["kind"], "diagnostic");

@@ -149,7 +149,7 @@ which is what an editor needs to complete a schema you write by hand.
 ```sh
 reldir status                   # validity, revision, external changes
 reldir check                    # full validation
-db --readonly check         # validate and mutate no data
+reldir --readonly check         # validate and mutate no data
 reldir check --strict           # lint findings also fail
 reldir lint                     # how schemas could be stronger
 reldir lint --strict            # exit non-zero on any finding

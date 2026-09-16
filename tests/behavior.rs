@@ -628,7 +628,7 @@ fn test0075_migrations_carry_schemas_in_the_dialect_and_refuse_any_other() {
 /// schema's identity is taken over. Printing it verbatim would show a reader a
 /// shape that appears in no file they can edit -- snake_case keys, columns as
 /// [name, definition] pairs -- so `diff` reports what changed about the table
-/// instead. `db diff` promises semantic changes; for a schema those are its
+/// instead. `reldir diff` promises semantic changes; for a schema those are its
 /// columns and constraints, not its serialization.
 #[test]
 fn test0076_schema_changes_are_reported_semantically() {
@@ -720,7 +720,7 @@ fn test0076_schema_changes_are_reported_semantically() {
 ///
 /// Pinning copies the working schema into `schema/`, so the fix can only ever
 /// create a declaration. Replacing one discards something a person wrote and
-/// stays an explicit `db schema pin --overwrite`.
+/// stays an explicit `reldir schema pin --overwrite`.
 #[test]
 fn test0077_doctor_pins_an_unpinned_schema_and_never_replaces_a_declaration() {
     let dir = tempfile::tempdir().unwrap();
@@ -860,7 +860,7 @@ fn test0078_a_fix_selected_by_its_printed_id_is_applied() {
     );
 }
 
-/// The documentation tells a reader to run `db schema dialect > file` before
+/// The documentation tells a reader to run `reldir schema dialect > file` before
 /// they have a database, so that is where it has to work.
 ///
 /// The dialect describes what the binary accepts, not what a directory
@@ -934,7 +934,7 @@ fn test0013_schema_errors_have_specific_codes_and_locations() {
     db().args(["init", dir.path().to_str().unwrap()])
         .assert()
         .success();
-    // A hand-written schema is a pin, and `db init` creates no pin directory.
+    // A hand-written schema is a pin, and `reldir init` creates no pin directory.
     fs::create_dir(dir.path().join("schema")).unwrap();
     pin(
         dir.path(),
@@ -1488,8 +1488,8 @@ fn test0026_internal_symlinks_are_rejected_without_following_them() {
 
 #[test]
 fn test0027_documented_flag_names_match_the_specified_cli_contract() {
-    // Section 29 specifies `db list users [--where <expr>] [--order <col>]
-    // [--limit n]`, and Section 39 specifies `db migrate add-column <t> <c>
+    // Section 29 specifies `reldir list users [--where <expr>] [--order <col>]
+    // [--limit n]`, and Section 39 specifies `reldir migrate add-column <t> <c>
     // --type <type>`. These long flags are part of the CLI contract, so a
     // derive attribute that silently renames one is a defect even though the
     // underlying operation still works under the wrong name.
@@ -2066,7 +2066,7 @@ fn test0034_inference_failures_are_specific_and_actionable() {
     .assert()
     .code(8)
     .stderr(
-        predicate::str::contains("INFER_NO_ROWS").and(predicate::str::contains("db schema new t")),
+        predicate::str::contains("INFER_NO_ROWS").and(predicate::str::contains("reldir schema new t")),
     );
 
     // A column that is null in every row cannot be typed under strict.
@@ -3053,7 +3053,7 @@ fn test0049_derived_state_planning_and_format_commands_operate() {
             .and(predicate::str::contains("physical_plan")),
     );
 
-    // `db explain` is the same plan without execution.
+    // `reldir explain` is the same plan without execution.
     db().args([
         "--db",
         root,
@@ -3077,7 +3077,7 @@ fn test0049_derived_state_planning_and_format_commands_operate() {
 #[test]
 fn test0050_completions_are_generated_for_every_documented_shell() {
     for (shell, marker) in [
-        ("bash", "_db"),
+        ("bash", "_reldir"),
         ("zsh", "#compdef"),
         ("fish", "complete"),
         ("powershell", "Register-ArgumentCompleter"),
@@ -3695,7 +3695,7 @@ fn test0066_an_unknown_table_names_the_ungoverned_directory_holding_it() {
         "an ungoverned directory is not a table: {stderr}"
     );
     assert!(
-        stderr.contains("db infer posts --write"),
+        stderr.contains("reldir infer posts --write"),
         "the error names the command that governs it: {stderr}"
     );
 
@@ -3712,8 +3712,8 @@ fn test0066_an_unknown_table_names_the_ungoverned_directory_holding_it() {
         .output()
         .unwrap();
     assert!(
-        String::from_utf8_lossy(&status.stdout).contains("db infer posts --write")
-            || String::from_utf8_lossy(&status.stderr).contains("db infer posts --write"),
+        String::from_utf8_lossy(&status.stdout).contains("reldir infer posts --write")
+            || String::from_utf8_lossy(&status.stderr).contains("reldir infer posts --write"),
         "status and the query path agree on the remedy"
     );
 
@@ -3767,7 +3767,7 @@ fn test0067_an_unknown_table_with_no_directory_offers_no_inference() {
         "the table really is unknown: {stderr}"
     );
     assert!(
-        !stderr.contains("db infer"),
+        !stderr.contains("reldir infer"),
         "there is no directory to infer from: {stderr}"
     );
 }

@@ -309,7 +309,7 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
                 format!("table {table:?} contains no .json rows"),
             )
             .at(table)
-            .help(format!("run `db schema new {table}`")),
+            .help(format!("run `reldir schema new {table}`")),
             8,
         ));
     }
@@ -428,7 +428,7 @@ fn infer_table(
                     ),
                 )
                 .at(r.path.clone())
-                .help("rename with `db doctor` or choose an appropriate x-reldir.filename"),
+                .help("rename with `reldir doctor` or choose an appropriate x-reldir.filename"),
                 8,
             ));
         }

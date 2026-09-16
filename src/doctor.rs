@@ -370,13 +370,13 @@ pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> 
 ///
 /// `LINT_SCHEMA_UNPINNED` says a table's schema exists only under `.db/`, where
 /// deleting the directory discards any refinement inference cannot re-derive.
-/// The remedy is to copy it to `schema/`, which is what `db schema pin` does --
+/// The remedy is to copy it to `schema/`, which is what `reldir schema pin` does --
 /// so the fix performs that copy rather than editing the schema, which is why
 /// it lives here and not in the lint-driven rewriting above.
 ///
 /// A table that already has a pin never raises the finding, so this can only
 /// ever create a declaration, never replace one. Replacing a pin discards
-/// something a person wrote and stays an explicit `db schema pin --overwrite`.
+/// something a person wrote and stays an explicit `reldir schema pin --overwrite`.
 fn pin_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> {
     let mut out = vec![];
     for d in lint::lint(&db.catalog, &db.config, false) {

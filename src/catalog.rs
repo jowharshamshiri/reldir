@@ -24,7 +24,7 @@ pub struct Row {
 /// govern. One text, so the `UNGOVERNED_DIRECTORY` warning and the
 /// `UNKNOWN_TABLE` error can never advise two different things.
 fn ungoverned_help(name: &str) -> String {
-    format!("run `db infer {name} --write` or add it to .db/config ignore")
+    format!("run `reldir infer {name} --write` or add it to .db/config ignore")
 }
 
 #[derive(Debug, Clone)]

@@ -1417,7 +1417,7 @@ mod tests {
         assert_eq!(explained.exit, 4);
         assert_eq!(
             explained.diagnostic.help.as_deref(),
-            Some("run `db infer posts --write` or add it to .db/config ignore"),
+            Some("run `reldir infer posts --write` or add it to .db/config ignore"),
             "an ungoverned directory earns the command that governs it"
         );
 
