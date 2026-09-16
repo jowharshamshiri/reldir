@@ -3955,11 +3955,20 @@ fn test0073_every_emitted_diagnostic_code_is_documented() {
         // Every helper that ultimately names a code, including the ones that
         // wrap `new` -- a scan that knew only the outermost constructors would
         // miss whatever a convenience method hard-codes inside itself.
+        // Every route by which a code reaches a reader. Suggestions and info
+        // findings are diagnostics like any other -- omitting them hid seven
+        // lint codes from this check, which then passed for them by
+        // construction. `bad` and `bad_at` forward a code they are given, so
+        // the literal sits at their call sites rather than inside them.
         for constructor in [
             "DbError::new(",
             "Diagnostic::error(",
             "Diagnostic::warning(",
+            "Diagnostic::suggestion(",
+            "Diagnostic::info(",
             "Self::new(",
+            "bad(",
+            "bad_at(",
         ] {
             for (index, _) in text.match_indices(constructor) {
                 let rest = &text[index + constructor.len()..];
@@ -3996,6 +4005,36 @@ fn test0073_every_emitted_diagnostic_code_is_documented() {
     assert!(
         undocumented.is_empty(),
         "these codes are emitted but documented nowhere: {undocumented:?}"
+    );
+
+    // And the reverse. A catalogue entry for a code nothing raises describes a
+    // condition that cannot occur: a reader who greps for it finds nothing and
+    // cannot tell whether the fault is theirs or the documentation's.
+    // `SCHEMA_MISSING` sat in the table for exactly that reason, unemitted and
+    // unnoticed, because this test only ever checked one direction.
+    let mut catalogued = std::collections::BTreeSet::new();
+    for line in documentation.lines() {
+        let cells: Vec<_> = line.split('|').map(str::trim).collect();
+        if cells.len() < 3 || !cells[1].starts_with('`') {
+            continue;
+        }
+        // A row may name several related codes: `UNKNOWN_TABLE` / `UNKNOWN_ROW`.
+        for part in cells[1].split('/') {
+            let code = part.trim().trim_matches('`');
+            if code.len() > 3
+                && !code.starts_with("FIX_")
+                && code
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase() || character == '_')
+            {
+                catalogued.insert(code.to_string());
+            }
+        }
+    }
+    let unreachable: Vec<_> = catalogued.difference(&emitted).collect();
+    assert!(
+        unreachable.is_empty(),
+        "these codes are documented but nothing emits them: {unreachable:?}"
     );
 }
 
