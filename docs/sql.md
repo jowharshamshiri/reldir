@@ -30,7 +30,7 @@ differently than written.
 ## Queries
 
 ```console
-$ reldir sql 'SELECT u.name, count(*) AS n
+$ reldir 'SELECT u.name, count(*) AS n
           FROM users u JOIN posts p ON p.user_id = u.id
           GROUP BY u.name ORDER BY n DESC LIMIT 3'
  name  | n
@@ -44,7 +44,7 @@ $ reldir sql 'SELECT u.name, count(*) AS n
 Off a terminal the same query emits JSON Lines, one object per row:
 
 ```console
-$ reldir sql 'SELECT name FROM users ORDER BY name' | head -2
+$ reldir 'SELECT name FROM users ORDER BY name' | head -2
 {"name":"Alice","kind":"row"}
 {"name":"Bob","kind":"row"}
 ```
@@ -55,14 +55,14 @@ SQLite's JSON functions are available, which is how a column holding an array of
 references is checked. `json_each` expands one row per element:
 
 ```console
-$ reldir sql 'SELECT b.id, e.value
+$ reldir 'SELECT b.id, e.value
           FROM blocks b, json_each(b.objective_refs) e
           WHERE e.value NOT IN (SELECT id FROM objectives)'
 (0 rows)
 ```
 
 No rows means every element resolves. See
-[references from inside an array](schemas#references-from-inside-an-array) for
+[references from inside an array]({{ site.baseurl }}/schemas#references-from-inside-an-array) for
 when to model this as its own table instead.
 
 ## Parameters
@@ -80,18 +80,22 @@ Because a parameter is a JSON literal, `'"2"'` is the string `2` and `2` is the
 number. Binding a string where an `int` column is expected is a `TYPE_MISMATCH`,
 not a silent conversion.
 
+These take the `sql` subcommand rather than the bare `reldir '<sql>'` form: a
+bare query is a single positional argument, so a following `--param` or
+`--explain` would be read as an argument to `reldir` itself and refused.
+
 ## Mutations
 
 ```sh
-reldir sql "UPDATE users SET name = 'Robert' WHERE id = 'u2'"
-reldir sql "INSERT INTO users (id, name) VALUES ('u3', 'Carol')"
-reldir sql "DELETE FROM users WHERE id = 'u3'"
+reldir "UPDATE users SET name = 'Robert' WHERE id = 'u2'"
+reldir "INSERT INTO users (id, name) VALUES ('u3', 'Carol')"
+reldir "DELETE FROM users WHERE id = 'u3'"
 ```
 
 Every mutation reports the files it changed:
 
 ```console
-$ reldir sql "DELETE FROM users WHERE id = 'u1'"
+$ reldir "DELETE FROM users WHERE id = 'u1'"
 changed 2 path(s); revision 4
   posts/p1.json
   users/u1.json
@@ -121,25 +125,28 @@ acceleration, and deleting them changes performance, not answers.
 
 ## Interactive shell
 
+Run `reldir` with no arguments:
+
 ```console
-$ reldir shell
-.tables
+$ reldir
+reldir> .tables
 users posts
-.describe users
-{ "table": "users", ... }
-SELECT name FROM users ORDER BY name;
+reldir> .describe users
+{ "$schema": "https://reldir.dev/schema/reldir-1", "type": "object", ... }
+reldir> SELECT name FROM users ORDER BY name;
  name
 -------
  Alice
  Bob
-.quit
+reldir> .quit
 ```
 
 Supports history and completion, plus `.tables`, `.describe <table>`, `.status`,
-and `.quit`/`.exit`.
+and `.quit`/`.exit`. `reldir shell` names the same thing explicitly, which is
+what you want in a script.
 
 ## Resource limits
 
 Queries are bounded by the configured limits: result rows, query memory, sort
 memory, and an optional timeout. Exceeding one fails with `RESOURCE_LIMIT` rather
-than returning a truncated answer. See [Configuration](configuration).
+than returning a truncated answer. See [Configuration]({{ site.baseurl }}/configuration).

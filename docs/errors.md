@@ -177,5 +177,5 @@ Warnings are reported alongside results and never set an exit code of their own.
 ## Lint
 
 Lint findings are warnings and suggestions rather than errors, and are listed in
-[Validation](validation#lint). They fail the command only under `--strict`,
+[Validation]({{ site.baseurl }}/validation#lint). They fail the command only under `--strict`,
 with exit code `7`.

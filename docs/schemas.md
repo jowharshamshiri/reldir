@@ -337,6 +337,6 @@ reldir schema restore users     # rebuild the working schema from its pin
 reldir schema validate          # validate every schema
 ```
 
-Schema changes are first-class database changes. See [migrations](cli#migrate) for
-transactional schema evolution, and [validation](validation) for tightening what
+Schema changes are first-class database changes. See [migrations]({{ site.baseurl }}/cli#migrate) for
+transactional schema evolution, and [validation]({{ site.baseurl }}/validation) for tightening what
 inference guessed.

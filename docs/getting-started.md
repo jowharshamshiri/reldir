@@ -19,25 +19,61 @@ cargo install --path . --locked
 
 Either way you get a single `reldir` executable.
 
-## Adopt a directory you already have
+## Point it at a folder
 
-If you already have folders of JSON files, `--adopt` infers a schema for each one,
-validates everything, and records the initial revision:
+If you already have folders of JSON files, there is nothing to set up. Run a
+query and `reldir` infers a schema for each directory, validates every row, and
+records the first revision as it answers:
 
 ```console
-$ ls ./data
+$ ls
 users/  posts/
 
+$ reldir 'SELECT * FROM users ORDER BY id'
+initialized database; inferred schemas for posts, users
+id | name
+---+------
+u1 | Alice
+u2 | Bob
+(2 rows)
+```
+
+Run `reldir` with no arguments and you get a shell over the same model:
+
+```console
+$ reldir
+reldir> .tables
+users posts
+reldir> SELECT name FROM users ORDER BY name;
+ name
+-------
+ Alice
+ Bob
+reldir> .quit
+```
+
+Inference is all-or-nothing. If it fails for any table, the command fails as a
+whole and writes nothing, so you are never left with a half-initialised
+directory.
+
+### Adopting explicitly
+
+`reldir init --adopt` does the same work as a separate, deliberate step, which
+is what you want in a script or a CI job where the setup should not be a side
+effect of the first query:
+
+```console
 $ reldir init ./data --adopt
 Scanned 2 directories, 5 JSON files.
 VALID   revision 1   root a8a1104e
 ```
 
-Adoption is all-or-nothing. If inference or validation fails for any table, the
-command fails as a whole and writes nothing, so you are never left with a
-half-initialised directory.
+The outcome is identical either way: the same revision 1, the same root hash,
+the same schema files.
 
-Inference writes one working schema per table into `.db/schema/`:
+### What inference wrote
+
+One working schema per table, in `.db/schema/`:
 
 ```json
 {
@@ -113,7 +149,7 @@ JSON
 $ reldir status
 VALID   revision 2   root b119300e   external changes: accepted
 
-$ reldir sql 'SELECT title FROM books'
+$ reldir 'SELECT title FROM books'
 title
 -----
 Dune
@@ -127,13 +163,13 @@ rather than nullability: a nullable column is written `"type": ["string",
 is, its primary key, and the order columns are written in.
 
 `reldir schema new <table>` scaffolds one to edit, and `reldir schema dialect` writes out
-the dialect so your editor can complete it. [Schemas](schemas) documents every
+the dialect so your editor can complete it. [Schemas]({{ site.baseurl }}/schemas) documents every
 keyword.
 
 ## Query
 
 ```console
-$ reldir sql 'SELECT * FROM users ORDER BY id'
+$ reldir 'SELECT * FROM users ORDER BY id'
 id | name
 ---+------
 u1 | Alice
@@ -145,7 +181,7 @@ Output is a table on a terminal and JSON Lines when redirected, so piping into
 other tools just works:
 
 ```console
-$ reldir sql 'SELECT * FROM users ORDER BY id' | head -1
+$ reldir 'SELECT * FROM users ORDER BY id' | head -1
 {"id":"u1","name":"Alice","kind":"row"}
 ```
 
@@ -161,7 +197,7 @@ reldir insert users '{"id":"u3","name":"Carol"}'
 reldir update users u3 '{"name":"Caroline"}'
 reldir delete users u3
 
-reldir sql "UPDATE users SET name = 'Rob' WHERE id = 'u2'"
+reldir "UPDATE users SET name = 'Rob' WHERE id = 'u2'"
 ```
 
 Every mutation prints the files it touched and the new revision:
@@ -201,6 +237,6 @@ error[TYPE_MISMATCH]: field "name" does not match type String
 
 ## Next steps
 
-- [Validation](validation): the `check` → `lint` → `doctor` workflow
-- [Schemas](schemas): tighten what inference guessed
-- [CLI reference](cli): the full command surface
+- [Validation]({{ site.baseurl }}/validation): the `check` → `lint` → `doctor` workflow
+- [Schemas]({{ site.baseurl }}/schemas): tighten what inference guessed
+- [CLI reference]({{ site.baseurl }}/cli): the full command surface

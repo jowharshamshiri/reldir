@@ -6,6 +6,12 @@ title: CLI reference
 
 ## Conventions
 
+**Invocation.** `reldir <command>` runs a command. `reldir '<sql>'` runs one
+query, and a bare `reldir` opens the shell — both over the current directory, so
+a folder of JSON files is queryable without being set up first: prerequisites
+are established as they are needed, and `--no-auto` reports what is missing
+instead.
+
 **Database discovery.** Without `--db <path>`, the binary walks up from the current
 directory looking for `.db/`, like `git`. `DB_DIR` overrides. If nothing is found,
 the error names every directory tried.
@@ -50,7 +56,7 @@ disabled by `--no-color` or a non-empty `NO_COLOR`.
 | `--timeout <SECS>` | query timeout |
 
 Resource limits may also be overridden per invocation. See
-[Configuration](configuration).
+[Configuration]({{ site.baseurl }}/configuration).
 
 ## Setting up
 
@@ -115,7 +121,7 @@ reldir explain 'SELECT ...'
 reldir shell                              # interactive REPL
 ```
 
-See [SQL](sql) for the supported subset.
+See [SQL]({{ site.baseurl }}/sql) for the supported subset.
 
 The shell answers `.tables`, `.describe <table>`, `.status`, and `.quit`/`.exit`
 in addition to SQL.
@@ -140,7 +146,7 @@ reldir schema dialect           # print the JSON Schema dialect reldir accepts
 
 `infer` never writes without `--write` and never overwrites an existing schema.
 
-Schemas are [JSON Schema 2020-12](schemas) documents, so everything these
+Schemas are [JSON Schema 2020-12]({{ site.baseurl }}/schemas) documents, so everything these
 commands print or write is one. `reldir schema dialect` emits the dialect itself,
 which is what an editor needs to complete a schema you write by hand.
 
@@ -162,7 +168,7 @@ reldir doctor --explain <FIX_ID>
 reldir doctor --no-snapshot
 ```
 
-See [Validation](validation) for the workflow.
+See [Validation]({{ site.baseurl }}/validation) for the workflow.
 
 ## History
 

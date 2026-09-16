@@ -59,7 +59,7 @@ anything. Every finding carries a stable code, a severity, the evidence, and the
 | `LINT_NON_CANONICAL_FORMATTING` | rows not in canonical formatting (informational) |
 | `LINT_NO_DESCRIPTION` | table or column lacks a description (opt in with `--descriptions`) |
 
-Thresholds are configurable. See [Configuration](configuration).
+Thresholds are configurable. See [Configuration]({{ site.baseurl }}/configuration).
 
 ### A note on inferred enums
 

@@ -20,7 +20,7 @@ $ reldir init ./data --adopt
 Scanned 3 directories, 1204 JSON files.
 VALID   revision 1   root 6e41f2…
 
-$ reldir sql 'SELECT name FROM users ORDER BY name'
+$ reldir 'SELECT name FROM users ORDER BY name'
  name
 -------
  Alice
@@ -52,16 +52,16 @@ error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
 
 ## Guides
 
-- **[Getting started](getting-started)**: adopt a directory, run queries, make edits
-- **[Concepts](concepts)**: the model behind validity, external edits, and provenance
-- **[Schemas](schemas)**: the JSON Schema dialect, writing one by hand, the type system, constraints
-- **[CLI reference](cli)**: every command and flag
-- **[SQL](sql)**: the supported subset and parameter binding
-- **[Validation](validation)**: `check`, `lint`, and `doctor`
-- **[Transactions](transactions)**: write safety, recovery, concurrency
-- **[Configuration](configuration)**: `.db/config` and resource limits
-- **[Errors](errors)**: error codes, exit codes, and what they mean
-- **[On-disk format](format-v1)**: format version 1
+- **[Getting started]({{ site.baseurl }}/getting-started)**: query a folder of JSON, then make it stricter
+- **[Concepts]({{ site.baseurl }}/concepts)**: the model behind validity, external edits, and provenance
+- **[Schemas]({{ site.baseurl }}/schemas)**: the JSON Schema dialect, writing one by hand, the type system, constraints
+- **[CLI reference]({{ site.baseurl }}/cli)**: every command and flag
+- **[SQL]({{ site.baseurl }}/sql)**: the supported subset and parameter binding
+- **[Validation]({{ site.baseurl }}/validation)**: `check`, `lint`, and `doctor`
+- **[Transactions]({{ site.baseurl }}/transactions)**: write safety, recovery, concurrency
+- **[Configuration]({{ site.baseurl }}/configuration)**: `.db/config` and resource limits
+- **[Errors]({{ site.baseurl }}/errors)**: error codes, exit codes, and what they mean
+- **[On-disk format]({{ site.baseurl }}/format-v1)**: format version 1
 
 ## Install
 

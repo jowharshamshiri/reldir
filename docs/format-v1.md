@@ -9,7 +9,7 @@ This document fixes the representation emitted and accepted by format version 1.
 ## Authoritative namespaces
 
 `.db/schema/<table>.json` contains the working schema, as a JSON Schema 2020-12
-document in the dialect described in [Schemas](schemas.md). `schema/<table>.json`,
+document in the dialect described in [Schemas]({{ site.baseurl }}/schemas). `schema/<table>.json`,
 when present, contains a pinned declaration in the same dialect; the two are
 byte-identical when both exist.
 `<table>/<filename-key>.json` contains one JSON-object row. Table and schema names

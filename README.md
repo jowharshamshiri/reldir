@@ -14,11 +14,7 @@ ownership of your bytes.
 $ ls ./data
 users/  posts/  comments/
 
-$ reldir init ./data --adopt
-Scanned 3 directories, 1204 JSON files.
-VALID   revision 1   root 6e41f2…
-
-$ reldir sql 'SELECT u.name, count(*) AS n
+$ reldir 'SELECT u.name, count(*) AS n
           FROM users u JOIN posts p ON p.user_id = u.id
           GROUP BY u.name ORDER BY n DESC LIMIT 3'
  name  | n
@@ -72,11 +68,12 @@ dependencies.
 ## Try it
 
 ```sh
-reldir init ./data --adopt     # infer schemas from existing JSON and adopt them
+reldir                         # a shell over the folder you are standing in
+reldir 'SELECT * FROM users'   # or one query; schemas are inferred as needed
+reldir init ./data --adopt     # or set it up explicitly, for scripts and CI
 reldir check                   # full validation
 reldir lint                    # how the schemas could be stronger
 reldir doctor                  # diagnose problems and propose fixes
-reldir sql 'SELECT * FROM users LIMIT 10'
 ```
 
 ## What you get
@@ -95,7 +92,7 @@ reldir sql 'SELECT * FROM users LIMIT 10'
 
 | Guide | |
 |---|---|
-| [Getting started](https://jowharshamshiri.github.io/reldir/getting-started) | Adopt a directory and run your first queries |
+| [Getting started](https://jowharshamshiri.github.io/reldir/getting-started) | Query a folder of JSON, then make it stricter |
 | [Concepts](https://jowharshamshiri.github.io/reldir/concepts) | The model: validity, external edits, provenance |
 | [Schemas](https://jowharshamshiri.github.io/reldir/schemas) | The JSON Schema dialect, writing one by hand, types, constraints |
 | [CLI reference](https://jowharshamshiri.github.io/reldir/cli) | Every command and flag |

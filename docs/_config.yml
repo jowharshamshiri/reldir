@@ -6,6 +6,11 @@ title: reldir
 description: A relational database that lives in a directory of JSON files.
 theme: jekyll-theme-primer
 
-# Relative permalinks keep the generated URLs stable under the /reldir/ project
-# path that Pages serves a project site from.
+# Pages serves this as a project site under /reldir/, and `permalink: pretty`
+# gives every page a directory URL (/reldir/cli/). A bare relative link like
+# [CLI reference](cli) therefore resolves against that directory and 404s at
+# /reldir/getting-started/cli. Declaring the base path lets every cross-link be
+# written {{ site.baseurl }}/cli, which is correct from any page.
+url: https://jowharshamshiri.github.io
+baseurl: /reldir
 permalink: pretty
