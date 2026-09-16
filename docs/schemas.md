@@ -1,0 +1,342 @@
+---
+title: Schemas
+---
+
+# Schemas
+
+Every table has a working schema at `.db/schema/<table>.json`, which the binary
+maintains and every command reads. The runtime never operates on an implicit
+schema: query, mutation, and validation always run against a file that physically
+exists.
+
+Pinning copies that schema to `schema/<table>.json`, making it a declaration you
+own: kept in version control, surviving `rm -rf .db`, and never inferred over.
+Where both exist they agree. If you edit the pin, it wins and the working copy is
+rebuilt from it.
+
+Table names must match `^[a-z][a-z0-9_]*$`, must not be `schema`, and must avoid
+Windows reserved device names.
+
+## The schema language
+
+A schema is a [JSON Schema 2020-12](https://json-schema.org/) document in jdb's
+own dialect, identified by `"$schema": "https://jdb.dev/schema/jdb-1"`. Ordinary
+JSON Schema tooling can read it.
+
+That URI names the dialect; it is not fetched, and nothing is served there yet.
+The dialect itself is compiled into the binary, so to get editor completion,
+write it out and point your editor at the local copy:
+
+```sh
+db schema dialect > .jdb-dialect.json
+```
+
+In VS Code, for example, associate it with your schema files:
+
+```json
+{
+  "json.schemas": [
+    { "fileMatch": ["schema/*.json", ".db/schema/*.json"],
+      "url": "./.jdb-dialect.json" }
+  ]
+}
+```
+
+jdb does not accept arbitrary JSON Schema. A document that says `oneOf`
+requests a semantics jdb has no relational meaning for, and ignoring it would let
+the file and the database disagree about which rows are valid. The dialect
+therefore declares a `$vocabulary` of its own, marked required, so a conforming
+reader learns that it cannot fully process the document without understanding
+jdb's keywords.
+
+Valid JSON Schema content that does not alter jdb's semantics is preserved.
+Content that would alter semantics jdb cannot represent is rejected by name with
+`SCHEMA_UNSUPPORTED_KEYWORD`.
+
+### What a document says
+
+Standard keywords describe the columns: `type`, `properties`, `items`, `enum`,
+`default`, `required`, `additionalProperties`, `format`, `pattern`,
+`contentEncoding`, and `description`.
+
+Everything relational that JSON Schema has no keyword for lives under one
+extension key, `x-jdb`:
+
+| Key | Meaning |
+|---|---|
+| `table` | the relation's identity; equals the file stem |
+| `primaryKey` | row identity, file naming, foreign-key targets |
+| `columnOrder` | the order columns were declared in |
+| `schemaVersion` | user-managed; default 1 |
+| `schemaFormat` | pins the format version explicitly |
+| `unique` | arrays of column-name arrays |
+| `indexes` | arrays of column-name arrays |
+| `foreignKeys` | `{ columns, references: { table, columns }, onDelete, onUpdate }` |
+| `checks` | `{ name, expr }`, where `expr` is a boolean SQL expression |
+| `generated` | column name to `uuid`, `ulid`, `now`, or `sequence` |
+| `filename` | the columns a row's filename is built from |
+
+`columnOrder` is required because rows are written in schema column order, so
+two schemas differing only in that order write different bytes for the same
+logical row. JSON object members are unordered, so the order has to be stated
+explicitly.
+
+A foreign key is deliberately **not** a `$ref`. In JSON Schema, `$ref` means
+"apply this schema to the value here", which is composition and reuse. It cannot
+say that a value names a row that must exist in another table, and it has nowhere
+to put a composite column list or a referential action. Spelling foreign keys
+with `$ref` would make the document look standard while making its meaning
+false.
+
+### References from inside an array
+
+A foreign key relates *columns*: `columns` names a tuple of this table's
+columns, and the target must be a primary key or a unique constraint. A column
+holding an array of ids is a different relationship — many edges from one row —
+and declaring it as a foreign key would make `columns` mean two things depending
+on the column's type.
+
+The recommended form is to keep the array and check it as a query, which
+`json_each` expands one element per row:
+
+```sql
+SELECT b.id, e.value
+FROM blocks b, json_each(b.objective_refs) e
+WHERE e.value NOT IN (SELECT id FROM objectives);
+```
+
+An empty result means every element resolves. Run it in `db check`'s company
+rather than in place of it: the schema still governs the array's element type,
+and this governs what the elements point at.
+
+Where the relationship deserves enforcement rather than inspection, give the
+edges their own table with a composite primary key of the two sides, and declare
+a foreign key on each. That is the form jdb enforces transactionally, including
+referential actions.
+
+### Nullability and presence
+
+These are different questions, and JSON Schema already distinguishes them.
+
+A **nullable** column admits null as a value, written as a type union:
+`"type": ["string", "null"]`.
+
+A **required** column is one a row cannot omit. A row may leave out a column that
+has a default or a generator, because the value can still be supplied; it may
+leave out a nullable column, because absence reads as null. Everything else is
+listed in `required`, and omitting it is `ROW_MISSING_FIELD`.
+
+A `NOT NULL` column with a default is therefore not required: it admits no
+null, but a row need not carry it.
+
+### Types
+
+Standard keywords carry the type where they can. Where they cannot distinguish
+two jdb types, the subschema is tagged with `x-jdb-type`: jdb's `int` is lexical
+where JSON Schema's `integer` is mathematical, and `decimal` and `ulid` are
+strings with application semantics. The tag sits on the subschema it describes,
+so it works at any depth. An `array` of `decimal` has no column name by which a
+document-level map could key it.
+
+| jdb type | JSON Schema |
+|---|---|
+| `bool` | `{"type": "boolean"}` |
+| `int` | `{"type": "integer", "x-jdb-type": "int"}` |
+| `float` | `{"type": "number"}` |
+| `decimal` | `{"type": "string", "pattern": …, "x-jdb-type": "decimal"}` |
+| `string` | `{"type": "string"}` |
+| `bytes` | `{"type": "string", "contentEncoding": "base64"}` |
+| `date` | `{"type": "string", "format": "date"}` |
+| `timestamp` | `{"type": "string", "format": "date-time"}` |
+| `uuid` | `{"type": "string", "format": "uuid"}` |
+| `ulid` | `{"type": "string", "pattern": …, "x-jdb-type": "ulid"}` |
+| `enum` | `{"type": "string", "enum": [...]}` |
+| `array` | `{"type": "array", "items": {...}}` |
+| `object` | `{"type": "object", "properties": {...}}` |
+| `json` | `{}` |
+
+In 2020-12 `format` is an annotation unless the format-assertion vocabulary is
+enabled, which this dialect does not enable. A generic validator therefore
+understands the structure of a jdb schema and checks its shape; jdb remains the
+authority on what a `uuid`, `ulid`, `decimal`, or `timestamp` actually admits.
+
+### Patterns
+
+`pattern` constrains a string value, and jdb enforces it. It applies wherever a
+string appears — a column, an array's elements, a nested property:
+
+```json
+{
+  "slug":     { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,63}$" },
+  "refs":     { "type": "array", "items": { "type": "string", "pattern": "^obj-[0-9]+$" } }
+}
+```
+
+A value that satisfies the type but not the pattern is `TYPE_MISMATCH`, and the
+message names the pattern it missed rather than the type it already has.
+
+Patterns are matched with Rust's `regex`, which is ECMA-262 syntax without
+backreferences or lookaround, and which matches in time linear in the subject.
+A pattern jdb cannot compile is refused when the schema is validated, with
+`SCHEMA_CHECK_INVALID` naming the column — never accepted and then quietly
+unenforced.
+
+An unanchored pattern matches anywhere in the value, as it does in JSON Schema.
+Anchor with `^` and `$` to constrain the whole string.
+
+A pattern decides which rows a schema admits, so it is part of what that schema
+*is*: adding or changing one changes the schema's hash, as changing a type does.
+
+`decimal` and `ulid` are the exception, and only because they are written with a
+`pattern` to begin with: that is how JSON Schema spells what those types admit.
+jdb reads that one back as the type restating itself rather than as a further
+constraint, so a `decimal` column has the same identity before and after its
+schema makes a round trip through disk.
+
+### Closed objects
+
+`additionalProperties: false` on an `object` column rejects members the column
+does not declare:
+
+```json
+{ "meta": { "type": "object",
+            "properties": { "source": { "type": "string" } },
+            "additionalProperties": false } }
+```
+
+The default is JSON Schema's own: absent means open. At the document root the
+same keyword decides whether a *row* may carry undeclared fields, reported per
+key as `ROW_UNKNOWN_FIELD`; on a column it decides whether the value matches the
+column at all.
+
+### Annotations
+
+`title`, `$comment`, `examples`, `readOnly`, and `deprecated` describe a schema
+without constraining a row. They are kept verbatim through a load and a save, and
+take no part in validation or in a schema's identity, so a comment cannot change
+a database's hash.
+
+## Example
+
+```json
+{
+  "$schema": "https://jdb.dev/schema/jdb-1",
+  "type": "object",
+  "properties": {
+    "id":      { "type": "string", "format": "uuid" },
+    "email":   { "type": "string" },
+    "role":    { "type": "string", "enum": ["admin", "member"], "default": "member" },
+    "team_id": { "type": ["string", "null"], "format": "uuid" },
+    "created": { "type": "string", "format": "date-time" }
+  },
+  "required": ["id", "email"],
+  "additionalProperties": false,
+  "x-jdb": {
+    "table": "users",
+    "schemaVersion": 1,
+    "primaryKey": ["id"],
+    "columnOrder": ["id", "email", "role", "team_id", "created"],
+    "unique": [["email"]],
+    "indexes": [["team_id"]],
+    "foreignKeys": [
+      {
+        "columns": ["team_id"],
+        "references": { "table": "teams", "columns": ["id"] },
+        "onDelete": "set_null",
+        "onUpdate": "restrict"
+      }
+    ],
+    "checks": [{ "name": "email_has_at", "expr": "email LIKE '%@%'" }],
+    "generated": { "id": "uuid", "created": "now" }
+  }
+}
+```
+
+## Type system
+
+| Type | JSON representation |
+|---|---|
+| `bool` | boolean |
+| `int` | number without fraction or exponent, 64-bit signed |
+| `float` | number, IEEE 754 double |
+| `decimal` | string in canonical decimal form, arbitrary precision |
+| `string` | string, valid Unicode |
+| `bytes` | string, standard base64 |
+| `date` | string, `YYYY-MM-DD` |
+| `timestamp` | string, RFC 3339 with offset; compared and stored canonically in UTC |
+| `uuid` | string, lowercase 8-4-4-4-12 |
+| `ulid` | string, 26 Crockford base32 uppercase |
+| `enum` | string, one of `values` |
+| `array` | array, elements validated against `items` |
+| `object` | object, validated against `properties` when given |
+| `json` | any JSON value; opaque to SQL beyond equality and text extraction |
+
+Validation is strict and reads no coercions: an `int` is accepted in a `float`
+column, and nothing else is converted. Everything else is `TYPE_MISMATCH`.
+`doctor` may offer lossless coercions as data fixes: `"42"` to `42` is
+lossless, while `"01"` to `1` is not, because it does not round-trip.
+
+`int` overflow is an error, never wraparound. Silent lossy coercion never occurs.
+
+## Missing and unknown fields
+
+- A key absent for a nullable column reads as `NULL`, or as the column default if
+  one is declared.
+- A key absent for a `NOT NULL` column with no default is `ROW_MISSING_FIELD`.
+- A key present in the row but absent from the schema is `ROW_UNKNOWN_FIELD`,
+  unless the schema sets `"additionalProperties": true`.
+
+Defaults are logical values: two rows that both omit a defaulted column share that
+column's value for uniqueness and identity purposes.
+
+## Cross-schema rules
+
+- Every column named in `primaryKey`, `unique`, `indexes`, `foreignKeys.columns`,
+  or `filename` must exist.
+- A foreign key's target table must have a schema.
+- A foreign key's target columns must be that table's primary key or a declared
+  unique constraint, in order.
+- Referencing and referenced column types must be identical.
+- `onDelete: set_null` requires nullable referencing columns; `set_default`
+  requires declared defaults.
+- Foreign keys must not form a cycle in which every edge is `cascade`.
+- `checks.expr` must parse and type-check as a boolean expression over the table's
+  columns.
+
+## Referential actions
+
+`restrict`, `cascade`, `set_null`, `set_default`, and `no_action` are supported on
+both `onDelete` and `onUpdate`. Binary-performed mutations execute them
+transactionally and list every row a cascade touched:
+
+```console
+$ db delete users u1
+changed 2 path(s); revision 2
+  posts/p1.json
+  users/u1.json
+```
+
+A blocked `restrict` is reported as `FOREIGN_KEY_VIOLATION` and changes nothing.
+
+## Custom file naming
+
+`x-jdb.filename` may name non-primary-key columns, a `slug` for example, as
+long as those columns are covered by a unique constraint and are `NOT NULL`:
+
+```json
+{ "storage": { "filename": ["slug"] } }
+```
+
+## Managing schemas
+
+```sh
+db schema show users        # print a schema
+db schema new users         # scaffold a minimal valid schema
+db schema pin users         # declare the working schema in schema/
+db schema restore users     # rebuild the working schema from its pin
+db schema validate          # validate every schema
+```
+
+Schema changes are first-class database changes. See [migrations](cli#migrate) for
+transactional schema evolution, and [validation](validation) for tightening what
+inference guessed.
