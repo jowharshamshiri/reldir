@@ -174,16 +174,23 @@ fn validate_row(
                 // merely too short names the wrong thing. The bound is part of
                 // what the column admits, so it is what the message says.
                 let missed_bound = !value::within_bounds(v, col);
+                // A value can satisfy its type and every bound and still match
+                // no alternative. Saying "does not match type String" about a
+                // string names the one thing that is not wrong with it.
+                let missed_composition = !value::satisfies_composition(v, col);
                 let diagnostic = Diagnostic::error(
                     "TYPE_MISMATCH",
-                    match (missed_pattern, missed_bound) {
-                        (Some(pattern), _) => {
+                    match (missed_pattern, missed_bound, missed_composition) {
+                        (Some(pattern), _, _) => {
                             format!("field {name:?} does not match pattern {pattern:?}")
                         }
-                        (None, true) => {
+                        (None, true, _) => {
                             format!("field {name:?} is outside the bounds declared for it")
                         }
-                        (None, false) => {
+                        (None, false, true) => format!(
+                            "field {name:?} satisfies none of the alternatives declared for it"
+                        ),
+                        (None, false, false) => {
                             format!("field {name:?} does not match type {:?}", col.kind)
                         }
                     },
@@ -199,10 +206,17 @@ fn validate_row(
                 // the fix anyway would name a remedy that selects nothing --
                 // doctor already classes this as manual, and the diagnostic
                 // must say the same thing.
-                out.push(match (missed_pattern.is_some(), missed_bound) {
-                    (true, _) | (_, true) => diagnostic,
-                    (false, false) => diagnostic.fix("FIX_COERCE_VALUE"),
-                });
+                // A coercion converts between representations of a value. It
+                // cannot make one shorter, distinct, divisible, or a member of
+                // an alternative set, so offering it for those names a remedy
+                // that selects nothing.
+                out.push(
+                    if missed_pattern.is_some() || missed_bound || missed_composition {
+                        diagnostic
+                    } else {
+                        diagnostic.fix("FIX_COERCE_VALUE")
+                    },
+                );
             }
             _ => {}
         }
@@ -339,7 +353,9 @@ pub(crate) fn locate(raw: &[u8], field: &str) -> Option<crate::diagnostic::Locat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AdditionalFields, Column, ColumnType, Storage};
+    use crate::schema::{
+        AdditionalFields, Column, ColumnType, Composition, CompositionKind, Storage,
+    };
     use indexmap::IndexMap;
     use serde_json::json;
     use std::path::PathBuf;
@@ -610,6 +626,98 @@ mod tests {
             mismatch.fixes.iter().any(|f| f == "FIX_COERCE_VALUE"),
             "a type miss must still name the fix that answers it: {:?}",
             mismatch.fixes
+        );
+    }
+
+    /// A diagnostic names the constraint a value actually missed.
+    ///
+    /// A value can satisfy its declared type and still be refused for its
+    /// pattern, its bounds, or its alternatives. Reporting "does not match type
+    /// String" about a string names the one thing that is not wrong with it,
+    /// and sends a reader looking at the column's type when the type is fine.
+    ///
+    /// The fix offer follows the same rule: a coercion converts between
+    /// representations, so it can answer a type miss and nothing else. Offering
+    /// it for a bound or an alternative names a remedy that selects nothing --
+    /// the defect `FIX_COERCE_VALUE` already had for patterns.
+    #[test]
+    fn test1163_a_diagnostic_names_the_constraint_that_was_missed() {
+        let mut s = schema(
+            &[
+                ("id", ColumnType::String, false),
+                ("name", ColumnType::String, false),
+                ("code", ColumnType::String, false),
+                ("n", ColumnType::Int, false),
+            ],
+            &["id"],
+        );
+        s.columns.get_mut("name").unwrap().min_size = Some(2);
+        s.columns.get_mut("code").unwrap().composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![{
+                let mut upper = column(ColumnType::String, false);
+                upper.pattern = Some("^[A-Z]+$".into());
+                upper
+            }],
+        });
+
+        let report = |body: Map<String, Value>| -> Diagnostic {
+            let mut out = vec![];
+            validate_row(&s, &body, &PathBuf::from("t/a.json"), &mut out);
+            out.into_iter()
+                .find(|d| d.code == "TYPE_MISMATCH")
+                .expect("a TYPE_MISMATCH is raised")
+        };
+
+        // Too short: the value is a string, so the type is not the problem.
+        let bound = report(body(&[
+            ("id", json!("a")),
+            ("name", json!("x")),
+            ("code", json!("ABC")),
+            ("n", json!(1)),
+        ]));
+        assert!(
+            bound.message.contains("outside the bounds"),
+            "a bound miss must say so: {}",
+            bound.message
+        );
+        assert!(
+            bound.fixes.is_empty(),
+            "no coercion makes a value longer: {:?}",
+            bound.fixes
+        );
+
+        // Satisfies no alternative, and is again a perfectly good string.
+        let composed = report(body(&[
+            ("id", json!("a")),
+            ("name", json!("ok")),
+            ("code", json!("lower")),
+            ("n", json!(1)),
+        ]));
+        assert!(
+            composed.message.contains("satisfies none of the alternatives"),
+            "a composition miss must say so: {}",
+            composed.message
+        );
+        assert!(composed.fixes.is_empty(), "no coercion satisfies an alternative");
+
+        // A genuine type miss still reports the type, and still offers the
+        // coercion that can answer it.
+        let typed = report(body(&[
+            ("id", json!("a")),
+            ("name", json!("ok")),
+            ("code", json!("ABC")),
+            ("n", json!("7")),
+        ]));
+        assert!(
+            typed.message.contains("does not match type"),
+            "a type miss still names the type: {}",
+            typed.message
+        );
+        assert!(
+            typed.fixes.iter().any(|f| f == "FIX_COERCE_VALUE"),
+            "a type miss keeps the fix that answers it: {:?}",
+            typed.fixes
         );
     }
 

@@ -29,21 +29,8 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
     // is asked alongside the type rather than instead of it. An alternative is
     // itself a column, so a nested pattern, bound or composition is judged by
     // the same recursion.
-    if let Some(composition) = &c.composition {
-        let satisfied = composition
-            .alternatives
-            .iter()
-            .filter(|alternative| matches_column(v, alternative))
-            .count();
-        let ok = match composition.kind {
-            CompositionKind::One => satisfied == 1,
-            CompositionKind::Any => satisfied >= 1,
-            CompositionKind::All => satisfied == composition.alternatives.len(),
-            CompositionKind::Not => satisfied == 0,
-        };
-        if !ok {
-            return false;
-        }
+    if !satisfies_composition(v, c) {
+        return false;
     }
     match c.kind {
         ColumnType::Bool => v.is_boolean(),
@@ -91,6 +78,29 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
             })
         }),
         ColumnType::Json => true,
+    }
+}
+
+/// Whether a value satisfies the column's composition, if it declares one.
+///
+/// Shared with `integrity` so a diagnostic can say which of a column's three
+/// constraints a value missed -- its pattern, its bounds, or its alternatives --
+/// using the same judgement that rejected it. A column declaring no composition
+/// is satisfied vacuously.
+pub fn satisfies_composition(v: &Value, c: &Column) -> bool {
+    let Some(composition) = &c.composition else {
+        return true;
+    };
+    let satisfied = composition
+        .alternatives
+        .iter()
+        .filter(|alternative| matches_column(v, alternative))
+        .count();
+    match composition.kind {
+        CompositionKind::One => satisfied == 1,
+        CompositionKind::Any => satisfied >= 1,
+        CompositionKind::All => satisfied == composition.alternatives.len(),
+        CompositionKind::Not => satisfied == 0,
     }
 }
 
