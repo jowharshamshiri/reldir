@@ -812,6 +812,7 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            required: Default::default(),
             min_size: None,
             max_size: None,
             minimum: None,
@@ -1047,6 +1048,33 @@ mod tests {
             ),
         ));
 
+        // An alternative that names only `required` says one thing: the value
+        // must carry this member. Without it in identity, two schemas admitting
+        // different objects would share a hash -- and this is exactly the shape
+        // a composition alternative takes.
+        let mut requiring = col(ColumnType::Object);
+        requiring.required = ["owner".to_string()].into_iter().collect();
+        let mut alternative = col(ColumnType::Object);
+        alternative.required = ["reviewer".to_string()].into_iter().collect();
+        let mut composed_required = col(ColumnType::Object);
+        composed_required.properties = Some({
+            let mut p = IndexMap::new();
+            p.insert("owner".to_string(), col(ColumnType::String));
+            p
+        });
+        composed_required.composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![requiring, alternative],
+        });
+        out.push((
+            "composed_required_members",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", composed_required)],
+                &["id"],
+            ),
+        ));
+
         // An element foreign key relates each element of an array, which is a
         // different relationship from the scalar key above it.
         let mut refs = col(ColumnType::Array);
@@ -1215,6 +1243,11 @@ mod tests {
             ("bounded_number", "22393847fd08fb4f08ae95524c9c30e5ae9449f54e235d5009db31d35e8332af"),
             ("unique_items", "cef58310f787e16311c28ed105eb7e1ba88f95c9860d243f49b48196b314cfcd"),
             ("composed_one_of", "3ed4c37a07d3255cdfb63e9af6c781cd362ed26b730b9520192b108a95749305"),
+            // An alternative that names only `required` says one thing: the
+            // value must carry this member. Two schemas whose alternatives
+            // require different members admit different objects, so the
+            // requirement is part of what each schema is.
+            ("composed_required_members", "46207d53d7a5cf48aba1a987539c84603db4d281d01466c5412ec8e009f4f217"),
             // An element foreign key is a different relationship from a scalar
             // one, and the spelling that says so is part of the schema.
             ("fk_per_element", "142628866e7833b8623b764902278cdc6372277f4621b01c2aaeedb18799ce6e"),

@@ -75,6 +75,18 @@ pub struct Column {
     /// `ROW_UNKNOWN_FIELD` per key; here the answer belongs to the value, so it
     /// is part of whether the value matches its column at all.
     pub additional_properties: bool,
+    /// Member names an object value must carry.
+    ///
+    /// Distinct from a declared column's own nullability, which answers whether
+    /// THIS column may be absent from its parent. This answers which members
+    /// the value itself must present, and it can name a member `properties`
+    /// never declares -- which is the whole content of a composition
+    /// alternative like `{"type": "object", "required": ["when_incorrect"]}`.
+    ///
+    /// Without it such an alternative decoded to a column with no properties,
+    /// which matched every object: `oneOf` then counted every alternative
+    /// satisfied and refused every row.
+    pub required: BTreeSet<String>,
     /// Bounds on the size of a value: string length, array length, object size.
     ///
     /// JSON Schema states these as separate keywords per type -- `minLength`,
@@ -538,6 +550,12 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: multipleOf must be greater than zero"),
         ));
     }
+    if !c.required.is_empty() && c.kind != ColumnType::Object {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: required is only valid for object columns"),
+        ));
+    }
     if c.unique_items && c.kind != ColumnType::Array {
         out.push(Diagnostic::error(
             "SCHEMA_UNKNOWN_KEY",
@@ -689,6 +707,7 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            required: Default::default(),
             min_size: None,
             max_size: None,
             minimum: None,

@@ -72,6 +72,13 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
             {
                 return false;
             }
+            // A member the value must carry, whether or not the subschema
+            // declares it. An alternative that names only `required` says
+            // exactly this and nothing else, and reading it any other way makes
+            // it match every object.
+            if c.required.iter().any(|name| !o.contains_key(name)) {
+                return false;
+            }
             c.properties.as_ref().is_none_or(|p| {
                 p.iter()
                     .all(|(n, c)| o.get(n).map_or(c.nullable, |v| matches_column(v, c)))
@@ -448,6 +455,7 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            required: Default::default(),
             min_size: None,
             max_size: None,
             minimum: None,
@@ -769,6 +777,61 @@ mod tests {
 
         list.unique_items = false;
         assert!(matches_column(&json!([1, 1]), &list), "repeats are fine unless asked");
+    }
+
+    /// An alternative may name members it does not declare.
+    ///
+    /// `{"type": "object", "required": ["when_incorrect"]}` says one thing: the
+    /// value must carry that member. Read as a column with no properties it
+    /// constrained nothing and matched every object, so a `oneOf` over three
+    /// such alternatives counted three satisfied and refused every row -- which
+    /// is exactly what happened to 210 rows of a real corpus.
+    #[test]
+    fn test1164_an_alternative_may_require_a_member_it_does_not_declare() {
+        let mut requires_a = column(ColumnType::Object);
+        requires_a.required = ["a".to_string()].into_iter().collect();
+        let mut requires_b = column(ColumnType::Object);
+        requires_b.required = ["b".to_string()].into_iter().collect();
+
+        let mut either = column(ColumnType::Object);
+        either.composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![requires_a, requires_b],
+        });
+
+        assert!(matches_column(&json!({"a": 1}), &either), "carries a, not b");
+        assert!(matches_column(&json!({"b": 2}), &either), "carries b, not a");
+        assert!(
+            !matches_column(&json!({"a": 1, "b": 2}), &either),
+            "carries both, and oneOf admits exactly one"
+        );
+        assert!(
+            !matches_column(&json!({"c": 3}), &either),
+            "carries neither, so no alternative is satisfied"
+        );
+    }
+
+    /// A required member is a question about the value, not about whether this
+    /// column may be absent from its parent. Both exist, and they are different.
+    #[test]
+    fn test1165_required_is_about_the_value_not_the_column() {
+        let mut object = column(ColumnType::Object);
+        object.required = ["owner".to_string()].into_iter().collect();
+        object.properties = Some({
+            let mut p = indexmap::IndexMap::new();
+            let mut owner = column(ColumnType::String);
+            owner.nullable = true;
+            p.insert("owner".to_string(), owner);
+            p
+        });
+
+        // The member is declared nullable -- so its ABSENCE would be excused by
+        // the old proxy -- and still required to be present.
+        assert!(matches_column(&json!({"owner": "x"}), &object));
+        assert!(
+            !matches_column(&json!({}), &object),
+            "a nullable member is still a member the value must carry"
+        );
     }
 
     /// Composition narrows which values of the declared type are legal, and the

@@ -149,6 +149,15 @@ fn encode_column(column: &Column) -> Value {
     if column.unique_items {
         out.insert("unique_items".into(), Value::Bool(true));
     }
+    // An object that must carry a member admits fewer values than one that need
+    // not, so the requirement is part of what the schema is. Sorted, because a
+    // set has no order and identity must not depend on one.
+    if !column.required.is_empty() {
+        out.insert(
+            "required".into(),
+            Value::Array(column.required.iter().map(|n| Value::String(n.clone())).collect()),
+        );
+    }
     // Composition changes which values are legal, and the ORDER of alternatives
     // is not meaningful to `oneOf` -- but it is meaningful to the document, and
     // reldir does not reorder what a person wrote. Encoding them as given keeps

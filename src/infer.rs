@@ -635,6 +635,7 @@ fn column(kind: ColumnType, nullable: bool) -> Column {
         // invent a constraint the corpus never stated.
         pattern: None,
         additional_properties: true,
+        required: Default::default(),
         min_size: None,
         max_size: None,
         minimum: None,

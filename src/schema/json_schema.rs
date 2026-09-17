@@ -318,11 +318,16 @@ fn encode_column(column: &Column) -> Value {
                     nested.insert(name.clone(), encode_column(inner));
                 }
                 out.insert("properties".into(), Value::Object(nested));
-                let required: Vec<Value> = properties
+                // Derived from the declared properties, plus any member the
+                // subschema requires without declaring. Both belong in the
+                // document: the first is how a nested object states presence,
+                // the second is what an alternative says.
+                let mut required: Vec<Value> = properties
                     .iter()
                     .filter(|(_, inner)| is_required(inner))
                     .map(|(name, _)| Value::String(name.clone()))
                     .collect();
+                required.extend(column.required.iter().map(|n| Value::String(n.clone())));
                 if !required.is_empty() {
                     out.insert("required".into(), Value::Array(required));
                 }
@@ -342,6 +347,19 @@ fn encode_column(column: &Column) -> Value {
         // `json` admits any value, which in JSON Schema is the empty schema.
         // A nullable json column is no different: it already admits null.
         ColumnType::Json => {}
+    }
+
+    // An object that declares no properties still carries its required list --
+    // a composition alternative is exactly that shape, and dropping the list
+    // would round-trip it to a subschema that constrains nothing.
+    if column.kind == ColumnType::Object
+        && column.properties.is_none()
+        && !column.required.is_empty()
+    {
+        out.insert(
+            "required".into(),
+            Value::Array(column.required.iter().map(|n| Value::String(n.clone())).collect()),
+        );
     }
 
     // A user pattern is emitted after the type's own, and for decimal and ulid
@@ -929,6 +947,36 @@ fn decode_column(
         None => nullable || (!required && default.is_none() && generated.is_none()),
     };
 
+    // Only the members the subschema does NOT declare.
+    //
+    // A nested object's `required` list is DERIVED on the way out, from which
+    // of its declared properties cannot be omitted. Reading that same list back
+    // as an independent fact would make a schema built in memory and the schema
+    // decoded from its own encoding differ -- the round trip would stop
+    // preserving identity, which is the defect `user_pattern` exists to prevent
+    // for decimal and ulid.
+    //
+    // What is NOT derivable is a member named by a subschema that declares no
+    // such property. That is the whole content of a composition alternative,
+    // and it is the only thing this set needs to carry.
+    let declared: std::collections::BTreeSet<&str> = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|nested| nested.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let required_members: std::collections::BTreeSet<String> = object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|name| !declared.contains(name))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Read before the literal takes ownership of `kind`: which pattern counts
     // as the user's depends on which type is restating itself.
     let pattern = user_pattern(object, &kind);
@@ -984,6 +1032,7 @@ fn decode_column(
             .get("additionalProperties")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        required: required_members,
         min_size,
         max_size,
         minimum,
@@ -1314,6 +1363,7 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            required: Default::default(),
             min_size: None,
             max_size: None,
             minimum: None,

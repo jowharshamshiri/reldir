@@ -371,6 +371,7 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            required: Default::default(),
             min_size: None,
             max_size: None,
             minimum: None,

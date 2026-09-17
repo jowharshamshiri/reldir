@@ -280,6 +280,27 @@ A column declares at most one composition keyword; two would be two constraints
 wearing one name, and the second would be invisible. `not` takes a single
 subschema rather than a list. Anything else is `SCHEMA_COMPOSITION_INVALID`.
 
+An alternative often says nothing but which member a value must carry:
+
+```json
+{
+  "trigger": {
+    "type": "object",
+    "properties": { "on_choice": { "type": ["integer", "null"], "x-reldir-type": "int" },
+                    "on_error":  { "type": ["boolean", "null"] } },
+    "oneOf": [ { "type": "object", "required": ["on_choice"] },
+               { "type": "object", "required": ["on_error"] } ]
+  }
+}
+```
+
+`required` inside an alternative is a question about the *value* — which members
+it must present — and it may name a member the alternative itself does not
+declare. That is different from the `required` list at the document root, which
+decides whether a row may omit a column, and different again from a column's
+nullability, which decides whether a declared member may be absent. All three
+coexist because they answer three different questions.
+
 An alternative is itself a column, so it may carry its own pattern, bounds, or
 composition, and is held to every rule a column is held to.
 
