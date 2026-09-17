@@ -1,4 +1,4 @@
-use crate::schema::{Column, ColumnType};
+use crate::schema::{Column, ColumnType, CompositionKind};
 use base64::Engine;
 use chrono::{DateTime, NaiveDate};
 use serde_json::Value;
@@ -21,6 +21,29 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
         && !matches_pattern(v, pattern)
     {
         return false;
+    }
+    if !within_bounds(v, c) {
+        return false;
+    }
+    // Composition constrains which values of the declared type are legal, so it
+    // is asked alongside the type rather than instead of it. An alternative is
+    // itself a column, so a nested pattern, bound or composition is judged by
+    // the same recursion.
+    if let Some(composition) = &c.composition {
+        let satisfied = composition
+            .alternatives
+            .iter()
+            .filter(|alternative| matches_column(v, alternative))
+            .count();
+        let ok = match composition.kind {
+            CompositionKind::One => satisfied == 1,
+            CompositionKind::Any => satisfied >= 1,
+            CompositionKind::All => satisfied == composition.alternatives.len(),
+            CompositionKind::Not => satisfied == 0,
+        };
+        if !ok {
+            return false;
+        }
     }
     match c.kind {
         ColumnType::Bool => v.is_boolean(),
@@ -69,6 +92,83 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
         }),
         ColumnType::Json => true,
     }
+}
+
+/// Whether a value satisfies the column's size and numeric bounds.
+///
+/// Size is one question asked of three shapes -- a string's characters, an
+/// array's elements, an object's members -- so one pair of fields answers it
+/// and the value's own shape decides which count to take. A value of a shape
+/// the bound cannot describe is unconstrained by it rather than failed:
+/// `validate_column` has already refused a schema that states a bound its
+/// column type cannot carry, so reaching here with a mismatch would mean
+/// judging rows against a schema that was never accepted.
+///
+/// String length counts characters, not bytes: JSON Schema counts code points,
+/// and a byte count would make a bound mean different things for the same text
+/// in different scripts.
+pub fn within_bounds(v: &Value, c: &Column) -> bool {
+    let size = match v {
+        Value::String(text) => Some(text.chars().count() as u64),
+        Value::Array(items) => Some(items.len() as u64),
+        Value::Object(members) => Some(members.len() as u64),
+        _ => None,
+    };
+    if let Some(size) = size {
+        if c.min_size.is_some_and(|bound| size < bound) {
+            return false;
+        }
+        if c.max_size.is_some_and(|bound| size > bound) {
+            return false;
+        }
+    }
+
+    if let Value::Array(items) = v
+        && c.unique_items
+    {
+        // Compared by canonical rendering, which is reldir's own notion of when
+        // two values are the same value: the rendering that decides a row's
+        // hash. It normalizes strings to NFC and collapses `-0.0`, and it
+        // deliberately keeps a number's spelling, so `1` and `1.0` are two
+        // elements here where JSON Schema's `uniqueItems` counts them as one.
+        //
+        // The divergence is the right way round. Adopting JSON Schema's numeric
+        // equality would mean either a second equality used only by this
+        // keyword, or changing what `compact` says two values are -- and
+        // `compact` decides row identity for every database in existence.
+        let mut seen = std::collections::BTreeSet::new();
+        if !items
+            .iter()
+            .all(|item| seen.insert(crate::canonical::compact(item)))
+        {
+            return false;
+        }
+    }
+
+    if let Some(number) = v.as_f64() {
+        if c.minimum.is_some_and(|bound| number < bound) {
+            return false;
+        }
+        if c.maximum.is_some_and(|bound| number > bound) {
+            return false;
+        }
+        if c.exclusive_minimum.is_some_and(|bound| number <= bound) {
+            return false;
+        }
+        if c.exclusive_maximum.is_some_and(|bound| number >= bound) {
+            return false;
+        }
+        if let Some(divisor) = c.multiple_of {
+            // A non-positive divisor is refused by `validate_column`, so it
+            // cannot reach here.
+            let quotient = number / divisor;
+            if (quotient - quotient.round()).abs() > f64::EPSILON * quotient.abs().max(1.0) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Whether a value satisfies a column's pattern.
@@ -323,7 +423,7 @@ pub fn generate(c: &Column, sequence: i64) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Column, ColumnType};
+    use crate::schema::{Column, ColumnType, Composition, CompositionKind};
     use indexmap::IndexMap;
     use serde_json::json;
 
@@ -338,6 +438,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: Default::default(),
         }
@@ -561,6 +670,142 @@ mod tests {
             !matches_column(&json!({"source": "a", "extra": 1}), &meta),
             "a closed object must reject a member it does not declare"
         );
+    }
+
+    /// A bound constrains the size of a value, and the shape of the value
+    /// decides which count it is asked for. A value the bound cannot describe
+    /// is unconstrained by it rather than failed: `validate_column` has already
+    /// refused a schema that states a bound its type cannot carry.
+    #[test]
+    fn test1154_size_bounds_constrain_strings_arrays_and_objects() {
+        let mut text = column(ColumnType::String);
+        text.min_size = Some(2);
+        text.max_size = Some(4);
+        assert!(matches_column(&json!("abc"), &text));
+        assert!(!matches_column(&json!("a"), &text), "shorter than the minimum");
+        assert!(!matches_column(&json!("abcde"), &text), "longer than the maximum");
+
+        // Characters, not bytes: a bound must mean the same thing in every
+        // script, and "é" is one character however it is encoded.
+        assert!(matches_column(&json!("éé"), &text), "two characters is two");
+
+        let mut list = column(ColumnType::Array);
+        list.items = Some(Box::new(column(ColumnType::String)));
+        list.min_size = Some(1);
+        assert!(matches_column(&json!(["a"]), &list));
+        assert!(!matches_column(&json!([]), &list), "empty is below the minimum");
+
+        let mut object = column(ColumnType::Object);
+        object.min_size = Some(1);
+        assert!(matches_column(&json!({"a": 1}), &object));
+        assert!(!matches_column(&json!({}), &object), "no members is below the minimum");
+    }
+
+    /// Numeric bounds, including the exclusive pair and divisibility.
+    #[test]
+    fn test1155_numeric_bounds_are_enforced() {
+        let mut n = column(ColumnType::Int);
+        n.minimum = Some(0.0);
+        n.maximum = Some(100.0);
+        assert!(matches_column(&json!(0), &n), "the minimum itself is admitted");
+        assert!(matches_column(&json!(100), &n), "the maximum itself is admitted");
+        assert!(!matches_column(&json!(-1), &n));
+        assert!(!matches_column(&json!(101), &n));
+
+        let mut exclusive = column(ColumnType::Float);
+        exclusive.exclusive_minimum = Some(0.0);
+        exclusive.exclusive_maximum = Some(1.0);
+        assert!(matches_column(&json!(0.5), &exclusive));
+        assert!(
+            !matches_column(&json!(0.0), &exclusive),
+            "an exclusive bound excludes its own value"
+        );
+        assert!(!matches_column(&json!(1.0), &exclusive));
+
+        let mut step = column(ColumnType::Int);
+        step.multiple_of = Some(5.0);
+        assert!(matches_column(&json!(10), &step));
+        assert!(!matches_column(&json!(7), &step));
+    }
+
+    /// `uniqueItems` compares elements by their canonical rendering, so two
+    /// equal values written differently are one element -- which is what JSON
+    /// Schema's own equality says, and what a byte comparison would miss.
+    #[test]
+    fn test1156_unique_items_compares_canonically() {
+        let mut list = column(ColumnType::Array);
+        list.items = Some(Box::new(column(ColumnType::Json)));
+        list.unique_items = true;
+
+        assert!(matches_column(&json!([1, 2, 3]), &list));
+        assert!(!matches_column(&json!([1, 1]), &list), "a literal repeat");
+
+        // Distinctness is reldir's own: the canonical rendering that decides a
+        // row's hash. It keeps a number's spelling, so these are two elements
+        // where JSON Schema's `uniqueItems` would call them one. Documented in
+        // `docs/schemas.md`, because a reader coming from JSON Schema will
+        // otherwise expect the other answer.
+        assert!(
+            matches_column(&json!([1, 1.0]), &list),
+            "canonical rendering keeps a number's spelling, so these differ"
+        );
+
+        // What it does collapse is what canonical form collapses everywhere:
+        // NFC for strings, and the sign on zero.
+        assert!(
+            !matches_column(&json!([0, -0.0]), &list),
+            "-0.0 normalizes to 0, so this is a repeat"
+        );
+
+        list.unique_items = false;
+        assert!(matches_column(&json!([1, 1]), &list), "repeats are fine unless asked");
+    }
+
+    /// Composition narrows which values of the declared type are legal, and the
+    /// arity is what distinguishes the four keywords.
+    #[test]
+    fn test1157_composition_arity_decides_what_is_admitted() {
+        let mut upper = column(ColumnType::String);
+        upper.pattern = Some("^[A-Z]+$".into());
+        let mut short = column(ColumnType::String);
+        short.max_size = Some(3);
+
+        let mut one = column(ColumnType::String);
+        one.composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![upper.clone(), short.clone()],
+        });
+        assert!(matches_column(&json!("ABCDE"), &one), "upper only");
+        assert!(matches_column(&json!("ab"), &one), "short only");
+        assert!(
+            !matches_column(&json!("AB"), &one),
+            "satisfies both, and oneOf admits exactly one"
+        );
+        assert!(!matches_column(&json!("abcde"), &one), "neither");
+
+        let mut any = column(ColumnType::String);
+        any.composition = Some(Composition {
+            kind: CompositionKind::Any,
+            alternatives: vec![upper.clone(), short.clone()],
+        });
+        assert!(matches_column(&json!("AB"), &any), "both is at least one");
+        assert!(!matches_column(&json!("abcde"), &any));
+
+        let mut all = column(ColumnType::String);
+        all.composition = Some(Composition {
+            kind: CompositionKind::All,
+            alternatives: vec![upper.clone(), short.clone()],
+        });
+        assert!(matches_column(&json!("AB"), &all));
+        assert!(!matches_column(&json!("ABCDE"), &all), "upper but not short");
+
+        let mut not = column(ColumnType::String);
+        not.composition = Some(Composition {
+            kind: CompositionKind::Not,
+            alternatives: vec![upper],
+        });
+        assert!(matches_column(&json!("abc"), &not));
+        assert!(!matches_column(&json!("ABC"), &not));
     }
 
     /// Section 15: timestamps are normalised to UTC for their canonical textual

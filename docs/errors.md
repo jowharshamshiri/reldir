@@ -105,6 +105,8 @@ Optional members are omitted rather than emitted as `null`.
 | `SCHEMA_DEFAULT_TYPE_MISMATCH` | a default or generator does not match its column |
 | `SCHEMA_FILENAME_NOT_UNIQUE` | `x-reldir.filename` is not a NOT NULL unique key |
 | `SCHEMA_CHECK_INVALID` | a check has no name, no expression, or is not boolean; or a `pattern` is not a valid regular expression |
+| `SCHEMA_BOUND_INVALID` | a bound is malformed or contradictory: a non-integer size, a non-finite number, a minimum above its maximum, or a `multipleOf` that is not positive |
+| `SCHEMA_COMPOSITION_INVALID` | a column declares more than one of `oneOf`/`anyOf`/`allOf`/`not`, or names no alternative |
 
 ## Schema semantics
 

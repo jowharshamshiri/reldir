@@ -27,8 +27,8 @@
 
 use super::meta::{DIALECT_URI, EXTENSION, TYPE_TAG};
 use super::{
-    Action, AdditionalFields, Check, Column, ColumnType, ForeignKey, Generated, GeneratedKind,
-    Reference, Schema, Storage,
+    Action, AdditionalFields, Check, Column, ColumnType, Composition, CompositionKind, ForeignKey,
+    Generated, GeneratedKind, Reference, Schema, Storage,
 };
 use crate::diagnostic::{DbError, Diagnostic, Result};
 use indexmap::IndexMap;
@@ -66,6 +66,30 @@ const COLUMN_SEMANTIC: &[&str] = &[
     "format",
     "pattern",
     "contentEncoding",
+    // Size bounds. Which one applies is decided by the column's type, and
+    // `validate_column` refuses one stated for a type it cannot describe.
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+    // Numeric bounds.
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    // Array element distinctness.
+    "uniqueItems",
+    // Composition. These constrain which values of the declared type are
+    // legal; they never decide the type itself.
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "not",
+    // `const` is `enum` with one member, and is read into the same field.
+    "const",
     TYPE_TAG,
 ];
 
@@ -327,6 +351,58 @@ fn encode_column(column: &Column) -> Value {
     // pattern -- `matches_column` checks both.
     if let Some(pattern) = &column.pattern {
         out.insert("pattern".into(), Value::String(pattern.clone()));
+    }
+
+    // Size bounds are written under the name the column's own type uses, which
+    // is how the document stays readable as ordinary JSON Schema: a string
+    // says `minLength`, an array `minItems`, an object `minProperties`.
+    let (min_key, max_key) = match column.kind {
+        ColumnType::Array => ("minItems", "maxItems"),
+        ColumnType::Object => ("minProperties", "maxProperties"),
+        _ => ("minLength", "maxLength"),
+    };
+    if let Some(bound) = column.min_size {
+        out.insert(min_key.into(), Value::from(bound));
+    }
+    if let Some(bound) = column.max_size {
+        out.insert(max_key.into(), Value::from(bound));
+    }
+
+    for (key, bound) in [
+        ("minimum", column.minimum),
+        ("maximum", column.maximum),
+        ("exclusiveMinimum", column.exclusive_minimum),
+        ("exclusiveMaximum", column.exclusive_maximum),
+        ("multipleOf", column.multiple_of),
+    ] {
+        if let Some(bound) = bound
+            && let Some(number) = serde_json::Number::from_f64(bound)
+        {
+            out.insert(key.into(), Value::Number(number));
+        }
+    }
+
+    // Emitted only when true, because false is JSON Schema's default and
+    // writing it would add a keyword that says nothing.
+    if column.unique_items {
+        out.insert("uniqueItems".into(), Value::Bool(true));
+    }
+
+    if let Some(composition) = &column.composition {
+        let keyword = match composition.kind {
+            CompositionKind::One => "oneOf",
+            CompositionKind::Any => "anyOf",
+            CompositionKind::All => "allOf",
+            CompositionKind::Not => "not",
+        };
+        let encoded: Vec<Value> = composition.alternatives.iter().map(encode_column).collect();
+        // `not` takes one subschema rather than a list, which is how it is
+        // read back.
+        let value = match composition.kind {
+            CompositionKind::Not => encoded.into_iter().next().unwrap_or(Value::Object(Map::new())),
+            _ => Value::Array(encoded),
+        };
+        out.insert(keyword.into(), value);
     }
     // Emitted only when closed, because open is JSON Schema's default and
     // writing it out would add a keyword that says nothing.
@@ -640,7 +716,9 @@ pub fn decode(document: &Value) -> Result<Schema> {
             Some(Value::Bool(true)) => AdditionalFields::Allow,
             _ => AdditionalFields::Reject,
         },
-        annotations: annotations_of(root),
+        // The root is not a column, so no `format` describes it and none is
+        // carried through.
+        annotations: annotations_of(root, None),
     })
 }
 
@@ -854,6 +932,42 @@ fn decode_column(
     // Read before the literal takes ownership of `kind`: which pattern counts
     // as the user's depends on which type is restating itself.
     let pattern = user_pattern(object, &kind);
+    let descriptive_format = descriptive_format(object, &kind);
+
+    // Size bounds arrive under three names because JSON Schema asks the
+    // question once per shape. Which name is legal for this column is
+    // `validate_column`'s judgement; reading all three here keeps the decoder
+    // from having to know the type's business, and a bound stated for the wrong
+    // shape is reported rather than silently dropped.
+    let min_size = first_u64(object, &["minLength", "minItems", "minProperties"], name)?;
+    let max_size = first_u64(object, &["maxLength", "maxItems", "maxProperties"], name)?;
+
+    let minimum = number(object, "minimum", name)?;
+    let maximum = number(object, "maximum", name)?;
+    let exclusive_minimum = number(object, "exclusiveMinimum", name)?;
+    let exclusive_maximum = number(object, "exclusiveMaximum", name)?;
+    let multiple_of = number(object, "multipleOf", name)?;
+
+    let unique_items = object
+        .get("uniqueItems")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let composition = composition_of(object, name)?;
+
+    // `const` is `enum` with one member, and reading it into the same field
+    // means one code path decides what an enumerated column admits.
+    let values = match (values, object.get("const")) {
+        (Some(values), _) => Some(values),
+        (None, Some(constant)) => Some(vec![constant.as_str().map(String::from).ok_or_else(|| {
+            bad_at(
+                "SCHEMA_TYPE_UNKNOWN",
+                name,
+                format!("column {name:?}: const must be a string"),
+            )
+        })?]),
+        (None, None) => None,
+    };
 
     Ok(Column {
         kind,
@@ -870,11 +984,20 @@ fn decode_column(
             .get("additionalProperties")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        min_size,
+        max_size,
+        minimum,
+        maximum,
+        exclusive_minimum,
+        exclusive_maximum,
+        multiple_of,
+        unique_items,
+        composition,
         description: object
             .get("description")
             .and_then(Value::as_str)
             .map(String::from),
-        annotations: annotations_of(object),
+        annotations: annotations_of(object, descriptive_format),
     })
 }
 
@@ -946,7 +1069,10 @@ fn column_kind(
         "array" => Ok(ColumnType::Array),
         "object" => Ok(ColumnType::Object),
         "string" => {
-            if object.contains_key("enum") {
+            // `const` is `enum` with one member, so it names the same type.
+            // Deciding otherwise here would leave a column carrying values it
+            // says it has no enumeration for -- a model that contradicts itself.
+            if object.contains_key("enum") || object.contains_key("const") {
                 return Ok(ColumnType::Enum);
             }
             if object.get("contentEncoding").and_then(Value::as_str) == Some("base64") {
@@ -956,11 +1082,13 @@ fn column_kind(
                 Some("date") => Ok(ColumnType::Date),
                 Some("date-time") => Ok(ColumnType::Timestamp),
                 Some("uuid") => Ok(ColumnType::Uuid),
-                Some(other) => Err(bad(
-                    "SCHEMA_TYPE_UNKNOWN",
-                    format!("column {name:?}: format {other:?} names no reldir type"),
-                )),
-                None => Ok(ColumnType::String),
+                // Every other `format` is a plain string that describes itself.
+                // In 2020-12 `format` asserts nothing unless the format-assertion
+                // vocabulary is enabled, and this dialect does not enable it, so
+                // `"format": "email"` says something about the author's intent
+                // and nothing about which rows are valid. It is preserved as an
+                // annotation rather than refused.
+                Some(_) | None => Ok(ColumnType::String),
             }
         }
         other => Err(bad_at(
@@ -1038,20 +1166,141 @@ fn reject_unknown_extension_keys(extension: &Map<String, Value>) -> Result<()> {
 }
 
 /// The annotations on a node, in the order a canonical rendering gives them.
-fn annotations_of(object: &Map<String, Value>) -> IndexMap<String, Value> {
+fn annotations_of(
+    object: &Map<String, Value>,
+    descriptive_format: Option<String>,
+) -> IndexMap<String, Value> {
     let mut out = IndexMap::new();
     for key in PRESERVED_ANNOTATIONS {
         if let Some(value) = object.get(*key) {
             out.insert((*key).to_string(), value.clone());
         }
     }
+    // A `format` that named no type is commentary, and travels with the other
+    // commentary. One that named a type is not here: it is the type, and
+    // `encode_column` writes it back from the kind.
+    if let Some(format) = descriptive_format {
+        out.insert("format".to_string(), Value::String(format));
+    }
     out
+}
+
+/// A `format` value that names no reldir type, and so describes rather than
+/// constrains. `date`, `date-time` and `uuid` are absent: those ARE the type,
+/// and re-emitting them from an annotation would write the keyword twice.
+fn descriptive_format(object: &Map<String, Value>, kind: &ColumnType) -> Option<String> {
+    let format = object.get("format").and_then(Value::as_str)?;
+    match kind {
+        ColumnType::Date | ColumnType::Timestamp | ColumnType::Uuid => None,
+        _ => Some(format.to_string()),
+    }
+}
+
+/// The first of several spellings of one bound, as a non-negative integer.
+///
+/// A bound written as a fraction or a negative is a malformed schema rather
+/// than a bound to round: a length cannot be -1, and silently truncating 2.5
+/// would enforce something nobody wrote.
+fn first_u64(object: &Map<String, Value>, keys: &[&str], name: &str) -> Result<Option<u64>> {
+    for key in keys {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let bound = value.as_u64().ok_or_else(|| {
+            bad_at(
+                "SCHEMA_BOUND_INVALID",
+                name,
+                format!("column {name:?}: {key} must be a non-negative integer"),
+            )
+        })?;
+        return Ok(Some(bound));
+    }
+    Ok(None)
+}
+
+/// One numeric bound, as a finite number.
+fn number(object: &Map<String, Value>, key: &str, name: &str) -> Result<Option<f64>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let bound = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| {
+            bad_at(
+                "SCHEMA_BOUND_INVALID",
+                name,
+                format!("column {name:?}: {key} must be a finite number"),
+            )
+        })?;
+    Ok(Some(bound))
+}
+
+/// The composition a column declares, if any.
+///
+/// Exactly one mode per column: a value that must satisfy one alternative set
+/// and simultaneously not satisfy another is two constraints wearing one name,
+/// and the second would be invisible in the model.
+fn composition_of(object: &Map<String, Value>, name: &str) -> Result<Option<Composition>> {
+    const MODES: &[(&str, CompositionKind)] = &[
+        ("oneOf", CompositionKind::One),
+        ("anyOf", CompositionKind::Any),
+        ("allOf", CompositionKind::All),
+        ("not", CompositionKind::Not),
+    ];
+
+    let declared: Vec<&(&str, CompositionKind)> = MODES
+        .iter()
+        .filter(|(keyword, _)| object.contains_key(*keyword))
+        .collect();
+    let Some((keyword, kind)) = declared.first().copied() else {
+        return Ok(None);
+    };
+    if declared.len() > 1 {
+        return Err(bad_at(
+            "SCHEMA_COMPOSITION_INVALID",
+            name,
+            format!(
+                "column {name:?} declares {} composition keywords; a column may declare one",
+                declared.len()
+            ),
+        ));
+    }
+
+    let value = &object[*keyword];
+    let alternatives = match kind {
+        // `not` takes a single subschema, not a list.
+        CompositionKind::Not => vec![decode_column(value, &format!("{name}/not"), true, None)?],
+        _ => {
+            let list = value.as_array().ok_or_else(|| {
+                bad_at(
+                    "SCHEMA_COMPOSITION_INVALID",
+                    name,
+                    format!("column {name:?}: {keyword} must be an array of subschemas"),
+                )
+            })?;
+            if list.is_empty() {
+                return Err(bad_at(
+                    "SCHEMA_COMPOSITION_INVALID",
+                    name,
+                    format!("column {name:?}: {keyword} must name at least one alternative"),
+                ));
+            }
+            list.iter()
+                .enumerate()
+                .map(|(index, alternative)| {
+                    decode_column(alternative, &format!("{name}/{keyword}/{index}"), true, None)
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    Ok(Some(Composition { kind: *kind, alternatives }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AdditionalFields, ColumnType};
+    use crate::schema::{AdditionalFields, ColumnType, CompositionKind};
     use serde_json::json;
 
     fn col(kind: ColumnType) -> Column {
@@ -1065,6 +1314,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: IndexMap::new(),
         }
@@ -1478,17 +1736,24 @@ mod tests {
     #[test]
     fn test1135_unsupported_keywords_are_refused_rather_than_ignored() {
         for keyword in [
-            "oneOf",
-            "anyOf",
-            "allOf",
-            "not",
+            // Composition and bounds are no longer here: the dialect reads
+            // them. What remains is what reldir still cannot express -- a
+            // member set discovered by regex, a shape that depends on a
+            // sibling's value, a positional tuple, and reference machinery
+            // pointing outside the database.
             "if",
+            "then",
+            "else",
             "patternProperties",
             "dependentSchemas",
+            "dependentRequired",
+            "propertyNames",
+            "prefixItems",
             "unevaluatedProperties",
+            "unevaluatedItems",
+            "contentMediaType",
             "$ref",
             "$defs",
-            "minLength",
         ] {
             let mut document = encode(&table(vec![("id", col(ColumnType::String))]));
             document[keyword] = json!({});
@@ -1585,6 +1850,99 @@ mod tests {
                 Box::new(|c: &Column| c.kind == ColumnType::Bytes),
             ),
             (
+                "minLength",
+                json!({"type": "string", "minLength": 2}),
+                Box::new(|c: &Column| c.min_size == Some(2)),
+            ),
+            (
+                "maxLength",
+                json!({"type": "string", "maxLength": 9}),
+                Box::new(|c: &Column| c.max_size == Some(9)),
+            ),
+            (
+                "minItems",
+                json!({"type": "array", "items": {"type": "string"}, "minItems": 1}),
+                Box::new(|c: &Column| c.min_size == Some(1)),
+            ),
+            (
+                "maxItems",
+                json!({"type": "array", "items": {"type": "string"}, "maxItems": 4}),
+                Box::new(|c: &Column| c.max_size == Some(4)),
+            ),
+            (
+                "minProperties",
+                json!({"type": "object", "properties": {}, "minProperties": 1}),
+                Box::new(|c: &Column| c.min_size == Some(1)),
+            ),
+            (
+                "maxProperties",
+                json!({"type": "object", "properties": {}, "maxProperties": 3}),
+                Box::new(|c: &Column| c.max_size == Some(3)),
+            ),
+            (
+                "minimum",
+                json!({"type": "integer", TYPE_TAG: "int", "minimum": 0}),
+                Box::new(|c: &Column| c.minimum == Some(0.0)),
+            ),
+            (
+                "maximum",
+                json!({"type": "integer", TYPE_TAG: "int", "maximum": 10}),
+                Box::new(|c: &Column| c.maximum == Some(10.0)),
+            ),
+            (
+                "exclusiveMinimum",
+                json!({"type": "number", "exclusiveMinimum": 0}),
+                Box::new(|c: &Column| c.exclusive_minimum == Some(0.0)),
+            ),
+            (
+                "exclusiveMaximum",
+                json!({"type": "number", "exclusiveMaximum": 1}),
+                Box::new(|c: &Column| c.exclusive_maximum == Some(1.0)),
+            ),
+            (
+                "multipleOf",
+                json!({"type": "number", "multipleOf": 5}),
+                Box::new(|c: &Column| c.multiple_of == Some(5.0)),
+            ),
+            (
+                "uniqueItems",
+                json!({"type": "array", "items": {"type": "string"}, "uniqueItems": true}),
+                Box::new(|c: &Column| c.unique_items),
+            ),
+            (
+                "oneOf",
+                json!({"type": "string", "oneOf": [{"type": "string", "minLength": 1}]}),
+                Box::new(|c: &Column| {
+                    c.composition.as_ref().is_some_and(|x| x.kind == CompositionKind::One)
+                }),
+            ),
+            (
+                "anyOf",
+                json!({"type": "string", "anyOf": [{"type": "string", "minLength": 1}]}),
+                Box::new(|c: &Column| {
+                    c.composition.as_ref().is_some_and(|x| x.kind == CompositionKind::Any)
+                }),
+            ),
+            (
+                "allOf",
+                json!({"type": "string", "allOf": [{"type": "string", "minLength": 1}]}),
+                Box::new(|c: &Column| {
+                    c.composition.as_ref().is_some_and(|x| x.kind == CompositionKind::All)
+                }),
+            ),
+            (
+                "not",
+                json!({"type": "string", "not": {"type": "string", "pattern": "^x$"}}),
+                Box::new(|c: &Column| {
+                    c.composition.as_ref().is_some_and(|x| x.kind == CompositionKind::Not)
+                }),
+            ),
+            (
+                "const",
+                json!({"type": "string", "const": "fixed"}),
+                Box::new(|c: &Column| c.values.as_deref() == Some(&["fixed".to_string()][..])),
+            ),
+            (
                 TYPE_TAG,
                 json!({"type": "integer", TYPE_TAG: "int"}),
                 Box::new(|c: &Column| c.kind == ColumnType::Int),
@@ -1616,6 +1974,93 @@ mod tests {
                  could state it while the database ignored it"
             );
         }
+    }
+
+    /// `const` is `enum` with one member, and reading it into the same field
+    /// means one code path decides what an enumerated column admits. A schema
+    /// that said `const` and a schema that said a one-member `enum` are the
+    /// same schema, and must round-trip to the same thing.
+    #[test]
+    fn test1158_const_is_a_single_valued_enum() {
+        let mut document = encode(&table(vec![("id", col(ColumnType::String))]));
+        document["properties"]["mode"] = json!({"type": "string", "const": "fixed"});
+        document["x-reldir"]["columnOrder"] = json!(["id", "mode"]);
+
+        let schema = decode(&document).expect("const decodes");
+        let column = &schema.columns["mode"];
+        assert_eq!(column.kind, ColumnType::Enum, "a fixed value is an enumeration");
+        assert_eq!(column.values.as_deref(), Some(&["fixed".to_string()][..]));
+
+        // And it writes back as an enum, because that is what it is. One
+        // spelling on the way out means a round trip cannot drift.
+        let written = encode(&schema);
+        assert_eq!(written["properties"]["mode"]["enum"], json!(["fixed"]));
+        assert!(written["properties"]["mode"].get("const").is_none());
+    }
+
+    /// A `format` that names no reldir type describes rather than constrains,
+    /// so it is preserved instead of refused.
+    ///
+    /// 2020-12 makes `format` an annotation unless the format-assertion
+    /// vocabulary is enabled, and this dialect does not enable it. Refusing the
+    /// document denied a schema reldir had no quarrel with; asserting the
+    /// format would claim something reldir does not check.
+    #[test]
+    fn test1159_a_descriptive_format_is_preserved_not_refused() {
+        let mut document = encode(&table(vec![("id", col(ColumnType::String))]));
+        document["properties"]["email"] = json!({"type": "string", "format": "email"});
+        document["x-reldir"]["columnOrder"] = json!(["id", "email"]);
+
+        let schema = decode(&document).expect("an unrecognised format must not refuse the document");
+        let column = &schema.columns["email"];
+        assert_eq!(column.kind, ColumnType::String, "it is a plain string");
+        assert_eq!(
+            column.annotations.get("format"),
+            Some(&json!("email")),
+            "kept as the annotation it is"
+        );
+
+        assert_eq!(
+            encode(&schema)["properties"]["email"]["format"],
+            json!("email"),
+            "and written back unchanged"
+        );
+
+        // A format that DOES name a type is the type, not an annotation, and
+        // must not be duplicated into both places.
+        let mut typed = encode(&table(vec![("id", col(ColumnType::String))]));
+        typed["properties"]["when"] = json!({"type": "string", "format": "date-time"});
+        typed["x-reldir"]["columnOrder"] = json!(["id", "when"]);
+        let typed = decode(&typed).expect("a type-naming format decodes");
+        assert_eq!(typed.columns["when"].kind, ColumnType::Timestamp);
+        assert!(
+            typed.columns["when"].annotations.get("format").is_none(),
+            "the type carries it; an annotation would write the keyword twice"
+        );
+    }
+
+    /// A column declares at most one composition keyword. Two would be two
+    /// constraints wearing one name, and the second would be invisible in a
+    /// model that holds one.
+    #[test]
+    fn test1160_a_column_declares_one_composition_at_most() {
+        let alternative = json!([{"type": "string", "minLength": 1}]);
+
+        let mut two = encode(&table(vec![("id", col(ColumnType::String))]));
+        two["properties"]["v"] = json!({
+            "type": "string",
+            "oneOf": alternative,
+            "anyOf": alternative,
+        });
+        two["x-reldir"]["columnOrder"] = json!(["id", "v"]);
+        let error = decode(&two).expect_err("two composition keywords must be refused");
+        assert_eq!(error.diagnostic.code, "SCHEMA_COMPOSITION_INVALID");
+
+        let mut empty = encode(&table(vec![("id", col(ColumnType::String))]));
+        empty["properties"]["v"] = json!({"type": "string", "oneOf": []});
+        empty["x-reldir"]["columnOrder"] = json!(["id", "v"]);
+        let error = decode(&empty).expect_err("an empty alternative list names nothing");
+        assert_eq!(error.diagnostic.code, "SCHEMA_COMPOSITION_INVALID");
     }
 
     /// Annotations carry no relational meaning, so they are preserved rather

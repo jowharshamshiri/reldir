@@ -75,6 +75,36 @@ pub struct Column {
     /// `ROW_UNKNOWN_FIELD` per key; here the answer belongs to the value, so it
     /// is part of whether the value matches its column at all.
     pub additional_properties: bool,
+    /// Bounds on the size of a value: string length, array length, object size.
+    ///
+    /// JSON Schema states these as separate keywords per type -- `minLength`,
+    /// `minItems`, `minProperties` -- but they are one question asked of three
+    /// shapes, and which one applies is already decided by the column's type.
+    /// Holding them as one pair keeps `matches_column` from growing three
+    /// near-identical branches, and keeps a schema from declaring a string
+    /// bound on an array.
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    /// Bounds on a numeric value. Exclusive bounds are separate fields rather
+    /// than a flag, because JSON Schema 2020-12 states them as separate
+    /// keywords and a column may carry one of each.
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub exclusive_minimum: Option<f64>,
+    pub exclusive_maximum: Option<f64>,
+    /// A number every value must be a multiple of. Must be strictly positive.
+    pub multiple_of: Option<f64>,
+    /// Whether an array's elements must be distinct, compared by their
+    /// canonical rendering so that two equal values written differently still
+    /// collide.
+    pub unique_items: bool,
+    /// Alternative subschemas a value must satisfy, beyond its declared type.
+    ///
+    /// Composition is a *constraint*, never the type itself: a column has one
+    /// declared type, which SQL binding, canonical column order and doctor's
+    /// coercions all depend on. `oneOf` narrows which values of that type are
+    /// legal; it cannot make a column two types at once.
+    pub composition: Option<Composition>,
     pub description: Option<String>,
     /// Standard JSON Schema annotations carried through untouched.
     ///
@@ -82,6 +112,36 @@ pub struct Column {
     /// them costs no semantics: a `$comment` a person wrote survives a load and
     /// a save. They take no part in validation and none in identity.
     pub annotations: IndexMap<String, Value>,
+}
+
+/// How a value must relate to a set of alternative subschemas.
+///
+/// JSON Schema spells four of these, and they differ only in how many
+/// alternatives a value must satisfy. Holding the arity as a variant rather
+/// than as four fields means `matches_column` asks one question, and a schema
+/// cannot declare two composition modes on one column.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositionKind {
+    /// `oneOf`: exactly one alternative.
+    One,
+    /// `anyOf`: at least one.
+    Any,
+    /// `allOf`: every one.
+    All,
+    /// `not`: none. Carries exactly one alternative.
+    Not,
+}
+
+/// Alternative subschemas, and how many of them a value must satisfy.
+///
+/// The alternatives are `Column`s because that is what a subschema decodes to,
+/// and it makes composition recursive for free: an alternative may itself carry
+/// a pattern, a bound, or a nested composition.
+#[derive(Debug, Clone)]
+pub struct Composition {
+    pub kind: CompositionKind,
+    pub alternatives: Vec<Column>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +164,18 @@ pub enum Action {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForeignKey {
+    /// The referencing columns.
+    ///
+    /// A name may carry a `[]` suffix -- `objective_refs[]` -- which addresses
+    /// *each element* of an array column rather than the column's value. That
+    /// is a different relationship from a composite key: a scalar key names one
+    /// target row per row, while an element key names one target row per
+    /// element. Both are spelled here because both are foreign keys; what
+    /// changes is how many lookups a row performs, not what a lookup means.
+    ///
+    /// Element addressing and composite keys do not combine: an element key
+    /// names exactly one column, because a tuple drawn from two arrays has no
+    /// defined pairing.
     pub columns: Vec<String>,
     pub references: Reference,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,7 +183,27 @@ pub struct ForeignKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_update: Option<Action>,
 }
+/// The column a foreign-key name addresses, and whether it addresses elements.
+pub struct KeyColumn<'a> {
+    pub name: &'a str,
+    pub per_element: bool,
+}
+
+/// Split a foreign-key column name into the column it names and whether it
+/// addresses that column's elements.
+pub fn key_column(spelled: &str) -> KeyColumn<'_> {
+    match spelled.strip_suffix("[]") {
+        Some(name) => KeyColumn { name, per_element: true },
+        None => KeyColumn { name: spelled, per_element: false },
+    }
+}
+
 impl ForeignKey {
+    /// Whether this key relates array elements rather than column values.
+    pub fn is_per_element(&self) -> bool {
+        self.columns.iter().any(|c| key_column(c).per_element)
+    }
+
     pub fn delete_action(&self) -> Action {
         self.on_delete.unwrap_or(Action::Restrict)
     }
@@ -392,6 +484,73 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: additionalProperties is only valid for object columns"),
         ));
     }
+    // A bound stated for a type it cannot describe is a schema that means
+    // nothing: `minLength` on a boolean constrains no value reldir will ever
+    // see. Refusing it here is the same rule `items` and `properties` follow.
+    let sized = matches!(
+        c.kind,
+        ColumnType::String
+            | ColumnType::Enum
+            | ColumnType::Decimal
+            | ColumnType::Bytes
+            | ColumnType::Array
+            | ColumnType::Object
+    );
+    if (c.min_size.is_some() || c.max_size.is_some()) && !sized {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!(
+                "{table}.{name}: a size bound is only valid for string, array, or object columns"
+            ),
+        ));
+    }
+    if let (Some(low), Some(high)) = (c.min_size, c.max_size)
+        && low > high
+    {
+        out.push(Diagnostic::error(
+            "SCHEMA_BOUND_INVALID",
+            format!("{table}.{name}: minimum size {low} exceeds maximum size {high}"),
+        ));
+    }
+    let numeric = matches!(c.kind, ColumnType::Int | ColumnType::Float);
+    let has_numeric_bound = c.minimum.is_some()
+        || c.maximum.is_some()
+        || c.exclusive_minimum.is_some()
+        || c.exclusive_maximum.is_some()
+        || c.multiple_of.is_some();
+    if has_numeric_bound && !numeric {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: a numeric bound is only valid for int or float columns"),
+        ));
+    }
+    if let (Some(low), Some(high)) = (c.minimum, c.maximum)
+        && low > high
+    {
+        out.push(Diagnostic::error(
+            "SCHEMA_BOUND_INVALID",
+            format!("{table}.{name}: minimum {low} exceeds maximum {high}"),
+        ));
+    }
+    if c.multiple_of.is_some_and(|divisor| divisor <= 0.0) {
+        out.push(Diagnostic::error(
+            "SCHEMA_BOUND_INVALID",
+            format!("{table}.{name}: multipleOf must be greater than zero"),
+        ));
+    }
+    if c.unique_items && c.kind != ColumnType::Array {
+        out.push(Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{table}.{name}: uniqueItems is only valid for array columns"),
+        ));
+    }
+    // An alternative is a column, so it is held to every rule a column is --
+    // including this one, which is what makes a nested composition legal.
+    if let Some(composition) = &c.composition {
+        for (index, alternative) in composition.alternatives.iter().enumerate() {
+            validate_column(table, &format!("{name}/{index}"), alternative, out);
+        }
+    }
     if let Some(default) = &c.default
         && !crate::value::matches_column(default, c)
     {
@@ -530,6 +689,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: Default::default(),
         }

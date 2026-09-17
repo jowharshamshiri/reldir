@@ -43,9 +43,15 @@ pub fn validate(c: &Catalog) -> Vec<Diagnostic> {
                 .filter_map(|r| key(&r.value, &fk.references.columns, target_schema))
                 .collect();
             for row in &c.rows[table] {
-                if let Some(k) = key(&row.value, &fk.columns, s)
-                    && !targets.contains(&k)
-                {
+                // An element key asks the same question once per element: each
+                // id in the array must name a row that exists. A scalar key
+                // asks it once for the row. Both fail the same way, because
+                // both are the same relationship -- what differs is how many
+                // lookups one row performs.
+                for k in row_keys(&row.value, fk, s) {
+                    if targets.contains(&k) {
+                        continue;
+                    }
                     let constraint = format!(
                         "{}.{} -> {}.{}",
                         table,
@@ -72,10 +78,11 @@ pub fn validate(c: &Catalog) -> Vec<Diagnostic> {
                     .observed(k)
                     .fix("FIX_ORPHAN_DELETE_ROW");
                     d.constraint = Some(constraint);
-                    if fk
-                        .columns
-                        .iter()
-                        .all(|x| s.columns.get(x).is_some_and(|c| c.nullable))
+                    if !fk.is_per_element()
+                        && fk
+                            .columns
+                            .iter()
+                            .all(|x| s.columns.get(x).is_some_and(|c| c.nullable))
                     {
                         d.fixes.insert(0, "FIX_ORPHAN_SET_NULL".into())
                     }
@@ -162,11 +169,23 @@ fn validate_row(
                     .pattern
                     .as_ref()
                     .filter(|pattern| v.is_string() && !value::matches_pattern(v, pattern));
+                // A value can satisfy its type and still miss a bound, and
+                // reporting "does not match type String" for a string that is
+                // merely too short names the wrong thing. The bound is part of
+                // what the column admits, so it is what the message says.
+                let missed_bound = !value::within_bounds(v, col);
                 let diagnostic = Diagnostic::error(
                     "TYPE_MISMATCH",
-                    match missed_pattern {
-                        Some(pattern) => format!("field {name:?} does not match pattern {pattern:?}"),
-                        None => format!("field {name:?} does not match type {:?}", col.kind),
+                    match (missed_pattern, missed_bound) {
+                        (Some(pattern), _) => {
+                            format!("field {name:?} does not match pattern {pattern:?}")
+                        }
+                        (None, true) => {
+                            format!("field {name:?} is outside the bounds declared for it")
+                        }
+                        (None, false) => {
+                            format!("field {name:?} does not match type {:?}", col.kind)
+                        }
                     },
                 )
                 .at(path)
@@ -180,9 +199,9 @@ fn validate_row(
                 // the fix anyway would name a remedy that selects nothing --
                 // doctor already classes this as manual, and the diagnostic
                 // must say the same thing.
-                out.push(match missed_pattern {
-                    Some(_) => diagnostic,
-                    None => diagnostic.fix("FIX_COERCE_VALUE"),
+                out.push(match (missed_pattern.is_some(), missed_bound) {
+                    (true, _) | (_, true) => diagnostic,
+                    (false, false) => diagnostic.fix("FIX_COERCE_VALUE"),
                 });
             }
             _ => {}
@@ -230,6 +249,39 @@ fn validate_unique(s: &Schema, rows: &[crate::catalog::Row], out: &mut Vec<Diagn
             }
         }
     }
+}
+
+/// Every target key one row must find, for one foreign key.
+///
+/// A scalar key yields at most one: the row's own tuple. An element key yields
+/// one per element of its array, because each element is a reference in its own
+/// right. Returning a list for both means `integrity` asks the same question in
+/// one loop rather than branching on a distinction that does not change what a
+/// violation means.
+///
+/// A null element yields nothing, exactly as a null column does: a null never
+/// matches a foreign key, and reporting one as an orphan would invent a
+/// reference the row does not make.
+pub fn row_keys(row: &Map<String, Value>, fk: &crate::schema::ForeignKey, s: &Schema) -> Vec<String> {
+    if !fk.is_per_element() {
+        return key(row, &fk.columns, s).into_iter().collect();
+    }
+    // An element key names exactly one column; `catalog` refuses any other
+    // shape, so the first name is the whole key.
+    let Some(spelled) = fk.columns.first() else {
+        return vec![];
+    };
+    let column = crate::schema::key_column(spelled).name;
+    row.get(column)
+        .and_then(Value::as_array)
+        .map(|elements| {
+            elements
+                .iter()
+                .filter(|element| !element.is_null())
+                .map(|element| crate::canonical::compact(&Value::Array(vec![element.clone()])))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn key(row: &Map<String, Value>, cols: &[String], s: &Schema) -> Option<String> {
@@ -303,6 +355,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: Default::default(),
         }

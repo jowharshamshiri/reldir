@@ -124,6 +124,29 @@ pub fn meta_schema() -> &'static Value {
                         "required": { "type": "array", "items": { "type": "string" } },
                         "additionalProperties": { "type": "boolean" },
                         "x-reldir-column-order": { "type": "array", "items": { "type": "string" } },
+                        // Size bounds. Which spelling is legal for a column is
+                        // decided by its type, which a meta-schema cannot see,
+                        // so all three are declared and `validate_column`
+                        // refuses one stated for the wrong shape.
+                        "minLength": { "type": "integer", "minimum": 0 },
+                        "maxLength": { "type": "integer", "minimum": 0 },
+                        "minItems": { "type": "integer", "minimum": 0 },
+                        "maxItems": { "type": "integer", "minimum": 0 },
+                        "minProperties": { "type": "integer", "minimum": 0 },
+                        "maxProperties": { "type": "integer", "minimum": 0 },
+                        // Numeric bounds.
+                        "minimum": { "type": "number" },
+                        "maximum": { "type": "number" },
+                        "exclusiveMinimum": { "type": "number" },
+                        "exclusiveMaximum": { "type": "number" },
+                        "multipleOf": { "type": "number", "exclusiveMinimum": 0 },
+                        "uniqueItems": { "type": "boolean" },
+                        // Composition. A column declares at most one of these.
+                        "oneOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
+                        "anyOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
+                        "allOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
+                        "not": { "$ref": "#/$defs/column" },
+                        "const": { "type": "string" },
                         // Standard annotations carry no relational meaning and
                         // are preserved verbatim rather than rejected.
                         "title": { "type": "string" },
@@ -132,6 +155,11 @@ pub fn meta_schema() -> &'static Value {
                         "readOnly": { "type": "boolean" },
                         "deprecated": { "type": "boolean" },
                     },
+                    // Closed, so a generic validator refuses exactly what the
+                    // binary refuses. Left open, the dialect called a document
+                    // with `patternProperties` conforming while reldir rejected
+                    // it -- two answers to one question.
+                    "additionalProperties": false,
                 },
                 "extension": {
                     "type": "object",
@@ -184,7 +212,7 @@ pub fn meta_schema() -> &'static Value {
                     "required": ["columns", "references"],
                     "additionalProperties": false,
                     "properties": {
-                        "columns": { "$ref": "#/$defs/columnList" },
+                        "columns": { "$ref": "#/$defs/keyColumnList" },
                         "references": {
                             "type": "object",
                             "required": ["table", "columns"],
@@ -205,6 +233,14 @@ pub fn meta_schema() -> &'static Value {
                     "type": "array",
                     "minItems": 1,
                     "items": { "type": "string" },
+                },
+                // A foreign key's referencing side may address each element of
+                // an array column, written with a trailing `[]`. The target
+                // side never does: it names columns of a row.
+                "keyColumnList": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\[\\])?$" },
                 },
                 "columnLists": {
                     "type": "array",

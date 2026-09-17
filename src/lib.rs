@@ -1,3 +1,10 @@
+// The dialect is one `json!` literal describing the whole schema language, and
+// declaring the bound and composition keywords pushed it past the macro
+// expander's default depth. The document is more legible as one literal than as
+// fragments assembled to suit an expander, so the limit moves rather than the
+// dialect.
+#![recursion_limit = "256"]
+
 pub mod canonical;
 pub mod catalog;
 pub mod cli;

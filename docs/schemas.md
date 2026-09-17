@@ -56,8 +56,11 @@ Content that would alter semantics reldir cannot represent is rejected by name w
 ### What a document says
 
 Standard keywords describe the columns: `type`, `properties`, `items`, `enum`,
-`default`, `required`, `additionalProperties`, `format`, `pattern`,
-`contentEncoding`, and `description`.
+`const`, `default`, `required`, `additionalProperties`, `format`, `pattern`,
+`contentEncoding`, and `description`; the bounds `minLength`, `maxLength`,
+`minItems`, `maxItems`, `minProperties`, `maxProperties`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, and `uniqueItems`; and the
+composition keywords `oneOf`, `anyOf`, `allOf`, and `not`.
 
 Everything relational that JSON Schema has no keyword for lives under one
 extension key, `x-reldir`:
@@ -90,11 +93,39 @@ false.
 
 ### References from inside an array
 
-A foreign key relates *columns*: `columns` names a tuple of this table's
-columns, and the target must be a primary key or a unique constraint. A column
-holding an array of ids is a different relationship — many edges from one row —
-and declaring it as a foreign key would make `columns` mean two things depending
-on the column's type.
+A column holding an array of ids is many edges from one row, and reldir enforces
+it. Suffix the column name with `[]` and each element must name a row that
+exists:
+
+```json
+{
+  "foreignKeys": [
+    {
+      "columns": ["objective_refs[]"],
+      "references": { "table": "objectives", "columns": ["id"] },
+      "onDelete": "restrict"
+    }
+  ]
+}
+```
+
+Each element is looked up on its own, so one row with four references performs
+four lookups and a missing target is reported per element. A null element makes
+no reference and is not an orphan, exactly as a null column is not.
+
+An element key names exactly one column: a tuple drawn from two arrays has no
+defined pairing. Its element type must match the target's, not the array's —
+`objective_refs` is an array of `string`, and the target `id` is a `string`.
+`set_null` and `set_default` are refused for an element key, because removing an
+element and nulling one are different operations and neither action says which
+was meant.
+
+Where a relationship carries its own attributes — a weight, an order, a
+rationale — give the edges their own table with a composite primary key and a
+foreign key on each side. That form holds data about the edge; an array holds
+only the fact of it.
+
+The alternative is still a query, if you would rather inspect than enforce:
 
 The recommended form is to keep the array and check it as a query, which
 `json_each` expands one element per row:
@@ -150,7 +181,7 @@ document-level map could key it.
 | `timestamp` | `{"type": "string", "format": "date-time"}` |
 | `uuid` | `{"type": "string", "format": "uuid"}` |
 | `ulid` | `{"type": "string", "pattern": …, "x-reldir-type": "ulid"}` |
-| `enum` | `{"type": "string", "enum": [...]}` |
+| `enum` | `{"type": "string", "enum": [...]}`, or `const` for a single value |
 | `array` | `{"type": "array", "items": {...}}` |
 | `object` | `{"type": "object", "properties": {...}}` |
 | `json` | `{}` |
@@ -192,6 +223,65 @@ A pattern decides which rows a schema admits, so it is part of what that schema
 reldir reads that one back as the type restating itself rather than as a further
 constraint, so a `decimal` column has the same identity before and after its
 schema makes a round trip through disk.
+
+### Bounds
+
+A bound says how large a value may be, or where a number may fall. reldir
+enforces them, and each is written under the name JSON Schema uses for that
+shape:
+
+```json
+{
+  "title":  { "type": "string", "minLength": 1, "maxLength": 200 },
+  "tags":   { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+  "meta":   { "type": "object", "properties": {}, "minProperties": 1 },
+  "year":   { "type": "integer", "x-reldir-type": "int", "minimum": 1000, "maximum": 3000 },
+  "ratio":  { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+  "amount": { "type": "number", "multipleOf": 0.01 }
+}
+```
+
+A string's length counts characters, not bytes, so a bound means the same thing
+in every script.
+
+`uniqueItems` compares elements by reldir's canonical rendering — the same
+rendering that decides a row's hash. It normalizes strings to NFC and collapses
+the sign on zero, but it keeps a number's spelling, so `1` and `1.0` are two
+elements here where JSON Schema's own equality counts them as one. The
+divergence is deliberate: adopting JSON Schema's numeric equality would mean
+either a second notion of sameness used by this keyword alone, or changing what
+canonical form says two values are — and canonical form decides row identity for
+every database reldir governs.
+
+A bound stated for a type it cannot describe is refused with
+`SCHEMA_UNKNOWN_KEY`: `minLength` on a boolean constrains nothing. A bound that
+contradicts itself — a minimum above its maximum, a `multipleOf` of zero — is
+`SCHEMA_BOUND_INVALID`.
+
+### Composition
+
+`oneOf`, `anyOf`, `allOf`, and `not` narrow which values of a column's declared
+type are legal. They do not decide the type: a column has exactly one, because
+row ordering, SQL binding, and coercion all depend on knowing it.
+
+```json
+{
+  "code": {
+    "type": "string",
+    "oneOf": [
+      { "type": "string", "pattern": "^[A-Z]{3}$" },
+      { "type": "string", "pattern": "^[0-9]{6}$" }
+    ]
+  }
+}
+```
+
+A column declares at most one composition keyword; two would be two constraints
+wearing one name, and the second would be invisible. `not` takes a single
+subschema rather than a list. Anything else is `SCHEMA_COMPOSITION_INVALID`.
+
+An alternative is itself a column, so it may carry its own pattern, bounds, or
+composition, and is held to every rule a column is held to.
 
 ### Closed objects
 

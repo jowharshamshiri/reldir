@@ -503,7 +503,21 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                 );
                 continue;
             }
-            for c in &fk.columns {
+            // An element key names exactly one column: a tuple drawn from two
+            // arrays has no defined pairing, so there is nothing for a
+            // composite element key to mean.
+            if fk.is_per_element() && fk.columns.len() != 1 {
+                out.push(
+                    Diagnostic::error(
+                        "SCHEMA_FK_ACTION_INVALID",
+                        "an element foreign key names exactly one column",
+                    )
+                    .table(table),
+                );
+                continue;
+            }
+            for spelled in &fk.columns {
+                let c = &crate::schema::key_column(spelled).name.to_string();
                 if !s.columns.contains_key(c) {
                     out.push(
                         Diagnostic::error(
@@ -552,8 +566,35 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                     .table(table),
                 );
             }
-            for (a, b) in fk.columns.iter().zip(&fk.references.columns) {
-                if let (Some(x), Some(y)) = (s.columns.get(a), target.columns.get(b))
+            for (spelled, b) in fk.columns.iter().zip(&fk.references.columns) {
+                let addressed = crate::schema::key_column(spelled);
+                let a = addressed.name;
+                // An element key compares the ARRAY'S ELEMENT against the
+                // target, because that is the value being matched. Comparing
+                // the array itself would always differ and report a mismatch
+                // that says nothing about the data.
+                let referencing = s.columns.get(a).and_then(|column| {
+                    if addressed.per_element {
+                        column.items.as_deref()
+                    } else {
+                        Some(column)
+                    }
+                });
+                if addressed.per_element
+                    && s.columns
+                        .get(a)
+                        .is_some_and(|column| column.kind != crate::schema::ColumnType::Array)
+                {
+                    out.push(
+                        Diagnostic::error(
+                            "SCHEMA_FK_TYPE_MISMATCH",
+                            format!("{table}.{a} is addressed per element but is not an array"),
+                        )
+                        .table(table),
+                    );
+                    continue;
+                }
+                if let (Some(x), Some(y)) = (referencing, target.columns.get(b))
                     && !same_column_type(x, y, false)
                 {
                     out.push(
@@ -568,11 +609,28 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                     );
                 }
             }
+            if fk.is_per_element()
+                && [fk.delete_action(), fk.update_action()].iter().any(|action| {
+                    matches!(
+                        action,
+                        crate::schema::Action::SetNull | crate::schema::Action::SetDefault
+                    )
+                })
+            {
+                out.push(
+                    Diagnostic::error(
+                        "SCHEMA_FK_ACTION_INVALID",
+                        "set_null and set_default have no meaning for an element foreign key: \
+                         an element is removed or it is not, and neither action says which",
+                    )
+                    .table(table),
+                );
+            }
             if [fk.delete_action(), fk.update_action()].contains(&crate::schema::Action::SetNull)
-                && fk
-                    .columns
-                    .iter()
-                    .any(|c| s.columns.get(c).is_some_and(|v| !v.nullable))
+                && fk.columns.iter().any(|spelled| {
+                    let c = crate::schema::key_column(spelled).name;
+                    s.columns.get(c).is_some_and(|v| !v.nullable)
+                })
             {
                 out.push(
                     Diagnostic::error(
@@ -583,10 +641,10 @@ fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>)
                 );
             }
             if [fk.delete_action(), fk.update_action()].contains(&crate::schema::Action::SetDefault)
-                && fk
-                    .columns
-                    .iter()
-                    .any(|c| s.columns.get(c).is_some_and(|v| v.default.is_none()))
+                && fk.columns.iter().any(|spelled| {
+                    let c = crate::schema::key_column(spelled).name;
+                    s.columns.get(c).is_some_and(|v| v.default.is_none())
+                })
             {
                 out.push(
                     Diagnostic::error(
@@ -692,6 +750,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: Default::default(),
         }
@@ -786,6 +853,80 @@ mod tests {
         // Declaring that target unique makes the same foreign key legitimate.
         wide.unique = vec![vec!["label".into()]];
         assert!(!cross(vec![wide, child]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into()));
+    }
+
+    /// An element key relates each element of an array, so its ELEMENT type is
+    /// what must match the target. Comparing the array itself would always
+    /// differ and report a mismatch that says nothing about the data.
+    #[test]
+    fn test1161_element_foreign_keys_compare_the_element_type() {
+        let parent = schema("parent", &[("id", ColumnType::String, false)], &["id"]);
+
+        let mut refs = column(ColumnType::Array, false);
+        refs.items = Some(Box::new(column(ColumnType::String, false)));
+        let mut child = schema("child", &[("id", ColumnType::String, false)], &["id"]);
+        child.columns.insert("parent_refs".into(), refs);
+        child.foreign_keys = vec![ForeignKey {
+            columns: vec!["parent_refs[]".into()],
+            references: Reference { table: "parent".into(), columns: vec!["id".into()] },
+            on_delete: Some(Action::Restrict),
+            on_update: Some(Action::Restrict),
+        }];
+
+        let mut schemas = BTreeMap::new();
+        schemas.insert("parent".to_string(), parent.clone());
+        schemas.insert("child".to_string(), child.clone());
+        let mut out = vec![];
+        validate_cross(&schemas, &mut out);
+        let found: Vec<&str> = out.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            !found.contains(&"SCHEMA_FK_TYPE_MISMATCH"),
+            "array<string> elements match a string target: {found:?}"
+        );
+
+        // An element key on a column that is not an array has no elements to
+        // relate, and saying so is more useful than comparing the wrong thing.
+        let mut scalar = child.clone();
+        scalar
+            .columns
+            .insert("parent_refs".into(), column(ColumnType::String, false));
+        let mut schemas = BTreeMap::new();
+        schemas.insert("parent".to_string(), parent.clone());
+        schemas.insert("child".to_string(), scalar);
+        let mut out = vec![];
+        validate_cross(&schemas, &mut out);
+        assert!(
+            out.iter().any(|d| d.code == "SCHEMA_FK_TYPE_MISMATCH"),
+            "a non-array addressed per element must be refused"
+        );
+    }
+
+    /// `set_null` and `set_default` have no meaning for an element key: an
+    /// element is removed or it is not, and neither action says which. A schema
+    /// that declares one is stating an intention reldir cannot carry out.
+    #[test]
+    fn test1162_element_keys_refuse_null_and_default_actions() {
+        let parent = schema("parent", &[("id", ColumnType::String, false)], &["id"]);
+        let mut refs = column(ColumnType::Array, true);
+        refs.items = Some(Box::new(column(ColumnType::String, false)));
+        let mut child = schema("child", &[("id", ColumnType::String, false)], &["id"]);
+        child.columns.insert("parent_refs".into(), refs);
+        child.foreign_keys = vec![ForeignKey {
+            columns: vec!["parent_refs[]".into()],
+            references: Reference { table: "parent".into(), columns: vec!["id".into()] },
+            on_delete: Some(Action::SetNull),
+            on_update: Some(Action::Restrict),
+        }];
+
+        let mut schemas = BTreeMap::new();
+        schemas.insert("parent".to_string(), parent);
+        schemas.insert("child".to_string(), child);
+        let mut out = vec![];
+        validate_cross(&schemas, &mut out);
+        assert!(
+            out.iter().any(|d| d.code == "SCHEMA_FK_ACTION_INVALID"),
+            "set_null on an element key must be refused"
+        );
     }
 
     /// Section 11: referencing and referenced column types must be identical, so

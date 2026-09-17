@@ -17,7 +17,8 @@
 //! it. That single change is the subject of the doc comment at `columns` below.
 
 use crate::schema::{
-    AdditionalFields, Action, Check, Column, ColumnType, ForeignKey, Generated, GeneratedKind,
+    AdditionalFields, Action, Check, Column, ColumnType, CompositionKind, ForeignKey, Generated,
+    GeneratedKind,
     Reference, Schema, Storage,
 };
 use serde_json::{Map, Value};
@@ -122,6 +123,50 @@ fn encode_column(column: &Column) -> Value {
     // the identity it had before the keyword existed.
     if !column.additional_properties {
         out.insert("additionalProperties".into(), Value::Bool(false));
+    }
+    // Every bound decides which rows a column admits, so each is part of what
+    // the schema IS. A column with no bound encodes nothing, which is what lets
+    // schemas written before bounds existed keep the identity they had.
+    if let Some(bound) = column.min_size {
+        out.insert("min_size".into(), bound.into());
+    }
+    if let Some(bound) = column.max_size {
+        out.insert("max_size".into(), bound.into());
+    }
+    for (key, bound) in [
+        ("minimum", column.minimum),
+        ("maximum", column.maximum),
+        ("exclusive_minimum", column.exclusive_minimum),
+        ("exclusive_maximum", column.exclusive_maximum),
+        ("multiple_of", column.multiple_of),
+    ] {
+        if let Some(bound) = bound
+            && let Some(number) = serde_json::Number::from_f64(bound)
+        {
+            out.insert(key.into(), Value::Number(number));
+        }
+    }
+    if column.unique_items {
+        out.insert("unique_items".into(), Value::Bool(true));
+    }
+    // Composition changes which values are legal, and the ORDER of alternatives
+    // is not meaningful to `oneOf` -- but it is meaningful to the document, and
+    // reldir does not reorder what a person wrote. Encoding them as given keeps
+    // identity agreeing with the artifact, as `unique` and `indexes` do.
+    if let Some(composition) = &column.composition {
+        let kind = match composition.kind {
+            CompositionKind::One => "one_of",
+            CompositionKind::Any => "any_of",
+            CompositionKind::All => "all_of",
+            CompositionKind::Not => "not",
+        };
+        let mut encoded = Map::new();
+        encoded.insert("kind".into(), Value::String(kind.into()));
+        encoded.insert(
+            "alternatives".into(),
+            Value::Array(composition.alternatives.iter().map(encode_column).collect()),
+        );
+        out.insert("composition".into(), Value::Object(encoded));
     }
     if let Some(description) = &column.description {
         out.insert("description".into(), Value::String(description.clone()));

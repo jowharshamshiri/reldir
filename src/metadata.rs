@@ -794,7 +794,8 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use crate::schema::{
-        AdditionalFields, Action, Check, Column, ColumnType, ForeignKey, Generated, GeneratedKind,
+        AdditionalFields, Action, Check, Column, ColumnType, Composition, CompositionKind,
+        ForeignKey, Generated, GeneratedKind,
         Reference, Schema, Storage,
     };
     use indexmap::IndexMap;
@@ -811,6 +812,15 @@ mod tests {
             properties: None,
             pattern: None,
             additional_properties: true,
+            min_size: None,
+            max_size: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            exclusive_maximum: None,
+            multiple_of: None,
+            unique_items: false,
+            composition: None,
             description: None,
             annotations: Default::default(),
         }
@@ -975,6 +985,88 @@ mod tests {
         permissive.additional_fields = AdditionalFields::Allow;
         out.push(("additional_fields_allow", permissive));
 
+        // Every bound decides which rows a schema admits, so each earns an
+        // identity of its own. Without these the identity change would be
+        // untested: no other fixture carries a bound, so adding the keywords
+        // moved nothing that already existed.
+        let mut bounded_string = col(ColumnType::String);
+        bounded_string.min_size = Some(1);
+        bounded_string.max_size = Some(64);
+        out.push((
+            "bounded_string",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", bounded_string)],
+                &["id"],
+            ),
+        ));
+
+        let mut bounded_number = col(ColumnType::Int);
+        bounded_number.minimum = Some(0.0);
+        bounded_number.maximum = Some(100.0);
+        bounded_number.multiple_of = Some(5.0);
+        out.push((
+            "bounded_number",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", bounded_number)],
+                &["id"],
+            ),
+        ));
+
+        let mut distinct = col(ColumnType::Array);
+        distinct.items = Some(Box::new(col(ColumnType::String)));
+        distinct.unique_items = true;
+        distinct.min_size = Some(1);
+        out.push((
+            "unique_items",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", distinct)],
+                &["id"],
+            ),
+        ));
+
+        // Composition narrows which values of the declared type are legal, so
+        // two schemas differing only by an alternative are different schemas.
+        let mut first = col(ColumnType::String);
+        first.pattern = Some("^[A-Z]{3}$".into());
+        let mut second = col(ColumnType::String);
+        second.pattern = Some("^[0-9]{6}$".into());
+        let mut composed = col(ColumnType::String);
+        composed.composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![first, second],
+        });
+        out.push((
+            "composed_one_of",
+            table(
+                "t",
+                vec![("id", col(ColumnType::String)), ("v", composed)],
+                &["id"],
+            ),
+        ));
+
+        // An element foreign key relates each element of an array, which is a
+        // different relationship from the scalar key above it.
+        let mut refs = col(ColumnType::Array);
+        refs.items = Some(Box::new(col(ColumnType::String)));
+        let mut referencing = table(
+            "child",
+            vec![("id", col(ColumnType::String)), ("parent_refs", refs)],
+            &["id"],
+        );
+        referencing.foreign_keys = vec![ForeignKey {
+            columns: vec!["parent_refs[]".into()],
+            references: Reference {
+                table: "parent".into(),
+                columns: vec!["id".into()],
+            },
+            on_delete: Some(Action::Restrict),
+            on_update: Some(Action::Restrict),
+        }];
+        out.push(("fk_per_element", referencing));
+
         // A pattern decides which rows a column admits, so it must be part of
         // what the schema *is*. Without these fixtures the identity change
         // would be untested: no other fixture carries a user pattern, and reldir's
@@ -1115,6 +1207,17 @@ mod tests {
             ("check", "4e61b420e65cf6b0a35b6ceb449770f039d6a67dce2f384ede06f51837cd1608"),
             ("storage_filename", "2c53387a296180351c470dc11f79471b2ebec6c7917a89346ddea40c2540b0aa"),
             ("additional_fields_allow", "df38fd9bf16cd9108c27f23adf84df9d62d5ca8876c1d780e7496d4307ff391c"),
+            // Bounds and composition decide which rows a schema admits, so each
+            // earns an identity of its own. Every hash above and below is
+            // unchanged: a schema that states no bound encodes none, so adding
+            // the keywords moved nothing that already existed.
+            ("bounded_string", "ceb718e0652738fa008fbf41e5db55f872ba0dab58d032b45437bf1ef7f8a714"),
+            ("bounded_number", "22393847fd08fb4f08ae95524c9c30e5ae9449f54e235d5009db31d35e8332af"),
+            ("unique_items", "cef58310f787e16311c28ed105eb7e1ba88f95c9860d243f49b48196b314cfcd"),
+            ("composed_one_of", "3ed4c37a07d3255cdfb63e9af6c781cd362ed26b730b9520192b108a95749305"),
+            // An element foreign key is a different relationship from a scalar
+            // one, and the spelling that says so is part of the schema.
+            ("fk_per_element", "142628866e7833b8623b764902278cdc6372277f4621b01c2aaeedb18799ce6e"),
             // A pattern and a closed object each decide which rows a schema
             // admits, so each earns an identity of its own. Every hash above
             // and below is unchanged: reldir's own decimal and ulid patterns are
