@@ -84,7 +84,18 @@ pub fn matches_column(v: &Value, c: &Column) -> bool {
                     .all(|(n, c)| o.get(n).map_or(c.nullable, |v| matches_column(v, c)))
             })
         }),
-        ColumnType::Json => true,
+        // The empty schema admits any value -- but an untyped subschema that
+        // names required members is not empty: it says the value must be an
+        // object carrying them. That is the whole content of a JSON Schema
+        // alternative written `{"required": ["when_incorrect"]}`, and reading it
+        // as "admits everything" would accept the constraint and ignore it.
+        ColumnType::Json => {
+            if c.required.is_empty() {
+                return true;
+            }
+            v.as_object()
+                .is_some_and(|o| c.required.iter().all(|name| o.contains_key(name)))
+        }
     }
 }
 
@@ -809,6 +820,46 @@ mod tests {
             !matches_column(&json!({"c": 3}), &either),
             "carries neither, so no alternative is satisfied"
         );
+    }
+
+    /// An untyped subschema that names required members is not the empty
+    /// schema. JSON Schema writes a composition alternative exactly that way --
+    /// `{"required": ["when_incorrect"]}`, no `type` -- and reading it as
+    /// "admits everything" accepts the constraint and then ignores it.
+    #[test]
+    fn test1166_an_untyped_column_still_honours_required_members() {
+        let mut untyped = column(ColumnType::Json);
+        untyped.required = ["a".to_string()].into_iter().collect();
+
+        assert!(matches_column(&json!({"a": 1}), &untyped));
+        assert!(
+            !matches_column(&json!({"b": 2}), &untyped),
+            "an object lacking the member does not satisfy it"
+        );
+        assert!(
+            !matches_column(&json!("text"), &untyped),
+            "a non-object carries no members at all"
+        );
+
+        // Without a requirement it is the empty schema again, admitting anything.
+        let open = column(ColumnType::Json);
+        assert!(matches_column(&json!("text"), &open));
+        assert!(matches_column(&json!({"b": 2}), &open));
+
+        // And the untyped form composes, which is the shape a standard uses.
+        let mut requires_a = column(ColumnType::Json);
+        requires_a.required = ["a".to_string()].into_iter().collect();
+        let mut requires_b = column(ColumnType::Json);
+        requires_b.required = ["b".to_string()].into_iter().collect();
+        let mut either = column(ColumnType::Object);
+        either.composition = Some(Composition {
+            kind: CompositionKind::One,
+            alternatives: vec![requires_a, requires_b],
+        });
+        assert!(matches_column(&json!({"a": 1}), &either));
+        assert!(matches_column(&json!({"b": 2}), &either));
+        assert!(!matches_column(&json!({"a": 1, "b": 2}), &either), "both is not one");
+        assert!(!matches_column(&json!({"c": 3}), &either), "neither");
     }
 
     /// A required member is a question about the value, not about whether this

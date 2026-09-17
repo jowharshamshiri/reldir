@@ -550,10 +550,21 @@ fn validate_column(table: &str, name: &str, c: &Column, out: &mut Vec<Diagnostic
             format!("{table}.{name}: multipleOf must be greater than zero"),
         ));
     }
-    if !c.required.is_empty() && c.kind != ColumnType::Object {
+    // `required` names members of an object value. A column typed `object`
+    // obviously has them; so does an untyped one, because the empty schema
+    // admits objects among everything else and naming a member narrows it to
+    // those that carry it. That untyped form is how JSON Schema writes a
+    // composition alternative, and refusing it turned a faithful translation of
+    // a standard into a document reldir would not load.
+    if !c.required.is_empty()
+        && !matches!(c.kind, ColumnType::Object | ColumnType::Json)
+    {
         out.push(Diagnostic::error(
             "SCHEMA_UNKNOWN_KEY",
-            format!("{table}.{name}: required is only valid for object columns"),
+            format!(
+                "{table}.{name}: required names object members, so it is only valid for an object \
+                 or an untyped column"
+            ),
         ));
     }
     if c.unique_items && c.kind != ColumnType::Array {

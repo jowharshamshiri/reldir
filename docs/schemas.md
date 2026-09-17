@@ -296,7 +296,9 @@ An alternative often says nothing but which member a value must carry:
 
 `required` inside an alternative is a question about the *value* — which members
 it must present — and it may name a member the alternative itself does not
-declare. That is different from the `required` list at the document root, which
+declare. The alternative need not state a type at all: JSON Schema writes these
+as bare `{ "required": ["on_choice"] }`, and reldir reads that as "an object
+carrying this member" rather than as the empty schema. That is different from the `required` list at the document root, which
 decides whether a row may omit a column, and different again from a column's
 nullability, which decides whether a declared member may be absent. All three
 coexist because they answer three different questions.
