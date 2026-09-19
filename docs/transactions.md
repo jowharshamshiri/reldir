@@ -70,7 +70,9 @@ and no paths that escape the database root.
 The model is multiple concurrent readers, one binary-managed writer.
 
 **Readers.** `--readonly` works from an in-memory observation and writes
-nothing: no derived state, no provenance. Any number may run at once.
+nothing: no derived state, no provenance. Any number may run at once, and none
+takes the writer lock, so a reader never contends and is never refused for
+contention.
 
 ```sh
 reldir --readonly sql 'SELECT * FROM users'
@@ -79,13 +81,52 @@ reldir --readonly sql 'SELECT * FROM users'
 Read-only mode is selected automatically when `.db/` is not writable, and
 reports when metadata is stale but the authoritative state is valid.
 
+There is exactly one state in which a reader is refused: while a transaction is
+**materialising**. Between the first rename and the last, the rows on disk are a
+partial application of a change, and answering from them would report a state
+that never existed — so the read fails with `TRANSACTION_INCOMPLETE` rather than
+lying. The window covers the renames alone, not the validation, index rebuild
+and provenance write that follow, and it clears the moment the writer finishes.
+
+A transaction that has only **staged** its bytes refuses nothing. That is the
+state every ordinary write passes through, so treating it as damage would mean a
+writer merely preparing a commit broke every concurrent query.
+
+A writer also publishes metadata as temp siblings renamed into place, and readers
+look past those rather than reporting them as corruption.
+
 **Writers.** A default (non-`--readonly`) invocation may record an externally
 observed revision and refresh derived state, so it takes the writer lock, even
-for a query. If another writer holds it, the command fails with
-`CONCURRENT_MODIFICATION` and exit code `3` rather than interleaving.
+for a query.
 
-> For many concurrent reads, pass `--readonly`. It is faster and not subject to
-> lock contention.
+A writer that finds the lock held **waits for it**, for `wait_seconds` (default
+5) or whatever `--wait` says. The wait is bounded polling with jittered backoff:
+bounded because a stuck writer must never become a hung caller, jittered because
+writers refused at the same instant would otherwise retry in lockstep and
+collide again. When the wait expires the command fails with `LOCK_CONTENDED` and
+exit code `3` rather than interleaving.
+
+```sh
+reldir --wait 30 update users u1 '{"name":"Alice"}'   # wait up to 30s
+reldir --wait 0  update users u1 '{"name":"Alice"}'   # fail at once if busy
+```
+
+`--wait 0` is a deliberate value, not an absent one: it means try once. There is
+no "wait forever".
+
+> For many concurrent reads, pass `--readonly`. It takes no lock at all, so it
+> is faster and never contends.
+
+### Three ways a write is refused
+
+All three exit `3`, and in all three **nothing was written**. They are separate
+codes because the right response differs:
+
+| Code | What happened | What to do |
+|---|---|---|
+| `LOCK_CONTENDED` | another writer held the lock for longer than the wait | retry; it is always safe |
+| `CONCURRENT_MODIFICATION` | the files moved underneath the mutation | retry, but the plan is recomputed against new data — a read-modify-write must re-read |
+| `PATH_INTERFERENCE` | a directory the transaction needs is no longer a directory | look at it; retrying meets the same path |
 
 ## External writers
 

@@ -4,7 +4,6 @@ use crate::{
     diagnostic::{DbError, Diagnostic, Result},
     integrity, metadata,
 };
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -19,9 +18,16 @@ pub enum Change {
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// What recovery needs to finish or discard an interrupted transaction.
+///
+/// It records the changes and nothing about the state they were planned
+/// against: recovery rolls a marked journal forward from its immutable staged
+/// bytes and discards an unmarked one, and neither decision consults the
+/// starting state. The journal used to carry the database's root hash at
+/// planning time, which nothing ever read -- and once the conflict check became
+/// per-path there was no longer a single root it could honestly name.
 struct Journal {
     id: String,
-    start_root: String,
     origin: String,
     changes: Vec<JournalChange>,
 }
@@ -32,10 +38,22 @@ struct JournalChange {
     stage: Option<String>,
 }
 
+/// Commit a planned mutation.
+///
+/// `start_entries` is what the caller observed for the paths it is about to
+/// write, taken from the same observation that produced the plan. It is not the
+/// whole database: a writer is only entitled to assume that the files it
+/// touches have not moved, and holding it to the state of every other file
+/// meant that any commit landing while it queued for the lock refused it for a
+/// change it had no stake in.
+///
+/// Concretely: six writers inserting six different rows would serialise on the
+/// lock, and the last five would each find the database's root hash advanced by
+/// the ones before them and abort, naming no path they actually collided with.
 pub fn commit(
     root: &Path,
     config: &Config,
-    start_root: &str,
+    start_entries: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
     changes: &[Change],
     origin: &str,
     dry_run: bool,
@@ -96,38 +114,31 @@ pub fn commit(
     }
     let lock_path = root.join(".db/lock");
     validate_lock_path(&lock_path)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| DbError::io(&lock_path, e))?;
-    lock.try_lock_exclusive().map_err(|_| {
-        DbError::new(
-            "CONCURRENT_MODIFICATION",
-            "another writer holds the database lock",
-            3,
-        )
-    })?;
+    // Held until this function returns, which is what serialises writers: the
+    // file owns the lock, so the guard's lifetime is the critical section.
+    let lock = crate::lock::acquire(
+        &lock_path,
+        config.lock_budget(),
+        crate::lock::Holder::Committing,
+    )?;
     // Validation reads the database and builds a shadow of it. Under the lock,
     // because a concurrent commit moving files beneath a validating reader is
     // not a conflict it can report -- it is a torn observation, and the reader
     // would fail on a vanished path rather than saying who won.
     validate_prospective(root, changes, resource_overrides)?;
     let current = Catalog::observe(root, config)?;
-    let (current_hash, current_entries) = metadata::state(&current)?;
-    if current_hash != start_root {
-        let changed = conflict_paths(root, start_root, &current_entries)?;
+    let (_, current_entries) = metadata::state(&current)?;
+    if let Some(conflict) = touched_conflict(changes, start_entries, &current_entries) {
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "CONCURRENT_MODIFICATION",
                 format!(
-                    "authoritative files changed while the mutation was being planned: {changed}"
+                    "authoritative files changed while the mutation was being planned: {}",
+                    conflict.description
                 ),
             )
-            .expected(start_root)
-            .observed(current_hash),
+            .expected(conflict.expected)
+            .observed(conflict.observed),
             3,
         ));
     }
@@ -159,23 +170,24 @@ pub fn commit(
     }
     let journal = Journal {
         id: id.clone(),
-        start_root: start_root.into(),
         origin: origin.into(),
         changes: jc,
     };
     metadata::write_json_atomic(&dir.join("journal.json"), &journal)?;
     let rechecked = Catalog::observe(root, config)?;
-    let (rechecked_root, rechecked_entries) = metadata::state(&rechecked)?;
-    if rechecked_root != start_root {
+    let (_, rechecked_entries) = metadata::state(&rechecked)?;
+    if let Some(conflict) = touched_conflict(changes, start_entries, &rechecked_entries) {
         fs::remove_dir_all(&dir).map_err(|e| DbError::io(&dir, e))?;
-        let changed = conflict_paths(root, start_root, &rechecked_entries)?;
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "CONCURRENT_MODIFICATION",
-                format!("authoritative files changed while the transaction was staged: {changed}"),
+                format!(
+                    "authoritative files changed while the transaction was staged: {}",
+                    conflict.description
+                ),
             )
-            .expected(start_root)
-            .observed(rechecked_root),
+            .expected(conflict.expected)
+            .observed(conflict.observed),
             3,
         ));
     }
@@ -183,6 +195,20 @@ pub fn commit(
         .map_err(|e| DbError::io(&dir.join("COMMITTING"), e))?;
     metadata::sync_parent(&dir.join("COMMITTING"))?;
     apply_journal(root, &dir, &journal)?;
+    // The rows are whole again the moment the last rename lands, so the marker
+    // that tells readers "these files may be half-applied" comes off here --
+    // not after the validation, index rebuild and provenance write below, which
+    // touch no authoritative row. Leaving it on for that stretch made every
+    // concurrent reader fail with TRANSACTION_INCOMPLETE against a database
+    // whose rows were already complete and consistent.
+    //
+    // Recovery is unaffected: a crash before this point still finds COMMITTING
+    // and rolls the journal forward idempotently from the staged bytes, and a
+    // crash after it finds a journal without the marker, which is discarded
+    // precisely because nothing remains to apply.
+    let committing = dir.join("COMMITTING");
+    fs::remove_file(&committing).map_err(|e| DbError::io(&committing, e))?;
+    metadata::sync_parent(&committing)?;
     let committed_config = crate::db::load_config(root)?;
     let c = Catalog::observe(root, &committed_config)?;
     let errors = integrity::validate(&c);
@@ -219,21 +245,51 @@ pub fn commit(
         .collect())
 }
 
-fn conflict_paths(
-    root: &Path,
-    start_root: &str,
+/// The first path this mutation touches that moved since it was planned.
+struct TouchedConflict {
+    description: String,
+    expected: String,
+    observed: String,
+}
+
+/// Whether a path this transaction writes or deletes has changed underneath it.
+///
+/// A writer's assumption is about the files it is going to replace, so that is
+/// what is checked. Another commit landing on unrelated paths while this one
+/// queued for the lock changes the database's root hash without invalidating
+/// anything this transaction decided, and refusing it there produced a conflict
+/// that named no colliding path because there was none.
+///
+/// A path absent from both observations is not a conflict: a writer creating a
+/// row that still does not exist is exactly the case that must succeed.
+fn touched_conflict(
+    changes: &[Change],
+    start: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
     current: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
-) -> Result<String> {
-    let manifest = metadata::load_manifest(root)?;
-    let paths = manifest
-        .filter(|manifest| manifest.root_hash == start_root)
-        .map(|manifest| metadata::diff_entries(Some(&manifest.entries), current))
-        .unwrap_or_default();
-    Ok(if paths.is_empty() {
-        "paths could not be localized from the recorded start state".into()
-    } else {
-        paths.join(", ")
-    })
+) -> Option<TouchedConflict> {
+    for change in changes {
+        let path = match change {
+            Change::Write { path, .. } | Change::Delete { path } => path,
+        };
+        let key = path.to_string_lossy().replace('\\', "/");
+        let before = start.get(&key);
+        let now = current.get(&key);
+        let moved = match (before, now) {
+            (Some(before), Some(now)) => before.hash != now.hash,
+            // Appeared or vanished since the plan was made. Either way the
+            // premise the caller wrote this change under no longer holds.
+            (None, Some(_)) | (Some(_), None) => true,
+            (None, None) => false,
+        };
+        if moved {
+            return Some(TouchedConflict {
+                description: key.clone(),
+                expected: before.map_or_else(|| "absent".into(), |entry| entry.hash.clone()),
+                observed: now.map_or_else(|| "absent".into(), |entry| entry.hash.clone()),
+            });
+        }
+    }
+    None
 }
 
 fn validate_prospective(
@@ -539,8 +595,14 @@ fn validate_target_parent(root: &Path, relative: &Path) -> Result<()> {
             current.push(component);
             match fs::symlink_metadata(&current) {
                 Ok(metadata) if !metadata.file_type().is_dir() => {
+                    // Not contention and not an ordinary concurrent edit: a
+                    // directory this transaction needs has been replaced by
+                    // something that is not a directory. Retrying cannot help
+                    // -- the next attempt meets the same path -- so this is
+                    // named apart from both, and a caller that retries on
+                    // conflict does not spin against it.
                     return Err(DbError::new(
-                        "CONCURRENT_MODIFICATION",
+                        "PATH_INTERFERENCE",
                         format!(
                             "transaction target parent {} is no longer a real directory",
                             current.display()
@@ -557,12 +619,42 @@ fn validate_target_parent(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn has_pending(root: &Path) -> Result<bool> {
+/// What an unfinished transaction on disk means for someone reading the rows.
+///
+/// The distinction is the `COMMITTING` marker, and it decides whether the
+/// authoritative files can be trusted as they stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// Nothing unfinished.
+    None,
+    /// Staged, but no rename has happened.
+    ///
+    /// The transaction wrote only inside `.db/transactions/`; recovery deletes
+    /// it. The rows are exactly what they were, so a reader answers correctly
+    /// from them -- which matters because this is the state every ordinary
+    /// write passes through, and treating it as damage would mean a writer
+    /// staging a commit broke every concurrent reader.
+    Staged,
+    /// Materialising: some renames may have been applied and some not.
+    ///
+    /// Recovery rolls this forward from the staged bytes. Until it does, the
+    /// rows are a partial application of a change nobody can see the whole of.
+    Materialising,
+}
+
+impl Pending {
+    /// Whether the rows on disk may be a half-applied change.
+    pub fn is_materialising(self) -> bool {
+        matches!(self, Self::Materialising)
+    }
+}
+
+pub fn has_pending(root: &Path) -> Result<Pending> {
     let tx = root.join(".db/transactions");
     if !metadata::ensure_real_directory(&tx, false, "transaction store")? {
-        return Ok(false);
+        return Ok(Pending::None);
     }
-    let mut pending = false;
+    let mut pending = Pending::None;
     for entry in fs::read_dir(&tx).map_err(|e| DbError::io(&tx, e))? {
         let path = entry.map_err(|e| DbError::io(&tx, e))?.path();
         let entry_metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
@@ -576,7 +668,13 @@ pub fn has_pending(root: &Path) -> Result<bool> {
                 5,
             ));
         }
-        pending = true;
+        // One materialising transaction decides the answer for the whole
+        // store: if any renames may be half-applied, the rows are suspect
+        // whatever the other entries are doing.
+        if path.join("COMMITTING").exists() {
+            return Ok(Pending::Materialising);
+        }
+        pending = Pending::Staged;
     }
     Ok(pending)
 }
@@ -729,7 +827,6 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let journal = Journal {
             id: id.clone(),
-            start_root: "root".into(),
             origin: "internal".into(),
             changes: vec![JournalChange {
                 path: PathBuf::from("users/u1.json"),
@@ -749,8 +846,7 @@ mod tests {
             id: "not-a-uuid".into(),
             ..Journal {
                 id: String::new(),
-                start_root: "root".into(),
-                origin: "internal".into(),
+                    origin: "internal".into(),
                 changes: vec![JournalChange {
                     path: PathBuf::from("users/u1.json"),
                     stage: None,
@@ -770,7 +866,6 @@ mod tests {
         let directory = std::path::PathBuf::from("/tmp").join(&id);
         let journal = |origin: &str| Journal {
             id: id.clone(),
-            start_root: "root".into(),
             origin: origin.into(),
             changes: vec![JournalChange {
                 path: PathBuf::from("users/u1.json"),
@@ -805,7 +900,6 @@ mod tests {
         let directory = std::path::PathBuf::from("/tmp").join(&id);
         let with = |changes: Vec<JournalChange>| Journal {
             id: id.clone(),
-            start_root: "root".into(),
             origin: "internal".into(),
             changes,
         };

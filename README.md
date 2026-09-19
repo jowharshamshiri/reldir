@@ -103,6 +103,25 @@ reldir doctor                  # diagnose problems and propose fixes
 | [Errors](https://jowharshamshiri.github.io/reldir/errors) | Error and exit code catalogue |
 | [On-disk format](https://jowharshamshiri.github.io/reldir/format-v1) | Format version 1 |
 
+## Python
+
+```sh
+pip install reldir
+```
+
+```python
+import reldir
+
+with reldir.connect("./data") as db:
+    db.execute("INSERT INTO users (id, name) VALUES (?, ?)", ["u1", "Alice"])
+    for row in db.query("SELECT id, name FROM users ORDER BY name"):
+        print(row["id"], row["name"])
+```
+
+A driver in the shape you expect from one: parameter binding, typed exceptions
+carrying the binary's diagnostics, thread-safe connections, and retry policy for
+lock contention. See [python/README.md](python/README.md).
+
 ## Development
 
 ```sh

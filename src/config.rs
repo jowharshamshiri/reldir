@@ -37,6 +37,16 @@ fn default_transaction() -> u64 {
 fn default_indentation() -> usize {
     2
 }
+/// Wait for the writer lock by default.
+///
+/// The alternative -- failing the instant another writer holds the lock --
+/// makes every concurrent caller implement the same retry loop, and a caller
+/// that forgets gets spurious failures under load that look like corruption.
+/// Five seconds absorbs any ordinary commit while still failing in bounded time
+/// when a writer is genuinely stuck.
+fn default_wait() -> f64 {
+    5.0
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -62,6 +72,14 @@ pub struct Config {
     pub max_transaction_size: u64,
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Seconds to wait for the writer lock before reporting contention.
+    ///
+    /// Distinct from `timeout_seconds`, which bounds a query. This bounds only
+    /// the wait for another writer to finish. Every wait is bounded: there is
+    /// no "wait forever", because a stuck writer must not become a hung caller.
+    /// Zero means try once and report contention immediately.
+    #[serde(default = "default_wait")]
+    pub wait_seconds: f64,
     #[serde(default = "default_ignores")]
     pub ignore: Vec<String>,
 }
@@ -88,6 +106,7 @@ impl Default for Config {
             max_temporary_disk: default_temp_disk(),
             max_transaction_size: default_transaction(),
             timeout_seconds: None,
+            wait_seconds: default_wait(),
             ignore: default_ignores(),
         }
     }
@@ -103,6 +122,7 @@ pub struct ResourceOverrides {
     pub max_temporary_disk: Option<u64>,
     pub max_transaction_size: Option<u64>,
     pub timeout_seconds: Option<u64>,
+    pub wait_seconds: Option<f64>,
 }
 
 impl Config {
@@ -142,6 +162,17 @@ impl Config {
         if overrides.timeout_seconds.is_some() {
             self.timeout_seconds = overrides.timeout_seconds;
         }
+        if let Some(value) = overrides.wait_seconds {
+            self.wait_seconds = value;
+        }
+    }
+
+    /// How long to wait for the writer lock.
+    ///
+    /// `validate` rejects a negative or non-finite setting, so this conversion
+    /// cannot produce a nonsense duration or panic.
+    pub fn lock_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.wait_seconds)
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
@@ -172,6 +203,16 @@ impl Config {
         } else {
             None
         };
+        // `wait_seconds` is the one setting with a meaningful zero -- try once,
+        // report contention -- so it is deliberately not in the check above.
+        // What it cannot be is negative or non-finite: `Duration::from_secs_f64`
+        // panics on both, and a wait that ran backwards has no interpretation.
+        if !self.wait_seconds.is_finite() || self.wait_seconds < 0.0 {
+            return Err(format!(
+                "wait_seconds must be a finite number of seconds, zero or greater, not {}",
+                self.wait_seconds
+            ));
+        }
         match zero {
             // Only the timeout has a "none" spelling, so only it gets told
             // about one. The others simply have no valid zero.
@@ -212,6 +253,18 @@ mod tests {
             );
         }
         assert!(Config::default().validate().is_ok());
+
+        // `wait_seconds` is deliberately outside that rule: zero means "try
+        // once and report contention", which is a real posture a caller asks
+        // for, not a nonsensical limit.
+        let instant = Config {
+            wait_seconds: 0.0,
+            ..Default::default()
+        };
+        assert!(
+            instant.validate().is_ok(),
+            "zero is a meaningful wait, not a rejected limit"
+        );
 
         // Nine settings share this rule, so the message has to say which one
         // was set to zero. It used to name them collectively -- and told
@@ -265,6 +318,63 @@ mod tests {
             assert!(set.is_match(ignored), "{ignored} should be ignored");
         }
         assert!(!set.is_match("users/u1.json"));
+    }
+
+    /// A wait that cannot be turned into a duration must be refused by
+    /// `validate`, not by a panic inside `Duration::from_secs_f64` at the
+    /// moment a writer tries to take the lock.
+    #[test]
+    fn test1206_an_unusable_wait_is_rejected_before_it_reaches_a_duration() {
+        for unusable in [-1.0, -0.001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let config = Config {
+                wait_seconds: unusable,
+                ..Default::default()
+            };
+            let error = config
+                .validate()
+                .expect_err("an unusable wait must be rejected: {unusable}");
+            assert!(
+                error.contains("wait_seconds"),
+                "the message must name the setting: {error}"
+            );
+        }
+
+        // Every accepted wait must convert without panicking, which is the
+        // property `validate` exists to guarantee for `lock_budget`.
+        for usable in [0.0, 0.001, 5.0, 3600.0] {
+            let config = Config {
+                wait_seconds: usable,
+                ..Default::default()
+            };
+            config
+                .validate()
+                .expect("a finite, non-negative wait is usable");
+            assert_eq!(config.lock_budget().as_secs_f64(), usable);
+        }
+    }
+
+    /// A command-line `--wait` must override the stored setting, including
+    /// overriding a non-zero stored wait with zero.
+    #[test]
+    fn test1207_the_wait_override_replaces_the_stored_setting() {
+        let mut config = Config::default();
+        assert_eq!(config.wait_seconds, 5.0, "the default waits");
+
+        config.apply_overrides(&ResourceOverrides {
+            wait_seconds: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            config.wait_seconds, 0.0,
+            "`--wait 0` must reach the lock rather than being read as unset"
+        );
+        assert_eq!(config.lock_budget(), std::time::Duration::ZERO);
+
+        config.apply_overrides(&ResourceOverrides::default());
+        assert_eq!(
+            config.wait_seconds, 0.0,
+            "an absent override must not restore the default"
+        );
     }
 
     /// Section 61: a command-line limit overrides the stored configuration, and

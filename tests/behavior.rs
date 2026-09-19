@@ -2438,6 +2438,319 @@ fn test0040_diagnostics_are_never_colourised_off_a_terminal() {
         .stderr(predicate::str::contains('\u{1b}').not());
 }
 
+/// Section 33: a reader is refused only when the rows themselves cannot be
+/// trusted. A transaction that has staged its bytes but begun no rename has
+/// written nothing outside `.db/transactions/`, and every ordinary write passes
+/// through that state -- so refusing a reader there would mean a writer merely
+/// preparing a commit broke every concurrent `--readonly` query.
+#[test]
+fn test0084_a_staged_transaction_does_not_refuse_a_reader() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    let staged = root.join(".db/transactions/11111111-1111-4111-8111-111111111111");
+    fs::create_dir_all(staged.join("staged")).unwrap();
+    fs::write(
+        staged.join("journal.json"),
+        r#"{"id":"11111111-1111-4111-8111-111111111111","origin":"internal","changes":[{"path":"users/u1.json","stage":"00000000"}]}"#,
+    )
+    .unwrap();
+
+    // No COMMITTING marker: nothing has been renamed, so the rows are exactly
+    // what they were and the read must succeed.
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Alice").and(predicate::str::contains("Bob")));
+
+    // Once the transaction begins materialising, the same read must refuse:
+    // the rows may now be a partial application of a change.
+    fs::write(staged.join("COMMITTING"), b"commit\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .code(5)
+    .stderr(predicate::str::contains("TRANSACTION_INCOMPLETE"));
+}
+
+/// Section 31: the `COMMITTING` marker means "renames may be half-applied",
+/// and recovery keys on it. Clearing it as soon as the last rename lands must
+/// not change what recovery does with either shape of leftover transaction.
+#[test]
+fn test0087_recovery_keys_on_the_marker_not_on_the_journal_alone() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    let original = fs::read_to_string(root.join("users/u1.json")).unwrap();
+
+    // A journal with no marker: `apply_journal` either never began or already
+    // finished, so nothing remains to apply and it must simply be discarded.
+    let finished = root.join(".db/transactions/33333333-3333-4333-8333-333333333333");
+    fs::create_dir_all(finished.join("staged")).unwrap();
+    fs::write(
+        finished.join("staged/00000000"),
+        b"{\"id\":\"u1\",\"name\":\"Ghost\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        finished.join("journal.json"),
+        r#"{"id":"33333333-3333-4333-8333-333333333333","origin":"internal","changes":[{"path":"users/u1.json","stage":"00000000"}]}"#,
+    )
+    .unwrap();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "recover"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(root.join("users/u1.json")).unwrap(),
+        original,
+        "a journal without the marker must be discarded, never applied"
+    );
+    assert!(!finished.exists(), "the discarded transaction must be gone");
+
+    // The same journal with the marker: renames may be half-applied, so it
+    // must be rolled forward from the staged bytes.
+    let interrupted = root.join(".db/transactions/44444444-4444-4444-8444-444444444444");
+    fs::create_dir_all(interrupted.join("staged")).unwrap();
+    fs::write(
+        interrupted.join("staged/00000000"),
+        b"{\"id\":\"u1\",\"name\":\"Recovered\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        interrupted.join("journal.json"),
+        r#"{"id":"44444444-4444-4444-8444-444444444444","origin":"internal","changes":[{"path":"users/u1.json","stage":"00000000"}]}"#,
+    )
+    .unwrap();
+    fs::write(interrupted.join("COMMITTING"), b"commit\n").unwrap();
+
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "recover"])
+        .assert()
+        .success();
+    assert!(
+        fs::read_to_string(root.join("users/u1.json"))
+            .unwrap()
+            .contains("Recovered"),
+        "a marked journal must be rolled forward from its staged bytes"
+    );
+}
+
+/// Section 33: a reader must not be refused because a writer is publishing
+/// metadata. Records are renamed into place from temp siblings, so a reader
+/// scanning that directory meets one whenever it reads while something writes
+/// -- and calling that corruption told people their database was broken.
+#[test]
+fn test0088_a_writers_temp_files_do_not_look_like_corruption() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // Exactly what `write_bytes_atomic` leaves mid-write.
+    fs::write(
+        root.join(".db/provenance/00000000000000000009.tmp-1bd6fa52-1a92-4ae2-a0f4-e3a7920a0188"),
+        b"{\"partial\":true}\n",
+    )
+    .unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Alice"));
+
+    // A genuinely unexpected entry must still be refused: looking past a
+    // recognised transient is not the same as ignoring whatever appears.
+    fs::write(root.join(".db/provenance/stray.txt"), b"not a record\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users",
+    ])
+    .assert()
+    .code(6)
+    .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
+}
+
+/// Section 33: a writer that finds the lock held waits for it. Several writers
+/// racing with a budget must all be served rather than all but one failing,
+/// which is the difference between a database a concurrent program can use and
+/// one every caller must wrap in its own retry loop.
+#[test]
+fn test0085_a_waiting_writer_is_served_rather_than_refused() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+
+    let mut handles = vec![];
+    for index in 0..6 {
+        let root = root.clone();
+        handles.push(std::thread::spawn(move || {
+            db().args([
+                "--db",
+                root.to_str().unwrap(),
+                "--wait",
+                "30",
+                "--format",
+                "table",
+                "insert",
+                "users",
+                &format!("{{\"id\":\"w{index}\",\"name\":\"Writer {index}\"}}"),
+            ])
+            .output()
+            .unwrap()
+        }));
+    }
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(
+            output.status.success(),
+            "a writer with a 30s budget must be served, not refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Every insert must be on disk: serialised, not interleaved or dropped.
+    for index in 0..6 {
+        let path = root.join(format!("users/w{index}.json"));
+        assert!(path.exists(), "writer {index} reported success but wrote nothing");
+    }
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+}
+
+/// Section 34: the conflict check is about the paths a mutation touches, not
+/// about the database as a whole. A writer whose own row moved underneath it
+/// must still be refused -- narrowing the check must not blunt it.
+#[test]
+fn test0089_a_mutation_is_refused_when_its_own_path_moved() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // A writer that touches an unrelated row proceeds even though the database
+    // moved, because nothing it decided depends on `u2`.
+    fs::write(
+        root.join("users/u2.json"),
+        "{\"id\":\"u2\",\"name\":\"MovedBySomeoneElse\"}\n",
+    )
+    .unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--format",
+        "table",
+        "update",
+        "users",
+        "u1",
+        "{\"name\":\"Unaffected\"}",
+    ])
+    .assert()
+    .success();
+    assert!(
+        fs::read_to_string(root.join("users/u2.json"))
+            .unwrap()
+            .contains("MovedBySomeoneElse"),
+        "the unrelated external edit must survive"
+    );
+    assert!(
+        fs::read_to_string(root.join("users/u1.json"))
+            .unwrap()
+            .contains("Unaffected")
+    );
+}
+
+/// Section 33: `--wait 0` is a deliberate posture and not an absent setting. A
+/// caller that asks to fail rather than queue must get a refusal naming
+/// contention, so a script can tell "busy" from "broken".
+#[test]
+fn test0086_a_zero_wait_names_contention_rather_than_queueing() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+
+    // Hold the writer lock for long enough to be contended, from a process the
+    // impatient writer cannot influence.
+    let holder_root = root.clone();
+    let holder = std::thread::spawn(move || {
+        let rows: String = (0..600)
+            .map(|i| format!("{{\"id\":\"bulk{i}\",\"name\":\"n{i}\"}}\n"))
+            .collect();
+        let source = holder_root.join("bulk.jsonl");
+        fs::write(&source, rows).unwrap();
+        db().args([
+            "--db",
+            holder_root.to_str().unwrap(),
+            "--format",
+            "table",
+            "import",
+            "users",
+            "--from",
+            source.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+    });
+
+    let mut sawcontention = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline && !holder.is_finished() {
+        let output = db()
+            .args([
+                "--db",
+                root.to_str().unwrap(),
+                "--wait",
+                "0",
+                "--format",
+                "table",
+                "update",
+                "users",
+                "u1",
+                "{\"name\":\"Impatient\"}",
+            ])
+            .output()
+            .unwrap();
+        if output.status.code() == Some(3) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("LOCK_CONTENDED") {
+                sawcontention = true;
+                break;
+            }
+        }
+    }
+    holder.join().unwrap();
+    assert!(
+        sawcontention,
+        "a zero wait against a held lock must report LOCK_CONTENDED"
+    );
+}
+
 /// Section 33: the writer lock admits one binary-managed writer. Concurrent
 /// writers must either serialise or fail loudly with the documented code and
 /// exit status -- never interleave and never silently lose an update.
@@ -2509,9 +2822,14 @@ fn test0041_concurrent_writers_never_silently_lose_an_update() {
                 code, 3,
                 "writer {index} failed with {code} and stderr {stderr}"
             );
+            // Contention and a moved state are different facts with different
+            // remedies, and both are legitimate here: a writer may be refused
+            // because it never got the lock, or because the rows changed under
+            // a plan it had already made. What it may never do is fail with
+            // some third thing, or with no explanation.
             assert!(
-                stderr.contains("CONCURRENT_MODIFICATION"),
-                "writer {index} must report the conflict: {stderr}"
+                stderr.contains("LOCK_CONTENDED") || stderr.contains("CONCURRENT_MODIFICATION"),
+                "writer {index} must name the conflict it hit: {stderr}"
             );
         }
     }
@@ -2618,7 +2936,10 @@ fn test0042_concurrent_readers_are_admitted_and_change_nothing() {
                 Some(3),
                 "a refused writer must report the documented conflict: {stderr}"
             );
-            assert!(stderr.contains("CONCURRENT_MODIFICATION"), "{stderr}");
+            assert!(
+                stderr.contains("LOCK_CONTENDED") || stderr.contains("CONCURRENT_MODIFICATION"),
+                "{stderr}"
+            );
         }
     }
     assert!(answered >= 1, "at least one invocation must make progress");

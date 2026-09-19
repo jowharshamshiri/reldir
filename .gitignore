@@ -3,3 +3,9 @@
 .DS_Store
 *.log
 .scrap/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/python/build/
+/python/dist/
+/python/*.egg-info/

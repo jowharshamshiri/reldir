@@ -17,6 +17,7 @@ pub mod infer;
 pub mod integrity;
 pub mod json;
 pub mod lint;
+pub mod lock;
 pub mod metadata;
 pub mod output;
 pub mod schema;

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reldir"
+version = "0.88.766"
+description = "Python driver for reldir, a filesystem-native relational JSON database"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["database", "json", "sql", "filesystem", "driver"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Database :: Front-Ends",
+  "Typing :: Typed",
+]
+
+# No runtime dependencies on purpose. The driver speaks to the `reldir`
+# executable through the standard library alone, so installing it cannot drag a
+# dependency tree into an application that only wanted to read a folder of JSON.
+dependencies = []
+
+[project.urls]
+Homepage = "https://jowharshamshiri.github.io/reldir/"
+Documentation = "https://jowharshamshiri.github.io/reldir/"
+Repository = "https://github.com/jowharshamshiri/reldir"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["reldir"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The suite runs real processes against real directories. Failing loudly on an
+# unexpected warning keeps a deprecation from hiding inside subprocess noise.
+filterwarnings = ["error"]

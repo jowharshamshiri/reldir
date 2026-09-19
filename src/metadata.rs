@@ -165,6 +165,15 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
+        // A writer publishes each record as a temp sibling that is then renamed
+        // into place, so a reader scanning this directory can legitimately meet
+        // one mid-write. It is not an unexpected entry and it is not this
+        // reader's to judge: the writer holding the lock will rename or remove
+        // it. Reporting it as corruption told people their database was broken
+        // whenever they read it while something wrote.
+        if is_in_progress_write(&path) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
         if !metadata.file_type().is_file()
             || has_multiple_links(&metadata)
@@ -263,11 +272,27 @@ pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<(
             || last.new_root_hash != m.root_hash
             || last.entries != m.entries)
     {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            "manifest does not match the latest provenance record",
-            6,
-        ));
+        // `record` publishes the provenance entry and then the manifest, as two
+        // separate atomic renames. A reader that arrives between them sees a
+        // history one revision ahead of the manifest -- not damage, just the
+        // instant before the second rename lands, and the only disagreement a
+        // correct writer can produce.
+        //
+        // Tolerating exactly that shape keeps the check strict: the newer
+        // record must be the manifest's immediate successor and must name the
+        // manifest as its predecessor, so a gap, a fork, or a mismatched
+        // predecessor is still corruption. Without this, reading a database
+        // while anything wrote to it reported the database as corrupt.
+        let publishing = last.revision == m.revision + 1
+            && last.previous_revision == Some(m.revision)
+            && last.previous_root_hash.as_deref() == Some(m.root_hash.as_str());
+        if !publishing {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                "manifest does not match the latest provenance record",
+                6,
+            ));
+        }
     }
     Ok(())
 }
@@ -369,6 +394,13 @@ pub fn provenance_head(root: &Path) -> Result<Option<Manifest>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
         let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
+        // The same transient a writer leaves while renaming a record into
+        // place. Reading the head of the history must look past it for the
+        // reason `validate_provenance` does: it belongs to a writer that holds
+        // the lock, and it is about to become a numbered record or vanish.
+        if is_in_progress_write(&path) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
         if !metadata.file_type().is_file()
             || has_multiple_links(&metadata)
@@ -582,6 +614,19 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(internal)?;
     bytes.push(b'\n');
     write_bytes_atomic(path, &bytes)
+}
+
+/// Whether this path is a temp sibling some writer is still filling in.
+///
+/// `write_bytes_atomic` renames a temp sibling into place, so any directory it
+/// publishes into can contain one for the length of a write. The name is the
+/// contract between the writer that creates it and the readers that must look
+/// past it, so it is recognised in one place rather than re-spelled at each
+/// scan.
+pub fn is_in_progress_write(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.starts_with("tmp-"))
 }
 
 /// Durably replace a file with exactly these bytes.

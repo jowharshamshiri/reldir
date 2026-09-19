@@ -71,8 +71,11 @@ version, format version, and UTC timestamp.
 
 ## Commit and recovery protocol
 
-A writer exclusively locks `.db/lock`, rechecks its observed starting root, and
-constructs a fully validated prospective directory before committing. It writes
+A writer exclusively locks `.db/lock`, rechecks the paths it is about to replace
+against what it observed when it planned them, and constructs a fully validated
+prospective directory before committing. The recheck is per-path rather than over
+the whole database, so a commit that landed on unrelated paths while this writer
+queued for the lock does not refuse it. It writes
 replacement bytes beneath `.db/transactions/<uuid>/staged`, fsyncs them, writes and
 fsyncs `journal.json`, then writes the `COMMITTING` marker. Each authoritative path
 is replaced with a same-directory temporary file plus atomic rename, or deleted,

@@ -54,6 +54,7 @@ disabled by `--no-color` or a non-empty `NO_COLOR`.
 | `--rebuild-metadata` | discard an unreadable `.db/` and rebuild it from your files |
 | `--no-auto` | never establish prerequisites implicitly; report what would be needed instead of creating it |
 | `--timeout <SECS>` | query timeout |
+| `--wait <SECS>` | how long to wait for the writer lock before reporting `LOCK_CONTENDED`; `0` tries once and fails immediately |
 
 Resource limits may also be overridden per invocation. See
 [Configuration]({{ site.baseurl }}/configuration).

@@ -6,7 +6,6 @@ use crate::{
     integrity,
     metadata::{self, Manifest},
 };
-use fs2::FileExt;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -131,21 +130,26 @@ impl Database {
         let writer_lock = if mode.may_write() {
             let path = root.join(".db/lock");
             validate_optional_private_file(&path, "lock")?;
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(|error| DbError::io(&path, error))?;
-            file.try_lock_exclusive().map_err(|_| {
+            // The configured wait is read before the lock is taken, because the
+            // whole point is to know how long to wait for it. `.db/config` is a
+            // plain read of a file only ever replaced atomically, so observing
+            // it outside the lock cannot yield a torn document -- and a caller
+            // who passed `--wait` on the command line must be honoured even
+            // when the database has no config file at all.
+            let mut waiting = load_config(&root)?;
+            waiting.apply_overrides(overrides);
+            waiting.validate().map_err(|message| {
                 DbError::new(
-                    "CONCURRENT_MODIFICATION",
-                    "another writer is validating or changing the database",
-                    3,
+                    "RESOURCE_LIMIT",
+                    format!("invalid command-line resource limit: {message}"),
+                    1,
                 )
             })?;
-            Some(file)
+            Some(crate::lock::acquire(
+                &path,
+                waiting.lock_budget(),
+                crate::lock::Holder::Observing,
+            )?)
         } else {
             None
         };
@@ -172,15 +176,34 @@ impl Database {
         })?;
         let mut catalog = Catalog::observe(&root, &config)?;
         let mut diagnostics = integrity::validate(&catalog);
-        if pending && !recovered {
-            diagnostics.insert(
-                0,
-                Diagnostic::error(
-                    "TRANSACTION_INCOMPLETE",
-                    "pending transaction requires recovery; no-write mode left it untouched",
-                )
-                .help("run `reldir recover` with write access"),
-            );
+        if !recovered {
+            match pending {
+                // Renames may be half-applied, so the rows cannot be trusted as
+                // they stand and no answer drawn from them would be sound.
+                crate::transaction::Pending::Materialising => diagnostics.insert(
+                    0,
+                    Diagnostic::error(
+                        "TRANSACTION_INCOMPLETE",
+                        "pending transaction requires recovery; no-write mode left it untouched",
+                    )
+                    .help("run `reldir recover` with write access"),
+                ),
+                // Staged and nothing more: the transaction has written only
+                // inside `.db/transactions/`, and recovery would simply delete
+                // it. The rows are untouched, so a reader answers from them
+                // correctly. Reporting this as damage would mean any writer
+                // staging a commit broke every concurrent reader -- which is
+                // precisely the case `--readonly` exists to serve.
+                crate::transaction::Pending::Staged => catalog.warnings.push(
+                    Diagnostic::warning(
+                        "TRANSACTION_STAGED",
+                        "a transaction is staged but has not begun materialising; \
+                         the rows are unaffected and it was left untouched",
+                    )
+                    .help("run `reldir recover` with write access to clear it"),
+                ),
+                crate::transaction::Pending::None => {}
+            }
         }
         let mut manifest_rebuild = false;
         let loaded = match metadata::load_manifest(&root) {

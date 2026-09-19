@@ -66,6 +66,13 @@ pub struct Cli {
     rebuild_metadata: bool,
     #[arg(long, global = true)]
     timeout: Option<u64>,
+    /// Seconds to wait for the writer lock before reporting contention.
+    ///
+    /// Separate from `--timeout`, which bounds a query. `0` tries once and
+    /// fails immediately, which is what a CI job wanting a deterministic
+    /// failure asks for. Every wait is bounded; there is no "wait forever".
+    #[arg(long, global = true, value_name = "SECONDS")]
+    wait: Option<f64>,
     #[arg(long, global = true)]
     max_json_file_size: Option<u64>,
     #[arg(long, global = true)]
@@ -530,6 +537,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         max_result_rows: cli.max_result_rows,
         max_transaction_size: cli.max_transaction_size,
         timeout_seconds: cli.timeout,
+        wait_seconds: cli.wait,
     };
     let requested_root = cli
         .db
@@ -1746,7 +1754,7 @@ fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &C
             machine_records.push(snapshot);
         }
     }
-    let start = current_root(db)?;
+    let start = observed_entries(db)?;
     let paths = transaction::commit(
         &db.root,
         &db.config,
@@ -1849,7 +1857,7 @@ fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<
     let paths = transaction::commit(
         &db.root,
         &db.config,
-        &current_root(db)?,
+        &observed_entries(db)?,
         &changes,
         "internal",
         cli.dry_run,
@@ -4682,7 +4690,7 @@ fn commit_changes(
     let paths = transaction::commit(
         &db.root,
         &db.config,
-        &current_root(db)?,
+        &observed_entries(db)?,
         &changes,
         origin,
         cli.dry_run,
@@ -4856,8 +4864,17 @@ fn pair_pinned_schema_writes(db: &Database, changes: Vec<Change>) -> Result<Vec<
     Ok(paired)
 }
 
-fn current_root(db: &Database) -> Result<String> {
-    Ok(metadata::state(&db.catalog)?.0)
+/// What this observation says about every governed path.
+///
+/// A mutation carries this into `commit` so the conflict check can ask whether
+/// the paths it touches have moved, rather than whether the database as a whole
+/// has. The whole-database question refused writers for commits they had no
+/// stake in, which is what made concurrent writes fail even when each one
+/// waited its turn for the lock.
+fn observed_entries(
+    db: &Database,
+) -> Result<std::collections::BTreeMap<String, metadata::ManifestEntry>> {
+    Ok(metadata::state(&db.catalog)?.1)
 }
 fn schema_for<'a>(db: &'a Database, table: &str) -> Result<&'a Schema> {
     db.catalog

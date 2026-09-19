@@ -14,7 +14,7 @@ major version, so scripts may depend on them.
 | `0` | success; database `VALID` |
 | `1` | usage error: bad flag, unknown command, missing argument |
 | `2` | database `INVALID` |
-| `3` | `CONCURRENT_MODIFICATION` or lock timeout |
+| `3` | contention or interference: `LOCK_CONTENDED`, `CONCURRENT_MODIFICATION`, or `PATH_INTERFERENCE`. Nothing was written in any of them; the code says whether retrying can help |
 | `4` | query error: unsupported SQL, type error, unknown table or column |
 | `5` | `TRANSACTION_INCOMPLETE`: recovery required or failed |
 | `6` | `FORMAT_UNSUPPORTED` or `INTERNAL_METADATA_CORRUPT` |
@@ -155,7 +155,9 @@ All inference failures exit `8`.
 
 | Code | Meaning |
 |---|---|
-| `CONCURRENT_MODIFICATION` | another writer holds the lock, or files changed mid-transaction |
+| `LOCK_CONTENDED` | another writer holds the writer lock, and the wait expired. Nothing was written, so retrying is always safe |
+| `CONCURRENT_MODIFICATION` | authoritative files changed underneath a transaction. Nothing was written, but the state the mutation was planned against has moved, so a retry re-plans against different data |
+| `PATH_INTERFERENCE` | a directory the transaction needs is no longer a directory. Retrying meets the same path, so this needs a look rather than another attempt |
 | `TRANSACTION_INCOMPLETE` | an interrupted transaction needs recovery |
 | `QUERY_UNSUPPORTED` | SQL outside the supported subset |
 | `QUERY_TYPE_ERROR` | a type error inside a query |
@@ -174,6 +176,7 @@ Warnings are reported alongside results and never set an exit code of their own.
 |---|---|
 | `INDEX_STALE` | derived indexes are missing, stale, or corrupt |
 | `MANIFEST_STALE` | the derived manifest is corrupt and was not rebuilt |
+| `TRANSACTION_STAGED` | a transaction has staged its bytes but begun no rename, so the rows are unaffected; a no-write invocation left it in place |
 | `METADATA_STALE_READONLY` | state is valid but differs from recorded metadata; read-only did not record it |
 
 ## Lint

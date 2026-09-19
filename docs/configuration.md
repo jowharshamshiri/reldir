@@ -24,6 +24,7 @@ every clone reads the same settings, so formatting and limits are reproducible.
   "max_temporary_disk": 4294967296,
   "max_transaction_size": 1073741824,
   "timeout_seconds": null,
+  "wait_seconds": 5.0,
   "ignore": [
     ".DS_Store",
     "*~",
@@ -34,7 +35,9 @@ every clone reads the same settings, so formatting and limits are reproducible.
 ```
 
 An unknown key is rejected rather than ignored, and every limit must be greater
-than zero. A malformed config is `INTERNAL_METADATA_CORRUPT`, not a silent
+than zero. `wait_seconds` is the one setting with a meaningful zero -- it means
+"try once, then report contention" -- so it is required only to be finite and
+not negative. A malformed config is `INTERNAL_METADATA_CORRUPT`, not a silent
 fallback to defaults.
 
 ## Settings
@@ -52,6 +55,7 @@ fallback to defaults.
 | `max_temporary_disk` | reserved: the query engine keeps temporary storage in memory, so nothing currently consumes temporary disk and this bounds nothing. It is validated and must be greater than zero. |
 | `max_transaction_size` | total bytes one transaction may stage |
 | `timeout_seconds` | query timeout; `null` for none |
+| `wait_seconds` | how long a writer waits for the writer lock before reporting `LOCK_CONTENDED`; `0` tries once |
 | `ignore` | glob patterns excluded from governance |
 
 Formatting is deliberately almost unconfigurable: only the indentation width can
@@ -67,6 +71,7 @@ reldir --max-result-rows 50 sql 'SELECT * FROM events'
 reldir --max-nesting-depth 512 check
 reldir --max-json-file-size 100000000 import blobs --from big.jsonl
 reldir --timeout 30 sql 'SELECT ...'
+reldir --wait 0 update users u1 '{"name":"Alice"}'   # fail at once if busy
 ```
 
 | Flag |
@@ -79,6 +84,7 @@ reldir --timeout 30 sql 'SELECT ...'
 | `--max-result-rows <ROWS>` |
 | `--max-transaction-size <BYTES>` |
 | `--timeout <SECONDS>` |
+| `--wait <SECONDS>` |
 
 Exceeding a limit is always an explicit `RESOURCE_LIMIT` failure, never a
 silently truncated result.
