@@ -12,7 +12,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/Users/bahram/ws/prj/reldir/python")
+# The driver lives two directories up in this repository. An installed
+# `reldir` package takes precedence; this only makes the example runnable
+# from a checkout without installing anything first.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import reldir  # noqa: E402
 

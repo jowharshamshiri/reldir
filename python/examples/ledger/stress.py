@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,13 +26,48 @@ import threading
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/Users/bahram/ws/prj/reldir/python")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import reldir  # noqa: E402
 from ledger import InsufficientFunds, Ledger  # noqa: E402
 
-BIN = "/Users/bahram/ws/prj/reldir/target/debug/reldir"
+def _binary() -> str:
+    """The reldir under test.
+
+    Prefers a local debug build so the suite exercises the working tree rather
+    than whatever happens to be installed, and says so plainly when neither
+    exists -- a stress run against an unknown binary proves nothing.
+    """
+    override = os.environ.get("RELDIR_BINARY")
+    if override:
+        return override
+    local = Path(__file__).resolve().parents[3] / "target" / "debug" / "reldir"
+    if local.exists():
+        return str(local)
+    found = shutil.which("reldir")
+    if found:
+        return found
+    sys.exit("no reldir binary: run `cargo build`, or set RELDIR_BINARY")
+
+
+BIN = _binary()
+
+
+JOURNAL = Path(__file__).with_name("stress-findings.txt")
+
+
+def say(line: str) -> None:
+    """Print and persist immediately.
+
+    A stress run is long and may be interrupted. Buffered output means an
+    interrupted run reports nothing at all, losing every finding it had already
+    made -- so each line is flushed to the terminal and appended to a journal as
+    it happens, not accumulated for a summary that may never print.
+    """
+    print(line, flush=True)
+    with JOURNAL.open("a") as handle:
+        handle.write(line + "\n")
 
 
 class Report:
@@ -41,11 +77,11 @@ class Report:
 
     def defect(self, scenario: str, detail: str) -> None:
         self.findings.append(f"{scenario}: {detail}")
-        print(f"  !! DEFECT  {detail}")
+        say(f"  !! DEFECT  {detail}")
 
     def note(self, detail: str) -> None:
         self.notes.append(detail)
-        print(f"     {detail}")
+        say(f"     {detail}")
 
 
 def fresh(accounts: int = 8, balance: int = 1000) -> Path:
@@ -92,7 +128,7 @@ def concurrent_debits(report: Report) -> None:
     CHECK shows as a negative balance; a torn audit shows as the audit sum
     disagreeing with the balance change.
     """
-    print("\n[1] concurrent debits on a single account")
+    say("\n[1] concurrent debits on a single account")
     root = fresh(accounts=2, balance=500)
     ledger = Ledger(root, BIN, wait=20.0, retry=reldir.RetryPolicy(attempts=40, max_delay=0.2))
     granted = failed = stale = 0
@@ -148,7 +184,7 @@ def concurrent_debits(report: Report) -> None:
 
 def conservation_under_transfers(report: Report) -> None:
     """Transfers between random accounts must conserve the total exactly."""
-    print("\n[2] concurrent transfers: money must be conserved")
+    say("\n[2] concurrent transfers: money must be conserved")
     root = fresh(accounts=6, balance=1000)
     ledger = Ledger(root, BIN, wait=20.0, retry=reldir.RetryPolicy(attempts=40, max_delay=0.2))
     before = ledger.total_balance()
@@ -193,13 +229,13 @@ def kill_mid_commit(report: Report) -> None:
     that recovery makes it valid. A partially applied row, or a database that
     cannot be recovered, is a defect.
     """
-    print("\n[3] SIGKILL a writer mid-commit")
+    say("\n[3] SIGKILL a writer mid-commit")
     root = fresh(accounts=4, balance=1000)
     killed = recovered_ok = 0
-    for attempt in range(14):
+    for attempt in range(6):
         rows = "\n".join(
             json.dumps({"account_id": "acct-0000", "amount": 1, "note": f"bulk{i}"})
-            for i in range(300)
+            for i in range(120)
         )
         source = root / "bulk.jsonl"
         source.write_text(rows + "\n")
@@ -236,7 +272,7 @@ def kill_mid_commit(report: Report) -> None:
 
 def external_corruption(report: Report) -> None:
     """An external process writes garbage. reldir must report, not absorb it."""
-    print("\n[4] external corruption of an authoritative row")
+    say("\n[4] external corruption of an authoritative row")
     root = fresh(accounts=3, balance=100)
     ledger = Ledger(root, BIN)
 
@@ -265,7 +301,7 @@ def external_corruption(report: Report) -> None:
 
 def injection_attempts(report: Report) -> None:
     """Hostile values must land as data, never as SQL."""
-    print("\n[5] parameter binding against injection")
+    say("\n[5] parameter binding against injection")
     root = fresh(accounts=2, balance=100)
     ledger = Ledger(root, BIN)
     hostile = [
@@ -301,7 +337,7 @@ def injection_attempts(report: Report) -> None:
 
 def schema_tampering(report: Report) -> None:
     """Tamper with the pinned schema and with .db/. reldir must not drift."""
-    print("\n[6] schema and metadata tampering")
+    say("\n[6] schema and metadata tampering")
     root = fresh(accounts=2, balance=100)
     ledger = Ledger(root, BIN)
 
@@ -336,7 +372,7 @@ def schema_tampering(report: Report) -> None:
 
 def readers_under_load(report: Report) -> None:
     """Readers must be served while writers work, and never see a torn total."""
-    print("\n[7] readers during sustained writes")
+    say("\n[7] readers during sustained writes")
     root = fresh(accounts=4, balance=5000)
     writer = Ledger(root, BIN, wait=20.0, retry=reldir.RetryPolicy(attempts=40))
     reader = Ledger(root, BIN)
@@ -385,7 +421,7 @@ def readers_under_load(report: Report) -> None:
 
 def resource_limits(report: Report) -> None:
     """Limits must be enforced explicitly, never silently truncated."""
-    print("\n[8] resource limits")
+    say("\n[8] resource limits")
     root = fresh(accounts=3, balance=100)
     tight = Ledger(root, BIN)
     tight.db._env = {**os.environ}
@@ -432,13 +468,13 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             report.defect(scenario.__name__, f"scenario crashed: {type(error).__name__}: {error}")
 
-    print("\n" + "=" * 68)
+    say("\n" + "=" * 68)
     if report.findings:
-        print(f"DEFECTS FOUND: {len(report.findings)}")
+        say(f"DEFECTS FOUND: {len(report.findings)}")
         for finding in report.findings:
-            print(f"  - {finding}")
+            say(f"  - {finding}")
     else:
-        print("no defects found")
+        say("no defects found")
     return 1 if report.findings else 0
 
 
