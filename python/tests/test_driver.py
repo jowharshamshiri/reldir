@@ -156,6 +156,25 @@ def test_a_constraint_violation_carries_its_diagnostic(db: reldir.Connection) ->
     assert isinstance(error.diagnostic, dict)
 
 
+def test_the_error_is_reported_not_a_warning_beside_it(
+    db: reldir.Connection, database: Path
+) -> None:
+    """A warning printed alongside an error must not be mistaken for the cause.
+
+    A read against a corrupt row emits INDEX_STALE and METADATA_STALE_READONLY
+    as warnings and INVALID_JSON as the error. Reporting a warning's code would
+    send a caller branching on `error.code` to the wrong handler, and did:
+    corrupt JSON was reported as METADATA_STALE_READONLY.
+    """
+    (database / "users" / "u1.json").write_text("{not json at all\n")
+    with pytest.raises(reldir.ReldirError) as caught:
+        db.check()
+    assert caught.value.code == "INVALID_JSON", (
+        f"the error must be reported, not a warning beside it: "
+        f"got {caught.value.code}"
+    )
+
+
 def test_unsupported_sql_is_a_query_error(db: reldir.Connection) -> None:
     with pytest.raises(reldir.QueryError):
         db.execute("CREATE TRIGGER t AFTER INSERT ON users BEGIN SELECT 1; END")

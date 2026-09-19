@@ -618,15 +618,23 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 /// Whether this path is a temp sibling some writer is still filling in.
 ///
-/// `write_bytes_atomic` renames a temp sibling into place, so any directory it
-/// publishes into can contain one for the length of a write. The name is the
-/// contract between the writer that creates it and the readers that must look
-/// past it, so it is recognised in one place rather than re-spelled at each
-/// scan.
+/// Two writers create these, in different directories and with different
+/// spellings: `write_bytes_atomic` publishes metadata as `<name>.tmp-<uuid>`,
+/// and `apply_journal` replaces a row as `<name>.reldir-tmp-<uuid>`. Both are
+/// renamed into place, so any directory either publishes into can contain one
+/// for the length of a write.
+///
+/// Both spellings are recognised here because this is the contract between the
+/// writers that create them and the readers that must look past them. Stating
+/// it once is the point: the row-directory case was missed for exactly as long
+/// as the rule lived only in the scans that happened to remember it, and a
+/// reader that met a row sibling was told its database was invalid.
 pub fn is_in_progress_write(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.starts_with("tmp-"))
+        .is_some_and(|extension| {
+            extension.starts_with("tmp-") || extension.starts_with("reldir-tmp-")
+        })
 }
 
 /// Durably replace a file with exactly these bytes.

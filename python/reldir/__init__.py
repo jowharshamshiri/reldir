@@ -741,24 +741,36 @@ def _result(invocation: _Invocation) -> Result:
 def _last_diagnostic(invocation: _Invocation) -> dict:
     """The diagnostic that explains a failure.
 
-    Errors are emitted on stderr as a single JSON object when a machine format
-    is selected, and diagnostics also appear inline on stdout. The stderr one
-    describes the failure that ended the run, so it wins; stdout is searched
-    only when stderr carried nothing parseable.
+    stderr carries warnings alongside the error that ended the run -- a stale
+    index and stale metadata are reported on a read that still answers -- so
+    position does not identify the failure. Severity does: the error is the
+    reason the command failed, and a warning riding beside it is not.
+
+    Taking the last parseable line instead reported a corrupt row as
+    METADATA_STALE_READONLY, which named a warning as the cause and would send
+    a caller branching on `code` to the wrong handler entirely.
     """
-    text = invocation.stderr.strip()
-    if text:
-        for line in reversed(text.splitlines()):
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict) and "code" in parsed:
-                return parsed
-    for record in reversed(invocation.records):
-        if record.get("kind") == "diagnostic" and record.get("severity") == "error":
+    records: list[dict] = []
+    for line in invocation.stderr.strip().splitlines():
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and "code" in parsed:
+            records.append(parsed)
+    records.extend(
+        record
+        for record in invocation.records
+        if record.get("kind") == "diagnostic" and "code" in record
+    )
+
+    for record in reversed(records):
+        if record.get("severity") == "error":
             return record
-    return {}
+    # No error was reported, so the command failed without explaining itself in
+    # a diagnostic. The last record is still better than nothing, and `_raise`
+    # falls back to raw stderr when there is none.
+    return records[-1] if records else {}
 
 
 def _bind(sql: str, params: Sequence[Any] | None) -> str:

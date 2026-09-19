@@ -189,6 +189,7 @@ def conservation_under_transfers(report: Report) -> None:
     ledger = Ledger(root, BIN, wait=20.0, retry=reldir.RetryPolicy(attempts=40, max_delay=0.2))
     before = ledger.total_balance()
     moved = 0
+    stale: list[str] = []
     lock = threading.Lock()
 
     def worker(seed: int) -> None:
@@ -200,8 +201,15 @@ def conservation_under_transfers(report: Report) -> None:
                 ledger.transfer(f"acct-{a:04d}", f"acct-{b:04d}", 25)
                 with lock:
                     moved += 1
-            except (InsufficientFunds, reldir.Stale):
+            except InsufficientFunds:
                 pass
+            except reldir.Stale as error:
+                # Not swallowed: a credit that exhausts its retry budget leaves
+                # the debit committed and the money nowhere, which is exactly
+                # the leak the conservation check would otherwise report as an
+                # unexplained number.
+                with lock:
+                    stale.append(str(error))
             except Exception as error:  # noqa: BLE001
                 report.defect("conservation", f"{type(error).__name__}: {error}")
 
@@ -213,6 +221,11 @@ def conservation_under_transfers(report: Report) -> None:
 
     after = ledger.total_balance()
     report.note(f"transfers completed={moved} total before={before} after={after}")
+    if stale:
+        report.defect(
+            "conservation",
+            f"{len(stale)} transfer half(s) lost their retry budget: {stale[:3]}",
+        )
     if before != after:
         report.defect(
             "conservation",

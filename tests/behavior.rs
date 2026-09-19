@@ -2597,6 +2597,57 @@ fn test0088_a_writers_temp_files_do_not_look_like_corruption() {
     .stderr(predicate::str::contains("INTERNAL_METADATA_CORRUPT"));
 }
 
+/// Section 33: a reader must not be refused because a writer is replacing a
+/// row. Rows are renamed into place from temp siblings, so a table directory
+/// holds one for the length of every commit -- a stress run observed one in 114
+/// of 400 samples during a single import. Calling that an unexpected file told
+/// people their database was invalid whenever they read it while something
+/// wrote.
+#[test]
+fn test0090_a_row_temp_sibling_does_not_look_like_corruption() {
+    let dir = adopted();
+    let root = dir.path().to_path_buf();
+    db().args(["--db", root.to_str().unwrap(), "--format", "table", "check"])
+        .assert()
+        .success();
+
+    // Exactly what `apply_journal` leaves while it renames a row into place.
+    fs::write(
+        root.join("users/u1.json.reldir-tmp-cef85d94-7f5f-4f7d-b284-25dd91ab13b7"),
+        b"{\"id\":\"u1\",\"name\":\"Alice\"}\n",
+    )
+    .unwrap();
+
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users ORDER BY name",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Alice").and(predicate::str::contains("Bob")));
+
+    // A genuinely unexpected entry must still be refused: looking past a
+    // recognised transient is not the same as ignoring whatever appears.
+    fs::write(root.join("users/notes.txt"), b"not a row\n").unwrap();
+    db().args([
+        "--db",
+        root.to_str().unwrap(),
+        "--readonly",
+        "--format",
+        "jsonl",
+        "sql",
+        "SELECT name FROM users",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("UNEXPECTED_FILE"));
+}
+
 /// Section 33: a writer that finds the lock held waits for it. Several writers
 /// racing with a budget must all be served rather than all but one failing,
 /// which is the difference between a database a concurrent program can use and

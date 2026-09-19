@@ -319,7 +319,26 @@ impl Catalog {
                     );
                     continue;
                 }
-                let md = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+                // A writer replaces a row by renaming a temp sibling over it, so
+                // this directory legitimately holds one for the length of every
+                // commit -- observed in 114 of 400 samples during one import.
+                // It is not a row and it is not this reader's to judge: the
+                // writer holding the lock will rename it into place or remove
+                // it. Reporting it as UNEXPECTED_FILE told people their database
+                // was invalid whenever they read it while something wrote.
+                if crate::metadata::is_in_progress_write(&path) {
+                    continue;
+                }
+                let md = match fs::symlink_metadata(&path) {
+                    Ok(md) => md,
+                    // The listing and the stat are separate syscalls, and a
+                    // rename between them removes the name the scan just saw.
+                    // A row that is no longer there is absent, which is an
+                    // ordinary state -- not an I/O fault that should abort the
+                    // whole observation and report the database unreadable.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(DbError::io(&path, error)),
+                };
                 if !md.file_type().is_file() {
                     self.diagnostics.push(
                         Diagnostic::error(
@@ -363,6 +382,11 @@ impl Catalog {
                 }
                 let raw = match fs::read(&path) {
                     Ok(v) => v,
+                    // Same window as the stat above, one step later: the row
+                    // was listed, stat'd, and then renamed away before it could
+                    // be read. Absent, not malformed -- calling it INVALID_JSON
+                    // would accuse the writer's completed work of being corrupt.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
                         self.diagnostics
                             .push(Diagnostic::error("INVALID_JSON", e.to_string()).at(rel));
