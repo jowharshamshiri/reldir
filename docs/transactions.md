@@ -4,186 +4,137 @@ title: Transactions
 
 # Transactions and safety
 
-Every change `reldir` makes is transactional. A failed or interrupted write never
-leaves a partially committed logical state.
+Every change reldir makes is one transaction: it lands whole, or not at all,
+and a crash at any instant leaves the files either exactly as they were or
+exactly as the change makes them.
 
-## The write sequence
+## The commit path
 
 ```text
-validate the starting state
+take the writer lock (.db/lock), waiting up to wait_seconds
         ↓
-acquire writer coordination (.db/lock)
+finish any interrupted transaction, observe the files again
         ↓
-construct the complete mutation set
+record a valid outside edit made since the command began, as its own revision
         ↓
-validate the prospective state
+plan the change against what is on disk now
         ↓
-stage the replacement bytes and fsync them
+complete it with the referential actions its foreign keys declare
         ↓
-write and fsync the journal
+judge the state it would produce, from memory -- no copy of the database is made
         ↓
-write the COMMITTING marker
+write it through the recoverable protocol below
         ↓
-replace each authoritative file by atomic rename; sync parents
-        ↓
-validate the resulting state
-        ↓
-refresh derived state, record provenance
-        ↓
-COMPLETE
+observe again, record the revision, release the lock
 ```
 
-Renaming many files is not globally atomic on real filesystems, so the protocol
-is built to be recoverable instead. After any crash, the state of a transaction
-is determinable: not committed, fully committed, or partially materialised but
-recoverable.
+A change planned before the lock was taken -- a repair, a migration -- names
+the bytes each path held when it was planned; if any moved, the change is
+refused with `CONCURRENT_MODIFICATION` and nothing is written. SQL and the row
+commands plan under the lock, so concurrent writers simply queue.
+
+## The protocol
+
+Renaming many files is not atomic on any real filesystem, so a transaction is
+made *recoverable* instead:
+
+```text
+stage every new file's bytes; fsync each             ─┐
+write the journal; fsync; rename into place             │ nothing visible changed:
+fsync the transaction directory                         │ recovery discards it
+write COMMITTING; fsync; fsync the directory           ─┘
+for each change: write a synced copy beside the target ─┐ partly visible:
+  and rename it over, or remove the target;              │ recovery rolls it forward
+  fsync its directory                                    │ from the staged bytes
+remove COMMITTING; fsync                               ─┘
+remove the transaction directory                        ─ complete
+```
+
+Every step goes through one filesystem interface, and the test suite runs the
+protocol against a simulated filesystem in which only fsynced data under
+fsynced directory entries survives, crashing it at every single operation and
+injecting I/O errors, full disks and torn writes: every outcome recovers to the
+state before or the state after.
 
 ## Recovery
 
-```sh
-reldir recover
-```
+Recovery runs at the start of any writing command, under the lock, and says
+what it did. `reldir recover` runs it explicitly.
 
-Recovery normally happens automatically when it is unambiguous and safe, and
-prints a one-line notice when it does:
+- A transaction without `COMMITTING` never began to apply: it is discarded.
+- One with `COMMITTING` is rolled forward from its staged bytes; every step is
+  idempotent, so a crash during recovery is recovered from too.
+- A journal that cannot be read under a `COMMITTING` marker is
+  `TRANSACTION_INCOMPLETE`: it is never guessed through.
 
-```console
-$ reldir status
-recovered an interrupted committed transaction
-VALID   revision 3   root 71ab3c9d   external changes: none
-```
-
-- A journal that never reached `COMMITTING` is discarded, because the
-  transaction had not begun materialising.
-- A journal with `COMMITTING` is rolled forward idempotently from the immutable
-  staged bytes.
-- A malformed journal fails with `TRANSACTION_INCOMPLETE` rather than being
-  guessed through.
-
-A journal is replayed only if it is internally consistent: its id must be a UUID
-matching its directory, its origin must be one of the known origins, and its
-change set must be unambiguous, with no repeated paths, no shared staged objects,
-and no paths that escape the database root.
+A reader (`--readonly`) never recovers. It answers normally while a transaction
+is merely staged, and refuses with `RECOVERY_REQUIRED` only while one is
+partway through its renames, when the rows on disk are part old and part new.
 
 ## Concurrency
 
-The model is multiple concurrent readers, one binary-managed writer.
+Many readers, one writer.
 
-**Readers.** `--readonly` works from an in-memory observation and writes
-nothing: no derived state, no provenance. Any number may run at once, and none
-takes the writer lock, so a reader never contends and is never refused for
-contention.
+- `--readonly` takes no lock and writes nothing, so readers never wait for each
+  other or for a writer.
+- A writing command waits for the lock for `wait_seconds` (5 by default, or
+  `--wait`), polling with jittered backoff, and then fails with `LOCK_CONTENDED`
+  (exit `3`). `--wait 0` tries once. There is no "wait forever": a stuck writer
+  never becomes a hung caller.
+- The lock is an advisory lock the kernel releases when its holder dies, so a
+  crashed writer never strands it.
 
-```sh
-reldir --readonly sql 'SELECT * FROM users'
-```
-
-Read-only mode is selected automatically when `.db/` is not writable, and
-reports when metadata is stale but the authoritative state is valid.
-
-There is exactly one state in which a reader is refused: while a transaction is
-**materialising**. Between the first rename and the last, the rows on disk are a
-partial application of a change, and answering from them would report a state
-that never existed — so the read fails with `TRANSACTION_INCOMPLETE` rather than
-lying. The window covers the renames alone, not the validation, index rebuild
-and provenance write that follow, and it clears the moment the writer finishes.
-
-A transaction that has only **staged** its bytes refuses nothing. That is the
-state every ordinary write passes through, so treating it as damage would mean a
-writer merely preparing a commit broke every concurrent query.
-
-A writer also publishes metadata as temp siblings renamed into place, and readers
-look past those rather than reporting them as corruption.
-
-**Writers.** A default (non-`--readonly`) invocation may record an externally
-observed revision and refresh derived state, so it takes the writer lock, even
-for a query.
-
-A writer that finds the lock held **waits for it**, for `wait_seconds` (default
-5) or whatever `--wait` says. The wait is bounded polling with jittered backoff:
-bounded because a stuck writer must never become a hung caller, jittered because
-writers refused at the same instant would otherwise retry in lockstep and
-collide again. When the wait expires the command fails with `LOCK_CONTENDED` and
-exit code `3` rather than interleaving.
-
-```sh
-reldir --wait 30 update users u1 '{"name":"Alice"}'   # wait up to 30s
-reldir --wait 0  update users u1 '{"name":"Alice"}'   # fail at once if busy
-```
-
-`--wait 0` is a deliberate value, not an absent one: it means try once. There is
-no "wait forever".
-
-> For many concurrent reads, pass `--readonly`. It takes no lock at all, so it
-> is faster and never contends.
-
-### Three ways a write is refused
-
-All three exit `3`, and in all three **nothing was written**. They are separate
-codes because the right response differs:
+All three refusals below exit `3`, and in each **nothing was written**:
 
 | Code | What happened | What to do |
 |---|---|---|
-| `LOCK_CONTENDED` | another writer held the lock for longer than the wait | retry; it is always safe |
-| `CONCURRENT_MODIFICATION` | the files moved underneath the mutation | retry, but the plan is recomputed against new data — a read-modify-write must re-read |
-| `PATH_INTERFERENCE` | a directory the transaction needs is no longer a directory | look at it; retrying meets the same path |
+| `LOCK_CONTENDED` | another writer held the lock past the wait | retry; always safe |
+| `CONCURRENT_MODIFICATION` | a file the change was planned against moved | retry; it is planned again |
+| `PATH_INTERFERENCE` | a directory the change needs is no longer one | look at it; a retry meets the same path |
 
-## External writers
+## Filesystems
 
-External tools cannot be made to take the lock, so binary transactions use
-optimistic validation:
+The protocol relies on two promises of a local POSIX filesystem: an exclusive
+lock excludes every other writer, and a rename replaces its target atomically.
+Network filesystems (NFS, SMB/CIFS, AFS, Ceph, Lustre, 9p) and FUSE-based sync
+clients often keep neither -- a lock silently local to one machine, a rename
+emulated as copy-then-delete -- and a database that trusted them would lose
+changes without an error.
 
-```text
-observe root R1
-        ↓
-plan the mutation against R1
-        ↓
-stage it
-        ↓
-re-observe the authoritative state
-        ↓
-still compatible with R1?  ── yes ──> commit
-                            └── no ──> CONCURRENT_MODIFICATION, naming the changed paths
-```
-
-If files changed underneath a transaction in a way that invalidates its
-assumptions, it aborts and names the paths that moved, rather than losing the
-update silently.
-
-An external edit that arrives *before* a mutation is planned is adopted as a new
-revision first, so editing one row by hand and then updating a different one
-through the CLI both succeed.
+So reldir asks the operating system what the filesystem is, and refuses to
+*write* to one of those with `UNSAFE_FILESYSTEM` (exit `11`) unless
+`.db/config` sets `"allow_remote_filesystem": true`: a decision someone made
+about a filesystem they know. Reading is always allowed; on such a filesystem
+reads simply take no lock and write no derived state.
 
 ## Snapshots
 
 ```sh
 reldir snapshot create before-import
 reldir snapshot list
-reldir snapshot restore before-import
-reldir snapshot delete before-import
+reldir --yes snapshot restore before-import
+reldir --yes snapshot delete before-import
 ```
 
-A snapshot preserves the logical database state. Restoration is transactional and
-records provenance with origin `snapshot_restore`. `doctor` creates one
-automatically before any fix that touches data or layout.
+A snapshot is a complete copy of the authoritative files -- rows, pins, working
+schemas, configuration -- including files that are not valid rows, so a
+snapshot taken before a repair can put back exactly what the repair changed. It
+is built beside its destination and renamed into place, so it is complete or
+absent. Restoring is an ordinary validated transaction with origin
+`snapshot_restore`.
 
-## Derived state is disposable
+## History
 
-Indexes, statistics, and the manifest can always be deleted and rebuilt from the
-authoritative files:
+Recorded history is kept so that it verifies: each revision names its
+predecessor and root, every object it references is checked against its hash,
+and a revision's root must be the root of the entries it describes. Objects are
+written first and made durable together, the revision after them; objects a
+crash leaves unreferenced are removed by `reldir gc`, and an object found
+damaged is simply written again, because an object is named by its content.
 
-```sh
-reldir reindex
-reldir analyze
-```
+## Derived state
 
-A corrupt or stale index never makes valid JSON unrecoverable, and changes only
-how fast a query is computed, not its answer.
-
-## Internal metadata corruption
-
-Authoritative data and internal metadata are treated differently:
-
-- Corrupt **derived** metadata is rebuilt, and the command says so.
-- Corrupt **provenance** is reported; history is never fabricated.
-- Invalid **authoritative** rows or schemas make the database `INVALID`.
+`.db/mirror.sqlite` is an index over the files: rebuildable from them at any
+moment, never consulted to decide what a row *is*. A mirror that is missing,
+from another layout or unreadable is rebuilt, and the command says so. Deleting
+it changes how fast the next command is, never its answer.

@@ -143,6 +143,18 @@ pub fn classify(text: &str) -> Result<StatementKind> {
     }
 }
 
+/// Whether a statement deletes rows: a `DELETE`, which removes data a
+/// person may need to confirm removing.
+pub fn deletes(text: &str) -> bool {
+    Parser::parse_sql(&SQLiteDialect {}, text)
+        .map(|statements| {
+            statements
+                .iter()
+                .any(|statement| matches!(statement, Statement::Delete(_)))
+        })
+        .unwrap_or(false)
+}
+
 fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
     let marker = "Line: ";
     let start = message.find(marker)? + marker.len();

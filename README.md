@@ -3,51 +3,68 @@
 **A relational database that lives in a directory of JSON files.**
 
 `reldir` turns an ordinary folder into a validated relational database. Rows stay
-as human-readable JSON files you can read, edit, `grep`, and commit to Git. The
-`reldir` binary governs their interpretation: it enforces schemas, checks referential
-integrity, answers SQL, and records how the state changed, without taking
-ownership of your bytes.
+human-readable JSON files you can read, edit, `grep` and commit to Git. The
+binary governs what they mean -- their schemas, the references between them, the
+rules over sets of them -- answers SQL, repairs what an outside edit broke, and
+records how the state changed, without taking ownership of your bytes.
 
 📦 **[crates.io](https://crates.io/crates/reldir)** &nbsp;·&nbsp; 📖 **[Documentation](https://jowharshamshiri.github.io/reldir/)**
 
 ```console
-$ ls ./data
-users/  posts/  comments/
-
-$ reldir 'SELECT u.name, count(*) AS n
-          FROM users u JOIN posts p ON p.user_id = u.id
-          GROUP BY u.name ORDER BY n DESC LIMIT 3'
- name  | n
--------+---
- Alice | 41
- Bob   | 37
- Carol | 29
+$ reldir sql 'SELECT u.name, p.title FROM users u JOIN posts p ON p.user_id = u.id ORDER BY u.name'
+name  | title
+------+----------
+Ada   | Engines
+Grace | Compilers
+(2 rows)
+2 row(s)
 ```
 
 ## Why
 
-A folder of JSON files is transparent, diffable, and editable by any tool, but
-nothing stops a typo from becoming invisible state. A database enforces
-integrity, but the data is no longer readable on disk.
+A folder of JSON is transparent, diffable and editable by any tool, but nothing
+stops a typo, a dangling reference or a half-finished edit from becoming
+invisible state. A database enforces integrity, but the data is no longer
+yours to read. reldir keeps the files authoritative and legible, and makes sure
+they stay a valid database:
 
-`reldir` keeps the filesystem authoritative and legible, and reports precisely when
-it stops being a valid database:
+- **Nothing reldir writes can break the rules.** Every change -- SQL, the row
+  commands, imports, migrations, repairs -- is judged as the state it would
+  produce before a byte is written, and refused, with every reason located to
+  the line, when that state would be invalid.
+- **Anything else may edit the files.** A valid outside edit is recorded as a
+  new revision; an invalid one is reported to the file, line, column and JSON
+  Pointer, and `reldir doctor` repairs it least destructively first -- a row
+  deleted by mistake is restored byte for byte from history.
 
 ```console
-$ echo '{"id":"019...","user_id":"nobody","title":"x"}' > posts/broken.json
-$ reldir status
-INVALID   revision 1   (1 external change, 1 violation)
-
-error[FOREIGN_KEY_VIOLATION]: posts.user_id references a row that does not exist
-  --> posts/broken.json:1:24
-   = constraint: posts.user_id -> users.id
-   = help: run `reldir doctor` for fix options
+$ reldir delete users ada
+error[FOREIGN_KEY_VIOLATION]: deleting users/ada.json refused: posts/p1.json still references it at /user_id (posts.user_id -> users, onDelete restrict)
+  --> posts/p1.json:3:14
+[..]
 ```
 
-Anything may edit the directory: you, your editor, a script, an agent, or `git
-merge`. `reldir` judges the state it observes at each operation boundary. Valid
-external edits are adopted as new revisions. Invalid ones are reported with the
-file, line, and column.
+## What you get
+
+- **JSON Schema 2020-12, all of it**, enforced on every row -- bounds,
+  patterns, formats, compositions, conditionals -- plus what JSON Schema cannot
+  say: primary keys, unique keys, references at any depth
+  (`modules[].lessons[].lesson_ref`), identity domains shared by many tables,
+  acyclic graphs, per-row SQL checks and set-level assertions.
+- **Referential actions** reldir carries out itself: `restrict`, `cascade`,
+  `remove` (drop the array element), `set_null`, `set_default`, on delete and on
+  key change, every touched row reported.
+- **SQL** in SQLite's dialect over an incrementally maintained mirror: joins,
+  window functions, JSON functions; changes validated before they are written.
+- **Inference** that bootstraps the strictest schemas your data supports, and a
+  **lint** that proposes the references and constraints the schemas miss.
+- **Crash-safe transactions**, tested by crashing at every single filesystem
+  operation; **history** that verifies; **snapshots**; **concurrent writers**
+  that queue rather than lose updates.
+- **One machine contract**: every command speaks a `command_result` JSON
+  envelope, JSON Lines, CSV or SARIF, with stable error codes and exit statuses.
+- **`reldir mcp`**: the database, served to AI agents over the Model Context
+  Protocol, with the same guarantees.
 
 ## Install
 
@@ -55,59 +72,36 @@ file, line, and column.
 cargo install reldir
 ```
 
-Or build from a checkout:
-
-```sh
-cargo install --path . --locked
-```
-
-Requires a recent stable Rust toolchain (edition 2024). The result is a single
-self-contained `reldir` executable, with no daemon, server, or runtime
-dependencies.
+Or from a checkout: `cargo install --path . --locked`. One self-contained
+executable (Rust 1.88 or later to build); no daemon, no server.
 
 ## Try it
 
 ```sh
-reldir                         # a shell over the folder you are standing in
-reldir 'SELECT * FROM users'   # or one query; schemas are inferred as needed
-reldir init ./data --adopt     # or set it up explicitly, for scripts and CI
-reldir check                   # full validation
-reldir lint                    # how the schemas could be stronger
-reldir doctor                  # diagnose problems and propose fixes
+reldir sql 'SELECT * FROM users'   # a folder of JSON is already a database
+reldir                             # a shell over it
+reldir check                       # is it valid?
+reldir lint                        # could its schemas say more?
+reldir doctor                      # what can be repaired, and how
 ```
-
-## What you get
-
-- **JSON files as rows**: one object per file, in canonical, diff-friendly formatting
-- **Schemas as JSON Schema**: 2020-12 documents in a declared dialect, maintained in `.db/schema/` and pinnable to `schema/*.json` for version control, with 14 column types, constraints, and checks
-- **Schema inference** that bootstraps the strictest schema your data supports
-- **SQL**: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, joins, grouping, aggregates, `EXPLAIN`
-- **Referential integrity**: primary keys, unique, foreign keys, `CHECK`, cascade actions
-- **Transactional writes** with a crash-recoverable journal
-- **Provenance**: every accepted state transition is recorded, including external edits
-- **Compiler-style diagnostics** with stable error codes and exit codes
-- **Git-native**: CI-friendly validation, stable formatting, no lockfile churn
 
 ## Documentation
 
-| Guide | |
+| | |
 |---|---|
 | [Getting started](https://jowharshamshiri.github.io/reldir/getting-started) | Query a folder of JSON, then make it stricter |
-| [Concepts](https://jowharshamshiri.github.io/reldir/concepts) | The model: validity, external edits, provenance |
-| [Schemas](https://jowharshamshiri.github.io/reldir/schemas) | The JSON Schema dialect, writing one by hand, types, constraints |
-| [CLI reference](https://jowharshamshiri.github.io/reldir/cli) | Every command and flag |
-| [SQL](https://jowharshamshiri.github.io/reldir/sql) | The supported subset |
-| [Validation](https://jowharshamshiri.github.io/reldir/validation) | `check`, `lint`, and `doctor` |
-| [Transactions](https://jowharshamshiri.github.io/reldir/transactions) | Safety, recovery, concurrency |
-| [Configuration](https://jowharshamshiri.github.io/reldir/configuration) | `.db/config` and resource limits |
-| [Errors](https://jowharshamshiri.github.io/reldir/errors) | Error and exit code catalogue |
-| [On-disk format](https://jowharshamshiri.github.io/reldir/format-v1) | Format version 1 |
+| [Concepts](https://jowharshamshiri.github.io/reldir/concepts) | Validity, outside edits, identity, history |
+| [Schemas](https://jowharshamshiri.github.io/reldir/schemas) | The dialect, references, domains, checks, assertions |
+| [SQL](https://jowharshamshiri.github.io/reldir/sql) | Queries, and changing rows safely |
+| [Validation](https://jowharshamshiri.github.io/reldir/validation) | `check`, `lint` and `doctor` |
+| [Transactions](https://jowharshamshiri.github.io/reldir/transactions) | The commit protocol, recovery, concurrency |
+| [CLI reference](https://jowharshamshiri.github.io/reldir/cli) | Every command, flag and output format |
+| [Configuration](https://jowharshamshiri.github.io/reldir/configuration) | `.db/config` and limits |
+| [Errors](https://jowharshamshiri.github.io/reldir/errors) | Every code and exit status |
+| [On-disk format](https://jowharshamshiri.github.io/reldir/format) | Format 2, byte for byte |
+| [MCP server](https://jowharshamshiri.github.io/reldir/mcp) | The database, served to AI agents |
 
 ## Python
-
-```sh
-pip install reldir
-```
 
 ```python
 import reldir
@@ -118,16 +112,16 @@ with reldir.connect("./data") as db:
         print(row["id"], row["name"])
 ```
 
-A driver in the shape you expect from one: parameter binding, typed exceptions
-carrying the binary's diagnostics, thread-safe connections, and retry policy for
-lock contention. See [python/README.md](python/README.md).
+A driver over the binary: parameter binding, typed exceptions carrying the
+binary's diagnostics, and retries for lock contention. See
+[python/README.md](python/README.md).
 
 ## Development
 
 ```sh
-cargo build
-cargo test          # unit tests in each module, behaviour tests in tests/
-cargo clippy --all-targets
+cargo test                      # unit tests in each module; tests/ for behavior, docs, MCP
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
 ## License

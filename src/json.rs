@@ -20,8 +20,8 @@ thread_local! {
 /// Bound the nesting depth this thread's parser accepts, for the duration of
 /// `body`.
 ///
-/// Section 61 makes maximum nesting depth a configured limit and Section 57
-/// requires parsers to enforce it. Enforcing it *during* deserialization is
+/// The maximum nesting depth is a configured limit, because every file read is
+/// untrusted input. Enforcing it *during* deserialization is
 /// what makes it real: a check applied to the parsed value cannot protect the
 /// parse itself, which recurses before any caller sees a value.
 pub fn with_depth_limit<T>(limit: usize, body: impl FnOnce() -> T) -> T {
@@ -200,7 +200,7 @@ impl<'de> Visitor<'de> for StrictVisitor {
 mod tests {
     use super::*;
 
-    /// Section 57: governed file contents are untrusted. A duplicate object key
+    /// Governed file contents are untrusted. A duplicate object key
     /// makes a row's logical value ambiguous, so it is rejected at parse time
     /// rather than silently resolved to the last occurrence.
     #[test]
@@ -218,7 +218,7 @@ mod tests {
         assert!(parse_str(r#"{"a":{"k":1},"b":{"k":2}}"#).is_ok());
     }
 
-    /// Section 15: a JSON number must denote a finite value; NaN and infinity
+    /// A JSON number must denote a finite value; NaN and infinity
     /// have no canonical representation and cannot be stored.
     #[test]
     fn test1055_non_finite_numbers_are_rejected() {
@@ -290,7 +290,7 @@ mod tests {
     }
 
     /// Reported error positions carry line and column so diagnostics can point
-    /// at the offending token (Section 49).
+    /// at the offending token.
     #[test]
     fn test1059_errors_report_line_and_column() {
         let error = parse_str("{\n  \"a\": ,\n}").unwrap_err();

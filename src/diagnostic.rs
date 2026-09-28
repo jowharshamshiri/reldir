@@ -117,9 +117,22 @@ impl Diagnostic {
     /// Resolve `pointer` against the bytes of the file the diagnostic is about,
     /// filling in the location and the source line a reader needs.
     pub fn locate_in(mut self, raw: &[u8], spans: &crate::locate::Spans) -> Self {
-        if let Some(pointer) = &self.pointer
-            && let Some(location) = spans.location(pointer)
-        {
+        // A fault in a member's name is shown at the name; every other fault
+        // is in a value, and is shown at the value.
+        let about_the_name = matches!(
+            self.code.as_str(),
+            "ROW_UNKNOWN_FIELD" | "SCHEMA_UNKNOWN_KEY" | "KEY_COLLISION"
+        );
+        let found = self.pointer.as_deref().and_then(|pointer| {
+            if about_the_name {
+                spans.location(pointer)
+            } else {
+                spans
+                    .value_location(pointer)
+                    .or_else(|| spans.location(pointer))
+            }
+        });
+        if let Some(location) = found {
             self.source_line = std::str::from_utf8(raw)
                 .ok()
                 .and_then(|text| text.lines().nth(location.line.saturating_sub(1)))
@@ -279,7 +292,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 mod tests {
     use super::*;
 
-    /// Section 52: machine-readable diagnostics are a stable contract. Every
+    /// Machine-readable diagnostics are a stable contract. Every
     /// record carries its kind, severity, code, and message, and optional fields
     /// are omitted rather than serialised as null.
     #[test]
@@ -329,7 +342,7 @@ mod tests {
         );
     }
 
-    /// Section 52: each severity serialises to its documented lowercase name.
+    /// Each severity serialises to its documented lowercase name.
     #[test]
     fn test1027_severities_serialise_in_lowercase() {
         for (diagnostic, expected) in [
@@ -345,7 +358,7 @@ mod tests {
         }
     }
 
-    /// Section 51: exit codes are a machine-readable contract. Metadata and
+    /// Exit codes are a machine-readable contract. Metadata and
     /// format faults outrank an incomplete transaction, which outranks an
     /// ordinary invalid database, and a clean run exits zero.
     #[test]

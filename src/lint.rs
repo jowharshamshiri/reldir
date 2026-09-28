@@ -377,17 +377,26 @@ fn table_findings(
         let declared = schema
             .document()
             .pointer(&format!("/x-reldir/foreignKeys/{index}"));
-        let defaulted =
-            declared.is_some_and(|fk| fk.get("onDelete").is_none() || fk.get("onUpdate").is_none());
-        if defaulted {
+        let unsaid: Vec<&str> = [("onDelete", "deleted"), ("onUpdate", "re-keyed")]
+            .into_iter()
+            .filter(|(key, _)| declared.is_some_and(|fk| fk.get(*key).is_none()))
+            .map(|(_, event)| event)
+            .collect();
+        if !unsaid.is_empty() {
             lint.schema(
                 table,
                 &format!("/x-reldir/foreignKeys/{index}"),
                 Diagnostic::suggestion(
                     "LINT_FK_ACTION_DEFAULTED",
                     format!(
-                        "{} does not say what happens when its target is deleted or rekeyed, so both are refused",
-                        fk.describe(table)
+                        "{} does not say what happens when its target is {}, so {} refused",
+                        fk.describe(table),
+                        unsaid.join(" or "),
+                        if unsaid.len() == 1 {
+                            "that is"
+                        } else {
+                            "both are"
+                        }
                     ),
                 ),
                 None,
@@ -578,35 +587,93 @@ mod tests {
         )
     }
 
-    /// Every fix the documentation pairs with a lint is attached where the
-    /// lint is raised, so `doctor --only <FIX>` selects what the plan shows.
+    /// Every fix the documentation pairs with a lint is attached where that
+    /// finding is raised, and comes with a remedy that applies it: a database
+    /// is built that exhibits each finding, and each finding is judged by what
+    /// lint actually reports for it.
     #[test]
-    fn test1146_every_documented_fix_is_attached_where_its_finding_is_raised() {
+    fn test1146_every_documented_fix_is_attached_to_its_finding() {
         let documentation = fs::read_to_string("docs/validation.md").unwrap();
-        let source = fs::read_to_string("src/lint.rs").unwrap();
-        let mut promised = vec![];
+        let mut promised: Vec<(String, String)> = vec![];
         for line in documentation.lines() {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             if cells.len() < 5 || !cells[1].starts_with("`FIX_") {
                 continue;
             }
             let fix = cells[1].trim_matches('`');
-            let from = cells[3].split('`').nth(1).unwrap_or_default();
-            if from.starts_with("LINT_") {
-                promised.push((fix.to_string(), from.to_string()));
+            for code in cells[3]
+                .split('`')
+                .filter(|token| token.starts_with("LINT_"))
+            {
+                promised.push((fix.to_string(), code.to_string()));
             }
         }
-        assert!(promised.len() >= 8, "found {}", promised.len());
+        assert!(promised.len() >= 10, "found {}", promised.len());
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        // `things` is unpinned, nullable-but-never-null, float-but-integral,
+        // enum-like, unique, never-negative, and references `owners` both by a
+        // conventional name and by one inference would not declare.
+        write(
+            root,
+            ".db/schema/things.json",
+            &schema(
+                "things",
+                r#"{"id":{"type":"string"},"n":{"type":["number","null"]},"state":{"type":"string"},"code":{"type":"string"},"count":{"type":"integer","x-reldir-type":"int"},"owned_by":{"type":"string"}}"#,
+                "",
+            ),
+        );
+        write(
+            root,
+            "schema/owners.json",
+            &schema("owners", r#"{"id":{"type":"string"}}"#, ""),
+        );
+        write(
+            root,
+            "schema/tokens.json",
+            &schema("tokens", r#"{"id":{"type":"string","format":"uuid"}}"#, ""),
+        );
+        write(root, "owners/o1.json", r#"{"id":"o1"}"#);
+        write(
+            root,
+            "tokens/0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e.json",
+            "{\"id\":\"0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e\"}\n",
+        );
+        for index in 0..24 {
+            let state = ["open", "closed"][index % 2];
+            write(
+                root,
+                &format!("things/t{index:02}.json"),
+                &format!(
+                    r#"{{"id":"t{index:02}","n":{index},"state":"{state}","code":"c{index}","count":{index},"owned_by":"o1"}}"#
+                ),
+            );
+        }
+        let findings = lint(&catalog(root), &Config::default(), false).unwrap();
         for (fix, code) in promised {
-            let raised: Vec<usize> = source
-                .match_indices(&format!("\"{code}\""))
-                .map(|(at, _)| at)
+            if code == "LINT_DOMAIN_CANDIDATE" {
+                continue; // exercised by test2171 and the behavior suite
+            }
+            let raised: Vec<&Finding> = findings
+                .iter()
+                .filter(|f| f.diagnostic.code == code)
                 .collect();
-            assert!(!raised.is_empty(), "{code} is never raised");
-            let attached = raised.iter().any(|at| {
-                source[*at..(*at + 900).min(source.len())].contains(&format!(".fix(\"{fix}\")"))
-            });
-            assert!(attached, "{code} does not attach {fix}");
+            assert!(
+                !raised.is_empty(),
+                "{code} is documented as the source of {fix}, and this database exhibits it"
+            );
+            for finding in raised {
+                assert!(
+                    finding.diagnostic.fixes.contains(&fix),
+                    "{code} does not offer {fix}: {:?}",
+                    finding.diagnostic
+                );
+                assert!(
+                    finding.remedy.is_some(),
+                    "{code} offers {fix} with no remedy to apply"
+                );
+            }
         }
     }
 

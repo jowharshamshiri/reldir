@@ -270,6 +270,14 @@ fn run_tool(
                 ));
             }
             dry(&mut context)?;
+            if crate::sql::deletes(&sql) && !context.dry_run && !context.yes {
+                return Err(DbError::new(
+                    "DECISION_REQUIRED",
+                    "a DELETE removes rows; it needs confirm: true",
+                    9,
+                )
+                .with_help("run it with dry_run first to see every row it removes"));
+            }
             Command::Sql {
                 statement: sql,
                 params: params(arguments)?,

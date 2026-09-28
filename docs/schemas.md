@@ -287,8 +287,13 @@ deletes a row, which may vacate keys of its own, which are resolved in turn.
 Every row an action touched is reported:
 
 ```console
-$ reldir delete subjects subject.calculus --dry-run
-referential_action remove courses/course.intro.json (fk_subject_refs of ["subject.calculus"] in subjects/subject.calculus.json)
+$ reldir delete tags history --dry-run
+remove posts/p1.json (posts.tags[] -> tags of ["history"] in tags/history.json)
+action | path              | planned
+-------+-------------------+--------
+delete | tags/history.json | true
+write  | posts/p1.json     | true
+(2 rows)
 dry run: 2 file(s) would change; nothing was written
 ```
 

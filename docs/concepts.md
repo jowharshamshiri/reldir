@@ -6,157 +6,146 @@ title: Concepts
 
 ## The filesystem is authoritative
 
-There is no hidden copy of your data. A row *is* a JSON file. The schema the
-runtime uses is a JSON file in `.db/schema/`. Like indexes, statistics and the
-manifest, it is derived state that can be deleted and rebuilt from your files at
-any time. Pinning a schema copies it to `schema/`, where it becomes a declaration
-you own and `rm -rf .db` cannot lose.
+There is no hidden copy of your data. A row *is* a JSON file; a table is a
+directory; a table's schema is a JSON Schema document. Everything reldir keeps
+beside them is either history or derived state it can rebuild.
 
 ```text
 database/
-├── schema/          authoritative: pinned declarations you keep in git
+├── schema/              pins: schemas you declare and keep in version control
 │   └── users.json
-├── users/           authoritative: one file per row
+├── users/               one file per row
 │   ├── u1.json
 │   └── u2.json
-└── .db/             metadata
-    ├── format       authoritative: how to interpret the directory
-    ├── config       authoritative: operational configuration
-    ├── provenance/  authoritative: history of accepted states
-    ├── schema/          derived: the working schema each command reads
-    ├── manifest.json    derived
-    ├── indexes/         derived
-    ├── statistics/      derived
-    ├── objects/         content-addressed revision objects
-    ├── snapshots/
+└── .db/
+    ├── format           how to interpret the directory          (versioned)
+    ├── config           operational settings                    (versioned)
+    ├── schema/          schemas reldir inferred for unpinned tables
+    ├── provenance/      the history of accepted states
+    ├── objects/         every recorded row and schema, by hash
+    ├── snapshots/       named copies
+    ├── mirror.sqlite    derived: the index SQL runs on
     ├── transactions/    ephemeral: staging and journals
-    └── lock             ephemeral
+    └── lock             ephemeral: the writer lock
 ```
+
+`.db/format` and `.db/config` are needed to interpret the directory, so
+`.db/.gitignore` keeps them under version control and ignores the rest.
+Deleting `.db/mirror.sqlite`, `.db/schema/` or all of `.db/` loses nothing a
+pin or a row says: the next command rebuilds it from the files.
 
 ## Rows and identity
 
-One JSON object per file. The root must be an object.
+A row is one JSON object in one file. Its identity is its primary key, read
+from the file's body; its file name is derived from that key by a fixed rule
+(see [Schemas]({{ site.baseurl }}/schemas#identity-and-file-names)), so each row has exactly one
+correct path. A file whose name is not the one its key gives is
+`IDENTITY_MISMATCH`, and `reldir doctor` renames it -- it never rewrites a
+body to match a name.
 
-A row's relational identity comes from its **primary key as stored in the file
-body**, not from its filename. The filename is derived from that identity by a
-deterministic rule, so a row always has exactly one correct path:
+reldir writes a row with exactly the members it has, in the order it has them:
+an omitted member stays omitted (it reads as its default where the row is
+read), and a file reldir rewrites keeps its members where its author put them.
+Member order and formatting are never part of identity; the state hash is taken
+over a key-sorted canonical form.
 
-```text
-<table>/<filename-key>.json
-```
+## Validity
 
-The filename key comes from the `x-reldir.filename` columns (the primary key by
-default). Each value is rendered canonically and percent-encoded for every byte
-outside `[A-Za-z0-9._-]`; multiple columns are joined with `,`. A leading `.` is
-encoded, so a row can never become a hidden file, and `/` can never appear, so a
-row can never escape its table directory.
-
-If a file's name disagrees with its body, that is `IDENTITY_MISMATCH`. `doctor`
-offers to rename the file. It will not rewrite the body to match the name unless
-you ask.
-
-## Validity states
-
-Every command begins by establishing which of these is true:
+Every command begins by observing the directory and judging it:
 
 | State | Meaning |
 |---|---|
-| `VALID_UNCHANGED` | The filesystem matches the last recorded state |
-| `VALID_CHANGED_EXTERNALLY` | It differs, and the result is still valid; adopted as a new revision |
-| `INVALID` | One or more invariants are violated |
-| `UNINITIALIZED` | No `.db/` metadata; only `init`, `infer`, `inspect`, and `help` operate |
+| `VALID` | the files are a valid database, and history has recorded them |
+| `VALID_CHANGED_EXTERNALLY` | valid, and different from history: recorded as a new revision now, with origin `external` |
+| `VALID_UNRECORDED` | valid and different from history, observed with `--readonly`, which records nothing |
+| `INVALID` | one or more faults, each reported with its file, line, column and JSON Pointer |
+| `EMPTY` | no metadata, no tables, no pins: nothing to govern |
 
-When the database is `INVALID`, commands whose correctness depends on a valid
-state refuse to run. The diagnostic commands keep working, because they are what
-you need when something is wrong: `status`, `check`, `lint`, `doctor`, `inspect`,
-`recover`, and `snapshot restore`.
+An invalid database still answers `status`, `check`, `lint`, `doctor`,
+`inspect`, `recover`, `log`, `diff` and `snapshot restore`, because those are
+how you return to a valid one. Queries refuse -- an answer computed from a state
+that breaks its own rules is not an answer -- unless you pass `--allow-invalid`,
+which answers anyway and marks the result `"database_valid": false`. Changes
+always refuse: a change to an invalid database would be judged against faults
+it did not make.
 
-## External modification
+## Changes made outside reldir
 
-External edits are a first-class input, not an error:
+Anything may edit the directory. reldir judges the state it observes when it
+runs; a directory that is briefly inconsistent midway through a multi-file edit
+is not a problem as long as no command runs at that moment.
 
 ```text
-observe filesystem
-        ↓
-determine changes since the known state
-        ↓
-validate the resulting database
-        ↓
-   valid?  ── yes ──> adopt as a new revision (origin: external)
-        └── no ───> INVALID + diagnostics
+observe the files ─→ valid? ── yes ─→ recorded as a new revision (origin: external)
+                          └──── no ──→ INVALID, every fault located; nothing recorded
 ```
 
-`reldir` judges only the state it observes when invoked. A directory that is
-temporarily inconsistent midway through a multi-file edit is not a problem as
-long as no command runs at that moment. If one does, it reports the
-inconsistency rather than assuming more edits are coming.
+A referential action describes what *reldir* does when *it* deletes or re-keys
+a row. A row you delete by hand is not cascaded after the fact: the state is
+judged as it stands, and a reference to the missing row is a
+`FOREIGN_KEY_VIOLATION`. `reldir doctor` then offers, in order: restoring the
+missing row exactly as history last recorded it, removing the reference, or
+deleting the row that holds it.
 
-If you externally delete a parent row whose foreign key says `onDelete: cascade`,
-`reldir` does **not** perform the cascade afterwards. The observed state is valid
-only if the dependent changes are already present. This avoids reading an
-incomplete edit as transactional intent. `doctor` can offer the cascade as a data
-fix.
+## Provenance is not validity
 
-## Provenance is not integrity
-
-Three separate questions, deliberately kept apart:
+Three questions, kept apart:
 
 | Question | Answered by |
 |---|---|
-| Is the current relational state valid? | **Integrity**: `check`, `status` |
-| What state transitions have been observed? | **Provenance**: `log`, `show` |
-| How does the binary safely perform multi-file writes? | **Transactions** |
+| Is the current state valid? | integrity: `check`, `status` |
+| How did the state come to be? | provenance: `log`, `show`, `diff` |
+| How is a multi-file change written safely? | [transactions]({{ site.baseurl }}/transactions) |
 
-A state can be valid even though `reldir` did not produce it. Provenance records
-*how* a state appeared (`internal`, `external`, `recovery`, `repair`,
-`migration`, `import`, or `snapshot_restore`). It never claims to know who made an
-external change, because that information is not available.
+Each accepted state is a revision in `.db/provenance/`, naming its predecessor
+and carrying only what changed; every row and schema it adds is kept, by hash,
+in `.db/objects/`, so any recorded state can be reconstructed and any deleted
+row restored byte for byte. A revision records *how* a state appeared --
+`internal`, `external`, `recovery`, `repair`, `migration`, `import` or
+`snapshot_restore` -- and never claims to know who made an outside edit.
 
-## Canonical state and hashing
+History that does not verify -- a record missing, an object altered -- is
+reported as `INTERNAL_METADATA_CORRUPT` with the revision named. Reads keep
+working; nothing new can be recorded until it is repaired, either by restoring
+`.db/provenance/` and `.db/objects/` from a backup, or by
+`reldir recover --history new-lineage --allow-destructive`, which moves the old
+history aside intact and begins a new one.
 
-Each accepted revision has a `state_root_hash` over the canonical *logical* state,
-so identity does not depend on incidental formatting. Reformatting a file without
-changing its values does not create a new revision.
+## Hashing and determinism
 
-Canonicalisation fixes: row keys in schema column order, nested object keys
-lexicographically, NFC strings, shortest round-trip numbers, `-0` normalised to
-`0`, UTC timestamps, two-space indentation, and a trailing newline.
+A revision's root hash covers the format, the configuration, each table's
+schema identity, and each row's canonical hash, built per table so that
+recognising "nothing changed" costs one read per table. Given the same files,
+reldir derives the same root, the same inferred schemas and the same findings
+on any machine. Nothing machine-specific -- timestamps, absolute paths, binary
+versions -- reaches the hash, so roots are comparable between clones.
 
-`reldir` will not rewrite your files merely to canonicalise them. Only
-`doctor --fix --only FIX_CANONICALIZE --allow-data` does that, and only on request.
+## One way to change anything
 
-A schema's identity follows what it *says*, not how it is written. The hash is
-taken over a versioned encoding of the relational model rather than over the JSON
-Schema document on disk, so reformatting a schema, or changing the file format
-itself, leaves every revision's identity intact. Column order is the exception:
-rows are written in it, so two schemas that order their columns differently
-describe different bytes.
+Every change the binary makes converges on one path: plan the row changes,
+complete them with their referential actions, judge the state they produce,
+write it through the recoverable [transaction protocol]({{ site.baseurl }}/transactions), record
+it. SQL, the row commands, imports, migrations, repairs and snapshot restore
+all take it; nothing writes a row any other way.
 
-## Determinism
-
-Given identical rows, identical schemas, and the same format version, `reldir`
-derives the same logical state, the same root hash, the same inferred schemas,
-and the same lint findings, on any machine and in any order.
-
-Nothing machine-specific reaches logical identity. Timestamps, paths outside the
-root, binary versions, and the contents of `.db/` beyond `format` and `config`
-are recorded as history, never mixed into the hash, so a root hash is comparable
-between two clones.
-
-## One mutation path
-
-Every change the binary makes converges on the same transaction and validation
-machinery: SQL, CRUD commands, import, migrations, cascades, doctor fixes, schema
-pin, and snapshot restore. No feature writes authoritative JSON any other way.
-
-## Unknown files
+## Files reldir does not recognise
 
 | What | Treatment |
 |---|---|
-| `.json` inside a table directory | a row |
-| Anything else inside a table directory | `UNEXPECTED_FILE` |
-| Editor artefacts (`.DS_Store`, `*~`, `*.swp`, `.gitkeep`) | ignored by default |
-| Paths matching `.db/config` `ignore` globs | ignored |
-| A top-level directory with no schema | `UNGOVERNED_DIRECTORY` (warning; error under `check --strict`) |
+| `.json` in a table directory | a row |
+| anything else in a table directory | `UNEXPECTED_FILE` |
+| editor artefacts (`.DS_Store`, `*~`, `*.swp`, `.gitkeep`) | ignored |
+| paths matching `.db/config` `ignore` | ignored |
+| a top-level directory no schema governs | `UNGOVERNED_DIRECTORY` (a warning) |
+| symlinks, sockets, FIFOs, devices, hard-linked files | `NON_REGULAR_FILE`, never followed |
+| two names equal under case or Unicode folding | `PATH_COLLISION` |
 
 Nothing is silently absorbed, so a typo cannot become invisible state.
+
+## What reldir is not
+
+It is not a server, and not for high write concurrency: one writer at a time
+holds the lock, and every change touches files. It does not replace a
+general-purpose database for large transactional workloads. It is for data
+that people and tools should be able to read, review and edit directly, and
+that must nonetheless always be right.

@@ -70,7 +70,6 @@ version = "0.61"
 assert_cmd = "2"
 predicates = "3"
 proptest = "1.11"
-trycmd = "1.2"
 
 [dev-dependencies.rmcp]
 features = ["client", "transport-io"]

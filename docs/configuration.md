@@ -4,133 +4,78 @@ title: Configuration
 
 # Configuration
 
-Operational configuration lives in `.db/config`, which is authoritative state:
-every clone reads the same settings, so formatting and limits are reproducible.
+`.db/config` holds the settings a person chooses. It is versioned beside the
+rows, so every clone formats and limits alike. An unknown key is an error, not
+something to ignore (`CONFIG_INVALID`), and every setting is checked before it
+is used.
 
-## Defaults
+## Settings
 
-`reldir init` writes this file:
+`reldir init` writes the defaults:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `indentation_width` | `2` | spaces per level when reldir writes a file |
+| `enum_max_values` | `10` | most distinct values a string column may hold and still be inferred as an `enum` |
+| `unique_min_rows` | `20` | rows needed before inference or lint proposes a `unique` constraint or a check |
+| `max_json_file_size` | `67108864` | largest file read, in bytes |
+| `max_nesting_depth` | `128` | deepest JSON nesting read |
+| `max_result_rows` | `1000000` | most rows a query may return |
+| `max_query_memory` | `268435456` | bytes a query may allocate, sorting included |
+| `max_transaction_size` | `1073741824` | most bytes one change may write |
+| `timeout_seconds` | `null` | seconds a query may run; `null` for no limit |
+| `wait_seconds` | `5.0` | seconds a writer waits for the lock; `0` tries once |
+| `ignore` | `.DS_Store`, `*~`, `*.swp`, `.gitkeep` | glob patterns reldir does not govern |
+| `allow_remote_filesystem` | `false` | permit writing on a network or FUSE filesystem ([why]({{ site.baseurl }}/transactions#filesystems)) |
+| `reference_naming` | see below | the column names that announce a reference |
+| `reference_min_values` | `1` | distinct resolving values a place must hold before a reference is proposed |
+
+Every limit must be greater than zero; `wait_seconds` may be zero and must be
+finite. Exceeding a limit is always `RESOURCE_LIMIT`, never a truncated answer.
+
+## Reference naming
+
+Inference declares a reference only when a place is *named* as one to its
+target; lint proposes the others. The names are patterns, with `{table}`
+standing for a table's name and `{singular}` for it without a trailing `s`:
 
 ```json
 {
-  "indentation_width": 2,
-  "enum_max_values": 10,
-  "unique_min_rows": 20,
-  "max_json_file_size": 67108864,
-  "max_nesting_depth": 128,
-  "max_result_rows": 1000000,
-  "max_query_memory": 268435456,
-  "max_sort_memory": 268435456,
-  "max_temporary_disk": 4294967296,
-  "max_transaction_size": 1073741824,
-  "timeout_seconds": null,
-  "wait_seconds": 5.0,
-  "ignore": [
-    ".DS_Store",
-    "*~",
-    "*.swp",
-    ".gitkeep"
+  "reference_naming": [
+    "{singular}_id", "{table}_id", "{singular}_ids",
+    "{singular}_ref", "{singular}_refs", "{table}_ref", "{table}_refs",
+    "{singular}", "{table}"
   ]
 }
 ```
 
-An unknown key is rejected rather than ignored, and every limit must be greater
-than zero. `wait_seconds` is the one setting with a meaningful zero -- it means
-"try once, then report contention" -- so it is required only to be finite and
-not negative. A malformed config is `INTERNAL_METADATA_CORRUPT`, not a silent
-fallback to defaults.
+With these, `user_id`, `user_ids`, `lesson_ref` and `objective_refs` announce
+references to `users`, `lessons` and `objectives`. A pattern must name the table
+with a placeholder, or it would match every table.
 
-## Settings
+## For one command
 
-| Key | Meaning |
-|---|---|
-| `indentation_width` | spaces used when the binary writes a JSON file |
-| `enum_max_values` | most distinct values a column may have and still be inferred as an `enum` |
-| `unique_min_rows` | rows required before inference will commit to a `unique` constraint or check |
-| `max_json_file_size` | largest governed file that will be read |
-| `max_nesting_depth` | deepest JSON nesting accepted, enforced while parsing |
-| `max_result_rows` | most rows a query may return |
-| `max_query_memory` | memory bound for a query's materialised result |
-| `max_sort_memory` | memory bound for queries that sort |
-| `max_temporary_disk` | reserved: the query engine keeps temporary storage in memory, so nothing currently consumes temporary disk and this bounds nothing. It is validated and must be greater than zero. |
-| `max_transaction_size` | total bytes one transaction may stage |
-| `timeout_seconds` | query timeout; `null` for none |
-| `wait_seconds` | how long a writer waits for the writer lock before reporting `LOCK_CONTENDED`; `0` tries once |
-| `ignore` | glob patterns excluded from governance |
-
-Formatting is deliberately almost unconfigurable: only the indentation width can
-change, so every clone of a database produces identical bytes.
-
-## Per-invocation overrides
-
-Every limit can be overridden for a single command, which is useful for one-off
-imports and for exploring a database you do not control:
+Each limit can be overridden for a single command:
 
 ```sh
 reldir --max-result-rows 50 sql 'SELECT * FROM events'
 reldir --max-nesting-depth 512 check
-reldir --max-json-file-size 100000000 import blobs --from big.jsonl
 reldir --timeout 30 sql 'SELECT ...'
-reldir --wait 0 update users u1 '{"name":"Alice"}'   # fail at once if busy
+reldir --wait 0 update users u1 '{"name":"Ada"}'
 ```
-
-| Flag |
-|---|
-| `--max-json-file-size <BYTES>` |
-| `--max-nesting-depth <DEPTH>` |
-| `--max-query-memory <BYTES>` |
-| `--max-sort-memory <BYTES>` |
-| `--max-temporary-disk <BYTES>` (reserved; see above) |
-| `--max-result-rows <ROWS>` |
-| `--max-transaction-size <BYTES>` |
-| `--timeout <SECONDS>` |
-| `--wait <SECONDS>` |
-
-Exceeding a limit is always an explicit `RESOURCE_LIMIT` failure, never a
-silently truncated result.
-
-## Ignoring files
-
-Add glob patterns to `ignore` to keep non-database files inside governed
-directories:
-
-```json
-{ "ignore": [".DS_Store", "*~", "*.swp", ".gitkeep", "*.md", "drafts/**"] }
-```
-
-A file inside a table directory that is not `.json` is `UNEXPECTED_FILE`, and a
-top-level directory with no schema is `UNGOVERNED_DIRECTORY`: a warning in
-`status`, an error under `check --strict`. Both are reported so that a typo does
-not become invisible state.
 
 ## Version control
 
-`reldir init` writes `.db/.gitignore`:
+`.db/.gitignore` versions `format` and `config` and ignores the rest -- the
+mirror, working schemas, history, snapshots and transaction staging are
+derived, per-clone or ephemeral. After a `git clone` the first command reads
+every row, builds the mirror and records the first revision.
 
-```text
-*
-!format
-!config
-```
+`reldir init --track-provenance` versions history as well: `provenance/` and
+the `objects/` it references, so a clone carries a complete, verifiable
+history.
 
-`.db/format` and `.db/config` are versioned because they are needed to interpret
-the database. The manifest, indexes, statistics, snapshots, and transaction
-staging are not, because they are derived or ephemeral.
-
-Provenance is per-clone by default. Use `reldir init --track-provenance` to version
-history as well, which also retains the content-addressed objects it references so
-a clone keeps a complete, verifiable history.
-
-After a `git clone`, the first command observes every row as an external
-transition and rebuilds derived state. This works with nothing in `.db/` beyond
-`format` and `config`.
-
-For CI:
-
-```sh
-reldir --readonly check --format json     # exits 2 on INVALID
-reldir --readonly check --strict          # also exits 7 on lint findings
-```
-
-Merge conflicts are a Git concern. `reldir` reports the result as `INVALID` with
-`INVALID_JSON` on conflict markers, and `doctor` classifies them as `manual`.
+In CI, `reldir --readonly check --format sarif` writes nothing, exits `2` on an
+invalid database, and produces a log code-scanning tools can annotate. A merge
+that leaves conflict markers in a row is `INVALID_JSON`, and the diagnostic
+says so.

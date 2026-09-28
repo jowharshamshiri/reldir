@@ -1,0 +1,19 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-2",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "tags",
+    "primaryKey": [
+      "id"
+    ]
+  }
+}
