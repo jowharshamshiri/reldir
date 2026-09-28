@@ -99,12 +99,14 @@ impl Source for Disk {
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let mut entries = vec![];
+        // Sorted by name: every entry shares the parent, so ordering the bare
+        // names orders the paths, without comparing them component by component.
+        let mut names = vec![];
         for entry in std::fs::read_dir(path)? {
-            entries.push(entry?.path());
+            names.push(entry?.file_name());
         }
-        entries.sort();
-        Ok(entries)
+        names.sort_unstable();
+        Ok(names.into_iter().map(|name| path.join(name)).collect())
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
@@ -238,22 +240,29 @@ impl Source for Overlay<'_> {
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
-        let mut entries: BTreeSet<PathBuf> = match self.base.read_dir(path) {
-            Ok(entries) => entries.into_iter().collect(),
+        // The base listing is sorted; the planned writes and deletes are a
+        // handful, so they are merged into it rather than re-sorting it.
+        let mut entries = match self.base.read_dir(path) {
+            Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound && self.created_dir(path) => {
-                BTreeSet::new()
+                vec![]
             }
             Err(error) => return Err(error),
         };
-        entries.retain(|entry| !self.deletes.contains(entry));
+        if !self.deletes.is_empty() {
+            entries.retain(|entry| !self.deletes.contains(entry));
+        }
         for written in self.writes.keys() {
             if let Ok(rest) = written.strip_prefix(path)
                 && let Some(first) = rest.components().next()
             {
-                entries.insert(path.join(first));
+                let entry = path.join(first);
+                if let Err(at) = entries.binary_search(&entry) {
+                    entries.insert(at, entry);
+                }
             }
         }
-        Ok(entries.into_iter().collect())
+        Ok(entries)
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {

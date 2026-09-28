@@ -20,7 +20,7 @@ format: any other version is `FORMAT_UNSUPPORTED`, never interpreted.
 | `.db/objects/<sha256>.json` | a recorded row, schema, format or configuration, named by its hash |
 | `.db/snapshots/<name>/` | a complete copy of the authoritative files |
 | `.db/provenance-quarantine/<time>/` | history moved aside by a new lineage |
-| `.db/mirror.sqlite` | derived: the relational index (layout `reldir-mirror-1`) |
+| `.db/mirror.sqlite` | derived: the relational index (layout `reldir-mirror-2`) |
 | `.db/transactions/<uuid>/` | ephemeral: a transaction's staged bytes and journal |
 | `.db/lock` | ephemeral: the advisory writer lock |
 

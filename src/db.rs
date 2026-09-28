@@ -591,22 +591,42 @@ impl Database {
         transaction::check_plan(&changes, self.config.max_transaction_size)?;
         let (writes, deletes) = overlay_parts(&self.root, &changes);
         let overlay = Overlay::new(&Disk, writes, deletes);
-        let prospective = self.catalog.prospect(&self.config, &overlay)?;
-        admit(request.admission, &before, &prospective)?;
-        if request.dry_run || changes.is_empty() {
-            drop(lock);
-            return Ok(Outcome {
-                rows,
-                induced,
-                changes,
-                revision: None,
-                warnings: prospective.warnings,
-                dry_run: request.dry_run,
-            });
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        transaction::journaled(&Disk, &self.root, &id, request.origin, &changes)?;
-        self.reobserve()?;
+        let prospect = self.catalog.prospect(&self.config, &overlay)?;
+        // Every fallible step between judging the change and committing it:
+        // whatever happens, the prospect is then kept or abandoned.
+        let committed = (|| -> Result<Option<String>> {
+            admit(request.admission, &before, &prospect.verdict)?;
+            if request.dry_run || changes.is_empty() {
+                return Ok(None);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            transaction::journaled(&Disk, &self.root, &id, request.origin, &changes)?;
+            Ok(Some(id))
+        })();
+        let id = match committed {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                let prospective = prospect.abandon()?;
+                drop(lock);
+                return Ok(Outcome {
+                    rows,
+                    induced,
+                    changes,
+                    revision: None,
+                    warnings: prospective.warnings,
+                    dry_run: request.dry_run,
+                });
+            }
+            Err(error) => {
+                if let Err(rollback) = prospect.abandon() {
+                    return Err(rollback.with_related(error.diagnostics()));
+                }
+                return Err(error);
+            }
+        };
+        // The files now hold what the prospect observed, so its observation
+        // is the new state; observing again would re-derive the same thing.
+        (self.catalog, self.verdict) = prospect.keep()?;
         // A change that leaves the state history already has -- restoring what
         // an outside edit removed -- is not a new revision.
         let revision = if metadata::pending_changes(&self.catalog)?.is_empty() {

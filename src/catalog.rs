@@ -65,6 +65,31 @@ fn ungoverned_help(name: &str) -> String {
     format!("run `reldir infer {name} --write`, or add it to the ignore list in .db/config")
 }
 
+const PROSPECT: &str = "reldir_prospect";
+
+/// A planned change, observed and judged, whose mirror changes are held until
+/// it is committed or abandoned. It must be resolved one way or the other:
+/// until then the mirror is inside the prospect's savepoint.
+#[must_use = "a prospect holds the mirror in a savepoint until it is kept or abandoned"]
+pub struct Prospect {
+    pub catalog: Catalog,
+    pub verdict: crate::integrity::Verdict,
+}
+
+impl Prospect {
+    /// The change was committed: the observation is the new state.
+    pub fn keep(self) -> Result<(Catalog, crate::integrity::Verdict)> {
+        self.catalog.mirror.release(PROSPECT)?;
+        Ok((self.catalog, self.verdict))
+    }
+
+    /// The change was not made: return the mirror to the state before it.
+    pub fn abandon(self) -> Result<crate::integrity::Verdict> {
+        self.catalog.mirror.rollback_to(PROSPECT)?;
+        Ok(self.verdict)
+    }
+}
+
 pub struct Catalog {
     pub root: PathBuf,
     /// Top-level directories holding data that no schema governs.
@@ -136,25 +161,28 @@ impl Catalog {
         })
     }
 
-    /// Observe the directory as a planned change would leave it, judge it, and
-    /// discard the observation. Nothing is written: the planned bytes are read
-    /// from memory, and the mirror is changed only inside a savepoint that is
-    /// rolled back.
-    pub fn prospect(
-        &self,
-        config: &Config,
-        source: &dyn Source,
-    ) -> Result<crate::integrity::Verdict> {
-        self.mirror.savepoint("reldir_prospect")?;
+    /// Observe the directory as a planned change would leave it, and judge it.
+    /// Nothing is written: the planned bytes are read from memory, and the
+    /// mirror's changes are held in a savepoint until the caller keeps them --
+    /// the change was committed, so the observation is the new state and need
+    /// not be made again -- or abandons them.
+    pub fn prospect(&self, config: &Config, source: &dyn Source) -> Result<Prospect> {
+        self.mirror.savepoint(PROSPECT)?;
         let outcome = crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut future = Self::empty(&self.root, config, Rc::clone(&self.mirror), false);
             future.load_schemas(config, source)?;
             crate::integrity::validate_schemas(&mut future);
             future.refresh(config, source)?;
-            crate::integrity::validate_through(&future, source)
+            let verdict = crate::integrity::validate_through(&future, source)?;
+            Ok((future, verdict))
         });
-        self.mirror.rollback_to("reldir_prospect")?;
-        outcome
+        match outcome {
+            Ok((catalog, verdict)) => Ok(Prospect { catalog, verdict }),
+            Err(error) => {
+                self.mirror.rollback_to(PROSPECT)?;
+                Err(error)
+            }
+        }
     }
 
     fn empty(root: &Path, config: &Config, mirror: Rc<Mirror>, rebuilt_mirror: bool) -> Self {
@@ -369,24 +397,8 @@ impl Catalog {
         mirror.savepoint("reldir_refresh")?;
         let outcome = (|| -> Result<()> {
             self.rebuilt_tables = mirror.sync_schemas(&governed)?;
-            let mut present = BTreeSet::new();
             for (table, schema) in &governed {
-                self.scan_table(
-                    table,
-                    schema,
-                    config,
-                    &ignores,
-                    seen_ns,
-                    source,
-                    &mut present,
-                )?;
-            }
-            for table in governed.keys() {
-                for path in mirror.paths(table)? {
-                    if !present.contains(&path) {
-                        mirror.remove(&path)?;
-                    }
-                }
+                self.scan_table(table, schema, config, &ignores, seen_ns, source)?;
             }
             // A duplicate that relaxed a table's key indexes may be gone now.
             mirror.tighten(&governed)?;
@@ -440,7 +452,8 @@ impl Catalog {
                 .any(|d| d.table.as_deref() == Some(table) && d.code.starts_with("SCHEMA_"))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Bring the mirror's entries for one table up to date with its
+    /// directory: read what changed, and forget what is gone.
     fn scan_table(
         &mut self,
         table: &str,
@@ -449,12 +462,12 @@ impl Catalog {
         ignores: &globset::GlobSet,
         seen_ns: i64,
         source: &dyn Source,
-        present: &mut BTreeSet<String>,
     ) -> Result<()> {
         let directory = self.root.join(table);
         match source.metadata(&directory) {
             Ok(meta) if meta.kind == Kind::Dir => {}
             Ok(_) => {
+                self.forget_table_files(table)?;
                 self.diagnostics.push(
                     Diagnostic::error(
                         "NON_REGULAR_FILE",
@@ -465,20 +478,32 @@ impl Catalog {
                 );
                 return Ok(());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.forget_table_files(table);
+            }
             Err(error) => return Err(DbError::io(&directory, error)),
         }
         let entries = source
             .read_dir(&directory)
             .map_err(|e| DbError::io(&directory, e))?;
         let rebuilt = self.rebuilt_tables.iter().any(|t| t == table);
-        let mut names = BTreeSet::new();
+        // A rebuilt table starts empty, so it has no stamps to trust.
+        let mut stamps = if rebuilt {
+            Default::default()
+        } else {
+            self.mirror.stamps(table)?
+        };
+        let mut names = std::collections::HashSet::with_capacity(entries.len());
         let mut progress = crate::output::Progress::new("scanning", entries.len());
         for path in entries {
             progress.advance();
             let relative_path = relative(&self.root, &path);
-            let key = slash(&relative_path);
             let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            let key = if name.is_empty() {
+                slash(&relative_path)
+            } else {
+                format!("{table}/{name}")
+            };
             if ignores.is_match(&relative_path) || ignores.is_match(name) {
                 continue;
             }
@@ -488,8 +513,7 @@ impl Catalog {
             if crate::metadata::is_in_progress_write(&path) {
                 continue;
             }
-            let normalized: String = name.nfc().flat_map(char::to_lowercase).collect();
-            if !names.insert(normalized) {
+            if !names.insert(fold(name)) {
                 self.diagnostics.push(
                     Diagnostic::error(
                         "PATH_COLLISION",
@@ -554,28 +578,26 @@ impl Catalog {
                 );
                 continue;
             }
-            present.insert(key.clone());
-            let cached = if rebuilt {
-                None
-            } else {
-                self.mirror.file(&key)?
-            };
-            if let Some(entry) = &cached
-                && entry.trusted_for(&meta.stat)
+            // What is left in `stamps` after the scan is what is gone.
+            let cached = stamps.remove(&key);
+            if let Some(stamp) = &cached
+                && stamp.trusted_for(&meta.stat)
             {
                 continue;
             }
             let raw = match source.read(&path) {
                 Ok(raw) => raw,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    present.remove(&key);
+                    if cached.is_some() {
+                        self.mirror.remove(&key)?;
+                    }
                     continue;
                 }
                 Err(error) => return Err(DbError::io(&path, error)),
             };
             let raw_hash = canonical::hash_bytes(&raw);
-            if let Some(entry) = &cached
-                && entry.raw_hash == raw_hash
+            if let Some(stamp) = &cached
+                && stamp.raw_hash == raw_hash
             {
                 self.mirror.touch(&key, &meta.stat, seen_ns)?;
                 continue;
@@ -592,6 +614,17 @@ impl Catalog {
                 row: row.as_ref(),
                 diagnostics,
             })?;
+        }
+        for gone in stamps.keys() {
+            self.mirror.remove(gone)?;
+        }
+        Ok(())
+    }
+
+    /// Forget every file of a table whose directory is not there to scan.
+    fn forget_table_files(&self, table: &str) -> Result<()> {
+        for path in self.mirror.paths(table)? {
+            self.mirror.remove(&path)?;
         }
         Ok(())
     }
@@ -827,6 +860,17 @@ pub fn has_multiple_links(_metadata: &std::fs::Metadata) -> bool {
 }
 
 /// A relative path with `/` separators, as the mirror and provenance name it.
+/// A file name folded as case-insensitive, normalising filesystems compare
+/// names: two names that fold alike are one file on some of them.
+fn fold(name: &str) -> String {
+    if name.is_ascii() {
+        // NFC is the identity on ASCII, and lowercasing it is byte-wise.
+        name.to_ascii_lowercase()
+    } else {
+        name.nfc().flat_map(char::to_lowercase).collect()
+    }
+}
+
 pub fn slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

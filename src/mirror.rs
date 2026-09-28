@@ -29,11 +29,14 @@ use crate::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::Value as SqlValue};
 use serde_json::{Map, Value};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 /// The layout this binary reads and writes. A mirror of any other layout is
 /// rebuilt rather than interpreted.
-pub const LAYOUT: &str = "reldir-mirror-1";
+pub const LAYOUT: &str = "reldir-mirror-2";
 
 /// The constraint name a primary key is stored under in `_reldir_keys`.
 pub const PRIMARY: &str = "pk";
@@ -108,8 +111,19 @@ pub struct FileEntry {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-impl FileEntry {
-    /// Whether the entry still describes a file with this stat, without
+/// What the stat pass knows about a file without its row: enough to decide
+/// whether the file must be read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pub stat: Stat,
+    /// SHA-256 of the file's bytes when last read.
+    pub raw_hash: String,
+    /// When it was last read, in the filesystem's clock.
+    pub seen_ns: i64,
+}
+
+impl Stamp {
+    /// Whether the stamp still describes a file with this stat, without
     /// reading the file.
     pub fn trusted_for(&self, stat: &Stat) -> bool {
         self.stat == *stat && stat.mtime_ns + RACY_WINDOW_NS < self.seen_ns
@@ -198,6 +212,48 @@ CREATE TABLE IF NOT EXISTS _reldir_edges (
 );
 CREATE INDEX IF NOT EXISTS _reldir_edges_target ON _reldir_edges (target, rule);
 CREATE INDEX IF NOT EXISTS _reldir_edges_rule ON _reldir_edges (rule);
+-- Paths whose row may differ between the files and the recorded head: every
+-- path absent from here holds exactly what was recorded, so what changed since
+-- the last revision is found without comparing every row. The triggers keep it
+-- in the same transaction as the change that unsettles a path; recording
+-- settles the paths it brought into agreement. A trigger's own conflict clause
+-- would be overridden by the statement that fires it (an upsert makes it an
+-- abort), so each inserts only a path that is not there yet.
+CREATE TABLE IF NOT EXISTS _reldir_unsettled (path TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS _reldir_files_added AFTER INSERT ON _reldir_files
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT NEW.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = NEW.path);
+END;
+CREATE TRIGGER IF NOT EXISTS _reldir_files_removed AFTER DELETE ON _reldir_files
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT OLD.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = OLD.path);
+END;
+CREATE TRIGGER IF NOT EXISTS _reldir_files_changed AFTER UPDATE OF path, row_hash ON _reldir_files
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT OLD.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = OLD.path);
+    INSERT INTO _reldir_unsettled (path) SELECT NEW.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = NEW.path);
+END;
+CREATE TRIGGER IF NOT EXISTS _reldir_recorded_added AFTER INSERT ON _reldir_recorded
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT NEW.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = NEW.path);
+END;
+CREATE TRIGGER IF NOT EXISTS _reldir_recorded_removed AFTER DELETE ON _reldir_recorded
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT OLD.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = OLD.path);
+END;
+CREATE TRIGGER IF NOT EXISTS _reldir_recorded_changed AFTER UPDATE ON _reldir_recorded
+BEGIN
+    INSERT INTO _reldir_unsettled (path) SELECT OLD.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = OLD.path);
+    INSERT INTO _reldir_unsettled (path) SELECT NEW.path
+    WHERE NOT EXISTS (SELECT 1 FROM _reldir_unsettled WHERE path = NEW.path);
+END;
 ";
 
 impl Mirror {
@@ -610,7 +666,9 @@ impl Mirror {
         let mut changed = self
             .conn
             .prepare(
-                "SELECT f.path, f.row_hash FROM _reldir_files f LEFT JOIN _reldir_recorded r ON r.path = f.path \
+                "SELECT f.path, f.row_hash FROM _reldir_unsettled u \
+                 JOIN _reldir_files f ON f.path = u.path \
+                 LEFT JOIN _reldir_recorded r ON r.path = f.path \
                  WHERE f.row_hash IS NOT NULL AND (r.hash IS NULL OR r.hash <> f.row_hash)",
             )
             .map_err(corrupt)?;
@@ -632,7 +690,8 @@ impl Mirror {
         let mut removed = self
             .conn
             .prepare(
-                "SELECT r.path FROM _reldir_recorded r WHERE r.kind = 'row' AND NOT EXISTS \
+                "SELECT r.path FROM _reldir_unsettled u JOIN _reldir_recorded r ON r.path = u.path \
+                 WHERE r.kind = 'row' AND NOT EXISTS \
                  (SELECT 1 FROM _reldir_files f WHERE f.path = r.path AND f.row_hash IS NOT NULL)",
             )
             .map_err(corrupt)?;
@@ -727,6 +786,7 @@ impl Mirror {
                 )
                 .map_err(corrupt)?;
         }
+        self.settle()?;
         match (revision, root) {
             (Some(revision), Some(root)) => {
                 self.set_meta("recorded_revision", &revision.to_string())?;
@@ -780,8 +840,24 @@ impl Mirror {
                 }
             }
         }
+        self.settle()?;
         self.set_meta("recorded_revision", &revision.to_string())?;
         self.set_meta("recorded_root", root)
+    }
+
+    /// Forget the unsettled paths whose file now holds what was recorded
+    /// there -- the same row, or no row on either side.
+    fn settle(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM _reldir_unsettled WHERE \
+                 (SELECT f.row_hash FROM _reldir_files f WHERE f.path = _reldir_unsettled.path) IS \
+                 (SELECT r.hash FROM _reldir_recorded r \
+                  WHERE r.path = _reldir_unsettled.path AND r.kind = 'row')",
+                [],
+            )
+            .map(|_| ())
+            .map_err(corrupt)
     }
 
     /// The mirror's record of a file, if it has one.
@@ -796,6 +872,40 @@ impl Mirror {
             .optional()
             .map_err(corrupt)?
             .transpose()
+    }
+
+    /// The stamp of every file the mirror knows in a table, in one query: the
+    /// stat pass compares these in memory and fetches nothing for a file its
+    /// stamp still vouches for.
+    pub fn stamps(&self, table: &str) -> Result<HashMap<String, Stamp>> {
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT path, size, mtime_ns, ctime_ns, inode, device, raw_hash, seen_ns \
+                 FROM _reldir_files WHERE tbl = ?1",
+            )
+            .map_err(corrupt)?;
+        let stamps = statement
+            .query_map([table], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Stamp {
+                        stat: Stat {
+                            size: row.get::<_, i64>(1)? as u64,
+                            mtime_ns: row.get(2)?,
+                            ctime_ns: row.get(3)?,
+                            inode: row.get::<_, i64>(4)? as u64,
+                            device: row.get::<_, i64>(5)? as u64,
+                        },
+                        raw_hash: row.get(6)?,
+                        seen_ns: row.get(7)?,
+                    },
+                ))
+            })
+            .map_err(corrupt)?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(corrupt)?;
+        Ok(stamps)
     }
 
     /// Every path the mirror knows in a table.
@@ -1769,11 +1879,144 @@ mod tests {
         );
     }
 
+    /// What `row_delta` must equal: every row compared with its record.
+    fn delta_by_comparing_everything(
+        mirror: &Mirror,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        let rows = |sql: &str| -> std::collections::BTreeMap<String, String> {
+            let mut statement = mirror.connection().prepare(sql).unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        let current = rows("SELECT path, row_hash FROM _reldir_files WHERE row_hash IS NOT NULL");
+        let recorded = rows("SELECT path, hash FROM _reldir_recorded WHERE kind = 'row'");
+        let mut delta = std::collections::BTreeMap::new();
+        for (path, hash) in &current {
+            if recorded.get(path) != Some(hash) {
+                delta.insert(path.clone(), Some(hash.clone()));
+            }
+        }
+        for path in recorded.keys() {
+            if !current.contains_key(path) {
+                delta.insert(path.clone(), None);
+            }
+        }
+        delta
+    }
+
+    fn delta_hashes(mirror: &Mirror) -> std::collections::BTreeMap<String, Option<String>> {
+        mirror
+            .row_delta()
+            .unwrap()
+            .into_iter()
+            .map(|(path, entry)| (path, entry.map(|entry| entry.hash)))
+            .collect()
+    }
+
+    #[derive(Debug, Clone)]
+    enum Step {
+        /// Write file `n` holding variant `v` of its row, or a file that is
+        /// not a row.
+        Put(u8, Option<u8>),
+        Remove(u8),
+        /// Record what changed, as a revision does.
+        Record,
+        /// Replace the recorded head with the current rows, as replaying
+        /// history onto a rebuilt mirror does.
+        ReplaceWithCurrent,
+        /// Forget the recorded head.
+        ReplaceWithNothing,
+        /// Make these changes inside a savepoint, then roll them back.
+        Abandoned(Vec<(u8, Option<u8>)>),
+    }
+
+    fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        let put = (0u8..6, proptest::option::of(0u8..3));
+        prop_oneof![
+            4 => put.clone().prop_map(|(n, v)| Step::Put(n, v)),
+            2 => (0u8..6).prop_map(Step::Remove),
+            2 => Just(Step::Record),
+            1 => Just(Step::ReplaceWithCurrent),
+            1 => Just(Step::ReplaceWithNothing),
+            1 => proptest::collection::vec(put, 1..4).prop_map(Step::Abandoned),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig { cases: 128, .. Default::default() })]
+
+        /// The unsettled paths make the delta cost what changed rather than
+        /// what exists; it must still be exactly the delta a comparison of
+        /// every row finds, whatever order changes, records and abandoned
+        /// prospects arrive in.
+        #[test]
+        fn test2081_the_delta_from_unsettled_paths_equals_a_full_comparison(
+            steps in proptest::collection::vec(step(), 1..24)
+        ) {
+            let mirror = Mirror::open_memory().unwrap();
+            let schema = schema();
+            let schemas = std::collections::BTreeMap::from([("people".to_string(), schema.clone())]);
+            mirror.sync_schemas(&schemas).unwrap();
+            let put = |n: u8, variant: Option<u8>| {
+                let path = format!("people/p{n}.json");
+                mirror.remove(&path).unwrap();
+                let data = variant.map(|v| row(json!({"id": format!("p{n}"), "email": format!("p{n}@"), "refs": vec![v.to_string()]})));
+                mirror.put(Ingest {
+                    path: &path,
+                    table: "people",
+                    schema: &schema,
+                    stat: Stat::default(),
+                    raw_hash: format!("{n}/{variant:?}"),
+                    seen_ns: 0,
+                    row: data.as_ref(),
+                    diagnostics: vec![],
+                }).unwrap();
+            };
+            let mut revision = 0;
+            for step in steps {
+                match step {
+                    Step::Put(n, v) => put(n, v),
+                    Step::Remove(n) => mirror.remove(&format!("people/p{n}.json")).unwrap(),
+                    Step::Record => {
+                        revision += 1;
+                        mirror.apply_recorded(&mirror.row_delta().unwrap(), revision, "root").unwrap();
+                    }
+                    Step::ReplaceWithCurrent => {
+                        let mut entries = std::collections::BTreeMap::new();
+                        let mut statement = mirror.connection()
+                            .prepare("SELECT path, row_hash FROM _reldir_files WHERE row_hash IS NOT NULL").unwrap();
+                        for pair in statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).unwrap() {
+                            let (path, hash) = pair.unwrap();
+                            entries.insert(path, crate::metadata::Entry { kind: "row".into(), hash });
+                        }
+                        drop(statement);
+                        revision += 1;
+                        mirror.replace_recorded(&entries, Some(revision), Some("root")).unwrap();
+                        proptest::prop_assert!(delta_hashes(&mirror).is_empty(), "the head was just replaced with the current rows");
+                    }
+                    Step::ReplaceWithNothing => mirror.replace_recorded(&Default::default(), None, None).unwrap(),
+                    Step::Abandoned(puts) => {
+                        let before = delta_hashes(&mirror);
+                        mirror.savepoint("abandoned").unwrap();
+                        for (n, v) in puts {
+                            put(n, v);
+                        }
+                        mirror.rollback_to("abandoned").unwrap();
+                        proptest::prop_assert_eq!(delta_hashes(&mirror), before, "an abandoned change leaves no trace");
+                    }
+                }
+                proptest::prop_assert_eq!(delta_hashes(&mirror), delta_by_comparing_everything(&mirror));
+            }
+        }
+    }
+
     #[test]
     fn test2073_the_stat_cache_distrusts_timestamps_inside_the_racy_window() {
-        let entry = FileEntry {
-            path: "t/a.json".into(),
-            table: "t".into(),
+        let entry = Stamp {
             stat: Stat {
                 size: 10,
                 mtime_ns: 1_000,
@@ -1781,15 +2024,12 @@ mod tests {
             },
             raw_hash: "h".into(),
             seen_ns: 1_000 + RACY_WINDOW_NS,
-            row_hash: None,
-            doc: None,
-            diagnostics: vec![],
         };
         assert!(
             !entry.trusted_for(&entry.stat),
             "modified in the same window it was read"
         );
-        let later = FileEntry {
+        let later = Stamp {
             seen_ns: 1_000 + RACY_WINDOW_NS + 1,
             ..entry.clone()
         };
