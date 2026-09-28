@@ -15,6 +15,7 @@ pub mod db;
 pub mod diagnostic;
 pub mod doctor;
 pub mod fs;
+pub mod fuzzing;
 pub mod infer;
 pub mod integrity;
 pub mod json;

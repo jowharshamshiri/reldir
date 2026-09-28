@@ -72,11 +72,11 @@ predicates = "3"
 proptest = "1.11"
 
 [dev-dependencies.rmcp]
-features = ["client", "transport-io"]
+features = ["client", "transport-child-process"]
 version = "3.5"
 
 [dev-dependencies.tokio]
-features = ["rt", "io-std", "io-util", "macros"]
+features = ["rt", "io-std", "io-util", "macros", "process"]
 version = "1"
 
 [package]

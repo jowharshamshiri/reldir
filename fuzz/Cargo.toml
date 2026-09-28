@@ -1,0 +1,50 @@
+[package]
+name = "reldir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+reldir = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "json_and_locator"
+path = "fuzz_targets/json_and_locator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_decode"
+path = "fuzz_targets/schema_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reference_path"
+path = "fuzz_targets/reference_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_front_end"
+path = "fuzz_targets/sql_front_end.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_name"
+path = "fuzz_targets/file_name.rs"
+test = false
+doc = false
+bench = false

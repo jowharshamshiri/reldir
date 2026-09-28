@@ -45,7 +45,7 @@ impl RowValidator {
         let compiled = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
             .should_validate_formats(true)
-            .build(document)
+            .build(&members_sorted(document))
             .map_err(|error| {
                 let text = error.to_string();
                 let external = text.contains("not present in a registry")
@@ -73,7 +73,7 @@ impl RowValidator {
 
     /// Whether a row is valid, without describing why not.
     pub fn is_valid(&self, row: &Value) -> bool {
-        self.compiled.is_valid(row) && {
+        self.compiled.is_valid(&members_sorted(row)) && {
             let mut out = vec![];
             lexical_row(row, &self.columns, &mut out);
             key_collisions(row, "", &mut out);
@@ -84,8 +84,9 @@ impl RowValidator {
     /// Every fault in a row, as diagnostics carrying pointers.
     pub fn check(&self, row: &Value) -> Vec<Diagnostic> {
         let mut out: Vec<Diagnostic> = vec![];
-        for error in self.compiled.iter_errors(row) {
-            out.extend(describe(&error, row));
+        let sorted = members_sorted(row);
+        for error in self.compiled.iter_errors(&sorted) {
+            out.extend(describe(&error, &sorted));
         }
         lexical_row(row, &self.columns, &mut out);
         key_collisions(row, "", &mut out);
@@ -113,6 +114,29 @@ impl RowValidator {
                 .is_some_and(|p| p == pointer || p.starts_with(&format!("{pointer}/")))
         });
         (!still_wrong).then_some(candidate)
+    }
+}
+
+/// A value with every object's members in name order.
+///
+/// The validator compares objects member by member in the order it holds
+/// them, so `{"a":1,"b":2}` would fail a `const` of `{"b":2,"a":1}` and two
+/// reordered copies would pass `uniqueItems`. Member order is never part of
+/// what a value is, so both the schema and every row are judged in one order.
+fn members_sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(members) => {
+            let mut entries: Vec<(&String, &Value)> = members.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), members_sorted(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(members_sorted).collect()),
+        other => other.clone(),
     }
 }
 

@@ -10,3 +10,6 @@ __pycache__/
 /python/dist/
 /python/*.egg-info/
 /python/examples/ledger/stress-findings.txt
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
