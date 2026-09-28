@@ -25,8 +25,16 @@ judge the state it would produce, from memory -- no copy of the database is made
         ↓
 write it through the recoverable protocol below
         ↓
-observe again, record the revision, release the lock
+record the revision, release the lock
 ```
+
+The judgement is an observation of the directory as the change leaves it, so
+once the change is written that observation is the new state: it is kept, not
+made again. Observation itself re-reads only files whose size, times or inode
+moved -- or were modified within two seconds of being read, where a timestamp
+cannot prove a file unchanged -- and what changed since the last revision is
+tracked as it happens, so a one-row change costs a stat of each file, not a
+read of each file.
 
 A change planned before the lock was taken -- a repair, a migration -- names
 the bytes each path held when it was planned; if any moved, the change is

@@ -1,0 +1,4 @@
+# Checked out byte-for-byte on every platform. Rows, schemas, fixtures and doc
+# transcripts are compared exactly; a CRLF conversion on Windows would make
+# them differ from what the tests and the canonical form expect.
+* -text

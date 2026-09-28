@@ -1,0 +1,35 @@
+# cargo-deny: what may enter the dependency graph.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every advisory fails the check, unmaintained and unsound included; one that
+# is judged not to apply is ignored here by id, with the reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only: reldir is MIT and must stay distributable as such.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
