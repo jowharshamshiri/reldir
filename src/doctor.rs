@@ -75,7 +75,10 @@ pub enum Action {
     Schemas(BTreeMap<String, Value>),
     /// Make the table's working schema its pin.
     Pin(String),
-    Rename { from: PathBuf, to: PathBuf },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// Row edits, completed by referential actions when applied.
     Rows(Vec<RowChange>),
     /// Rewrite files in canonical form.
@@ -87,16 +90,23 @@ impl Fix {
     /// The paths the fix writes, relative to the root.
     pub fn paths(&self, catalog: &Catalog) -> Vec<PathBuf> {
         match &self.action {
-            Action::Schemas(documents) => documents.keys().map(|table| crate::schema_store::home(catalog, table)).collect(),
+            Action::Schemas(documents) => documents
+                .keys()
+                .map(|table| crate::schema_store::home(catalog, table))
+                .collect(),
             Action::Pin(table) => vec![PathBuf::from(crate::schema_store::pin_relative(table))],
             Action::Rename { from, to } => vec![from.clone(), to.clone()],
             Action::Rows(rows) => rows
                 .iter()
                 .filter_map(|change| {
-                    change.before.as_ref().map(|row| row.relative.clone()).or_else(|| {
-                        let schema = catalog.schemas.get(&change.table)?;
-                        crate::plan::row_path(schema, change.after.as_ref()?).ok()
-                    })
+                    change
+                        .before
+                        .as_ref()
+                        .map(|row| row.relative.clone())
+                        .or_else(|| {
+                            let schema = catalog.schemas.get(&change.table)?;
+                            crate::plan::row_path(schema, change.after.as_ref()?).ok()
+                        })
                 })
                 .collect(),
             Action::Canonicalize(paths) => paths.clone(),
@@ -131,8 +141,12 @@ pub fn plan(database: &Database) -> Result<Vec<Fix>> {
     // more of them.
     if database.is_valid() {
         for finding in lint::lint(catalog, &database.config, false)? {
-            let Some(remedy) = finding.remedy else { continue };
-            let Some(id) = finding.diagnostic.fixes.first().map(|fix| fix_id(fix)) else { continue };
+            let Some(remedy) = finding.remedy else {
+                continue;
+            };
+            let Some(id) = finding.diagnostic.fixes.first().map(|fix| fix_id(fix)) else {
+                continue;
+            };
             let action = match remedy {
                 Remedy::Edit(documents) => Action::Schemas(documents),
                 Remedy::Pin(table) => Action::Pin(table),
@@ -140,7 +154,11 @@ pub fn plan(database: &Database) -> Result<Vec<Fix>> {
             };
             out.push(Fix {
                 id,
-                class: if matches!(action, Action::Canonicalize(_)) { Class::Data } else { Class::Schema },
+                class: if matches!(action, Action::Canonicalize(_)) {
+                    Class::Data
+                } else {
+                    Class::Schema
+                },
                 description: finding.diagnostic.message.clone(),
                 resolves: finding.diagnostic.code.clone(),
                 at: finding.diagnostic.path.clone(),
@@ -164,29 +182,73 @@ fn fix_id(text: &str) -> &'static str {
 
 /// Every fix, and what it does. The catalogue `doctor --explain` reads.
 pub const FIXES: &[(&str, &str)] = &[
-    ("FIX_RESTORE_TARGET", "restores the row a dangling reference names, exactly as recorded history last had it"),
-    ("FIX_REMOVE_REFERENCE", "removes the dangling reference: the array element that holds it, or -- where no array holds it -- the value, which becomes null"),
-    ("FIX_ORPHAN_DELETE_ROW", "deletes the row holding a dangling reference, with whatever its own referrers' actions require"),
-    ("FIX_RENAME_TO_IDENTITY", "renames a row file to the name its key gives it; its contents are unchanged"),
-    ("FIX_RENAME_FIELD", "renames an unknown member to the missing column it is an unambiguous misspelling of"),
-    ("FIX_DROP_UNKNOWN_FIELD", "removes a member the schema does not declare"),
-    ("FIX_COERCE_VALUE", "replaces a value with the same value written as its column's type, where the conversion loses nothing"),
-    ("FIX_FILL_DEFAULT", "sets an absent or null column to the default its schema declares"),
-    ("FIX_PIN_SCHEMA", "moves an inferred working schema to schema/, making it the table's declaration"),
+    (
+        "FIX_RESTORE_TARGET",
+        "restores the row a dangling reference names, exactly as recorded history last had it",
+    ),
+    (
+        "FIX_REMOVE_REFERENCE",
+        "removes the dangling reference: the array element that holds it, or -- where no array holds it -- the value, which becomes null",
+    ),
+    (
+        "FIX_ORPHAN_DELETE_ROW",
+        "deletes the row holding a dangling reference, with whatever its own referrers' actions require",
+    ),
+    (
+        "FIX_RENAME_TO_IDENTITY",
+        "renames a row file to the name its key gives it; its contents are unchanged",
+    ),
+    (
+        "FIX_RENAME_FIELD",
+        "renames an unknown member to the missing column it is an unambiguous misspelling of",
+    ),
+    (
+        "FIX_DROP_UNKNOWN_FIELD",
+        "removes a member the schema does not declare",
+    ),
+    (
+        "FIX_COERCE_VALUE",
+        "replaces a value with the same value written as its column's type, where the conversion loses nothing",
+    ),
+    (
+        "FIX_FILL_DEFAULT",
+        "sets an absent or null column to the default its schema declares",
+    ),
+    (
+        "FIX_PIN_SCHEMA",
+        "moves an inferred working schema to schema/, making it the table's declaration",
+    ),
     ("FIX_TIGHTEN_NULLABLE", "removes null from a column's type"),
-    ("FIX_NARROW_TYPE", "narrows a column to the type every value already has"),
+    (
+        "FIX_NARROW_TYPE",
+        "narrows a column to the type every value already has",
+    ),
     ("FIX_ADD_ENUM", "restricts a column to the values it holds"),
     ("FIX_ADD_UNIQUE", "declares a column unique"),
-    ("FIX_ADD_FK", "declares a reference the data already satisfies, joining tables to an identity domain where needed"),
+    (
+        "FIX_ADD_FK",
+        "declares a reference the data already satisfies, joining tables to an identity domain where needed",
+    ),
     ("FIX_ADD_CHECK", "declares a check every row already passes"),
-    ("FIX_ADD_GENERATOR", "generates a uuid or ulid key when an insert supplies none"),
-    ("FIX_CANONICALIZE", "rewrites row files in canonical formatting; the rows are unchanged"),
+    (
+        "FIX_ADD_GENERATOR",
+        "generates a uuid or ulid key when an insert supplies none",
+    ),
+    (
+        "FIX_CANONICALIZE",
+        "rewrites row files in canonical formatting; the rows are unchanged",
+    ),
     ("FIX_MANUAL", "nothing: the fault needs a person's decision"),
 ];
 
 fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
     let catalog = &database.catalog;
-    let base = |id: &'static str, class: Class, description: String, rank: usize, destructive: bool, action: Action| Fix {
+    let base = |id: &'static str,
+                class: Class,
+                description: String,
+                rank: usize,
+                destructive: bool,
+                action: Action| Fix {
         id,
         class,
         description,
@@ -200,13 +262,18 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
         vec![base(
             "FIX_MANUAL",
             Class::Manual,
-            diagnostic.help.clone().unwrap_or_else(|| diagnostic.message.clone()),
+            diagnostic
+                .help
+                .clone()
+                .unwrap_or_else(|| diagnostic.message.clone()),
             0,
             false,
             Action::Manual,
         )]
     };
-    let Some(path) = diagnostic.path.clone() else { return Ok(manual()) };
+    let Some(path) = diagnostic.path.clone() else {
+        return Ok(manual());
+    };
     let row = catalog.row_at(&path)?;
     let offered = |fix: &str| diagnostic.fixes.iter().any(|offered| offered == fix);
     let mut out = vec![];
@@ -221,7 +288,10 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
                         format!("rename {} to {}", path.display(), to.display()),
                         0,
                         false,
-                        Action::Rename { from: path.clone(), to },
+                        Action::Rename {
+                            from: path.clone(),
+                            to,
+                        },
                     ));
                 }
             }
@@ -259,14 +329,19 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
             out.push(base(
                 "FIX_ORPHAN_DELETE_ROW",
                 Class::Data,
-                format!("delete {}, which holds the dangling reference", path.display()),
+                format!(
+                    "delete {}, which holds the dangling reference",
+                    path.display()
+                ),
                 out.len(),
                 true,
                 Action::Rows(vec![RowChange::delete(row)]),
             ));
         }
         "ROW_UNKNOWN_FIELD" => {
-            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else {
+                return Ok(manual());
+            };
             if offered("FIX_RENAME_FIELD")
                 && let Some(to) = &diagnostic.expected
             {
@@ -295,9 +370,14 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
             ));
         }
         "TYPE_MISMATCH" if offered("FIX_COERCE_VALUE") => {
-            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else {
+                return Ok(manual());
+            };
             let schema = &catalog.schemas[&row.table];
-            if let Some(value) = schema.validator().coercion(&Value::Object(row.value.clone()), &field) {
+            if let Some(value) = schema
+                .validator()
+                .coercion(&Value::Object(row.value.clone()), &field)
+            {
                 let mut edited = row.value.clone();
                 edited.insert(field.clone(), value.clone());
                 out.push(base(
@@ -311,9 +391,15 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
             }
         }
         "ROW_MISSING_FIELD" | "NOT_NULL_VIOLATION" if offered("FIX_FILL_DEFAULT") => {
-            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else {
+                return Ok(manual());
+            };
             let schema = &catalog.schemas[&row.table];
-            if let Some(default) = schema.column(&field).and_then(|column| column.default()).cloned() {
+            if let Some(default) = schema
+                .column(&field)
+                .and_then(|column| column.default())
+                .cloned()
+            {
                 let mut edited = row.value.clone();
                 edited.insert(field.clone(), default.clone());
                 out.push(base(
@@ -336,12 +422,17 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
 
 /// The row a dangling reference names, as recorded history last had it:
 /// (table, path, revision, row).
-fn restoration(database: &Database, diagnostic: &Diagnostic) -> Result<Option<(String, PathBuf, u64, Map<String, Value>)>> {
+type Restoration = (String, PathBuf, u64, Map<String, Value>);
+
+/// The row a dangling reference names, and where history had it.
+fn restoration(database: &Database, diagnostic: &Diagnostic) -> Result<Option<Restoration>> {
     let catalog = &database.catalog;
     let (Some(observed), Some(table)) = (&diagnostic.observed, &diagnostic.table) else {
         return Ok(None);
     };
-    let Some(schema) = catalog.schemas.get(table) else { return Ok(None) };
+    let Some(schema) = catalog.schemas.get(table) else {
+        return Ok(None);
+    };
     let Some(fk) = schema.foreign_keys().iter().find(|fk| {
         diagnostic
             .constraint
@@ -350,16 +441,24 @@ fn restoration(database: &Database, diagnostic: &Diagnostic) -> Result<Option<(S
     }) else {
         return Ok(None);
     };
-    let Ok(Value::Array(key)) = serde_json::from_str::<Value>(observed) else { return Ok(None) };
+    let Ok(Value::Array(key)) = serde_json::from_str::<Value>(observed) else {
+        return Ok(None);
+    };
     for target in crate::integrity::target_tables(&catalog.schemas, fk.to()) {
-        let Some(target_schema) = catalog.schemas.get(&target) else { continue };
+        let Some(target_schema) = catalog.schemas.get(&target) else {
+            continue;
+        };
         let columns = crate::integrity::target_columns(fk, target_schema);
         if columns != target_schema.primary_key() || columns.len() != key.len() {
             continue;
         }
         let probe: Map<String, Value> = columns.iter().cloned().zip(key.iter().cloned()).collect();
-        let Ok(relative) = crate::plan::row_path(target_schema, &probe) else { continue };
-        if let Some((revision, Value::Object(row))) = crate::metadata::last_known(&database.root, &crate::catalog::slash(&relative))? {
+        let Ok(relative) = crate::plan::row_path(target_schema, &probe) else {
+            continue;
+        };
+        if let Some((revision, Value::Object(row))) =
+            crate::metadata::last_known(&database.root, &crate::catalog::slash(&relative))?
+        {
             return Ok(Some((target, relative, revision, row)));
         }
     }
@@ -388,7 +487,10 @@ fn remove_reference(row: &Map<String, Value>, pointer: &str) -> Option<Map<Strin
     }
     match element {
         Some(depth) => {
-            let parent: String = tokens[..depth].iter().map(|t| format!("/{}", crate::schema::path::escape_pointer(t))).collect();
+            let parent: String = tokens[..depth]
+                .iter()
+                .map(|t| format!("/{}", crate::schema::path::escape_pointer(t)))
+                .collect();
             let index: usize = tokens[depth].parse().ok()?;
             root.pointer_mut(&parent)?.as_array_mut()?.remove(index);
         }
@@ -425,7 +527,11 @@ pub fn select<'f>(
         if !selected || (fix.class == Class::Data && !allow_data) {
             continue;
         }
-        let problem = (fix.resolves.clone(), fix.at.clone(), fix.description.clone());
+        let problem = (
+            fix.resolves.clone(),
+            fix.at.clone(),
+            fix.description.clone(),
+        );
         if !resolved.insert(problem) {
             continue;
         }
@@ -457,28 +563,44 @@ pub fn changes(database: &Database, fixes: &[&Fix]) -> Result<(Vec<RowChange>, V
                 }
             }
             Action::Pin(table) => {
-                let schema = catalog.schemas.get(table).ok_or_else(|| catalog.unknown_table(table))?;
+                let schema = catalog
+                    .schemas
+                    .get(table)
+                    .ok_or_else(|| catalog.unknown_table(table))?;
                 files.push(Change::Write {
                     path: PathBuf::from(crate::schema_store::pin_relative(table)),
                     bytes: schema.bytes(width),
                 });
-                files.push(Change::Delete { path: crate::schema_store::working_relative(table) });
+                files.push(Change::Delete {
+                    path: crate::schema_store::working_relative(table),
+                });
             }
             Action::Rename { from, to } => {
-                let bytes = std::fs::read(database.root.join(from)).map_err(|e| DbError::io(&database.root.join(from), e))?;
+                let bytes = std::fs::read(database.root.join(from))
+                    .map_err(|e| DbError::io(&database.root.join(from), e))?;
                 files.push(Change::Delete { path: from.clone() });
-                files.push(Change::Write { path: to.clone(), bytes });
+                files.push(Change::Write {
+                    path: to.clone(),
+                    bytes,
+                });
             }
             Action::Rows(changes) => rows.extend(changes.iter().cloned()),
             Action::Canonicalize(paths) => {
                 for path in paths {
-                    let row: Row = catalog
-                        .row_at(path)?
-                        .ok_or_else(|| DbError::new("CONCURRENT_MODIFICATION", format!("{} is gone", path.display()), 3))?;
+                    let row: Row = catalog.row_at(path)?.ok_or_else(|| {
+                        DbError::new(
+                            "CONCURRENT_MODIFICATION",
+                            format!("{} is gone", path.display()),
+                            3,
+                        )
+                    })?;
                     let schema = &catalog.schemas[&row.table];
                     files.push(Change::Write {
                         path: path.clone(),
-                        bytes: crate::canonical::pretty_with_indent(&crate::canonical::canonical_row(&row.value, schema), width),
+                        bytes: crate::canonical::pretty_with_indent(
+                            &crate::canonical::canonical_row(&row.value, schema),
+                            width,
+                        ),
                     });
                 }
             }
@@ -501,9 +623,16 @@ mod tests {
         }))
         .unwrap();
         let edited = remove_reference(&row, "/modules/0/lessons/1/lesson_ref").unwrap();
-        assert_eq!(edited["modules"], json!([{"lessons": [{"lesson_ref": "l1"}]}]));
+        assert_eq!(
+            edited["modules"],
+            json!([{"lessons": [{"lesson_ref": "l1"}]}])
+        );
         let nulled = remove_reference(&row, "/owner").unwrap();
-        assert_eq!(nulled["owner"], Value::Null, "with no array, the value itself is removed");
+        assert_eq!(
+            nulled["owner"],
+            Value::Null,
+            "with no array, the value itself is removed"
+        );
         assert!(remove_reference(&row, "/missing").is_none());
     }
 
@@ -512,7 +641,10 @@ mod tests {
         let documentation = std::fs::read_to_string("docs/validation.md").unwrap();
         for (id, explanation) in FIXES {
             assert!(!explanation.is_empty());
-            assert!(documentation.contains(&format!("`{id}`")), "{id} is not documented");
+            assert!(
+                documentation.contains(&format!("`{id}`")),
+                "{id} is not documented"
+            );
         }
         assert_eq!(fix_id("FIX_ADD_FK"), "FIX_ADD_FK");
         assert_eq!(fix_id("FIX_NOT_A_FIX"), "FIX_MANUAL");

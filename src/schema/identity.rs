@@ -34,7 +34,12 @@ const ANNOTATIONS: &[&str] = &[
 ];
 
 /// Keywords whose value is a map from names to subschemas.
-const SUBSCHEMA_MAPS: &[&str] = &["properties", "patternProperties", "$defs", "dependentSchemas"];
+const SUBSCHEMA_MAPS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "$defs",
+    "dependentSchemas",
+];
 
 /// Keywords whose value is one subschema.
 const SUBSCHEMA_SINGLE: &[&str] = &[
@@ -138,9 +143,7 @@ fn write_canonical(value: &Value, out: &mut String) {
         }
         Value::Object(members) => {
             let mut entries: Vec<(&String, &Value)> = members.iter().collect();
-            entries.sort_by(|(left, _), (right, _)| {
-                left.encode_utf16().cmp(right.encode_utf16())
-            });
+            entries.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
             out.push('{');
             for (index, (key, child)) in entries.into_iter().enumerate() {
                 if index > 0 {
@@ -217,7 +220,11 @@ fn canonical_float(value: f64) -> Option<String> {
             format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], exponent.abs())
         }
     };
-    Some(if value < 0.0 { format!("-{body}") } else { body })
+    Some(if value < 0.0 {
+        format!("-{body}")
+    } else {
+        body
+    })
 }
 
 #[cfg(test)]
@@ -237,7 +244,11 @@ mod tests {
             (json!(1e20), "100000000000000000000"),
             (json!(0.000001), "0.000001"),
             (json!(0.0000001), "1e-7"),
-            (json!(333333333.33333329), "333333333.3333333"),
+            // RFC 8785's vector, written with more digits than a double holds.
+            (
+                serde_json::from_str("333333333.33333329").unwrap(),
+                "333333333.3333333",
+            ),
             (json!(-1.5), "-1.5"),
             (json!(4.5), "4.5"),
             (json!(9007199254740992_u64), "9007199254740992"),
@@ -247,8 +258,14 @@ mod tests {
         // Members sort by UTF-16 code units, not by UTF-8 bytes: U+E000 sorts
         // before U+1F600, whose surrogate pair begins with 0xD83D.
         let object = json!({"\u{1F600}": 1, "\u{E000}": 2, "a": 3});
-        assert_eq!(canonical_json(&object), "{\"a\":3,\"\u{1F600}\":1,\"\u{E000}\":2}");
-        assert_eq!(canonical_json(&json!("a\"b\n\u{1}")), "\"a\\\"b\\n\\u0001\"");
+        assert_eq!(
+            canonical_json(&object),
+            "{\"a\":3,\"\u{1F600}\":1,\"\u{E000}\":2}"
+        );
+        assert_eq!(
+            canonical_json(&json!("a\"b\n\u{1}")),
+            "\"a\\\"b\\n\\u0001\""
+        );
     }
 
     #[test]

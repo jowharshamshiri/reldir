@@ -29,23 +29,33 @@ pub fn log(context: &Context, sink: &mut dyn Sink, limit: Option<usize>) -> Resu
         sink.record(out)?;
         shown += 1;
     }
-    Ok(Finish::ok(format!("{shown} of {} revision(s)", revisions.len())))
+    Ok(Finish::ok(format!(
+        "{shown} of {} revision(s)",
+        revisions.len()
+    )))
 }
 
 pub fn show(context: &Context, sink: &mut dyn Sink, revision: u64) -> Result<Finish> {
     let database = context.open_database(sink, Intent::Read)?;
-    let before = if revision > 1 { metadata::entries_at(&database.root, revision - 1)? } else { BTreeMap::new() };
+    let before = if revision > 1 {
+        metadata::entries_at(&database.root, revision - 1)?
+    } else {
+        BTreeMap::new()
+    };
     metadata::entries_at(&database.root, revision)?;
     let record = metadata::load_record(&database.root, revision)?;
     for line in record.summary(&before) {
         let (action, path) = line.split_once(' ').unwrap_or(("?", line.as_str()));
         let mut out = Map::new();
         out.insert("kind".into(), json!("revision_change"));
-        out.insert("action".into(), json!(match action {
-            "A" => "added",
-            "D" => "removed",
-            _ => "modified",
-        }));
+        out.insert(
+            "action".into(),
+            json!(match action {
+                "A" => "added",
+                "D" => "removed",
+                _ => "modified",
+            }),
+        );
         out.insert("path".into(), json!(path));
         sink.record(out)?;
     }
@@ -89,11 +99,14 @@ pub fn document_diff(pointer: &str, old: &Value, new: &Value) -> Vec<Map<String,
 
 fn change(pointer: &str, old: Option<Value>, new: Option<Value>) -> Map<String, Value> {
     let mut out = Map::new();
-    out.insert("kind".into(), json!(match (&old, &new) {
-        (None, _) => "added",
-        (_, None) => "removed",
-        _ => "changed",
-    }));
+    out.insert(
+        "kind".into(),
+        json!(match (&old, &new) {
+            (None, _) => "added",
+            (_, None) => "removed",
+            _ => "changed",
+        }),
+    );
     out.insert("pointer".into(), json!(pointer));
     out.insert("old".into(), old.unwrap_or(Value::Null));
     out.insert("new".into(), new.unwrap_or(Value::Null));
@@ -113,7 +126,11 @@ pub fn diff(context: &Context, sink: &mut dyn Sink, options: DiffOptions) -> Res
     let root = database.root.clone();
     let object = |entry: &Entry| metadata::load_object(&root, &entry.hash);
     let (old, new, live) = match options.revisions {
-        Some((a, b)) => (metadata::entries_at(&root, a)?, metadata::entries_at(&root, b)?, false),
+        Some((a, b)) => (
+            metadata::entries_at(&root, a)?,
+            metadata::entries_at(&root, b)?,
+            false,
+        ),
         None => {
             let head = match database.history.head() {
                 Some(head) => metadata::entries_at(&root, head.revision)?,
@@ -126,11 +143,17 @@ pub fn diff(context: &Context, sink: &mut dyn Sink, options: DiffOptions) -> Res
         if !live {
             return object(entry);
         }
-        if let Some(table) = path.strip_prefix("schema/").and_then(|p| p.strip_suffix(".json")) {
+        if let Some(table) = path
+            .strip_prefix("schema/")
+            .and_then(|p| p.strip_suffix(".json"))
+        {
             return Ok(database.catalog.schemas[table].document().clone());
         }
         match database.catalog.row_at(std::path::Path::new(path))? {
-            Some(row) => Ok(crate::canonical::canonical_row(&row.value, &database.catalog.schemas[&row.table])),
+            Some(row) => Ok(crate::canonical::canonical_row(
+                &row.value,
+                &database.catalog.schemas[&row.table],
+            )),
             None => object(entry),
         }
     };
@@ -140,7 +163,9 @@ pub fn diff(context: &Context, sink: &mut dyn Sink, options: DiffOptions) -> Res
             return false;
         }
         match &options.table {
-            Some(table) => path.starts_with(&format!("{table}/")) || path == format!("schema/{table}.json"),
+            Some(table) => {
+                path.starts_with(&format!("{table}/")) || path == format!("schema/{table}.json")
+            }
             None => !path.starts_with(".db/"),
         }
     };
@@ -228,11 +253,21 @@ pub fn snapshot(context: &Context, sink: &mut dyn Sink, action: SnapshotAction) 
         SnapshotAction::Restore(name) => {
             let mut database = context.open_database(sink, Intent::Write)?;
             let (changes, expected) = crate::snapshot::restore(&database, &name)?;
-            super::confirm(context, &format!("restore snapshot {name}, replacing {} file(s)", changes.len()))?;
+            super::confirm(
+                context,
+                &format!(
+                    "restore snapshot {name}, replacing {} file(s)",
+                    changes.len()
+                ),
+            )?;
             let outcome = database.commit(
                 changes,
                 &expected,
-                Request { origin: "snapshot_restore", admission: Admission::Valid, dry_run: context.dry_run },
+                Request {
+                    origin: "snapshot_restore",
+                    admission: Admission::Valid,
+                    dry_run: context.dry_run,
+                },
             )?;
             super::committed(sink, &outcome, "restored")
         }
@@ -253,8 +288,16 @@ pub fn snapshot(context: &Context, sink: &mut dyn Sink, action: SnapshotAction) 
 pub fn recover(context: &Context, sink: &mut dyn Sink, new_lineage: bool) -> Result<Finish> {
     let mut database = context.open_database(sink, Intent::Write)?;
     if !new_lineage {
-        let recovered = database.events.iter().any(|event| matches!(event, crate::db::Event::Recovered { .. }));
-        return Ok(Finish::ok(if recovered { "recovered" } else { "nothing to recover" }).with("recovered", recovered));
+        let recovered = database
+            .events
+            .iter()
+            .any(|event| matches!(event, crate::db::Event::Recovered { .. }));
+        return Ok(Finish::ok(if recovered {
+            "recovered"
+        } else {
+            "nothing to recover"
+        })
+        .with("recovered", recovered));
     }
     if !context.allow_destructive {
         return Err(DbError::new(
@@ -265,20 +308,30 @@ pub fn recover(context: &Context, sink: &mut dyn Sink, new_lineage: bool) -> Res
         .with_help("pass --allow-destructive to begin a new lineage"));
     }
     if context.dry_run {
-        return Ok(Finish::ok("would move history to .db/provenance-quarantine/ and begin a new lineage"));
+        return Ok(Finish::ok(
+            "would move history to .db/provenance-quarantine/ and begin a new lineage",
+        ));
     }
     let reason = match &database.history {
         crate::db::History::Degraded(error) => error.diagnostic.message.clone(),
         _ => "requested".to_string(),
     };
     let record = database.begin_new_lineage(&reason)?;
-    let quarantined = record.lineage.as_ref().map(|lineage| lineage.quarantined.clone()).unwrap_or_default();
+    let quarantined = record
+        .lineage
+        .as_ref()
+        .map(|lineage| lineage.quarantined.clone())
+        .unwrap_or_default();
     sink.event(
         "new_lineage",
         json!({"revision": record.revision, "quarantined": quarantined}),
         &format!("history moved to {quarantined}"),
     )?;
-    Ok(Finish::ok(format!("began a new lineage at revision {}", record.revision)).with("revision", record.revision))
+    Ok(Finish::ok(format!(
+        "began a new lineage at revision {}",
+        record.revision
+    ))
+    .with("revision", record.revision))
 }
 
 pub fn gc(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
@@ -293,7 +346,11 @@ pub fn gc(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
     }
     Ok(Finish::ok(format!(
         "{} {} unreferenced file(s)",
-        if context.dry_run { "would remove" } else { "removed" },
+        if context.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        },
         removed.len()
     )))
 }

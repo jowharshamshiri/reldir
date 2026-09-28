@@ -132,7 +132,11 @@ pub fn filename_fits(name: &str) -> bool {
 }
 
 fn windows_reserved_component(value: &str) -> bool {
-    let base = value.split('.').next().unwrap_or(value).to_ascii_lowercase();
+    let base = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
     matches!(base.as_str(), "con" | "prn" | "aux" | "nul")
         || base
             .strip_prefix("com")
@@ -207,7 +211,10 @@ mod tests {
     }
 
     fn row(pairs: &[(&str, Value)]) -> Map<String, Value> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -223,7 +230,10 @@ mod tests {
         ] {
             let name = filename(&s, &row(&[("id", json!(id))])).unwrap();
             assert_eq!(name, expected);
-            assert_eq!(percent_decode(name.trim_end_matches(".json")).as_deref(), Some(id));
+            assert_eq!(
+                percent_decode(name.trim_end_matches(".json")).as_deref(),
+                Some(id)
+            );
         }
     }
 
@@ -232,16 +242,28 @@ mod tests {
         let s = schema(&[("id", "string")], &["id"], json!({}));
         for reserved in ["CON", "con", "PRN", "aux", "NUL", "COM1", "lpt9"] {
             let produced = filename(&s, &row(&[("id", json!(reserved))])).unwrap();
-            assert!(produced.starts_with('%'), "{reserved} must be escaped, got {produced}");
+            assert!(
+                produced.starts_with('%'),
+                "{reserved} must be escaped, got {produced}"
+            );
         }
-        assert_eq!(filename(&s, &row(&[("id", json!("console"))])), Some("console.json".into()));
-        assert_eq!(filename(&s, &row(&[("id", json!("COM10"))])), Some("COM10.json".into()));
+        assert_eq!(
+            filename(&s, &row(&[("id", json!("console"))])),
+            Some("console.json".into())
+        );
+        assert_eq!(
+            filename(&s, &row(&[("id", json!("COM10"))])),
+            Some("COM10.json".into())
+        );
     }
 
     #[test]
     fn test1002_composite_filenames_join_encoded_components() {
         let s = schema(&[("a", "string"), ("b", "string")], &["a", "b"], json!({}));
-        assert_eq!(filename(&s, &row(&[("a", json!("x")), ("b", json!("y"))])), Some("x,y.json".into()));
+        assert_eq!(
+            filename(&s, &row(&[("a", json!("x")), ("b", json!("y"))])),
+            Some("x,y.json".into())
+        );
         assert_eq!(
             filename(&s, &row(&[("a", json!("x,y")), ("b", json!("z"))])),
             Some("x%2Cy,z.json".into())
@@ -251,24 +273,65 @@ mod tests {
     #[test]
     fn test1004_normalisation_collapses_incidental_representations() {
         assert_eq!(compact(&json!(-0.0)), "0");
-        assert_eq!(compact(&Value::String("e\u{0301}".into())), compact(&Value::String("\u{e9}".into())));
-        assert_eq!(compact(&json!({ "e\u{0301}": 1 })), compact(&json!({ "\u{e9}": 1 })));
+        assert_eq!(
+            compact(&Value::String("e\u{0301}".into())),
+            compact(&Value::String("\u{e9}".into()))
+        );
+        assert_eq!(
+            compact(&json!({ "e\u{0301}": 1 })),
+            compact(&json!({ "\u{e9}": 1 }))
+        );
     }
 
     #[test]
     fn test1006_the_canonical_row_holds_exactly_the_members_the_row_has() {
-        let mut s = schema(&[("id", "string"), ("tag", "string"), ("note", "string")], &["id"], json!({})).edit();
+        let mut s = schema(
+            &[("id", "string"), ("tag", "string"), ("note", "string")],
+            &["id"],
+            json!({}),
+        )
+        .edit();
         s.set_default("tag", Some(json!("fallback")));
         let s = s.finish().unwrap();
         let omitted = canonical_row(&row(&[("id", json!("a"))]), &s);
-        assert_eq!(omitted, json!({"id": "a"}), "no default and no null is written for an omitted member");
+        assert_eq!(
+            omitted,
+            json!({"id": "a"}),
+            "no default and no null is written for an omitted member"
+        );
         let explicit = canonical_row(&row(&[("note", json!(null)), ("id", json!("a"))]), &s);
         assert_eq!(compact(&explicit), r#"{"id":"a","note":null}"#);
-        let authored = canonical_row(&row(&[("note", json!("n")), ("tag", json!({"z": 1, "a": 2})), ("id", json!("a"))]), &s);
-        assert_eq!(authored.as_object().unwrap().keys().collect::<Vec<_>>(), ["note", "tag", "id"], "in the author's order");
-        assert_eq!(serde_json::to_string(&authored["tag"]).unwrap(), r#"{"z":1,"a":2}"#, "nested members too");
-        let reordered = canonical_row(&row(&[("id", json!("a")), ("tag", json!({"a": 2, "z": 1})), ("note", json!("n"))]), &s);
-        assert_eq!(row_hash(&authored), row_hash(&reordered), "order is not identity");
+        let authored = canonical_row(
+            &row(&[
+                ("note", json!("n")),
+                ("tag", json!({"z": 1, "a": 2})),
+                ("id", json!("a")),
+            ]),
+            &s,
+        );
+        assert_eq!(
+            authored.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["note", "tag", "id"],
+            "in the author's order"
+        );
+        assert_eq!(
+            serde_json::to_string(&authored["tag"]).unwrap(),
+            r#"{"z":1,"a":2}"#,
+            "nested members too"
+        );
+        let reordered = canonical_row(
+            &row(&[
+                ("id", json!("a")),
+                ("tag", json!({"a": 2, "z": 1})),
+                ("note", json!("n")),
+            ]),
+            &s,
+        );
+        assert_eq!(
+            row_hash(&authored),
+            row_hash(&reordered),
+            "order is not identity"
+        );
     }
 
     #[test]
@@ -289,6 +352,8 @@ mod tests {
         let long = "é".repeat(100);
         let name = filename(&s, &row(&[("id", json!(long))])).unwrap();
         assert!(!filename_fits(&name));
-        assert!(filename_fits(&filename(&s, &row(&[("id", json!("short"))])).unwrap()));
+        assert!(filename_fits(
+            &filename(&s, &row(&[("id", json!("short"))])).unwrap()
+        ));
     }
 }

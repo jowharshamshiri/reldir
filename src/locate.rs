@@ -57,8 +57,15 @@ impl Spans {
 }
 
 enum Frame {
-    Object { pointer: String, key: Option<String> },
-    Array { pointer: String, index: usize, started: bool },
+    Object {
+        pointer: String,
+        key: Option<String>,
+    },
+    Array {
+        pointer: String,
+        index: usize,
+        started: bool,
+    },
 }
 
 struct Scanner<'a> {
@@ -118,9 +125,10 @@ impl Scanner<'_> {
 
     /// Consume a number, `true`, `false` or `null`.
     fn scalar(&mut self) {
-        while self.peek().is_some_and(|byte| {
-            !matches!(byte, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
-        }) {
+        while self
+            .peek()
+            .is_some_and(|byte| !matches!(byte, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r'))
+        {
             self.bump();
         }
     }
@@ -164,7 +172,10 @@ impl Scanner<'_> {
                     return;
                 };
                 match frame {
-                    Frame::Object { pointer: parent, key } => {
+                    Frame::Object {
+                        pointer: parent,
+                        key,
+                    } => {
                         match self.peek() {
                             Some(b'}') => {
                                 self.bump();
@@ -184,7 +195,8 @@ impl Scanner<'_> {
                         }
                         let name_at = self.here();
                         let Some(name) = self.string() else { return };
-                        let child = format!("{parent}/{}", crate::schema::path::escape_pointer(&name));
+                        let child =
+                            format!("{parent}/{}", crate::schema::path::escape_pointer(&name));
                         spans.keys.insert(child.clone(), name_at);
                         *key = Some(name);
                         self.whitespace();
@@ -245,12 +257,18 @@ mod tests {
   ],
   "a/b": { "c~d": [10, [20, 30]] },
   "café": "é"
-}"#.as_bytes();
+}"#
+        .as_bytes();
         let spans = Spans::of(raw);
         assert_eq!(at(&spans, ""), (1, 1));
         assert_eq!(at(&spans, "/id"), (2, 3));
         assert_eq!(at(&spans, "/feedback_rules"), (3, 3));
-        assert_eq!(spans.value_location("/feedback_rules/0").map(|l| (l.line, l.column)), Some((4, 5)));
+        assert_eq!(
+            spans
+                .value_location("/feedback_rules/0")
+                .map(|l| (l.line, l.column)),
+            Some((4, 5))
+        );
         assert_eq!(at(&spans, "/feedback_rules/0/when_choice_index"), (4, 23));
         // A repeated member name resolves to its own occurrence, not the first.
         assert_eq!(at(&spans, "/feedback_rules/1/id"), (6, 7));

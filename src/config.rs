@@ -65,7 +65,12 @@ fn default_reference_naming() -> Vec<String> {
     .collect()
 }
 fn default_ignores() -> Vec<String> {
-    vec![".DS_Store".into(), "*~".into(), "*.swp".into(), ".gitkeep".into()]
+    vec![
+        ".DS_Store".into(),
+        "*~".into(),
+        "*.swp".into(),
+        ".gitkeep".into(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +156,8 @@ impl Config {
         let mut builder = globset::GlobSetBuilder::new();
         for pattern in &self.ignore {
             builder.add(
-                globset::Glob::new(pattern).map_err(|error| format!("invalid ignore glob {pattern:?}: {error}"))?,
+                globset::Glob::new(pattern)
+                    .map_err(|error| format!("invalid ignore glob {pattern:?}: {error}"))?,
             );
         }
         builder.build().map_err(|error| error.to_string())
@@ -192,7 +198,11 @@ impl Config {
         let singular = table.strip_suffix('s').unwrap_or(table);
         self.reference_naming
             .iter()
-            .map(|pattern| pattern.replace("{singular}", singular).replace("{table}", table))
+            .map(|pattern| {
+                pattern
+                    .replace("{singular}", singular)
+                    .replace("{table}", table)
+            })
             .collect()
     }
 
@@ -249,14 +259,27 @@ mod tests {
     #[test]
     fn test1015_zero_limits_are_rejected_and_named() {
         for (key, mutate) in [
-            ("indentation_width", (|c: &mut Config| c.indentation_width = 0) as fn(&mut Config)),
-            ("max_json_file_size", |c: &mut Config| c.max_json_file_size = 0),
-            ("max_nesting_depth", |c: &mut Config| c.max_nesting_depth = 0),
+            (
+                "indentation_width",
+                (|c: &mut Config| c.indentation_width = 0) as fn(&mut Config),
+            ),
+            ("max_json_file_size", |c: &mut Config| {
+                c.max_json_file_size = 0
+            }),
+            ("max_nesting_depth", |c: &mut Config| {
+                c.max_nesting_depth = 0
+            }),
             ("max_result_rows", |c: &mut Config| c.max_result_rows = 0),
             ("max_query_memory", |c: &mut Config| c.max_query_memory = 0),
-            ("max_transaction_size", |c: &mut Config| c.max_transaction_size = 0),
-            ("reference_min_values", |c: &mut Config| c.reference_min_values = 0),
-            ("timeout_seconds", |c: &mut Config| c.timeout_seconds = Some(0)),
+            ("max_transaction_size", |c: &mut Config| {
+                c.max_transaction_size = 0
+            }),
+            ("reference_min_values", |c: &mut Config| {
+                c.reference_min_values = 0
+            }),
+            ("timeout_seconds", |c: &mut Config| {
+                c.timeout_seconds = Some(0)
+            }),
         ] {
             let mut config = Config::default();
             mutate(&mut config);
@@ -264,12 +287,23 @@ mod tests {
             assert!(message.contains(key), "{key}: {message}");
         }
         assert!(Config::default().validate().is_ok());
-        assert!(Config { wait_seconds: 0.0, ..Default::default() }.validate().is_ok(), "zero is a meaningful wait");
+        assert!(
+            Config {
+                wait_seconds: 0.0,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok(),
+            "zero is a meaningful wait"
+        );
     }
 
     #[test]
     fn test1016_invalid_ignore_globs_are_rejected() {
-        let mut config = Config { ignore: vec!["[unclosed".into()], ..Default::default() };
+        let mut config = Config {
+            ignore: vec!["[unclosed".into()],
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         config.ignore = vec!["*.tmp".into(), "build/**".into()];
         let set = config.ignore_set().expect("valid globs compile");
@@ -281,11 +315,22 @@ mod tests {
     #[test]
     fn test1206_an_unusable_wait_is_rejected_before_it_reaches_a_duration() {
         for unusable in [-1.0, -0.001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let config = Config { wait_seconds: unusable, ..Default::default() };
-            assert!(config.validate().expect_err("unusable").contains("wait_seconds"));
+            let config = Config {
+                wait_seconds: unusable,
+                ..Default::default()
+            };
+            assert!(
+                config
+                    .validate()
+                    .expect_err("unusable")
+                    .contains("wait_seconds")
+            );
         }
         for usable in [0.0, 0.001, 5.0, 3600.0] {
-            let config = Config { wait_seconds: usable, ..Default::default() };
+            let config = Config {
+                wait_seconds: usable,
+                ..Default::default()
+            };
             config.validate().unwrap();
             assert_eq!(config.lock_budget().as_secs_f64(), usable);
         }
@@ -293,13 +338,27 @@ mod tests {
 
     #[test]
     fn test1018_overrides_replace_only_what_they_specify() {
-        let mut config = Config { max_result_rows: 500, timeout_seconds: Some(30), ..Default::default() };
-        config.apply_overrides(&ResourceOverrides { max_json_file_size: Some(4096), ..Default::default() });
+        let mut config = Config {
+            max_result_rows: 500,
+            timeout_seconds: Some(30),
+            ..Default::default()
+        };
+        config.apply_overrides(&ResourceOverrides {
+            max_json_file_size: Some(4096),
+            ..Default::default()
+        });
         assert_eq!(config.max_json_file_size, 4096);
         assert_eq!(config.max_result_rows, 500);
         assert_eq!(config.timeout_seconds, Some(30));
-        config.apply_overrides(&ResourceOverrides { wait_seconds: Some(0.0), ..Default::default() });
-        assert_eq!(config.lock_budget(), std::time::Duration::ZERO, "`--wait 0` is honoured, not read as unset");
+        config.apply_overrides(&ResourceOverrides {
+            wait_seconds: Some(0.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            config.lock_budget(),
+            std::time::Duration::ZERO,
+            "`--wait 0` is honoured, not read as unset"
+        );
     }
 
     #[test]
@@ -314,12 +373,30 @@ mod tests {
     fn test2150_reference_names_expand_per_table_and_are_validated() {
         let config = Config::default();
         let names = config.reference_names("subjects");
-        for expected in ["subject_id", "subjects_id", "subject_refs", "subject_ref", "subjects"] {
-            assert!(names.contains(&expected.to_string()), "{expected} in {names:?}");
+        for expected in [
+            "subject_id",
+            "subjects_id",
+            "subject_refs",
+            "subject_ref",
+            "subjects",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} in {names:?}"
+            );
         }
-        let bad = Config { reference_naming: vec!["{tabel}_refs".into()], ..Default::default() };
+        let bad = Config {
+            reference_naming: vec!["{tabel}_refs".into()],
+            ..Default::default()
+        };
         assert!(bad.validate().unwrap_err().contains("{tabel}_refs"));
-        let bare = Config { reference_naming: vec!["refs".into()], ..Default::default() };
-        assert!(bare.validate().is_err(), "a pattern that names no table matches every table");
+        let bare = Config {
+            reference_naming: vec!["refs".into()],
+            ..Default::default()
+        };
+        assert!(
+            bare.validate().is_err(),
+            "a pattern that names no table matches every table"
+        );
     }
 }

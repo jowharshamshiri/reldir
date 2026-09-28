@@ -267,7 +267,9 @@ impl Mirror {
         {
             let copied = {
                 let backup = rusqlite::backup::Backup::new(&source, &mut conn);
-                backup.and_then(|backup| backup.run_to_completion(256, std::time::Duration::ZERO, None))
+                backup.and_then(|backup| {
+                    backup.run_to_completion(256, std::time::Duration::ZERO, None)
+                })
             };
             if copied.is_err() {
                 conn = Connection::open_in_memory().map_err(corrupt)?;
@@ -383,7 +385,11 @@ impl Mirror {
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         self.conn
-            .query_row("SELECT value FROM _reldir_meta WHERE key = ?1", [key], |row| row.get(0))
+            .query_row(
+                "SELECT value FROM _reldir_meta WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(corrupt)
     }
@@ -411,12 +417,11 @@ impl Mirror {
                 .conn
                 .prepare("SELECT tbl, identity FROM _reldir_tables")
                 .map_err(corrupt)?;
-            let rows = statement
+            statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(corrupt)?
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(corrupt)?;
-            rows
+                .map_err(corrupt)?
         };
         let mut rebuilt = vec![];
         for (table, identity) in &known {
@@ -472,7 +477,11 @@ impl Mirror {
                     "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                     quote(&index_name(table, columns)),
                     quote(table),
-                    columns.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+                    columns
+                        .iter()
+                        .map(|c| quote(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ))
                 .map_err(corrupt)?;
         }
@@ -500,7 +509,11 @@ impl Mirror {
                     q = quote(&name),
                     kind = if unique { "UNIQUE " } else { "" },
                     t = quote(table),
-                    c = columns.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ")
+                    c = columns
+                        .iter()
+                        .map(|c| quote(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ))
                 .map_err(corrupt)?;
         }
@@ -520,19 +533,24 @@ impl Mirror {
                 .conn
                 .prepare("SELECT tbl FROM _reldir_tables WHERE enforced = 0")
                 .map_err(corrupt)?;
-            let rows = statement
+            statement
                 .query_map([], |row| row.get(0))
                 .map_err(corrupt)?
                 .collect::<std::result::Result<Vec<String>, _>>()
-                .map_err(corrupt)?;
-            rows
+                .map_err(corrupt)?
         };
         for table in relaxed {
-            let Some(schema) = schemas.get(&table) else { continue };
+            let Some(schema) = schemas.get(&table) else {
+                continue;
+            };
             let mut clean = true;
             for columns in schema.candidate_keys() {
                 if !self
-                    .duplicates(std::slice::from_ref(&table), &constraint_name(schema, columns), false)?
+                    .duplicates(
+                        std::slice::from_ref(&table),
+                        &constraint_name(schema, columns),
+                        false,
+                    )?
                     .is_empty()
                 {
                     clean = false;
@@ -549,7 +567,11 @@ impl Mirror {
     pub fn table_digest(&self, table: &str) -> Result<String> {
         let cached: Option<Option<String>> = self
             .conn
-            .query_row("SELECT digest FROM _reldir_tables WHERE tbl = ?1", [table], |row| row.get(0))
+            .query_row(
+                "SELECT digest FROM _reldir_tables WHERE tbl = ?1",
+                [table],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(corrupt)?;
         if let Some(Some(digest)) = cached {
@@ -561,21 +583,29 @@ impl Mirror {
                 .filter_map(|(path, hash)| hash.as_deref().map(|hash| (path.as_str(), hash))),
         );
         self.conn
-            .execute("UPDATE _reldir_tables SET digest = ?2 WHERE tbl = ?1", params![table, digest])
+            .execute(
+                "UPDATE _reldir_tables SET digest = ?2 WHERE tbl = ?1",
+                params![table, digest],
+            )
             .map_err(corrupt)?;
         Ok(digest)
     }
 
     fn invalidate(&self, table: &str) -> Result<()> {
         self.conn
-            .execute("UPDATE _reldir_tables SET digest = NULL WHERE tbl = ?1", [table])
+            .execute(
+                "UPDATE _reldir_tables SET digest = NULL WHERE tbl = ?1",
+                [table],
+            )
             .map(|_| ())
             .map_err(corrupt)
     }
 
     /// Rows whose hash differs from the recorded head, and recorded rows no
     /// longer present.
-    pub fn row_delta(&self) -> Result<std::collections::BTreeMap<String, Option<crate::metadata::Entry>>> {
+    pub fn row_delta(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Option<crate::metadata::Entry>>> {
         let mut out = std::collections::BTreeMap::new();
         let mut changed = self
             .conn
@@ -585,11 +615,19 @@ impl Mirror {
             )
             .map_err(corrupt)?;
         for row in changed
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(corrupt)?
         {
             let (path, hash) = row.map_err(corrupt)?;
-            out.insert(path, Some(crate::metadata::Entry { kind: "row".into(), hash }));
+            out.insert(
+                path,
+                Some(crate::metadata::Entry {
+                    kind: "row".into(),
+                    hash,
+                }),
+            );
         }
         let mut removed = self
             .conn
@@ -598,14 +636,19 @@ impl Mirror {
                  (SELECT 1 FROM _reldir_files f WHERE f.path = r.path AND f.row_hash IS NOT NULL)",
             )
             .map_err(corrupt)?;
-        for row in removed.query_map([], |row| row.get::<_, String>(0)).map_err(corrupt)? {
+        for row in removed
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(corrupt)?
+        {
             out.insert(row.map_err(corrupt)?, None);
         }
         Ok(out)
     }
 
     /// The recorded entries that are not rows.
-    pub fn recorded_non_rows(&self) -> Result<std::collections::BTreeMap<String, crate::metadata::Entry>> {
+    pub fn recorded_non_rows(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, crate::metadata::Entry>> {
         let mut statement = self
             .conn
             .prepare("SELECT path, kind, hash FROM _reldir_recorded WHERE kind <> 'row'")
@@ -647,7 +690,9 @@ impl Mirror {
         revision: Option<u64>,
         root: Option<&str>,
     ) -> Result<()> {
-        self.atomically("reldir_recorded", || self.replace_recorded_inner(entries, revision, root))
+        self.atomically("reldir_recorded", || {
+            self.replace_recorded_inner(entries, revision, root)
+        })
     }
 
     /// Run `work` as one unit: all of it lands, with one flush, or none does.
@@ -671,7 +716,9 @@ impl Mirror {
         revision: Option<u64>,
         root: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute("DELETE FROM _reldir_recorded", []).map_err(corrupt)?;
+        self.conn
+            .execute("DELETE FROM _reldir_recorded", [])
+            .map_err(corrupt)?;
         for (path, entry) in entries {
             self.conn
                 .execute(
@@ -704,7 +751,9 @@ impl Mirror {
         revision: u64,
         root: &str,
     ) -> Result<()> {
-        self.atomically("reldir_recorded", || self.apply_recorded_inner(changes, revision, root))
+        self.atomically("reldir_recorded", || {
+            self.apply_recorded_inner(changes, revision, root)
+        })
     }
 
     fn apply_recorded_inner(
@@ -764,7 +813,11 @@ impl Mirror {
     }
 
     /// Visit every file of a table in path order.
-    pub fn each_file(&self, table: &str, mut visit: impl FnMut(FileEntry) -> Result<()>) -> Result<()> {
+    pub fn each_file(
+        &self,
+        table: &str,
+        mut visit: impl FnMut(FileEntry) -> Result<()>,
+    ) -> Result<()> {
         let mut statement = self
             .conn
             .prepare(
@@ -813,7 +866,10 @@ impl Mirror {
         if let Some((table, rowid)) = &trow {
             if let Some(rowid) = rowid {
                 self.conn
-                    .execute(&format!("DELETE FROM {} WHERE rowid = ?1", quote(table)), [rowid])
+                    .execute(
+                        &format!("DELETE FROM {} WHERE rowid = ?1", quote(table)),
+                        [rowid],
+                    )
                     .map_err(corrupt)?;
             }
             self.invalidate(table)?;
@@ -851,7 +907,11 @@ impl Mirror {
                 let insert = format!(
                     "INSERT INTO {} ({}) VALUES ({})",
                     quote(ingest.table),
-                    names.iter().map(|n| quote(n)).collect::<Vec<_>>().join(", "),
+                    names
+                        .iter()
+                        .map(|n| quote(n))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     vec!["?"; names.len()].join(", ")
                 );
                 match self
@@ -940,8 +1000,16 @@ impl Mirror {
     }
 
     /// The paths holding a key under a constraint in any of `tables`.
-    pub fn holders(&self, key: &str, constraint: &str, tables: &[String]) -> Result<Vec<(String, String)>> {
-        let placeholders = (0..tables.len()).map(|i| format!("?{}", i + 3)).collect::<Vec<_>>().join(", ");
+    pub fn holders(
+        &self,
+        key: &str,
+        constraint: &str,
+        tables: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let placeholders = (0..tables.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut statement = self
             .conn
             .prepare(&format!(
@@ -949,10 +1017,15 @@ impl Mirror {
                  ORDER BY path"
             ))
             .map_err(corrupt)?;
-        let mut arguments: Vec<SqlValue> = vec![SqlValue::Text(key.into()), SqlValue::Text(constraint.into())];
+        let mut arguments: Vec<SqlValue> = vec![
+            SqlValue::Text(key.into()),
+            SqlValue::Text(constraint.into()),
+        ];
         arguments.extend(tables.iter().map(|t| SqlValue::Text(t.clone())));
         let found = statement
-            .query_map(rusqlite::params_from_iter(arguments), |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(rusqlite::params_from_iter(arguments), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .map_err(corrupt)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(corrupt)?;
@@ -961,7 +1034,10 @@ impl Mirror {
 
     /// The references, under the given rules, that name `target`.
     pub fn referrers(&self, target: &str, rules: &[String]) -> Result<Vec<Edge>> {
-        let placeholders = (0..rules.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
+        let placeholders = (0..rules.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut statement = self
             .conn
             .prepare(&format!(
@@ -1009,7 +1085,10 @@ impl Mirror {
 
     /// References under a rule whose target no key in the allowed tables holds.
     pub fn dangling(&self, rule: &str, constraint: &str, tables: &[String]) -> Result<Vec<Edge>> {
-        let placeholders = (0..tables.len()).map(|i| format!("?{}", i + 3)).collect::<Vec<_>>().join(", ");
+        let placeholders = (0..tables.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut statement = self
             .conn
             .prepare(&format!(
@@ -1018,7 +1097,10 @@ impl Mirror {
                  ORDER BY e.path, e.ptr"
             ))
             .map_err(corrupt)?;
-        let mut arguments: Vec<SqlValue> = vec![SqlValue::Text(rule.into()), SqlValue::Text(constraint.into())];
+        let mut arguments: Vec<SqlValue> = vec![
+            SqlValue::Text(rule.into()),
+            SqlValue::Text(constraint.into()),
+        ];
         arguments.extend(tables.iter().map(|t| SqlValue::Text(t.clone())));
         let found = statement
             .query_map(rusqlite::params_from_iter(arguments), |row| {
@@ -1037,9 +1119,21 @@ impl Mirror {
 
     /// Keys held by more than one file under one constraint of one table, or --
     /// across tables -- under the primary keys of several.
-    pub fn duplicates(&self, tables: &[String], constraint: &str, across: bool) -> Result<Vec<Duplicate>> {
-        let placeholders = (0..tables.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(", ");
-        let having = if across { "count(DISTINCT tbl) > 1" } else { "count(*) > 1" };
+    pub fn duplicates(
+        &self,
+        tables: &[String],
+        constraint: &str,
+        across: bool,
+    ) -> Result<Vec<Duplicate>> {
+        let placeholders = (0..tables.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let having = if across {
+            "count(DISTINCT tbl) > 1"
+        } else {
+            "count(*) > 1"
+        };
         let mut statement = self
             .conn
             .prepare(&format!(
@@ -1079,7 +1173,9 @@ impl Mirror {
             .prepare("SELECT path, diagnostics FROM _reldir_files WHERE diagnostics <> '[]' ORDER BY path")
             .map_err(corrupt)?;
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(corrupt)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(corrupt)?;
@@ -1109,9 +1205,11 @@ impl Mirror {
     /// Row count of a table.
     pub fn count(&self, table: &str) -> Result<u64> {
         self.conn
-            .query_row("SELECT count(*) FROM _reldir_files WHERE tbl = ?1", [table], |row| {
-                row.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT count(*) FROM _reldir_files WHERE tbl = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
             .map(|count| count as u64)
             .map_err(corrupt)
     }
@@ -1133,7 +1231,10 @@ impl Mirror {
 
 fn decode_diagnostics(text: &str) -> Result<Vec<Diagnostic>> {
     let values: Vec<Value> = serde_json::from_str(text).map_err(corrupt)?;
-    values.into_iter().map(|value| Diagnostic::from_json(&value).map_err(corrupt)).collect()
+    values
+        .into_iter()
+        .map(|value| Diagnostic::from_json(&value).map_err(corrupt))
+        .collect()
 }
 
 fn file_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<FileEntry>> {
@@ -1195,7 +1296,11 @@ pub struct Duplicate {
 /// valid.
 fn signature(schema: &Schema) -> String {
     let columns: Vec<&str> = schema.columns().keys().map(String::as_str).collect();
-    format!("{}:{}", schema.identity(), canonical::hash_bytes(columns.join("\u{1f}").as_bytes()))
+    format!(
+        "{}:{}",
+        schema.identity(),
+        canonical::hash_bytes(columns.join("\u{1f}").as_bytes())
+    )
 }
 
 /// The rule name a foreign key's edges are stored under.
@@ -1232,7 +1337,11 @@ pub fn key(row: &Map<String, Value>, columns: &[String], schema: &Schema) -> Opt
     let mut values = Vec::with_capacity(columns.len());
     for name in columns {
         let column = schema.column(name)?;
-        let value = row.get(name).or(column.default()).cloned().unwrap_or(Value::Null);
+        let value = row
+            .get(name)
+            .or(column.default())
+            .cloned()
+            .unwrap_or(Value::Null);
         if value.is_null() {
             return None;
         }
@@ -1272,7 +1381,10 @@ pub fn edges(row: &Map<String, Value>, schema: &Schema) -> Vec<RowEdge> {
                 out.push(RowEdge {
                     rule: rule.clone(),
                     pointer: occurrence.pointer,
-                    target: canonical::compact(&Value::Array(vec![key_component(occurrence.value, &kind)])),
+                    target: canonical::compact(&Value::Array(vec![key_component(
+                        occurrence.value,
+                        &kind,
+                    )])),
                 });
             }
         } else {
@@ -1314,7 +1426,10 @@ pub fn edges(row: &Map<String, Value>, schema: &Schema) -> Vec<RowEdge> {
                 out.push(RowEdge {
                     rule: rule.clone(),
                     pointer: occurrence.pointer,
-                    target: canonical::compact(&Value::Array(vec![key_component(occurrence.value, &kind)])),
+                    target: canonical::compact(&Value::Array(vec![key_component(
+                        occurrence.value,
+                        &kind,
+                    )])),
                 });
             }
         }
@@ -1351,12 +1466,15 @@ pub fn to_sql(value: &Value, kind: &ColumnType) -> SqlValue {
     match (kind, value) {
         (_, Value::Null) => SqlValue::Null,
         (ColumnType::Bool, Value::Bool(flag)) => SqlValue::Integer(i64::from(*flag)),
-        (ColumnType::Int, Value::Number(number)) if number.as_i64().is_some() && !number.is_f64() => {
+        (ColumnType::Int, Value::Number(number))
+            if number.as_i64().is_some() && !number.is_f64() =>
+        {
             SqlValue::Integer(number.as_i64().unwrap_or_default())
         }
-        (ColumnType::Float, Value::Number(number)) => {
-            number.as_f64().map(SqlValue::Real).unwrap_or(SqlValue::Null)
-        }
+        (ColumnType::Float, Value::Number(number)) => number
+            .as_f64()
+            .map(SqlValue::Real)
+            .unwrap_or(SqlValue::Null),
         (ColumnType::Array | ColumnType::Object | ColumnType::Json, _) => {
             SqlValue::Text(canonical::compact(value))
         }
@@ -1390,18 +1508,24 @@ pub fn from_sql(value: rusqlite::types::ValueRef<'_>) -> Value {
     match value {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(integer) => Value::Number(integer.into()),
-        ValueRef::Real(real) => serde_json::Number::from_f64(real).map(Value::Number).unwrap_or(Value::Null),
+        ValueRef::Real(real) => serde_json::Number::from_f64(real)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         ValueRef::Text(text) => Value::String(String::from_utf8_lossy(text).into()),
-        ValueRef::Blob(bytes) => {
-            Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes))
-        }
+        ValueRef::Blob(bytes) => Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            bytes,
+        )),
     }
 }
 
 /// A value read from a column of a known type, decoded to the JSON that type
 /// is written as.
 pub fn decode_typed(value: Value, kind: &ColumnType) -> Result<Value> {
-    decode_declared(value, Some(sqlite_type(kind).split_whitespace().next().unwrap_or("")))
+    decode_declared(
+        value,
+        Some(sqlite_type(kind).split_whitespace().next().unwrap_or("")),
+    )
 }
 
 /// A result value decoded by the declared type of its source column, when it
@@ -1424,7 +1548,10 @@ pub fn decode_declared(value: Value, declared: Option<&str>) -> Result<Value> {
             let text = value.as_str().ok_or_else(|| {
                 DbError::new(
                     "QUERY_TYPE_ERROR",
-                    format!("a {} column produced non-text data", kind.trim_start_matches("RELDIR_BLOB_").to_lowercase()),
+                    format!(
+                        "a {} column produced non-text data",
+                        kind.trim_start_matches("RELDIR_BLOB_").to_lowercase()
+                    ),
                     4,
                 )
             })?;
@@ -1445,7 +1572,10 @@ pub fn decode_declared(value: Value, declared: Option<&str>) -> Result<Value> {
             } else {
                 Err(DbError::new(
                     "QUERY_TYPE_ERROR",
-                    format!("a {} column produced the wrong JSON shape", kind.trim_start_matches("RELDIR_BLOB_").to_lowercase()),
+                    format!(
+                        "a {} column produced the wrong JSON shape",
+                        kind.trim_start_matches("RELDIR_BLOB_").to_lowercase()
+                    ),
                     4,
                 ))
             }
@@ -1468,7 +1598,10 @@ pub fn index_name(table: &str, columns: &[String]) -> String {
         identity.push_str(column);
         identity.push(';');
     }
-    format!("reldir_{table}_{}", &canonical::hash_bytes(identity.as_bytes())[..12])
+    format!(
+        "reldir_{table}_{}",
+        &canonical::hash_bytes(identity.as_bytes())[..12]
+    )
 }
 
 #[cfg(test)]
@@ -1511,8 +1644,14 @@ mod tests {
         let mirror = Mirror::open_memory().unwrap();
         let schema = schema();
         let schemas = std::collections::BTreeMap::from([("people".to_string(), schema.clone())]);
-        assert_eq!(mirror.sync_schemas(&schemas).unwrap(), vec!["people".to_string()]);
-        for (id, email, refs) in [("a", "x@", json!(["b"])), ("b", "y@", json!(["a", "ghost"]))] {
+        assert_eq!(
+            mirror.sync_schemas(&schemas).unwrap(),
+            vec!["people".to_string()]
+        );
+        for (id, email, refs) in [
+            ("a", "x@", json!(["b"])),
+            ("b", "y@", json!(["a", "ghost"])),
+        ] {
             let data = row(json!({"id": id, "email": email, "refs": refs}));
             mirror
                 .put(Ingest {
@@ -1528,7 +1667,11 @@ mod tests {
                 .unwrap();
         }
         let dangling = mirror
-            .dangling(&fk_rule("people", "fk_refs"), PRIMARY, &["people".to_string()])
+            .dangling(
+                &fk_rule("people", "fk_refs"),
+                PRIMARY,
+                &["people".to_string()],
+            )
             .unwrap();
         assert_eq!(dangling.len(), 1);
         assert_eq!(dangling[0].path, "people/b.json");
@@ -1543,16 +1686,25 @@ mod tests {
 
         let count: i64 = mirror
             .connection()
-            .query_row("SELECT count(*) FROM people WHERE email LIKE '%@'", [], |r| r.get(0))
+            .query_row(
+                "SELECT count(*) FROM people WHERE email LIKE '%@'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 2, "typed rows are queryable");
 
         // Removing a file removes everything it contributed: its dangling
         // reference goes with it, and the reference to it now dangles.
         mirror.remove("people/b.json").unwrap();
-        let dangling = mirror.dangling(&fk_rule("people", "fk_refs"), PRIMARY, &["people".into()]).unwrap();
+        let dangling = mirror
+            .dangling(&fk_rule("people", "fk_refs"), PRIMARY, &["people".into()])
+            .unwrap();
         assert_eq!(dangling.len(), 1);
-        assert_eq!((dangling[0].path.as_str(), dangling[0].target.as_str()), ("people/a.json", "[\"b\"]"));
+        assert_eq!(
+            (dangling[0].path.as_str(), dangling[0].target.as_str()),
+            ("people/a.json", "[\"b\"]")
+        );
         assert_eq!(mirror.count("people").unwrap(), 1);
     }
 
@@ -1561,9 +1713,15 @@ mod tests {
         let mirror = Mirror::open_memory().unwrap();
         let schema = schema();
         mirror
-            .sync_schemas(&std::collections::BTreeMap::from([("people".to_string(), schema.clone())]))
+            .sync_schemas(&std::collections::BTreeMap::from([(
+                "people".to_string(),
+                schema.clone(),
+            )]))
             .unwrap();
-        for (path, id, email) in [("people/a.json", "a", "same@"), ("people/b.json", "b", "same@")] {
+        for (path, id, email) in [
+            ("people/a.json", "a", "same@"),
+            ("people/b.json", "b", "same@"),
+        ] {
             let data = row(json!({"id": id, "email": email, "refs": []}));
             mirror
                 .put(Ingest {
@@ -1579,11 +1737,20 @@ mod tests {
                 .unwrap();
         }
         let duplicates = mirror
-            .duplicates(&["people".into()], &constraint_name(&schema, &["email".into()]), false)
+            .duplicates(
+                &["people".into()],
+                &constraint_name(&schema, &["email".into()]),
+                false,
+            )
             .unwrap();
         assert_eq!(duplicates.len(), 1);
         assert_eq!(duplicates[0].holders.len(), 2);
-        assert!(mirror.duplicates(&["people".into()], PRIMARY, false).unwrap().is_empty());
+        assert!(
+            mirror
+                .duplicates(&["people".into()], PRIMARY, false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1595,7 +1762,11 @@ mod tests {
             key(&offset, &["at".into()], &schema),
             key(&utc, &["at".into()], &schema)
         );
-        assert_eq!(key(&row(json!({})), &["at".into()], &schema), None, "null takes no part in a key");
+        assert_eq!(
+            key(&row(json!({})), &["at".into()], &schema),
+            None,
+            "null takes no part in a key"
+        );
     }
 
     #[test]
@@ -1603,16 +1774,32 @@ mod tests {
         let entry = FileEntry {
             path: "t/a.json".into(),
             table: "t".into(),
-            stat: Stat { size: 10, mtime_ns: 1_000, ..Stat::default() },
+            stat: Stat {
+                size: 10,
+                mtime_ns: 1_000,
+                ..Stat::default()
+            },
             raw_hash: "h".into(),
             seen_ns: 1_000 + RACY_WINDOW_NS,
             row_hash: None,
             doc: None,
             diagnostics: vec![],
         };
-        assert!(!entry.trusted_for(&entry.stat), "modified in the same window it was read");
-        let later = FileEntry { seen_ns: 1_000 + RACY_WINDOW_NS + 1, ..entry.clone() };
+        assert!(
+            !entry.trusted_for(&entry.stat),
+            "modified in the same window it was read"
+        );
+        let later = FileEntry {
+            seen_ns: 1_000 + RACY_WINDOW_NS + 1,
+            ..entry.clone()
+        };
         assert!(later.trusted_for(&later.stat));
-        assert!(!later.trusted_for(&Stat { size: 11, ..later.stat }), "a changed size is a change");
+        assert!(
+            !later.trusted_for(&Stat {
+                size: 11,
+                ..later.stat
+            }),
+            "a changed size is a change"
+        );
     }
 }

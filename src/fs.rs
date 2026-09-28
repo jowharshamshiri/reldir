@@ -117,7 +117,10 @@ impl Fs for Disk {
         std::fs::write(path, bytes)
     }
     fn sync_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::OpenOptions::new().read(true).open(path)?.sync_all()
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(path)?
+            .sync_all()
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
@@ -186,12 +189,22 @@ pub struct Overlay<'a> {
 
 impl<'a> Overlay<'a> {
     /// `writes` and `deletes` are absolute paths.
-    pub fn new(base: &'a dyn Source, writes: BTreeMap<PathBuf, Vec<u8>>, deletes: BTreeSet<PathBuf>) -> Self {
-        Self { base, writes, deletes }
+    pub fn new(
+        base: &'a dyn Source,
+        writes: BTreeMap<PathBuf, Vec<u8>>,
+        deletes: BTreeSet<PathBuf>,
+    ) -> Self {
+        Self {
+            base,
+            writes,
+            deletes,
+        }
     }
 
     fn created_dir(&self, path: &Path) -> bool {
-        self.writes.keys().any(|written| written.starts_with(path) && written != path)
+        self.writes
+            .keys()
+            .any(|written| written.starts_with(path) && written != path)
     }
 }
 
@@ -212,12 +225,14 @@ impl Source for Overlay<'_> {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
         match self.base.metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound && self.created_dir(path) => Ok(Meta {
-                kind: Kind::Dir,
-                len: 0,
-                links: 1,
-                stat: Stat::default(),
-            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && self.created_dir(path) => {
+                Ok(Meta {
+                    kind: Kind::Dir,
+                    len: 0,
+                    links: 1,
+                    stat: Stat::default(),
+                })
+            }
             other => other,
         }
     }
@@ -225,7 +240,9 @@ impl Source for Overlay<'_> {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<PathBuf>> {
         let mut entries: BTreeSet<PathBuf> = match self.base.read_dir(path) {
             Ok(entries) => entries.into_iter().collect(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound && self.created_dir(path) => BTreeSet::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && self.created_dir(path) => {
+                BTreeSet::new()
+            }
             Err(error) => return Err(error),
         };
         entries.retain(|entry| !self.deletes.contains(entry));
@@ -332,7 +349,10 @@ impl Sim {
             ancestor = dir.parent();
         }
         state.live.files.insert(path.to_path_buf(), bytes.to_vec());
-        state.durable.files.insert(path.to_path_buf(), bytes.to_vec());
+        state
+            .durable
+            .files
+            .insert(path.to_path_buf(), bytes.to_vec());
     }
 
     /// Inject a fault at the `index`-th operation from now.
@@ -546,10 +566,20 @@ impl Fs for Sim {
             .filter(|dir| dir.parent() == Some(path))
             .cloned()
             .collect();
-        state.durable.files.retain(|file, _| file.parent() != Some(path));
-        state.durable.dirs.retain(|dir| dir.parent() != Some(path) || live_dirs.contains(dir));
+        state
+            .durable
+            .files
+            .retain(|file, _| file.parent() != Some(path));
+        state
+            .durable
+            .dirs
+            .retain(|dir| dir.parent() != Some(path) || live_dirs.contains(dir));
         for (file, bytes) in live_children {
-            let persisted = if state.unsynced.contains(&file) { vec![] } else { bytes };
+            let persisted = if state.unsynced.contains(&file) {
+                vec![]
+            } else {
+                bytes
+            };
             state.durable.files.insert(file, persisted);
         }
         for dir in live_dirs {
@@ -580,7 +610,10 @@ mod tests {
             overlay.read_dir(Path::new("/db/t")).unwrap(),
             vec![PathBuf::from("/db/t/b.json"), PathBuf::from("/db/t/c.json")]
         );
-        assert_eq!(overlay.metadata(Path::new("/db/u")).unwrap().kind, Kind::Dir);
+        assert_eq!(
+            overlay.metadata(Path::new("/db/u")).unwrap().kind,
+            Kind::Dir
+        );
         assert_eq!(overlay.read(Path::new("/db/u/x.json")).unwrap(), b"X");
         assert!(overlay.read(Path::new("/db/t/a.json")).is_err());
         assert_eq!(overlay.read(Path::new("/db/t/b.json")).unwrap(), b"B");
@@ -598,7 +631,10 @@ mod tests {
         assert!(sim.crashed().files().is_empty());
         sim.sync_dir(Path::new("/d")).unwrap();
         let after = sim.crashed().files();
-        assert_eq!(after.get(Path::new("/d/synced")).map(Vec::as_slice), Some(&b"kept"[..]));
+        assert_eq!(
+            after.get(Path::new("/d/synced")).map(Vec::as_slice),
+            Some(&b"kept"[..])
+        );
         assert_eq!(
             after.get(Path::new("/d/unsynced")).map(Vec::as_slice),
             Some(&b""[..]),
@@ -612,7 +648,8 @@ mod tests {
         sim.seed(Path::new("/d/row"), b"old");
         sim.write(Path::new("/d/row.tmp"), b"new").unwrap();
         sim.sync_file(Path::new("/d/row.tmp")).unwrap();
-        sim.rename(Path::new("/d/row.tmp"), Path::new("/d/row")).unwrap();
+        sim.rename(Path::new("/d/row.tmp"), Path::new("/d/row"))
+            .unwrap();
         assert_eq!(sim.crashed().files()[Path::new("/d/row")], b"old");
         sim.sync_dir(Path::new("/d")).unwrap();
         assert_eq!(sim.crashed().files()[Path::new("/d/row")], b"new");
@@ -624,14 +661,27 @@ mod tests {
         sim.create_dir_all(Path::new("/d")).unwrap();
         sim.fault_at(1, Fault::Error(io::ErrorKind::StorageFull));
         sim.write(Path::new("/d/a"), b"1").unwrap();
-        assert_eq!(sim.write(Path::new("/d/b"), b"2").unwrap_err().kind(), io::ErrorKind::StorageFull);
+        assert_eq!(
+            sim.write(Path::new("/d/b"), b"2").unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
         sim.fault_at(0, Fault::Crash);
         assert!(sim.write(Path::new("/d/c"), b"3").is_err());
-        assert!(sim.write(Path::new("/d/d"), b"4").is_err(), "a crashed process does nothing more");
+        assert!(
+            sim.write(Path::new("/d/d"), b"4").is_err(),
+            "a crashed process does nothing more"
+        );
         let torn = Sim::new();
         torn.seed(Path::new("/d/t"), b"old!");
         torn.fault_at(0, Fault::Torn);
-        assert!(torn.write(Path::new("/d/t"), b"abcd").is_err(), "a torn write is a crash");
-        assert_eq!(torn.crashed().files()[Path::new("/d/t")], b"ab", "half of it reached the disk");
+        assert!(
+            torn.write(Path::new("/d/t"), b"abcd").is_err(),
+            "a torn write is a crash"
+        );
+        assert_eq!(
+            torn.crashed().files()[Path::new("/d/t")],
+            b"ab",
+            "half of it reached the disk"
+        );
     }
 }

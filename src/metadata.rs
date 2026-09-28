@@ -123,7 +123,8 @@ pub fn config_entry(root: &Path) -> Result<Option<Entry>> {
     let path = root.join(".db/config");
     match fs::read(&path) {
         Ok(bytes) => {
-            let value = crate::json::parse(&bytes).map_err(|e| corrupt(format!(".db/config: {e}")))?;
+            let value =
+                crate::json::parse(&bytes).map_err(|e| corrupt(format!(".db/config: {e}")))?;
             let normalized = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
             Ok(Some(Entry {
                 kind: "config".into(),
@@ -142,24 +143,26 @@ pub fn table_digest<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> S
         hasher.update(path.as_bytes());
         hasher.update([0]);
         hasher.update(hash.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())
 }
 
+/// Each table's schema identity and row digest, by table.
+pub type TableDigests = BTreeMap<String, (Option<String>, String)>;
+
+/// A table's schema identity and its rows' (path, hash) pairs.
+type Grouped<'a> = BTreeMap<String, (Option<String>, Vec<(&'a str, &'a str)>)>;
+
 /// The root over a state's parts.
-pub fn root_hash(
-    format: Option<&Entry>,
-    config: Option<&Entry>,
-    tables: &BTreeMap<String, (Option<String>, String)>,
-) -> String {
+pub fn root_hash(format: Option<&Entry>, config: Option<&Entry>, tables: &TableDigests) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("reldir-state-v{FORMAT_VERSION}\0").as_bytes());
     for (label, entry) in [("format", format), ("config", config)] {
         hasher.update(label.as_bytes());
         hasher.update([0]);
         hasher.update(entry.map_or("", |e| e.hash.as_str()).as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     for (table, (identity, digest)) in tables {
         hasher.update(table.as_bytes());
@@ -167,7 +170,7 @@ pub fn root_hash(
         hasher.update(identity.as_deref().unwrap_or("").as_bytes());
         hasher.update([0]);
         hasher.update(digest.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())
 }
@@ -175,11 +178,14 @@ pub fn root_hash(
 /// The root of a set of entries, however they were obtained. The same function
 /// the live state's root is built from, applied to a reconstructed history.
 pub fn root_of(entries: &BTreeMap<String, Entry>) -> String {
-    let mut tables: BTreeMap<String, (Option<String>, Vec<(&str, &str)>)> = BTreeMap::new();
+    let mut tables: Grouped<'_> = BTreeMap::new();
     for (path, entry) in entries {
         match entry.kind.as_str() {
             "schema" => {
-                if let Some(table) = path.strip_prefix("schema/").and_then(|p| p.strip_suffix(".json")) {
+                if let Some(table) = path
+                    .strip_prefix("schema/")
+                    .and_then(|p| p.strip_suffix(".json"))
+                {
                     tables.entry(table.to_string()).or_default().0 = Some(entry.hash.clone());
                 }
             }
@@ -199,7 +205,11 @@ pub fn root_of(entries: &BTreeMap<String, Entry>) -> String {
         .into_iter()
         .map(|(table, (identity, rows))| (table, (identity, table_digest(rows))))
         .collect();
-    root_hash(entries.get(".db/format"), entries.get(".db/config"), &digests)
+    root_hash(
+        entries.get(".db/format"),
+        entries.get(".db/config"),
+        &digests,
+    )
 }
 
 /// The live state: its root, and -- on request -- its entries.
@@ -210,7 +220,10 @@ pub fn live_root(catalog: &Catalog) -> Result<String> {
     for (table, schema) in &catalog.schemas {
         tables.insert(
             table.clone(),
-            (Some(schema.identity().to_string()), catalog.mirror.table_digest(table)?),
+            (
+                Some(schema.identity().to_string()),
+                catalog.mirror.table_digest(table)?,
+            ),
         );
     }
     Ok(root_hash(format.as_ref(), config.as_ref(), &tables))
@@ -235,7 +248,13 @@ pub fn live_entries(catalog: &Catalog) -> Result<BTreeMap<String, Entry>> {
         );
         for (path, hash) in catalog.mirror.row_hashes(table)? {
             if let Some(hash) = hash {
-                entries.insert(path, Entry { kind: "row".into(), hash });
+                entries.insert(
+                    path,
+                    Entry {
+                        kind: "row".into(),
+                        hash,
+                    },
+                );
             }
         }
     }
@@ -279,12 +298,20 @@ pub fn load_record(root: &Path, revision: u64) -> Result<Provenance> {
     let path = record_path(root, revision);
     let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
     if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
-        return Err(corrupt(format!("provenance {} is not a private regular file", path.display())));
+        return Err(corrupt(format!(
+            "provenance {} is not a private regular file",
+            path.display()
+        )));
     }
-    let record: Provenance = crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
-        .map_err(|e| corrupt(format!("invalid provenance {}: {e}", path.display())))?;
+    let record: Provenance =
+        crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
+            .map_err(|e| corrupt(format!("invalid provenance {}: {e}", path.display())))?;
     if record.revision != revision {
-        return Err(corrupt(format!("provenance {} records revision {}", path.display(), record.revision)));
+        return Err(corrupt(format!(
+            "provenance {} records revision {}",
+            path.display(),
+            record.revision
+        )));
     }
     if record.format_version != FORMAT_VERSION {
         return Err(DbError::new(
@@ -297,7 +324,10 @@ pub fn load_record(root: &Path, revision: u64) -> Result<Provenance> {
         ));
     }
     if !ORIGINS.contains(&record.origin.as_str()) {
-        return Err(corrupt(format!("provenance revision {revision} has unknown origin {:?}", record.origin)));
+        return Err(corrupt(format!(
+            "provenance revision {revision} has unknown origin {:?}",
+            record.origin
+        )));
     }
     Ok(record)
 }
@@ -328,9 +358,12 @@ pub fn verify_history(root: &Path) -> Result<BTreeMap<String, Entry>> {
             Some(previous)
                 if record.revision != previous.revision + 1
                     || record.previous_revision != Some(previous.revision)
-                    || record.previous_root_hash.as_deref() != Some(previous.new_root_hash.as_str()) =>
+                    || record.previous_root_hash.as_deref()
+                        != Some(previous.new_root_hash.as_str()) =>
             {
-                return Err(corrupt(format!("provenance is broken at revision {revision}")));
+                return Err(corrupt(format!(
+                    "provenance is broken at revision {revision}"
+                )));
             }
             _ => {}
         }
@@ -359,15 +392,24 @@ pub fn verify_history(root: &Path) -> Result<BTreeMap<String, Entry>> {
 pub fn entries_at(root: &Path, revision: u64) -> Result<BTreeMap<String, Entry>> {
     let revisions = revisions(root)?;
     if !revisions.contains(&revision) {
-        return Err(DbError::new("UNKNOWN_REVISION", format!("there is no revision {revision}"), 4).with_help(
-            match revisions.last() {
-                Some(last) => format!("revisions run from {} to {last}; `reldir log` lists them", revisions[0]),
-                None => "nothing has been recorded yet".into(),
-            },
-        ));
+        return Err(DbError::new(
+            "UNKNOWN_REVISION",
+            format!("there is no revision {revision}"),
+            4,
+        )
+        .with_help(match revisions.last() {
+            Some(last) => format!(
+                "revisions run from {} to {last}; `reldir log` lists them",
+                revisions[0]
+            ),
+            None => "nothing has been recorded yet".into(),
+        }));
     }
     let mut entries = BTreeMap::new();
-    for number in revisions.into_iter().take_while(|number| *number <= revision) {
+    for number in revisions
+        .into_iter()
+        .take_while(|number| *number <= revision)
+    {
         for (path, entry) in load_record(root, number)?.changes {
             match entry {
                 Some(entry) => {
@@ -400,16 +442,30 @@ fn object_path(root: &Path, hash: &str) -> PathBuf {
 
 /// Check one recorded object against its entry.
 pub fn verify_object(root: &Path, path: &str, entry: &Entry) -> Result<()> {
-    if entry.hash.len() != 64 || !entry.hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        return Err(corrupt(format!("invalid object hash {:?} for {path}", entry.hash)));
+    if entry.hash.len() != 64
+        || !entry
+            .hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(corrupt(format!(
+            "invalid object hash {:?} for {path}",
+            entry.hash
+        )));
     }
     let expected = expected_kind(path);
     if entry.kind != expected {
-        return Err(corrupt(format!("object {path} has kind {:?}, expected {expected:?}", entry.kind)));
+        return Err(corrupt(format!(
+            "object {path} has kind {:?}, expected {expected:?}",
+            entry.kind
+        )));
     }
     let value = load_object(root, &entry.hash)?;
     if object_hash(&entry.kind, &value)? != entry.hash {
-        return Err(corrupt(format!("revision object {} does not match its hash", entry.hash)));
+        return Err(corrupt(format!(
+            "revision object {} does not match its hash",
+            entry.hash
+        )));
     }
     Ok(())
 }
@@ -418,23 +474,43 @@ pub fn verify_object(root: &Path, path: &str, entry: &Entry) -> Result<()> {
 pub fn object_hash(kind: &str, value: &Value) -> Result<String> {
     Ok(match kind {
         "format" => canonical::hash_bytes(
-            format!("{}\n", value.as_str().ok_or_else(|| corrupt("a format object is a string"))?.trim()).as_bytes(),
+            format!(
+                "{}\n",
+                value
+                    .as_str()
+                    .ok_or_else(|| corrupt("a format object is a string"))?
+                    .trim()
+            )
+            .as_bytes(),
         ),
         "schema" => crate::schema::identity::identity(value),
         "row" => canonical::row_hash(value),
-        _ => canonical::hash_bytes(&serde_json::to_vec(&canonical::normalize(value)).map_err(internal)?),
+        _ => canonical::hash_bytes(
+            &serde_json::to_vec(&canonical::normalize(value)).map_err(internal)?,
+        ),
     })
 }
 
 pub fn load_object(root: &Path, hash: &str) -> Result<Value> {
     let path = object_path(root, hash);
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|error| corrupt(format!("missing revision object {}: {error}", path.display())))?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        corrupt(format!(
+            "missing revision object {}: {error}",
+            path.display()
+        ))
+    })?;
     if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
-        return Err(corrupt(format!("revision object {} is not a private regular file", path.display())));
+        return Err(corrupt(format!(
+            "revision object {} is not a private regular file",
+            path.display()
+        )));
     }
-    crate::json::parse(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
-        .map_err(|error| corrupt(format!("invalid revision object {}: {error}", path.display())))
+    crate::json::parse(&fs::read(&path).map_err(|e| DbError::io(&path, e))?).map_err(|error| {
+        corrupt(format!(
+            "invalid revision object {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// The content a path last had in recorded history, and the revision that
@@ -560,14 +636,19 @@ pub fn record(
     // content-addressed, so one found damaged -- torn by such a crash -- is
     // simply written again.
     let mut written = false;
-    for (path, entry) in changes.iter().filter_map(|(p, e)| e.as_ref().map(|e| (p, e))) {
+    for (path, entry) in changes
+        .iter()
+        .filter_map(|(p, e)| e.as_ref().map(|e| (p, e)))
+    {
         let target = object_path(root, &entry.hash);
         if target.exists() && verify_object(root, path, entry).is_ok() {
             continue;
         }
         let value = object_value(catalog, path, entry)?;
         if object_hash(&entry.kind, &value)? != entry.hash {
-            return Err(corrupt(format!("the object for {path} does not hash to its entry")));
+            return Err(corrupt(format!(
+                "the object for {path} does not hash to its entry"
+            )));
         }
         let mut bytes = serde_json::to_vec_pretty(&value).map_err(internal)?;
         bytes.push(b'\n');
@@ -577,7 +658,8 @@ pub fn record(
         written = true;
     }
     if written {
-        crate::fs::flush_everything_under(&objects).map_err(|error| DbError::io(&objects, error))?;
+        crate::fs::flush_everything_under(&objects)
+            .map_err(|error| DbError::io(&objects, error))?;
     }
     let record = Provenance {
         revision: head.map_or(1, |h| h.revision + 1),
@@ -595,7 +677,10 @@ pub fn record(
     ensure_real_directory(&provenance_dir(root), true, "provenance")?;
     let path = record_path(root, record.revision);
     if path.exists() {
-        return Err(corrupt(format!("provenance revision {} already exists", record.revision)));
+        return Err(corrupt(format!(
+            "provenance revision {} already exists",
+            record.revision
+        )));
     }
     write_json_atomic(&path, &record)?;
     catalog
@@ -630,7 +715,9 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 pub fn is_in_progress_write(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.starts_with("tmp-") || extension.starts_with("reldir-tmp-"))
+        .is_some_and(|extension| {
+            extension.starts_with("tmp-") || extension.starts_with("reldir-tmp-")
+        })
 }
 
 /// Durably replace a file with exactly these bytes: temp sibling, fsync,
@@ -658,7 +745,10 @@ pub fn sync_parent(path: &Path) -> Result<()> {
 pub fn ensure_real_directory(path: &Path, create: bool, description: &str) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(corrupt(format!("{description} {} is not a real directory", path.display()))),
+        Ok(_) => Err(corrupt(format!(
+            "{description} {} is not a real directory",
+            path.display()
+        ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
             fs::create_dir_all(path).map_err(|error| DbError::io(path, error))?;
             sync_parent(path)?;
@@ -674,14 +764,20 @@ mod tests {
     use super::*;
 
     fn entry(kind: &str, hash: &str) -> Entry {
-        Entry { kind: kind.into(), hash: hash.into() }
+        Entry {
+            kind: kind.into(),
+            hash: hash.into(),
+        }
     }
 
     #[test]
     fn test2120_the_root_is_a_function_of_the_entries_alone() {
         let mut entries = BTreeMap::from([
             (".db/format".to_string(), entry("format", &"a".repeat(64))),
-            ("schema/users.json".to_string(), entry("schema", &"b".repeat(64))),
+            (
+                "schema/users.json".to_string(),
+                entry("schema", &"b".repeat(64)),
+            ),
             ("users/u1.json".to_string(), entry("row", &"c".repeat(64))),
             ("users/u2.json".to_string(), entry("row", &"d".repeat(64))),
         ]);
@@ -690,11 +786,18 @@ mod tests {
         entries.insert("users/u2.json".into(), entry("row", &"e".repeat(64)));
         assert_ne!(first, root_of(&entries), "a changed row is a changed state");
         entries.insert("users/u2.json".into(), entry("row", &"d".repeat(64)));
-        assert_eq!(first, root_of(&entries), "and changing it back restores the state");
+        assert_eq!(
+            first,
+            root_of(&entries),
+            "and changing it back restores the state"
+        );
         // The table grouping is by the first path component.
         let moved = BTreeMap::from([
             (".db/format".to_string(), entry("format", &"a".repeat(64))),
-            ("schema/users.json".to_string(), entry("schema", &"b".repeat(64))),
+            (
+                "schema/users.json".to_string(),
+                entry("schema", &"b".repeat(64)),
+            ),
             ("people/u1.json".to_string(), entry("row", &"c".repeat(64))),
             ("users/u2.json".to_string(), entry("row", &"d".repeat(64))),
         ]);
@@ -710,7 +813,10 @@ mod tests {
             previous_root_hash: None,
             new_root_hash: "c".repeat(64),
             origin: "import".into(),
-            changes: BTreeMap::from([("users/u1.json".to_string(), Some(entry("row", &"a".repeat(64))))]),
+            changes: BTreeMap::from([(
+                "users/u1.json".to_string(),
+                Some(entry("row", &"a".repeat(64))),
+            )]),
             binary_version: VERSION.into(),
             format_version: FORMAT_VERSION,
             transaction_id: None,
@@ -730,7 +836,12 @@ mod tests {
             let error = verify_object(root, "users/u1.json", &entry("row", &invalid)).unwrap_err();
             assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
         }
-        let error = verify_object(root, "schema/users.json", &entry("row", &"a".repeat(64))).unwrap_err();
-        assert!(error.diagnostic.message.contains("expected \"schema\""), "{}", error.diagnostic.message);
+        let error =
+            verify_object(root, "schema/users.json", &entry("row", &"a".repeat(64))).unwrap_err();
+        assert!(
+            error.diagnostic.message.contains("expected \"schema\""),
+            "{}",
+            error.diagnostic.message
+        );
     }
 }

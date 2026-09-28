@@ -60,7 +60,13 @@ pub fn classify(path: &Path) -> Class {
 }
 
 /// Classify the filesystem holding `path`.
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 pub fn classify(path: &Path) -> Class {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -79,7 +85,9 @@ pub fn classify(path: &Path) -> Class {
         .collect();
     let name = String::from_utf8_lossy(&raw).to_string();
     match name.as_str() {
-        "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs" | "osxfuse" | "macfuse" | "fusefs" => Class::Remote(name),
+        "nfs" | "smbfs" | "afpfs" | "webdav" | "cifs" | "osxfuse" | "macfuse" | "fusefs" => {
+            Class::Remote(name)
+        }
         name if name.starts_with("fuse") => Class::Remote(name.to_string()),
         _ => Class::Local,
     }
@@ -90,7 +98,11 @@ pub fn classify(path: &Path) -> Class {
 pub fn classify(path: &Path) -> Class {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut volume = vec![0u16; 1024];
     // SAFETY: both buffers are valid for their stated lengths.
     if unsafe { GetVolumePathNameW(wide.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0 {

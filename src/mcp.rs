@@ -17,9 +17,10 @@ use crate::{
 use rmcp::{
     ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+        ServerConfig, Tool, ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
 };
@@ -53,7 +54,11 @@ fn params_schema() -> Value {
 /// The tools, their arguments, and what they may do.
 pub fn tools() -> Vec<Tool> {
     let read = || ToolAnnotations::new().read_only(true);
-    let write = |destructive: bool| ToolAnnotations::new().read_only(false).destructive(destructive);
+    let write = |destructive: bool| {
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(destructive)
+    };
     let table = json!({ "type": "string", "description": "A table name" });
     vec![
         Tool::new("status", "Validity, unrecorded changes and the current revision.", object(json!({"type": "object"})))
@@ -223,7 +228,12 @@ pub fn call(base: &Context, name: &str, arguments: &Map<String, Value>) -> Value
     sink.envelope(name, &outcome)
 }
 
-fn run_tool(base: &Context, name: &str, arguments: &Map<String, Value>, sink: &mut Collect) -> Result<Finish> {
+fn run_tool(
+    base: &Context,
+    name: &str,
+    arguments: &Map<String, Value>,
+    sink: &mut Collect,
+) -> Result<Finish> {
     let mut context = base.clone();
     let dry = |context: &mut Context| -> Result<()> {
         context.dry_run = flag(arguments, "dry_run", true)?;
@@ -233,52 +243,93 @@ fn run_tool(base: &Context, name: &str, arguments: &Map<String, Value>, sink: &m
     let command = match name {
         "status" => Command::Status,
         "tables" => Command::Tables,
-        "describe" => Command::Describe { table: text(arguments, "table")? },
-        "schema_show" => Command::Schema(SchemaCommand::Show { table: text(arguments, "table")? }),
+        "describe" => Command::Describe {
+            table: text(arguments, "table")?,
+        },
+        "schema_show" => Command::Schema(SchemaCommand::Show {
+            table: text(arguments, "table")?,
+        }),
         "query" => {
             let sql = text(arguments, "sql")?;
             if crate::sql::classify(&sql)? != crate::sql::StatementKind::Read {
-                return Err(DbError::usage("query runs read-only statements; use mutate to change rows"));
+                return Err(DbError::usage(
+                    "query runs read-only statements; use mutate to change rows",
+                ));
             }
             context.allow_invalid = flag(arguments, "allow_invalid", false)?;
-            Command::Sql { statement: sql, params: params(arguments)? }
+            Command::Sql {
+                statement: sql,
+                params: params(arguments)?,
+            }
         }
         "mutate" => {
             let sql = text(arguments, "sql")?;
             if crate::sql::classify(&sql)? != crate::sql::StatementKind::Mutation {
-                return Err(DbError::usage("mutate runs INSERT, UPDATE and DELETE; use query to read"));
+                return Err(DbError::usage(
+                    "mutate runs INSERT, UPDATE and DELETE; use query to read",
+                ));
             }
             dry(&mut context)?;
-            Command::Sql { statement: sql, params: params(arguments)? }
+            Command::Sql {
+                statement: sql,
+                params: params(arguments)?,
+            }
         }
         "insert_row" => {
             dry(&mut context)?;
-            let row = arguments.get("row").ok_or_else(|| DbError::usage("the \"row\" argument is required"))?;
-            Command::Insert { table: text(arguments, "table")?, json: Some(row.to_string()), from: None }
+            let row = arguments
+                .get("row")
+                .ok_or_else(|| DbError::usage("the \"row\" argument is required"))?;
+            Command::Insert {
+                table: text(arguments, "table")?,
+                row: Some(row.to_string()),
+                from: None,
+            }
         }
         "update_row" => {
             dry(&mut context)?;
-            let patch = arguments.get("patch").ok_or_else(|| DbError::usage("the \"patch\" argument is required"))?;
-            Command::Update { table: text(arguments, "table")?, key: key(arguments)?, patch: patch.to_string() }
+            let patch = arguments
+                .get("patch")
+                .ok_or_else(|| DbError::usage("the \"patch\" argument is required"))?;
+            Command::Update {
+                table: text(arguments, "table")?,
+                key: key(arguments)?,
+                patch: patch.to_string(),
+            }
         }
         "delete_row" => {
             dry(&mut context)?;
             if !context.dry_run && !context.yes {
-                return Err(DbError::new("DECISION_REQUIRED", "deleting a row needs confirm: true", 9)
-                    .with_help("run with dry_run first to see every row the delete touches"));
+                return Err(DbError::new(
+                    "DECISION_REQUIRED",
+                    "deleting a row needs confirm: true",
+                    9,
+                )
+                .with_help("run with dry_run first to see every row the delete touches"));
             }
-            Command::Delete { table: text(arguments, "table")?, key: key(arguments)? }
+            Command::Delete {
+                table: text(arguments, "table")?,
+                key: key(arguments)?,
+            }
         }
-        "check" => Command::Check { strict: flag(arguments, "strict", false)? },
+        "check" => Command::Check {
+            strict: flag(arguments, "strict", false)?,
+        },
         "lint" => Command::Lint {
-            table: arguments.get("table").and_then(Value::as_str).map(String::from),
+            table: arguments
+                .get("table")
+                .and_then(Value::as_str)
+                .map(String::from),
             strict: false,
             descriptions: false,
         },
         "doctor_plan" => Command::Doctor {
             fix: false,
             allow_data: true,
-            only: arguments.get("only").and_then(Value::as_str).map(String::from),
+            only: arguments
+                .get("only")
+                .and_then(Value::as_str)
+                .map(String::from),
             explain: None,
             no_snapshot: true,
         },
@@ -287,18 +338,29 @@ fn run_tool(base: &Context, name: &str, arguments: &Map<String, Value>, sink: &m
             Command::Doctor {
                 fix: true,
                 allow_data: flag(arguments, "allow_data", false)?,
-                only: arguments.get("only").and_then(Value::as_str).map(String::from),
+                only: arguments
+                    .get("only")
+                    .and_then(Value::as_str)
+                    .map(String::from),
                 explain: None,
                 no_snapshot: false,
             }
         }
         "diff" => Command::Diff {
-            table: arguments.get("table").and_then(Value::as_str).map(String::from),
+            table: arguments
+                .get("table")
+                .and_then(Value::as_str)
+                .map(String::from),
             from: arguments.get("from").and_then(Value::as_u64),
             to: arguments.get("to").and_then(Value::as_u64),
             schema: flag(arguments, "schema_only", false)?,
         },
-        "log" => Command::Log { limit: arguments.get("limit").and_then(Value::as_u64).map(|n| n as usize) },
+        "log" => Command::Log {
+            limit: arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        },
         other => return Err(DbError::usage(format!("there is no tool {other:?}"))),
     };
     crate::cli::dispatch(&context, sink, command)
@@ -306,12 +368,18 @@ fn run_tool(base: &Context, name: &str, arguments: &Map<String, Value>, sink: &m
 
 impl Server {
     pub fn new(context: Context) -> Self {
-        Self { context: Arc::new(context) }
+        Self {
+            context: Arc::new(context),
+        }
     }
 
     fn resource(&self, uri: &str) -> Result<(String, &'static str)> {
         if uri == "reldir://dialect" {
-            return Ok((serde_json::to_string_pretty(crate::schema::meta::meta_schema()).unwrap_or_default(), "application/schema+json"));
+            return Ok((
+                serde_json::to_string_pretty(crate::schema::meta::meta_schema())
+                    .unwrap_or_default(),
+                "application/schema+json",
+            ));
         }
         if let Some(page) = uri.strip_prefix("reldir://docs/")
             && let Some((_, text)) = DOCS.iter().find(|(name, _)| *name == page)
@@ -319,14 +387,35 @@ impl Server {
             return Ok((text.to_string(), "text/markdown"));
         }
         if let Some(table) = uri.strip_prefix("reldir://schema/") {
-            let envelope = call(&self.context, "schema_show", &json!({"table": table}).as_object().cloned().unwrap_or_default());
+            let envelope = call(
+                &self.context,
+                "schema_show",
+                &json!({"table": table})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             if envelope["ok"] == true {
                 let document = &envelope["records"][0]["document"];
-                return Ok((serde_json::to_string_pretty(document).unwrap_or_default(), "application/schema+json"));
+                return Ok((
+                    serde_json::to_string_pretty(document).unwrap_or_default(),
+                    "application/schema+json",
+                ));
             }
-            return Err(DbError::new("UNKNOWN_TABLE", envelope["summary"].as_str().unwrap_or("unknown table").to_string(), 4));
+            return Err(DbError::new(
+                "UNKNOWN_TABLE",
+                envelope["summary"]
+                    .as_str()
+                    .unwrap_or("unknown table")
+                    .to_string(),
+                4,
+            ));
         }
-        Err(DbError::new("UNKNOWN_RESOURCE", format!("there is no resource {uri}"), 4))
+        Err(DbError::new(
+            "UNKNOWN_RESOURCE",
+            format!("there is no resource {uri}"),
+            4,
+        ))
     }
 }
 
@@ -362,7 +451,10 @@ impl ServerHandler for Server {
     ) -> std::result::Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         if !tools().iter().any(|tool| tool.name == name) {
-            return Err(ErrorData::invalid_params(format!("there is no tool {name:?}"), None));
+            return Err(ErrorData::invalid_params(
+                format!("there is no tool {name:?}"),
+                None,
+            ));
         }
         let arguments = request.arguments.unwrap_or_default();
         let context = Arc::clone(&self.context);
@@ -370,7 +462,9 @@ impl ServerHandler for Server {
         // it runs start to finish on a blocking thread.
         let envelope = tokio::task::spawn_blocking(move || call(&context, &name, &arguments))
             .await
-            .map_err(|error| ErrorData::internal_error(format!("the command panicked: {error}"), None))?;
+            .map_err(|error| {
+                ErrorData::internal_error(format!("the command panicked: {error}"), None)
+            })?;
         let result = if envelope["ok"] == true {
             CallToolResult::structured(envelope)
         } else {
@@ -389,7 +483,12 @@ impl ServerHandler for Server {
             let envelope = call(&context, "tables", &Map::new());
             envelope["records"]
                 .as_array()
-                .map(|records| records.iter().filter_map(|r| r["table"].as_str().map(String::from)).collect())
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter_map(|r| r["table"].as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         })
         .await
@@ -400,12 +499,18 @@ impl ServerHandler for Server {
                 .with_mime_type("application/schema+json"),
         ];
         for (page, _) in DOCS {
-            resources.push(Resource::new(format!("reldir://docs/{page}"), format!("docs/{page}")).with_mime_type("text/markdown"));
+            resources.push(
+                Resource::new(format!("reldir://docs/{page}"), format!("docs/{page}"))
+                    .with_mime_type("text/markdown"),
+            );
         }
         for table in tables {
             resources.push(
-                Resource::new(format!("reldir://schema/{table}"), format!("schema/{table}"))
-                    .with_mime_type("application/schema+json"),
+                Resource::new(
+                    format!("reldir://schema/{table}"),
+                    format!("schema/{table}"),
+                )
+                .with_mime_type("application/schema+json"),
             );
         }
         Ok(ListResourcesResult::with_all_items(resources))
@@ -426,7 +531,10 @@ impl ServerHandler for Server {
                 ResourceContents::text(text, request.uri.clone()).with_mime_type(mime),
             ])
             .into()),
-            Err(error) => Err(ErrorData::resource_not_found(error.diagnostic.message.clone(), None)),
+            Err(error) => Err(ErrorData::resource_not_found(
+                error.diagnostic.message.clone(),
+                None,
+            )),
         }
     }
 }
@@ -436,16 +544,31 @@ pub fn serve(context: Context) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| DbError::new("IO_ERROR", format!("cannot start the MCP runtime: {error}"), 6))?;
+        .map_err(|error| {
+            DbError::new(
+                "IO_ERROR",
+                format!("cannot start the MCP runtime: {error}"),
+                6,
+            )
+        })?;
     runtime.block_on(async {
         let running = Server::new(context)
             .serve(rmcp::transport::stdio())
             .await
-            .map_err(|error| DbError::new("IO_ERROR", format!("the MCP session did not start: {error}"), 6))?;
-        running
-            .waiting()
-            .await
-            .map_err(|error| DbError::new("IO_ERROR", format!("the MCP session ended abnormally: {error}"), 6))?;
+            .map_err(|error| {
+                DbError::new(
+                    "IO_ERROR",
+                    format!("the MCP session did not start: {error}"),
+                    6,
+                )
+            })?;
+        running.waiting().await.map_err(|error| {
+            DbError::new(
+                "IO_ERROR",
+                format!("the MCP session ended abnormally: {error}"),
+                6,
+            )
+        })?;
         Ok(())
     })
 }

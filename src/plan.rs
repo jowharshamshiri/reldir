@@ -97,14 +97,17 @@ pub fn render(catalog: &Catalog, rows: &[RowChange]) -> Result<Vec<Change>> {
             None => None,
         };
         if let Some(before) = &change.before
-            && target.as_ref().is_none_or(|(path, _)| path != &before.relative)
+            && target
+                .as_ref()
+                .is_none_or(|(path, _)| path != &before.relative)
         {
             deletes.push(before.relative.clone());
         }
         if let Some((path, after)) = target {
             let canonical_after = canonical::canonical_row(after, schema);
             let unchanged = change.before.as_ref().is_some_and(|before| {
-                before.relative == path && canonical::canonical_row(&before.value, schema) == canonical_after
+                before.relative == path
+                    && canonical::canonical_row(&before.value, schema) == canonical_after
             });
             if !unchanged {
                 writes.insert(
@@ -116,14 +119,19 @@ pub fn render(catalog: &Catalog, rows: &[RowChange]) -> Result<Vec<Change>> {
     }
     // A row may only land on a path that is free, or that a row of this plan
     // is leaving. Anything else would silently replace a file.
-    let vacated: std::collections::BTreeSet<&PathBuf> =
-        rows.iter().filter_map(|change| change.before.as_ref().map(|row| &row.relative)).collect();
+    let vacated: std::collections::BTreeSet<&PathBuf> = rows
+        .iter()
+        .filter_map(|change| change.before.as_ref().map(|row| &row.relative))
+        .collect();
     for path in writes.keys() {
         if !vacated.contains(path) && catalog.mirror.file(&crate::catalog::slash(path))?.is_some() {
             return Err(DbError::from_diag(
                 crate::diagnostic::Diagnostic::error(
                     "PRIMARY_KEY_VIOLATION",
-                    format!("{} already exists, and the change would replace it", path.display()),
+                    format!(
+                        "{} already exists, and the change would replace it",
+                        path.display()
+                    ),
                 )
                 .at(path.clone())
                 .help("update the existing row instead, or choose a different key"),
@@ -136,6 +144,10 @@ pub fn render(catalog: &Catalog, rows: &[RowChange]) -> Result<Vec<Change>> {
         .filter(|path| !writes.contains_key(path))
         .map(|path| Change::Delete { path })
         .collect();
-    out.extend(writes.into_iter().map(|(path, bytes)| Change::Write { path, bytes }));
+    out.extend(
+        writes
+            .into_iter()
+            .map(|(path, bytes)| Change::Write { path, bytes }),
+    );
     Ok(out)
 }

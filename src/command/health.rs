@@ -38,8 +38,15 @@ fn counts<'a>(codes: impl Iterator<Item = &'a str>) -> Value {
 /// Validity, what changed, and where history stands. Always exits 0 unless the
 /// database cannot be read: status reports, `check` judges.
 pub fn status(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
-    let Some(database) = context.open(sink, Intent::Read)? else { return Ok(empty()) };
-    for diagnostic in database.verdict.errors.iter().chain(&database.verdict.warnings) {
+    let Some(database) = context.open(sink, Intent::Read)? else {
+        return Ok(empty());
+    };
+    for diagnostic in database
+        .verdict
+        .errors
+        .iter()
+        .chain(&database.verdict.warnings)
+    {
         sink.diagnostic(diagnostic)?;
     }
     for change in &database.unrecorded {
@@ -51,7 +58,11 @@ pub fn status(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
     let head = database.history.head();
     let state = state_name(&database);
     let summary = match head {
-        Some(head) => format!("{state}   revision {}   root {}", head.revision, &head.new_root_hash[..12]),
+        Some(head) => format!(
+            "{state}   revision {}   root {}",
+            head.revision,
+            &head.new_root_hash[..12]
+        ),
         None => format!("{state}   nothing recorded yet"),
     };
     let mut finish = Finish::ok(summary)
@@ -61,7 +72,9 @@ pub fn status(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
         .with("rows", database.catalog.row_count()?)
         .with("violations", database.verdict.errors.len());
     if let Some(head) = head {
-        finish = finish.with("revision", head.revision).with("root", head.new_root_hash.clone());
+        finish = finish
+            .with("revision", head.revision)
+            .with("root", head.new_root_hash.clone());
     }
     if !database.is_valid() {
         sink.note("run `reldir doctor` for repairs");
@@ -72,7 +85,9 @@ pub fn status(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
 /// Full validation. Exits 2 when invalid, and -- with `strict` -- 7 when lint
 /// has findings.
 pub fn check(context: &Context, sink: &mut dyn Sink, strict: bool) -> Result<Finish> {
-    let Some(database) = context.open(sink, Intent::Read)? else { return Ok(empty()) };
+    let Some(database) = context.open(sink, Intent::Read)? else {
+        return Ok(empty());
+    };
     for diagnostic in &database.verdict.errors {
         sink.diagnostic(diagnostic)?;
     }
@@ -82,7 +97,12 @@ pub fn check(context: &Context, sink: &mut dyn Sink, strict: bool) -> Result<Fin
         vec![]
     };
     if strict {
-        for diagnostic in database.verdict.warnings.iter().chain(findings.iter().map(|f| &f.diagnostic)) {
+        for diagnostic in database
+            .verdict
+            .warnings
+            .iter()
+            .chain(findings.iter().map(|f| &f.diagnostic))
+        {
             sink.diagnostic(diagnostic)?;
         }
     } else {
@@ -117,28 +137,49 @@ pub fn check(context: &Context, sink: &mut dyn Sink, strict: bool) -> Result<Fin
         .with("state", state_name(&database))
         .with("tables", tables)
         .with("rows", rows)
-        .with("violations", counts(database.verdict.errors.iter().map(|d| d.code.as_str())))
-        .with("warnings", counts(database.verdict.warnings.iter().map(|d| d.code.as_str())))
-        .with("lint", counts(findings.iter().map(|f| f.diagnostic.code.as_str())))
+        .with(
+            "violations",
+            counts(database.verdict.errors.iter().map(|d| d.code.as_str())),
+        )
+        .with(
+            "warnings",
+            counts(database.verdict.warnings.iter().map(|d| d.code.as_str())),
+        )
+        .with(
+            "lint",
+            counts(findings.iter().map(|f| f.diagnostic.code.as_str())),
+        )
         .with("elapsed_ms", database.validation_elapsed.as_millis() as u64))
 }
 
 /// How the schemas could say more than they do.
-pub fn lint(context: &Context, sink: &mut dyn Sink, table: Option<&str>, strict: bool, descriptions: bool) -> Result<Finish> {
-    let Some(database) = context.open(sink, Intent::Read)? else { return Ok(empty()) };
+pub fn lint(
+    context: &Context,
+    sink: &mut dyn Sink,
+    table: Option<&str>,
+    strict: bool,
+    descriptions: bool,
+) -> Result<Finish> {
+    let Some(database) = context.open(sink, Intent::Read)? else {
+        return Ok(empty());
+    };
     if let Some(table) = table {
         super::schema_of(&database, table)?;
     }
     let findings = crate::lint::lint(&database.catalog, &database.config, descriptions)?;
     let shown: Vec<_> = findings
         .iter()
-        .filter(|finding| table.is_none_or(|table| finding.diagnostic.table.as_deref() == Some(table)))
+        .filter(|finding| {
+            table.is_none_or(|table| finding.diagnostic.table.as_deref() == Some(table))
+        })
         .collect();
     for finding in &shown {
         sink.diagnostic(&finding.diagnostic)?;
     }
     if !database.is_valid() {
-        sink.note("the database is invalid; lint judges schemas, and `reldir check` lists the violations");
+        sink.note(
+            "the database is invalid; lint judges schemas, and `reldir check` lists the violations",
+        );
     }
     Ok(Finish::ok(format!("{} lint finding(s)", shown.len()))
         .exit(if strict && !shown.is_empty() { 7 } else { 0 })
@@ -155,12 +196,20 @@ pub struct DoctorOptions<'a> {
 }
 
 /// Diagnose, and with `fix` repair.
-pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>) -> Result<Finish> {
+pub fn doctor(
+    context: &Context,
+    sink: &mut dyn Sink,
+    options: DoctorOptions<'_>,
+) -> Result<Finish> {
     if let Some(id) = options.explain {
         let (id, text) = doctor::FIXES
             .iter()
             .find(|(fix, _)| *fix == id)
-            .ok_or_else(|| DbError::usage(format!("{id:?} is not a fix; `reldir doctor` lists the fixes that apply")))?;
+            .ok_or_else(|| {
+                DbError::usage(format!(
+                    "{id:?} is not a fix; `reldir doctor` lists the fixes that apply"
+                ))
+            })?;
         let mut record = Map::new();
         record.insert("kind".into(), json!("fix_explanation"));
         record.insert("id".into(), json!(id));
@@ -168,23 +217,46 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
         sink.record(record)?;
         return Ok(Finish::ok(format!("{id}: {text}")));
     }
-    let intent = if options.fix { Intent::Write } else { Intent::Read };
-    let Some(mut database) = context.open(sink, intent)? else { return Ok(empty()) };
+    let intent = if options.fix {
+        Intent::Write
+    } else {
+        Intent::Read
+    };
+    let Some(mut database) = context.open(sink, intent)? else {
+        return Ok(empty());
+    };
     let fixes = doctor::plan(&database)?;
     if let Some(only) = options.only
-        && !fixes.iter().any(|fix| fix.id == only || fix.resolves == only)
+        && !fixes
+            .iter()
+            .any(|fix| fix.id == only || fix.resolves == only)
     {
         return Err(DbError::usage(format!("no fix here matches {only:?}")));
     }
-    for fix in fixes.iter().filter(|fix| options.only.is_none_or(|only| fix.id == only || fix.resolves == only)) {
-        let mut record = fix.to_json(&database.catalog).as_object().cloned().unwrap_or_default();
+    for fix in fixes.iter().filter(|fix| {
+        options
+            .only
+            .is_none_or(|only| fix.id == only || fix.resolves == only)
+    }) {
+        let mut record = fix
+            .to_json(&database.catalog)
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
         record.insert("kind".into(), json!("fix"));
         sink.record(record)?;
     }
-    let (chosen, deferred) = doctor::select(&database.catalog, &fixes, options.only, options.allow_data);
-    let manual = fixes.iter().filter(|fix| fix.class == Class::Manual).count();
+    let (chosen, deferred) =
+        doctor::select(&database.catalog, &fixes, options.only, options.allow_data);
+    let manual = fixes
+        .iter()
+        .filter(|fix| fix.class == Class::Manual)
+        .count();
     if !options.fix {
-        let data_waiting = fixes.iter().filter(|fix| fix.class == Class::Data && fix.rank == 0).count();
+        let data_waiting = fixes
+            .iter()
+            .filter(|fix| fix.class == Class::Data && fix.rank == 0)
+            .count();
         let mut summary = format!(
             "{} fix(es) would apply, {} need a decision, {} alternative(s) in all",
             chosen.len(),
@@ -192,7 +264,9 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
             fixes.len()
         );
         if !options.allow_data && data_waiting > 0 {
-            summary.push_str(&format!("; {data_waiting} rewrite rows and need --allow-data"));
+            summary.push_str(&format!(
+                "; {data_waiting} rewrite rows and need --allow-data"
+            ));
         }
         sink.note("apply with `reldir doctor --fix`; choose an alternative with --only <FIX_ID>");
         return Ok(Finish::ok(summary)
@@ -202,7 +276,9 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
             .with("manual", manual));
     }
     if chosen.is_empty() {
-        return Ok(Finish::ok("nothing to apply").with("valid", database.is_valid()).with("manual", manual));
+        return Ok(Finish::ok("nothing to apply")
+            .with("valid", database.is_valid())
+            .with("manual", manual));
     }
     let destructive: Vec<&&doctor::Fix> = chosen.iter().filter(|fix| fix.destructive).collect();
     if !destructive.is_empty() {
@@ -211,11 +287,17 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
             &format!(
                 "{} of the fixes remove data ({}); apply them",
                 destructive.len(),
-                destructive.iter().map(|fix| fix.id).collect::<Vec<_>>().join(", ")
+                destructive
+                    .iter()
+                    .map(|fix| fix.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         )?;
     }
-    let rewrites = chosen.iter().any(|fix| matches!(fix.class, Class::Data | Class::Layout));
+    let rewrites = chosen
+        .iter()
+        .any(|fix| matches!(fix.class, Class::Data | Class::Layout));
     if rewrites && !options.no_snapshot && !context.dry_run {
         let revision = database.history.head().map_or(0, |head| head.revision);
         let mut name = format!("pre-doctor-{revision}");
@@ -228,7 +310,9 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
         sink.event(
             "snapshot",
             json!({"name": name, "action": "created"}),
-            &format!("snapshot {name} taken; `reldir snapshot restore {name} --yes` puts everything back"),
+            &format!(
+                "snapshot {name} taken; `reldir snapshot restore {name} --yes` puts everything back"
+            ),
         )?;
     }
     let (rows, files) = doctor::changes(&database, &chosen)?;
@@ -236,13 +320,28 @@ pub fn doctor(context: &Context, sink: &mut dyn Sink, options: DoctorOptions<'_>
         rows,
         files,
         &crate::db::Expected::new(),
-        Request { origin: "repair", admission: Admission::NoNewFaults, dry_run: context.dry_run },
+        Request {
+            origin: "repair",
+            admission: Admission::NoNewFaults,
+            dry_run: context.dry_run,
+        },
     )?;
     for fix in &deferred {
-        sink.note(&format!("{} deferred: it touches a file another fix changes; run doctor again", fix.id));
+        sink.note(&format!(
+            "{} deferred: it touches a file another fix changes; run doctor again",
+            fix.id
+        ));
     }
     let applied: Vec<&str> = chosen.iter().map(|fix| fix.id).collect();
     let mut finish = super::committed(sink, &outcome, "repaired")?;
-    finish.summary = format!("{} ({} fix(es): {})", finish.summary, applied.len(), applied.join(", "));
-    Ok(finish.with("applied", applied.len()).with("deferred", deferred.len()).with("valid", database.is_valid()))
+    finish.summary = format!(
+        "{} ({} fix(es): {})",
+        finish.summary,
+        applied.len(),
+        applied.join(", ")
+    );
+    Ok(finish
+        .with("applied", applied.len())
+        .with("deferred", deferred.len())
+        .with("valid", database.is_valid()))
 }

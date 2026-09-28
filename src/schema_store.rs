@@ -105,7 +105,10 @@ mod tests {
     #[test]
     fn test1120_working_schemas_and_pins_occupy_separate_locations() {
         let root = Path::new("/db");
-        assert_eq!(working_path(root, "users"), root.join(".db/schema/users.json"));
+        assert_eq!(
+            working_path(root, "users"),
+            root.join(".db/schema/users.json")
+        );
         assert_eq!(pin_path(root, "users"), root.join("schema/users.json"));
         assert!(working_path(root, "users").starts_with(root.join(".db")));
         assert!(!pin_path(root, "users").starts_with(root.join(".db")));
@@ -114,8 +117,16 @@ mod tests {
     #[test]
     fn test1121_schema_paths_are_recognised_in_both_locations_only() {
         assert_eq!(schema_table(Path::new("schema/users.json")), Some("users"));
-        assert_eq!(schema_table(Path::new(".db/schema/users.json")), Some("users"));
-        for other in ["users/u1.json", "schema/users.txt", "x/schema/users.json", ".db/config"] {
+        assert_eq!(
+            schema_table(Path::new(".db/schema/users.json")),
+            Some("users")
+        );
+        for other in [
+            "users/u1.json",
+            "schema/users.txt",
+            "x/schema/users.json",
+            ".db/config",
+        ] {
             assert_eq!(schema_table(Path::new(other)), None, "{other}");
         }
     }
@@ -123,10 +134,15 @@ mod tests {
     #[test]
     fn test1122_equivalence_is_identity_ignoring_annotations_but_not_rules() {
         let plain = schema(None, false);
-        assert!(equivalent(&plain, &schema(Some("people we know"), false)), "an annotation is not a rule");
-        assert!(!equivalent(&plain, &schema(None, true)), "a different rule is a different schema");
+        assert!(
+            equivalent(&plain, &schema(Some("people we know"), false)),
+            "an annotation is not a rule"
+        );
+        assert!(
+            !equivalent(&plain, &schema(None, true)),
+            "a different rule is a different schema"
+        );
         let wide = Schema::from_bytes(&plain.bytes(4)).unwrap();
         assert!(equivalent(&plain, &wide), "formatting is not a rule");
     }
-
 }

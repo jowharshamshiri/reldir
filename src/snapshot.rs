@@ -36,7 +36,9 @@ pub fn validate_name(name: &str) -> Result<()> {
         || name.len() > 128
         || name.starts_with('.')
         || name.ends_with(['.', ' '])
-        || name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        || name.chars().any(|c| {
+            c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
         || reserved;
     if bad {
         return Err(DbError::new(
@@ -81,10 +83,18 @@ pub fn create(database: &Database, name: &str) -> Result<PathBuf> {
     crate::metadata::ensure_real_directory(&base, true, "snapshot directory")?;
     let destination = base.join(name);
     for entry in fs::read_dir(&base).map_err(|error| DbError::io(&base, error))? {
-        let existing = entry.map_err(|error| DbError::io(&base, error))?.file_name().to_string_lossy().to_lowercase();
+        let existing = entry
+            .map_err(|error| DbError::io(&base, error))?
+            .file_name()
+            .to_string_lossy()
+            .to_lowercase();
         if existing == name.to_lowercase() {
-            return Err(DbError::new("SNAPSHOT_EXISTS", format!("snapshot {name:?} already exists"), 1)
-                .with_help("choose another name, or delete it first with `reldir snapshot delete`"));
+            return Err(DbError::new(
+                "SNAPSHOT_EXISTS",
+                format!("snapshot {name:?} already exists"),
+                1,
+            )
+            .with_help("choose another name, or delete it first with `reldir snapshot delete`"));
         }
     }
     let staging = base.join(format!(".creating-{}", uuid::Uuid::new_v4()));
@@ -143,8 +153,12 @@ pub fn restore(database: &Database, name: &str) -> Result<(Vec<Change>, Expected
     validate_name(name)?;
     let source = base(&database.root).join(name);
     if !source.is_dir() {
-        return Err(DbError::new("UNKNOWN_SNAPSHOT", format!("there is no snapshot {name:?}"), 4)
-            .with_help("list them with `reldir snapshot list`"));
+        return Err(DbError::new(
+            "UNKNOWN_SNAPSHOT",
+            format!("there is no snapshot {name:?}"),
+            4,
+        )
+        .with_help("list them with `reldir snapshot list`"));
     }
     let mut held: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
     collect(&source, &source, &mut held)?;
@@ -171,7 +185,10 @@ pub fn restore(database: &Database, name: &str) -> Result<(Vec<Change>, Expected
         let now = database.fingerprint(&relative)?;
         if now.as_deref() != Some(crate::canonical::hash_bytes(&bytes).as_str()) {
             expected.insert(relative.clone(), now);
-            changes.push(Change::Write { path: relative, bytes });
+            changes.push(Change::Write {
+                path: relative,
+                bytes,
+            });
         }
     }
     Ok((changes, expected))
@@ -185,7 +202,10 @@ fn collect(base: &Path, directory: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) 
             collect(base, &path, out)?;
         } else if meta.is_file() {
             let relative = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-            out.insert(PathBuf::from(slash(&relative)), fs::read(&path).map_err(|error| DbError::io(&path, error))?);
+            out.insert(
+                PathBuf::from(slash(&relative)),
+                fs::read(&path).map_err(|error| DbError::io(&path, error))?,
+            );
         } else {
             return Err(DbError::new(
                 "INTERNAL_METADATA_CORRUPT",
@@ -201,7 +221,11 @@ pub fn delete(root: &Path, name: &str) -> Result<()> {
     validate_name(name)?;
     let path = base(root).join(name);
     if !path.is_dir() {
-        return Err(DbError::new("UNKNOWN_SNAPSHOT", format!("there is no snapshot {name:?}"), 4));
+        return Err(DbError::new(
+            "UNKNOWN_SNAPSHOT",
+            format!("there is no snapshot {name:?}"),
+            4,
+        ));
     }
     fs::remove_dir_all(&path).map_err(|error| DbError::io(&path, error))?;
     crate::metadata::sync_parent(&path)
@@ -216,7 +240,16 @@ mod tests {
         for good in ["before-import", "pre-doctor-12", "v1.2"] {
             validate_name(good).unwrap();
         }
-        for bad in ["", ".hidden", "a/b", "con", "lpt1.txt", "trailing.", "x:y", "a\u{0}b"] {
+        for bad in [
+            "",
+            ".hidden",
+            "a/b",
+            "con",
+            "lpt1.txt",
+            "trailing.",
+            "x:y",
+            "a\u{0}b",
+        ] {
             assert!(validate_name(bad).is_err(), "{bad:?}");
         }
     }

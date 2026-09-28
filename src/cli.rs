@@ -5,17 +5,16 @@
 //! chosen format.
 
 use crate::{
-    command::{self, Context, health::DoctorOptions, history, rows::ListOptions, schema::OnConflict},
+    command::{
+        self, Context, health::DoctorOptions, history, rows::ListOptions, schema::OnConflict,
+    },
     config::ResourceOverrides,
     diagnostic::{DbError, Result},
     migrate::{Constraint, Migration, Operation},
     output::{self, Finish, Format, Sink, Terminal},
 };
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use std::{
-    io::IsTerminal,
-    path::PathBuf,
-};
+use std::{io::IsTerminal, path::PathBuf};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -130,7 +129,9 @@ pub enum Command {
     #[command(after_help = "Example: reldir status")]
     Status,
     /// Validate everything; exit 2 when invalid.
-    #[command(after_help = "Examples:\n  reldir check\n  reldir --readonly check --format sarif > reldir.sarif")]
+    #[command(
+        after_help = "Examples:\n  reldir check\n  reldir --readonly check --format sarif > reldir.sarif"
+    )]
     Check {
         /// Also fail, with exit 7, on warnings and lint findings.
         #[arg(long)]
@@ -149,7 +150,9 @@ pub enum Command {
         descriptions: bool,
     },
     /// Diagnose, and repair least destructively.
-    #[command(after_help = "Examples:\n  reldir doctor\n  reldir doctor --fix\n  reldir doctor --fix --allow-data --only FIX_REMOVE_REFERENCE")]
+    #[command(
+        after_help = "Examples:\n  reldir doctor\n  reldir doctor --fix\n  reldir doctor --fix --allow-data --only FIX_REMOVE_REFERENCE"
+    )]
     Doctor {
         /// Apply the default fix for each problem.
         #[arg(long)]
@@ -176,7 +179,9 @@ pub enum Command {
         table: String,
     },
     /// One row, by primary key.
-    #[command(after_help = "Examples:\n  reldir get users u1\n  reldir get memberships '[\"team1\",\"u1\"]'")]
+    #[command(
+        after_help = "Examples:\n  reldir get users u1\n  reldir get memberships '[\"team1\",\"u1\"]'"
+    )]
     Get {
         /// The table.
         table: String,
@@ -184,7 +189,9 @@ pub enum Command {
         key: String,
     },
     /// Rows of a table.
-    #[command(after_help = "Example: reldir list users --where \"role = 'admin'\" --order -created_at --limit 10")]
+    #[command(
+        after_help = "Example: reldir list users --where \"role = 'admin'\" --order -created_at --limit 10"
+    )]
     List {
         /// The table.
         table: String,
@@ -199,15 +206,17 @@ pub enum Command {
         limit: Option<usize>,
     },
     /// Insert a row, or an array of rows, as one transaction.
-    #[command(after_help = "Examples:\n  reldir insert users '{\"id\":\"u3\",\"name\":\"Ada\"}'\n  reldir insert users --from rows.json")]
+    #[command(
+        after_help = "Examples:\n  reldir insert users '{\"id\":\"u3\",\"name\":\"Ada\"}'\n  reldir insert users --from rows.json"
+    )]
     Insert {
         /// The table.
         table: String,
         /// The row as JSON, or an array of rows.
         #[arg(required_unless_present = "from")]
-        json: Option<String>,
+        row: Option<String>,
         /// Read the JSON from a file, or `-` for stdin.
-        #[arg(long, value_name = "FILE", conflicts_with = "json")]
+        #[arg(long, value_name = "FILE", conflicts_with = "row")]
         from: Option<String>,
     },
     /// Set columns of one row.
@@ -229,7 +238,9 @@ pub enum Command {
         key: String,
     },
     /// Run one SQL statement: a query, or an INSERT, UPDATE or DELETE.
-    #[command(after_help = "Examples:\n  reldir sql 'SELECT * FROM users WHERE id = ?' --param u1\n  echo 'SELECT count(*) FROM users' | reldir sql -")]
+    #[command(
+        after_help = "Examples:\n  reldir sql 'SELECT * FROM users WHERE id = ?' --param u1\n  echo 'SELECT count(*) FROM users' | reldir sql -"
+    )]
     Sql {
         /// The statement; `-` reads it from stdin.
         statement: String,
@@ -249,7 +260,9 @@ pub enum Command {
     #[command(subcommand)]
     Schema(SchemaCommand),
     /// Infer schemas from rows.
-    #[command(after_help = "Examples:\n  reldir infer users\n  reldir infer --all --write\n  reldir infer users --write --on-schema-conflict compare")]
+    #[command(
+        after_help = "Examples:\n  reldir infer users\n  reldir infer --all --write\n  reldir infer users --write --on-schema-conflict compare"
+    )]
     Infer {
         /// Tables to infer; all when none are named.
         tables: Vec<String>,
@@ -291,7 +304,9 @@ pub enum Command {
         out: Option<PathBuf>,
     },
     /// What changed: since the last revision, or between two.
-    #[command(after_help = "Examples:\n  reldir diff\n  reldir diff users\n  reldir diff --from 3 --to 5 --schema")]
+    #[command(
+        after_help = "Examples:\n  reldir diff\n  reldir diff users\n  reldir diff --from 3 --to 5 --schema"
+    )]
     Diff {
         /// Only this table.
         table: Option<String>,
@@ -453,7 +468,9 @@ pub enum MigrateCommand {
         using: Option<String>,
     },
     /// Add a constraint, as JSON with a `kind` of unique, foreign_key, check, acyclic or assertion.
-    #[command(after_help = "Example: reldir migrate add-constraint posts '{\"kind\":\"foreign_key\",\"from\":[\"user_id\"],\"to\":{\"table\":\"users\"}}'")]
+    #[command(
+        after_help = "Example: reldir migrate add-constraint posts '{\"kind\":\"foreign_key\",\"from\":[\"user_id\"],\"to\":{\"table\":\"users\"}}'"
+    )]
     AddConstraint {
         /// The table.
         table: String,
@@ -587,9 +604,15 @@ pub fn run(cli: Cli) -> i32 {
     let context = cli.context();
     let command = match (&cli.command, &cli.sql) {
         (Some(command), _) => command.clone(),
-        (None, Some(statement)) => Command::Sql { statement: statement.clone(), params: vec![] },
+        (None, Some(statement)) => Command::Sql {
+            statement: statement.clone(),
+            params: vec![],
+        },
         (None, None) if std::io::stdin().is_terminal() => Command::Shell,
-        (None, None) => Command::Sql { statement: "-".into(), params: vec![] },
+        (None, None) => Command::Sql {
+            statement: "-".into(),
+            params: vec![],
+        },
     };
     match command {
         Command::Shell => return shell(&context),
@@ -609,8 +632,15 @@ pub fn run(cli: Cli) -> i32 {
         _ => {}
     }
     let name = command_name(&command);
-    if format == Format::Sarif && !matches!(command, Command::Check { .. } | Command::Lint { .. } | Command::Doctor { .. }) {
-        let error = DbError::usage("--format sarif reports diagnostics, so it applies to check, lint and doctor");
+    if format == Format::Sarif
+        && !matches!(
+            command,
+            Command::Check { .. } | Command::Lint { .. } | Command::Doctor { .. }
+        )
+    {
+        let error = DbError::usage(
+            "--format sarif reports diagnostics, so it applies to check, lint and doctor",
+        );
         error.render_human();
         return error.exit;
     }
@@ -623,28 +653,57 @@ pub fn run(cli: Cli) -> i32 {
 pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Result<Finish> {
     use command::{health, query, rows, schema, setup};
     match command {
-        Command::Init { path, adopt, track_provenance } => setup::init(context, sink, path.as_deref(), adopt, track_provenance),
+        Command::Init {
+            path,
+            adopt,
+            track_provenance,
+        } => setup::init(context, sink, path.as_deref(), adopt, track_provenance),
         Command::Inspect { path } => setup::inspect(context, sink, path.as_deref()),
         Command::Status => health::status(context, sink),
         Command::Check { strict } => health::check(context, sink, strict),
-        Command::Lint { table, strict, descriptions } => health::lint(context, sink, table.as_deref(), strict, descriptions),
-        Command::Doctor { fix, allow_data, only, explain, no_snapshot } => health::doctor(
+        Command::Lint {
+            table,
+            strict,
+            descriptions,
+        } => health::lint(context, sink, table.as_deref(), strict, descriptions),
+        Command::Doctor {
+            fix,
+            allow_data,
+            only,
+            explain,
+            no_snapshot,
+        } => health::doctor(
             context,
             sink,
-            DoctorOptions { fix, allow_data, only: only.as_deref(), explain: explain.as_deref(), no_snapshot },
+            DoctorOptions {
+                fix,
+                allow_data,
+                only: only.as_deref(),
+                explain: explain.as_deref(),
+                no_snapshot,
+            },
         ),
         Command::Tables => rows::tables(context, sink),
         Command::Describe { table } => rows::describe(context, sink, &table),
         Command::Get { table, key } => rows::get(context, sink, &table, &key),
-        Command::List { table, filter, order, limit } => rows::list(
+        Command::List {
+            table,
+            filter,
+            order,
+            limit,
+        } => rows::list(
             context,
             sink,
             &table,
-            ListOptions { filter: filter.as_deref(), order: order.as_deref(), limit },
+            ListOptions {
+                filter: filter.as_deref(),
+                order: order.as_deref(),
+                limit,
+            },
         ),
-        Command::Insert { table, json, from } => {
-            let text = match (json, from) {
-                (Some(json), None) => json,
+        Command::Insert { table, row, from } => {
+            let text = match (row, from) {
+                (Some(row), None) => row,
                 (None, Some(from)) => command::read_input(&from, 1 << 30)?,
                 _ => return Err(DbError::usage("give the row as JSON, or --from a file")),
             };
@@ -653,13 +712,22 @@ pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Res
         Command::Update { table, key, patch } => rows::update(context, sink, &table, &key, &patch),
         Command::Delete { table, key } => rows::delete(context, sink, &table, &key),
         Command::Sql { statement, params } => query::sql(context, sink, &statement, &params),
-        Command::Explain { statement, params } => query::explain(context, sink, &statement, &params),
+        Command::Explain { statement, params } => {
+            query::explain(context, sink, &statement, &params)
+        }
         Command::Schema(SchemaCommand::Show { table }) => schema::show(context, sink, &table),
         Command::Schema(SchemaCommand::New { table }) => schema::new(context, sink, &table),
         Command::Schema(SchemaCommand::Pin { table }) => schema::pin(context, sink, &table),
         Command::Schema(SchemaCommand::Validate) => schema::validate(context, sink),
         Command::Schema(SchemaCommand::Dialect) => schema::dialect(sink),
-        Command::Infer { tables, all, write, strictness, pk, on_schema_conflict } => schema::infer(
+        Command::Infer {
+            tables,
+            all,
+            write,
+            strictness,
+            pk,
+            on_schema_conflict,
+        } => schema::infer(
             context,
             sink,
             schema::InferOptions {
@@ -674,19 +742,33 @@ pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Res
         Command::Migrate(migrate) => {
             let migration = match migrate {
                 MigrateCommand::Apply { file } => schema::read_migration(&file)?,
-                other => Migration { operations: vec![operation(other)?] },
+                other => Migration {
+                    operations: vec![operation(other)?],
+                },
             };
             schema::migrate(context, sink, migration)
         }
         Command::Import { table, from } => rows::import(context, sink, &table, &from),
         Command::Export { table, out } => {
-            let as_csv = out.as_deref().and_then(|path| path.extension()).is_some_and(|ext| ext == "csv");
+            let as_csv = out
+                .as_deref()
+                .and_then(|path| path.extension())
+                .is_some_and(|ext| ext == "csv");
             rows::export(context, sink, &table, out.as_deref(), as_csv)
         }
-        Command::Diff { table, from, to, schema } => history::diff(
+        Command::Diff {
+            table,
+            from,
+            to,
+            schema,
+        } => history::diff(
             context,
             sink,
-            history::DiffOptions { revisions: from.zip(to), table, schema_only: schema },
+            history::DiffOptions {
+                revisions: from.zip(to),
+                table,
+                schema_only: schema,
+            },
         ),
         Command::Log { limit } => history::log(context, sink, limit),
         Command::Show { revision } => history::show(context, sink, revision),
@@ -703,24 +785,34 @@ pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Res
         Command::Recover { history: mode } => history::recover(context, sink, mode.is_some()),
         Command::Gc => history::gc(context, sink),
         Command::Analyze => history::analyze(context, sink),
-        Command::Shell | Command::Mcp | Command::Completions { .. } => {
-            Err(DbError::usage("this command runs interactively and has no result to report"))
-        }
+        Command::Shell | Command::Mcp | Command::Completions { .. } => Err(DbError::usage(
+            "this command runs interactively and has no result to report",
+        )),
     }
 }
 
 fn operation(command: MigrateCommand) -> Result<Operation> {
     let json = |text: &str, what: &str| {
-        crate::json::parse_str(text).map_err(|error| DbError::usage(format!("{what} is not JSON: {error}")))
+        crate::json::parse_str(text)
+            .map_err(|error| DbError::usage(format!("{what} is not JSON: {error}")))
     };
     Ok(match command {
         MigrateCommand::AddTable { table, from } => {
             let text = command::read_input(&from, 64 * 1024 * 1024)?;
-            Operation::AddTable { table, schema: Box::new(json(&text, "the schema")?) }
+            Operation::AddTable {
+                table,
+                schema: Box::new(json(&text, "the schema")?),
+            }
         }
         MigrateCommand::DropTable { table } => Operation::DropTable { table },
         MigrateCommand::RenameTable { table, new } => Operation::RenameTable { table, new },
-        MigrateCommand::AddColumn { table, column, kind, nullable, default } => Operation::AddColumn {
+        MigrateCommand::AddColumn {
+            table,
+            column,
+            kind,
+            nullable,
+            default,
+        } => Operation::AddColumn {
             table,
             column,
             kind,
@@ -728,17 +820,33 @@ fn operation(command: MigrateCommand) -> Result<Operation> {
             default: default.map(|text| json(&text, "the default")).transpose()?,
         },
         MigrateCommand::DropColumn { table, column } => Operation::DropColumn { table, column },
-        MigrateCommand::RenameColumn { table, column, new } => Operation::RenameColumn { table, column, new },
-        MigrateCommand::ChangeType { table, column, kind, using } => Operation::ChangeType { table, column, kind, using },
+        MigrateCommand::RenameColumn { table, column, new } => {
+            Operation::RenameColumn { table, column, new }
+        }
+        MigrateCommand::ChangeType {
+            table,
+            column,
+            kind,
+            using,
+        } => Operation::ChangeType {
+            table,
+            column,
+            kind,
+            using,
+        },
         MigrateCommand::AddConstraint { table, definition } => {
-            let definition: Constraint = serde_json::from_value(json(&definition, "the constraint")?)
-                .map_err(|error| DbError::usage(format!("the constraint is not one reldir knows: {error}")))?;
+            let definition: Constraint =
+                serde_json::from_value(json(&definition, "the constraint")?).map_err(|error| {
+                    DbError::usage(format!("the constraint is not one reldir knows: {error}"))
+                })?;
             Operation::AddConstraint { table, definition }
         }
         MigrateCommand::DropConstraint { table, name } => Operation::DropConstraint { table, name },
         MigrateCommand::AddIndex { table, columns } => Operation::AddIndex { table, columns },
         MigrateCommand::DropIndex { table, columns } => Operation::DropIndex { table, columns },
-        MigrateCommand::SetDomain { table, domain } => Operation::SetIdentityDomain { table, domain },
+        MigrateCommand::SetDomain { table, domain } => {
+            Operation::SetIdentityDomain { table, domain }
+        }
         MigrateCommand::Apply { .. } => unreachable!("handled by the caller"),
     })
 }
@@ -753,7 +861,11 @@ fn shell(context: &Context) -> i32 {
     eprintln!("reldir {} -- SQL ending in `;`, or .help", crate::VERSION);
     let mut buffer = String::new();
     loop {
-        let prompt = if buffer.is_empty() { "reldir> " } else { "   ...> " };
+        let prompt = if buffer.is_empty() {
+            "reldir> "
+        } else {
+            "   ...> "
+        };
         match editor.readline(prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
@@ -763,12 +875,18 @@ fn shell(context: &Context) -> i32 {
                     let command = match (words.next(), words.next()) {
                         (Some(".quit" | ".exit"), _) => return 0,
                         (Some(".help"), _) => {
-                            eprintln!(".tables  .describe TABLE  .schema TABLE  .check  .status  .quit");
+                            eprintln!(
+                                ".tables  .describe TABLE  .schema TABLE  .check  .status  .quit"
+                            );
                             continue;
                         }
                         (Some(".tables"), _) => Command::Tables,
-                        (Some(".describe"), Some(table)) => Command::Describe { table: table.into() },
-                        (Some(".schema"), Some(table)) => Command::Schema(SchemaCommand::Show { table: table.into() }),
+                        (Some(".describe"), Some(table)) => Command::Describe {
+                            table: table.into(),
+                        },
+                        (Some(".schema"), Some(table)) => Command::Schema(SchemaCommand::Show {
+                            table: table.into(),
+                        }),
                         (Some(".check"), _) => Command::Check { strict: false },
                         (Some(".status"), _) => Command::Status,
                         _ => {
@@ -789,7 +907,12 @@ fn shell(context: &Context) -> i32 {
                 let statement = std::mem::take(&mut buffer);
                 let _ = editor.add_history_entry(statement.trim());
                 let mut terminal = Terminal::new(Format::Table, "sql");
-                let outcome = command::query::sql(context, &mut terminal, statement.trim().trim_end_matches(';'), &[]);
+                let outcome = command::query::sql(
+                    context,
+                    &mut terminal,
+                    statement.trim().trim_end_matches(';'),
+                    &[],
+                );
                 terminal.finish(outcome);
             }
             Err(ReadlineError::Interrupted) => buffer.clear(),

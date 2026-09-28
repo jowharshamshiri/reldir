@@ -16,7 +16,10 @@ use crate::{
     catalog::Catalog,
     config::Config,
     diagnostic::{DbError, Diagnostic, Result},
-    schema::{ColumnType, Schema, document::{TableBuilder, enum_subschema, subschema}},
+    schema::{
+        ColumnType, Schema,
+        document::{TableBuilder, enum_subschema, subschema},
+    },
 };
 use serde_json::{Map, Value, json};
 use std::{
@@ -129,9 +132,16 @@ pub fn infer_all(
             }
             let rows = catalog.rows(table)?;
             let key = (schema.primary_key().len() == 1)
-                .then(|| schema.column(&schema.primary_key()[0]).map(|c| (schema.primary_key()[0].clone(), c.kind().clone())))
+                .then(|| {
+                    schema
+                        .column(&schema.primary_key()[0])
+                        .map(|c| (schema.primary_key()[0].clone(), c.kind().clone()))
+                })
                 .flatten();
-            facts.insert(table.clone(), TableFacts::gather(table, key, Some(schema), rows.iter().map(|r| &r.value)));
+            facts.insert(
+                table.clone(),
+                TableFacts::gather(table, key, Some(schema), rows.iter().map(|r| &r.value)),
+            );
         }
     }
     for proposal in references::detect(&facts, config) {
@@ -145,19 +155,26 @@ pub fn infer_all(
                 continue;
             }
             for table in join {
-                builders.get_mut(table).expect("checked above").0.identity_domain(Some(name.clone()));
+                builders
+                    .get_mut(table)
+                    .expect("checked above")
+                    .0
+                    .identity_domain(Some(name.clone()));
             }
         }
-        builders.get_mut(&proposal.table).expect("checked above").0.foreign_key(proposal.definition());
+        builders
+            .get_mut(&proposal.table)
+            .expect("checked above")
+            .0
+            .foreign_key(proposal.definition());
     }
 
     let mut out = BTreeMap::new();
     for (table, (builder, _, _)) in builders {
         let schema = builder.build().map_err(|problems| {
-            let first = problems
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| Diagnostic::error("SCHEMA_INVALID", "the inferred schema is invalid"));
+            let first = problems.into_iter().next().unwrap_or_else(|| {
+                Diagnostic::error("SCHEMA_INVALID", "the inferred schema is invalid")
+            });
             DbError::from_diag(first.table(table.as_str()), 8)
         })?;
         for row in &samples[&table] {
@@ -172,7 +189,9 @@ pub fn infer_all(
                         ),
                     )
                     .at(row.path.clone())
-                    .help("rename the file, choose the key with --pk, or declare x-reldir.filename"),
+                    .help(
+                        "rename the file, choose the key with --pk, or declare x-reldir.filename",
+                    ),
                     8,
                 ));
             }
@@ -185,7 +204,9 @@ pub fn infer_all(
 /// Read every row of a table as an inference sample, under the configured
 /// size and nesting bounds.
 fn load_samples(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>> {
-    crate::json::with_depth_limit(config.max_nesting_depth, || load_samples_bounded(root, table, config))
+    crate::json::with_depth_limit(config.max_nesting_depth, || {
+        load_samples_bounded(root, table, config)
+    })
 }
 
 fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec<Sample>> {
@@ -194,7 +215,11 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(DbError::from_diag(
-                Diagnostic::error("INFER_NO_ROWS", format!("table directory {table:?} does not exist")).at(table),
+                Diagnostic::error(
+                    "INFER_NO_ROWS",
+                    format!("table directory {table:?} does not exist"),
+                )
+                .at(table),
                 8,
             ));
         }
@@ -202,7 +227,11 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
     };
     if !metadata.file_type().is_dir() {
         return Err(DbError::from_diag(
-            Diagnostic::error("NON_REGULAR_FILE", "a table path must be a real directory, not a symlink").at(table),
+            Diagnostic::error(
+                "NON_REGULAR_FILE",
+                "a table path must be a real directory, not a symlink",
+            )
+            .at(table),
             8,
         ));
     }
@@ -212,30 +241,52 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
     }
     paths.sort();
     let mut progress = crate::output::Progress::new("inferring", paths.len());
-    let ignores = config.ignore_set().map_err(|error| DbError::new("CONFIG_INVALID", error, 1))?;
+    let ignores = config
+        .ignore_set()
+        .map_err(|error| DbError::new("CONFIG_INVALID", error, 1))?;
     let mut rows = vec![];
     for path in paths {
         progress.advance();
         let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if ignores.is_match(&relative) || ignores.is_match(name) || crate::metadata::is_in_progress_write(&path) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if ignores.is_match(&relative)
+            || ignores.is_match(name)
+            || crate::metadata::is_in_progress_write(&path)
+        {
             continue;
         }
         let md = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
-        let refuse = |code: &str, message: &str| DbError::from_diag(Diagnostic::error(code, message).at(relative.clone()), 8);
+        let refuse = |code: &str, message: &str| {
+            DbError::from_diag(Diagnostic::error(code, message).at(relative.clone()), 8)
+        };
         if md.is_dir() {
-            return Err(refuse("INFER_NESTED_DIRECTORY", "a table directory holds rows, not directories"));
+            return Err(refuse(
+                "INFER_NESTED_DIRECTORY",
+                "a table directory holds rows, not directories",
+            ));
         }
         if !md.is_file() || crate::catalog::has_multiple_links(&md) {
-            return Err(refuse("NON_REGULAR_FILE", "rows are private regular files: no symlinks or hard links"));
+            return Err(refuse(
+                "NON_REGULAR_FILE",
+                "rows are private regular files: no symlinks or hard links",
+            ));
         }
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
-            return Err(refuse("INFER_NON_JSON_FILE", "a table directory holds only .json files"));
+            return Err(refuse(
+                "INFER_NON_JSON_FILE",
+                "a table directory holds only .json files",
+            ));
         }
         if md.len() > config.max_json_file_size {
             return Err(refuse(
                 "RESOURCE_LIMIT",
-                &format!("the file exceeds the {} byte limit", config.max_json_file_size),
+                &format!(
+                    "the file exceeds the {} byte limit",
+                    config.max_json_file_size
+                ),
             ));
         }
         let bytes = fs::read(&path).map_err(|e| DbError::io(&path, e))?;
@@ -243,29 +294,47 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
             if crate::json::is_depth_limit(&error) {
                 return refuse(
                     "RESOURCE_LIMIT",
-                    &format!("JSON nesting exceeds the depth limit {}", config.max_nesting_depth),
+                    &format!(
+                        "JSON nesting exceeds the depth limit {}",
+                        config.max_nesting_depth
+                    ),
                 );
             }
-            let mut diagnostic = Diagnostic::error("INFER_INVALID_JSON", error.to_string()).at(relative.clone());
-            diagnostic.location = Some(crate::diagnostic::Location { line: error.line(), column: error.column() });
-            diagnostic.source_line =
-                String::from_utf8_lossy(&bytes).lines().nth(error.line().saturating_sub(1)).map(String::from);
+            let mut diagnostic =
+                Diagnostic::error("INFER_INVALID_JSON", error.to_string()).at(relative.clone());
+            diagnostic.location = Some(crate::diagnostic::Location {
+                line: error.line(),
+                column: error.column(),
+            });
+            diagnostic.source_line = String::from_utf8_lossy(&bytes)
+                .lines()
+                .nth(error.line().saturating_sub(1))
+                .map(String::from);
             DbError::from_diag(diagnostic, 8)
         })?;
         let Value::Object(obj) = value else {
-            return Err(refuse("INFER_ROOT_NOT_OBJECT", "a row file holds one JSON object"));
+            return Err(refuse(
+                "INFER_ROOT_NOT_OBJECT",
+                "a row file holds one JSON object",
+            ));
         };
         rows.push(Sample {
             path: relative,
-            stem: path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default(),
+            stem: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             obj,
         });
     }
     if rows.is_empty() {
         return Err(DbError::from_diag(
-            Diagnostic::error("INFER_NO_ROWS", format!("table {table:?} holds no .json rows"))
-                .at(table)
-                .help(format!("declare it with `reldir schema new {table}`")),
+            Diagnostic::error(
+                "INFER_NO_ROWS",
+                format!("table {table:?} holds no .json rows"),
+            )
+            .at(table)
+            .help(format!("declare it with `reldir schema new {table}`")),
             8,
         ));
     }
@@ -294,13 +363,20 @@ fn infer_table(
     for name in &names {
         let present: Vec<&Value> = rows.iter().filter_map(|row| row.obj.get(name)).collect();
         let nullable = present.len() != rows.len() || present.iter().any(|value| value.is_null());
-        let values: Vec<&Value> = present.into_iter().filter(|value| !value.is_null()).collect();
-        let inferred = infer_value(name, &values, nullable, strictness, config).map_err(|mut error| {
-            if error.diagnostic.path.is_none() {
-                error.diagnostic.path = rows.iter().find(|row| row.obj.contains_key(name)).map(|row| row.path.clone());
-            }
-            error
-        })?;
+        let values: Vec<&Value> = present
+            .into_iter()
+            .filter(|value| !value.is_null())
+            .collect();
+        let inferred =
+            infer_value(name, &values, nullable, strictness, config).map_err(|mut error| {
+                if error.diagnostic.path.is_none() {
+                    error.diagnostic.path = rows
+                        .iter()
+                        .find(|row| row.obj.contains_key(name))
+                        .map(|row| row.path.clone());
+                }
+                error
+            })?;
         let required = rows.iter().all(|row| row.obj.contains_key(name));
         columns.insert(name.clone(), (inferred, required && !nullable));
     }
@@ -314,7 +390,11 @@ fn infer_table(
     let key_kind = columns[&key[0]].0.kind.clone();
     let mut builder = TableBuilder::new(table);
     for (name, (inferred, required)) in &columns {
-        builder.column(name, inferred.subschema.clone(), *required || key.contains(name));
+        builder.column(
+            name,
+            inferred.subschema.clone(),
+            *required || key.contains(name),
+        );
     }
     builder.primary_key(key.clone());
     if rows.len() >= config.unique_min_rows {
@@ -322,8 +402,10 @@ fn infer_table(
             if key.contains(name) || !required {
                 continue;
             }
-            let distinct: HashSet<String> =
-                rows.iter().map(|row| canonical::compact(row.obj.get(name).unwrap_or(&Value::Null))).collect();
+            let distinct: HashSet<String> = rows
+                .iter()
+                .map(|row| canonical::compact(row.obj.get(name).unwrap_or(&Value::Null)))
+                .collect();
             if distinct.len() == rows.len() {
                 builder.unique(vec![name.clone()]);
             }
@@ -331,11 +413,19 @@ fn infer_table(
     }
     if strictness == Strictness::Strict && rows.len() >= config.unique_min_rows {
         for (name, (inferred, _)) in &columns {
-            let values = || rows.iter().filter_map(|row| row.obj.get(name)).filter(|value| !value.is_null());
+            let values = || {
+                rows.iter()
+                    .filter_map(|row| row.obj.get(name))
+                    .filter(|value| !value.is_null())
+            };
             let quoted = crate::mirror::quote(name);
-            if inferred.kind == ColumnType::Int && values().all(|value| value.as_i64().is_some_and(|v| v >= 0)) {
+            if inferred.kind == ColumnType::Int
+                && values().all(|value| value.as_i64().is_some_and(|v| v >= 0))
+            {
                 builder.check(&format!("{name}_nonnegative"), &format!("{quoted} >= 0"));
-            } else if inferred.kind == ColumnType::String && values().all(|value| value.as_str().is_some_and(|v| !v.is_empty())) {
+            } else if inferred.kind == ColumnType::String
+                && values().all(|value| value.as_str().is_some_and(|v| !v.is_empty()))
+            {
                 builder.check(&format!("{name}_nonempty"), &format!("{quoted} <> ''"));
             }
         }
@@ -352,25 +442,43 @@ fn validate_requested_key(
     let mut seen_names = BTreeSet::new();
     for name in requested {
         if !seen_names.insert(name) {
-            return Err(fail("INFER_NO_PRIMARY_KEY", format!("--pk repeats column {name:?} for table {table}")));
-        }
-        if !columns.contains_key(name) {
-            return Err(fail("INFER_NO_PRIMARY_KEY", format!("--pk names {name:?}, which no row of {table} holds")));
-        }
-        if let Some(row) = rows.iter().find(|row| row.obj.get(name).is_none_or(Value::is_null)) {
             return Err(fail(
                 "INFER_NO_PRIMARY_KEY",
-                format!("--pk column {name:?} is null or absent in {}", row.path.display()),
+                format!("--pk repeats column {name:?} for table {table}"),
+            ));
+        }
+        if !columns.contains_key(name) {
+            return Err(fail(
+                "INFER_NO_PRIMARY_KEY",
+                format!("--pk names {name:?}, which no row of {table} holds"),
+            ));
+        }
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.obj.get(name).is_none_or(Value::is_null))
+        {
+            return Err(fail(
+                "INFER_NO_PRIMARY_KEY",
+                format!(
+                    "--pk column {name:?} is null or absent in {}",
+                    row.path.display()
+                ),
             ));
         }
     }
     let mut seen = BTreeMap::<String, &Sample>::new();
     for row in rows {
-        let key = canonical::compact(&Value::Array(requested.iter().map(|name| row.obj[name].clone()).collect()));
+        let key = canonical::compact(&Value::Array(
+            requested.iter().map(|name| row.obj[name].clone()).collect(),
+        ));
         if let Some(previous) = seen.insert(key.clone(), row) {
             return Err(fail(
                 "INFER_NO_PRIMARY_KEY",
-                format!("--pk is not unique: {key} is in {} and {}", previous.path.display(), row.path.display()),
+                format!(
+                    "--pk is not unique: {key} is in {} and {}",
+                    previous.path.display(),
+                    row.path.display()
+                ),
             ));
         }
     }
@@ -398,9 +506,15 @@ fn infer_value(
 ) -> Result<Inferred> {
     if values.is_empty() {
         if strictness == Strictness::Strict {
-            return Err(fail("INFER_UNTYPED_COLUMN", format!("{name:?} is null or absent in every row")));
+            return Err(fail(
+                "INFER_UNTYPED_COLUMN",
+                format!("{name:?} is null or absent in every row"),
+            ));
         }
-        return Ok(Inferred { kind: ColumnType::Json, subschema: json!({}) });
+        return Ok(Inferred {
+            kind: ColumnType::Json,
+            subschema: json!({}),
+        });
     }
     let kinds: BTreeSet<&str> = values.iter().map(|value| kind_of(value)).collect();
     if kinds.len() > 1 {
@@ -413,13 +527,21 @@ fn infer_value(
                 ),
             ));
         }
-        return Ok(Inferred { kind: ColumnType::Json, subschema: json!({}) });
+        return Ok(Inferred {
+            kind: ColumnType::Json,
+            subschema: json!({}),
+        });
     }
-    let scalar = |kind: ColumnType| Inferred { subschema: subschema(&kind, nullable), kind };
+    let scalar = |kind: ColumnType| Inferred {
+        subschema: subschema(&kind, nullable),
+        kind,
+    };
     Ok(match values[0] {
         Value::Bool(_) => scalar(ColumnType::Bool),
         Value::Number(_) => {
-            if values.iter().all(|value| value.as_i64().is_some() && !value.as_number().is_some_and(|n| n.is_f64())) {
+            if values.iter().all(|value| {
+                value.as_i64().is_some() && !value.as_number().is_some_and(|n| n.is_f64())
+            }) {
                 scalar(ColumnType::Int)
             } else {
                 scalar(ColumnType::Float)
@@ -427,29 +549,49 @@ fn infer_value(
         }
         Value::String(_) => {
             let texts: Vec<&str> = values.iter().filter_map(|value| value.as_str()).collect();
-            if texts.iter().all(|s| s.len() == 36 && uuid::Uuid::parse_str(s).is_ok() && *s == s.to_ascii_lowercase()) {
+            if texts.iter().all(|s| {
+                s.len() == 36 && uuid::Uuid::parse_str(s).is_ok() && *s == s.to_ascii_lowercase()
+            }) {
                 scalar(ColumnType::Uuid)
-            } else if texts.iter().all(|s| s.len() == 26 && ulid::Ulid::from_string(s).is_ok() && *s == s.to_ascii_uppercase()) {
+            } else if texts.iter().all(|s| {
+                s.len() == 26 && ulid::Ulid::from_string(s).is_ok() && *s == s.to_ascii_uppercase()
+            }) {
                 scalar(ColumnType::Ulid)
-            } else if texts.iter().all(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()) {
+            } else if texts
+                .iter()
+                .all(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+            {
                 scalar(ColumnType::Timestamp)
-            } else if texts.iter().all(|s| s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()) {
+            } else if texts
+                .iter()
+                .all(|s| s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+            {
                 scalar(ColumnType::Date)
             } else {
                 let distinct: BTreeSet<&str> = texts.iter().copied().collect();
                 if distinct.len() <= config.enum_max_values && values.len() >= 3 * distinct.len() {
                     let members: Vec<String> = distinct.into_iter().map(String::from).collect();
-                    Inferred { kind: ColumnType::Enum, subschema: enum_subschema(&members, nullable) }
+                    Inferred {
+                        kind: ColumnType::Enum,
+                        subschema: enum_subschema(&members, nullable),
+                    }
                 } else {
                     scalar(ColumnType::String)
                 }
             }
         }
         Value::Array(_) => {
-            let elements: Vec<&Value> = values.iter().flat_map(|value| value.as_array().into_iter().flatten()).collect();
+            let elements: Vec<&Value> = values
+                .iter()
+                .flat_map(|value| value.as_array().into_iter().flatten())
+                .collect();
             let mut schema = subschema(&ColumnType::Array, nullable);
             if !elements.is_empty() {
-                let nonnull: Vec<&Value> = elements.iter().copied().filter(|value| !value.is_null()).collect();
+                let nonnull: Vec<&Value> = elements
+                    .iter()
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .collect();
                 let items = infer_value(
                     &format!("{name}[]"),
                     &nonnull,
@@ -459,20 +601,34 @@ fn infer_value(
                 )?;
                 schema["items"] = items.subschema;
             }
-            Inferred { kind: ColumnType::Array, subschema: schema }
+            Inferred {
+                kind: ColumnType::Array,
+                subschema: schema,
+            }
         }
         Value::Object(_) => {
             let mut keys = indexmap::IndexSet::new();
             for value in values {
-                keys.extend(value.as_object().into_iter().flat_map(|object| object.keys().cloned()));
+                keys.extend(
+                    value
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|object| object.keys().cloned()),
+                );
             }
             let mut properties = Map::new();
             let mut required = vec![];
             for key in keys {
-                let present: Vec<&Value> =
-                    values.iter().filter_map(|value| value.as_object().and_then(|object| object.get(&key))).collect();
+                let present: Vec<&Value> = values
+                    .iter()
+                    .filter_map(|value| value.as_object().and_then(|object| object.get(&key)))
+                    .collect();
                 let everywhere = present.len() == values.len();
-                let nonnull: Vec<&Value> = present.iter().copied().filter(|value| !value.is_null()).collect();
+                let nonnull: Vec<&Value> = present
+                    .iter()
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .collect();
                 let member = infer_value(
                     &format!("{name}.{key}"),
                     &nonnull,
@@ -490,9 +646,15 @@ fn infer_value(
             if !required.is_empty() {
                 schema["required"] = json!(required);
             }
-            Inferred { kind: ColumnType::Object, subschema: schema }
+            Inferred {
+                kind: ColumnType::Object,
+                subschema: schema,
+            }
         }
-        Value::Null => Inferred { kind: ColumnType::Json, subschema: json!({}) },
+        Value::Null => Inferred {
+            kind: ColumnType::Json,
+            subschema: json!({}),
+        },
     })
 }
 
@@ -505,10 +667,16 @@ fn infer_primary_key(
     let mut rejected = vec![];
     for (name, (inferred, _)) in columns {
         if !inferred.kind.is_scalar() {
-            rejected.push(format!("{name}: {} values cannot be a key", inferred.kind.name()));
+            rejected.push(format!(
+                "{name}: {} values cannot be a key",
+                inferred.kind.name()
+            ));
             continue;
         }
-        if let Some(row) = rows.iter().find(|row| row.obj.get(name).is_none_or(Value::is_null)) {
+        if let Some(row) = rows
+            .iter()
+            .find(|row| row.obj.get(name).is_none_or(Value::is_null))
+        {
             rejected.push(format!("{name}: null or absent in {}", row.path.display()));
             continue;
         }
@@ -517,7 +685,11 @@ fn infer_primary_key(
         for row in rows {
             let value = canonical::compact(&row.obj[name]);
             if let Some(previous) = first.insert(value.clone(), row) {
-                duplicate = Some(format!("{value} is in {} and {}", previous.path.display(), row.path.display()));
+                duplicate = Some(format!(
+                    "{value} is in {} and {}",
+                    previous.path.display(),
+                    row.path.display()
+                ));
                 break;
             }
         }
@@ -537,9 +709,10 @@ fn infer_primary_key(
             builder.primary_key(vec![(*name).clone()]);
             builder.column(name, columns[*name].0.subschema.clone(), true);
             match builder.build() {
-                Ok(trial) => rows
-                    .iter()
-                    .all(|row| canonical::filename(&trial, &row.obj).as_deref() == Some(&format!("{}.json", row.stem))),
+                Ok(trial) => rows.iter().all(|row| {
+                    canonical::filename(&trial, &row.obj).as_deref()
+                        == Some(&format!("{}.json", row.stem))
+                }),
                 Err(_) => false,
             }
         })
@@ -557,11 +730,17 @@ fn infer_primary_key(
         1 => Ok(candidates),
         0 => Err(fail(
             "INFER_NO_PRIMARY_KEY",
-            format!("no column of {table} is present, non-null and distinct in every row: {}", rejected.join("; ")),
+            format!(
+                "no column of {table} is present, non-null and distinct in every row: {}",
+                rejected.join("; ")
+            ),
         )),
         _ => Err(fail(
             "INFER_AMBIGUOUS_PRIMARY_KEY",
-            format!("several columns of {table} could be its key: {}; choose one with --pk", candidates.join(", ")),
+            format!(
+                "several columns of {table} could be its key: {}; choose one with --pk",
+                candidates.join(", ")
+            ),
         )),
     }
 }
@@ -587,24 +766,38 @@ mod tests {
             (vec![json!(true), json!(false)], ColumnType::Bool),
             (vec![json!(1), json!(-2)], ColumnType::Int),
             (vec![json!(1.5), json!(2)], ColumnType::Float),
-            (vec![json!("0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e")], ColumnType::Uuid),
+            (
+                vec![json!("0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e")],
+                ColumnType::Uuid,
+            ),
             (vec![json!("01ARZ3NDEKTSV4RRFFQ69G5FAV")], ColumnType::Ulid),
             (vec![json!("2026-09-14T10:00:00Z")], ColumnType::Timestamp),
             (vec![json!("2026-09-14")], ColumnType::Date),
             (vec![json!("free form text")], ColumnType::String),
         ];
         for (items, expected) in cases {
-            assert_eq!(infer(&items, false, Strictness::Balanced).unwrap().kind, expected, "{items:?}");
+            assert_eq!(
+                infer(&items, false, Strictness::Balanced).unwrap().kind,
+                expected,
+                "{items:?}"
+            );
         }
     }
 
     #[test]
     fn test1039_enum_inference_requires_supporting_evidence() {
-        let plenty: Vec<Value> = (0..9).map(|i| json!(if i % 3 == 0 { "a" } else { "b" })).collect();
+        let plenty: Vec<Value> = (0..9)
+            .map(|i| json!(if i % 3 == 0 { "a" } else { "b" }))
+            .collect();
         let column = infer(&plenty, false, Strictness::Balanced).unwrap();
         assert_eq!(column.kind, ColumnType::Enum);
         assert_eq!(column.subschema["enum"], json!(["a", "b"]));
-        assert_eq!(infer(&[json!("a"), json!("b")], false, Strictness::Balanced).unwrap().kind, ColumnType::String);
+        assert_eq!(
+            infer(&[json!("a"), json!("b")], false, Strictness::Balanced)
+                .unwrap()
+                .kind,
+            ColumnType::String
+        );
     }
 
     #[test]
@@ -615,15 +808,32 @@ mod tests {
             assert_eq!(error.diagnostic.code, "INFER_TYPE_CONFLICT");
             assert_eq!(error.exit, 8);
         }
-        assert_eq!(infer(&mixed, false, Strictness::Loose).unwrap().kind, ColumnType::Json);
+        assert_eq!(
+            infer(&mixed, false, Strictness::Loose).unwrap().kind,
+            ColumnType::Json
+        );
     }
 
     #[test]
     fn test1043_nested_shapes_are_described_with_their_required_members() {
-        let column = infer(&[json!({"a": 1, "b": "x"}), json!({"a": 2})], false, Strictness::Balanced).unwrap();
+        let column = infer(
+            &[json!({"a": 1, "b": "x"}), json!({"a": 2})],
+            false,
+            Strictness::Balanced,
+        )
+        .unwrap();
         assert_eq!(column.subschema["properties"]["a"]["type"], "integer");
-        assert_eq!(column.subschema["required"], json!(["a"]), "b is absent from one row");
-        let array = infer(&[json!([{"k": "v"}]), json!([])], true, Strictness::Balanced).unwrap();
+        assert_eq!(
+            column.subschema["required"],
+            json!(["a"]),
+            "b is absent from one row"
+        );
+        let array = infer(
+            &[json!([{"k": "v"}]), json!([])],
+            true,
+            Strictness::Balanced,
+        )
+        .unwrap();
         assert_eq!(array.subschema["type"], json!(["array", "null"]));
         assert_eq!(array.subschema["items"]["required"], json!(["k"]));
     }
@@ -634,21 +844,55 @@ mod tests {
     fn test2180_inferred_schemas_accept_every_row_they_were_inferred_from() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        write(root, "users/u1.json", json!({"id": "u1", "name": "A", "tags": ["x"], "meta": {"k": 1}}));
-        write(root, "users/u2.json", json!({"id": "u2", "tags": [], "meta": null}));
-        write(root, "posts/p1.json", json!({"id": "p1", "user_id": "u1", "reviewers": ["u1", "u2"]}));
-        write(root, "posts/p2.json", json!({"id": "p2", "user_id": "u2", "reviewers": []}));
-        let schemas =
-            infer_all(root, &["posts".into(), "users".into()], Strictness::Balanced, &Config::default(), None, None).unwrap();
+        write(
+            root,
+            "users/u1.json",
+            json!({"id": "u1", "name": "A", "tags": ["x"], "meta": {"k": 1}}),
+        );
+        write(
+            root,
+            "users/u2.json",
+            json!({"id": "u2", "tags": [], "meta": null}),
+        );
+        write(
+            root,
+            "posts/p1.json",
+            json!({"id": "p1", "user_id": "u1", "reviewers": ["u1", "u2"]}),
+        );
+        write(
+            root,
+            "posts/p2.json",
+            json!({"id": "p2", "user_id": "u2", "reviewers": []}),
+        );
+        let schemas = infer_all(
+            root,
+            &["posts".into(), "users".into()],
+            Strictness::Balanced,
+            &Config::default(),
+            None,
+            None,
+        )
+        .unwrap();
         for (table, schema) in &schemas {
             for entry in fs::read_dir(root.join(table)).unwrap() {
                 let value = crate::json::parse(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
-                assert!(schema.validator().check(&value).is_empty(), "{table}: {value}");
+                assert!(
+                    schema.validator().check(&value).is_empty(),
+                    "{table}: {value}"
+                );
             }
         }
         let posts = &schemas["posts"];
-        let declared: Vec<String> = posts.foreign_keys().iter().map(|fk| fk.from()[0].to_string()).collect();
-        assert_eq!(declared, vec!["user_id".to_string()], "only the conventionally named reference is declared");
+        let declared: Vec<String> = posts
+            .foreign_keys()
+            .iter()
+            .map(|fk| fk.from()[0].to_string())
+            .collect();
+        assert_eq!(
+            declared,
+            vec!["user_id".to_string()],
+            "only the conventionally named reference is declared"
+        );
     }
 
     #[test]
@@ -657,7 +901,15 @@ mod tests {
         let root = directory.path();
         write(root, "things/alpha.json", json!({"slug": "alpha", "n": 1}));
         write(root, "things/beta.json", json!({"slug": "beta", "n": 2}));
-        let schemas = infer_all(root, &["things".into()], Strictness::Balanced, &Config::default(), None, None).unwrap();
+        let schemas = infer_all(
+            root,
+            &["things".into()],
+            Strictness::Balanced,
+            &Config::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(schemas["things"].primary_key(), ["slug".to_string()]);
     }
 
@@ -667,11 +919,29 @@ mod tests {
         let root = directory.path();
         write(root, "things/a.json", json!({"x": 1, "tags": []}));
         write(root, "things/b.json", json!({"x": 1, "tags": []}));
-        let error = infer_all(root, &["things".into()], Strictness::Balanced, &Config::default(), None, None)
-            .err()
-            .unwrap();
+        let error = infer_all(
+            root,
+            &["things".into()],
+            Strictness::Balanced,
+            &Config::default(),
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.diagnostic.code, "INFER_NO_PRIMARY_KEY");
-        assert!(error.diagnostic.message.contains("x: 1 is in"), "{}", error.diagnostic.message);
-        assert!(error.diagnostic.message.contains("tags: array values cannot be a key"), "{}", error.diagnostic.message);
+        assert!(
+            error.diagnostic.message.contains("x: 1 is in"),
+            "{}",
+            error.diagnostic.message
+        );
+        assert!(
+            error
+                .diagnostic
+                .message
+                .contains("tags: array values cannot be a key"),
+            "{}",
+            error.diagnostic.message
+        );
     }
 }

@@ -405,7 +405,10 @@ fn nested_extension(value: &Value, pointer: &str, root: bool, out: &mut Vec<Diag
                     out.push(diagnostic);
                 }
                 // Instance data and the extension itself are not subschemas.
-                if matches!(key.as_str(), "enum" | "const" | "default" | "examples" | EXTENSION) {
+                if matches!(
+                    key.as_str(),
+                    "enum" | "const" | "default" | "examples" | EXTENSION
+                ) {
                     continue;
                 }
                 nested_extension(child, &at, false, out);
@@ -423,20 +426,39 @@ fn nested_extension(value: &Value, pointer: &str, root: bool, out: &mut Vec<Diag
 /// The member name a `propertyNames` failure is about, however the evaluation
 /// reached it: reported either as the wrapping `propertyNames` error or as the
 /// inner failure whose instance is the name itself.
-fn unknown_member(error: &jsonschema::ValidationError<'_>, pointer: &str, document: &Value) -> Option<String> {
+fn unknown_member(
+    error: &jsonschema::ValidationError<'_>,
+    pointer: &str,
+    document: &Value,
+) -> Option<String> {
     use jsonschema::error::ValidationErrorKind as Kind;
     let named = |name: &str| {
-        document.pointer(pointer).and_then(Value::as_object).is_some_and(|object| object.contains_key(name))
+        document
+            .pointer(pointer)
+            .and_then(Value::as_object)
+            .is_some_and(|object| object.contains_key(name))
     };
     match error.kind() {
-        Kind::PropertyNames { error: inner } => inner.instance().as_str().filter(|name| named(name)).map(String::from),
-        Kind::AnyOf { .. } => error.instance().as_str().filter(|name| named(name)).map(String::from),
+        Kind::PropertyNames { error: inner } => inner
+            .instance()
+            .as_str()
+            .filter(|name| named(name))
+            .map(String::from),
+        Kind::AnyOf { .. } => error
+            .instance()
+            .as_str()
+            .filter(|name| named(name))
+            .map(String::from),
         _ => None,
     }
 }
 
 /// One validation error against the dialect, stated for a schema author.
-fn describe(error: &jsonschema::ValidationError<'_>, pointer: &str, document: &Value) -> Diagnostic {
+fn describe(
+    error: &jsonschema::ValidationError<'_>,
+    pointer: &str,
+    document: &Value,
+) -> Diagnostic {
     use jsonschema::error::ValidationErrorKind as Kind;
     let at = if pointer.is_empty() { "/" } else { pointer };
     match error.kind() {
@@ -466,7 +488,9 @@ fn describe(error: &jsonschema::ValidationError<'_>, pointer: &str, document: &V
             "SCHEMA_MISSING_REQUIRED",
             format!(
                 "{at}: {} is required",
-                property.as_str().map_or_else(|| property.to_string(), |p| format!("{p:?}"))
+                property
+                    .as_str()
+                    .map_or_else(|| property.to_string(), |p| format!("{p:?}"))
             ),
         ),
         Kind::AdditionalProperties { unexpected } => Diagnostic::error(
@@ -548,7 +572,10 @@ mod tests {
             .find(|d| d.code == "SCHEMA_UNKNOWN_KEY")
             .unwrap_or_else(|| panic!("a typo deep in a composition is caught: {found:?}"));
         assert!(hit.message.contains("\"required\""), "{}", hit.message);
-        assert_eq!(hit.pointer.as_deref(), Some("/properties/rules/items/oneOf/0"));
+        assert_eq!(
+            hit.pointer.as_deref(),
+            Some("/properties/rules/items/oneOf/0")
+        );
 
         // Third-party annotations remain welcome; reldir's own namespace does not
         // tolerate a typo.
@@ -562,16 +589,37 @@ mod tests {
     #[test]
     fn test2022_table_roots_must_state_what_a_table_needs() {
         for (label, mutate) in [
-            ("no x-reldir", (|d: &mut Value| { d.as_object_mut().unwrap().remove("x-reldir"); }) as fn(&mut Value)),
-            ("no additionalProperties", |d: &mut Value| { d.as_object_mut().unwrap().remove("additionalProperties"); }),
-            ("wrong dialect", |d: &mut Value| d["$schema"] = json!("https://json-schema.org/draft/2020-12/schema")),
+            (
+                "no x-reldir",
+                (|d: &mut Value| {
+                    d.as_object_mut().unwrap().remove("x-reldir");
+                }) as fn(&mut Value),
+            ),
+            ("no additionalProperties", |d: &mut Value| {
+                d.as_object_mut().unwrap().remove("additionalProperties");
+            }),
+            ("wrong dialect", |d: &mut Value| {
+                d["$schema"] = json!("https://json-schema.org/draft/2020-12/schema")
+            }),
             ("array root", |d: &mut Value| d["type"] = json!("array")),
-            ("unknown x-reldir key", |d: &mut Value| d["x-reldir"]["cascadeEverything"] = json!(true)),
-            ("bad action", |d: &mut Value| d["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode")),
-            ("two targets", |d: &mut Value| d["x-reldir"]["foreignKeys"][0]["to"] = json!({"table": "a", "domain": "b"})),
-            ("nested x-reldir", |d: &mut Value| d["properties"]["id"]["x-reldir"] = json!({})),
-            ("bad tag", |d: &mut Value| d["properties"]["id"]["x-reldir-type"] = json!("bogus")),
-            ("negative bound", |d: &mut Value| d["properties"]["email"]["minLength"] = json!(-1)),
+            ("unknown x-reldir key", |d: &mut Value| {
+                d["x-reldir"]["cascadeEverything"] = json!(true)
+            }),
+            ("bad action", |d: &mut Value| {
+                d["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode")
+            }),
+            ("two targets", |d: &mut Value| {
+                d["x-reldir"]["foreignKeys"][0]["to"] = json!({"table": "a", "domain": "b"})
+            }),
+            ("nested x-reldir", |d: &mut Value| {
+                d["properties"]["id"]["x-reldir"] = json!({})
+            }),
+            ("bad tag", |d: &mut Value| {
+                d["properties"]["id"]["x-reldir-type"] = json!("bogus")
+            }),
+            ("negative bound", |d: &mut Value| {
+                d["properties"]["email"]["minLength"] = json!(-1)
+            }),
         ] {
             let mut document = users();
             mutate(&mut document);

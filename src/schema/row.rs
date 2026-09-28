@@ -38,7 +38,10 @@ impl RowValidator {
     /// Compile a table document. A document that cannot be compiled -- an
     /// uncompilable pattern, a `$ref` that points outside it -- is a schema
     /// fault, reported against the schema.
-    pub fn compile(document: &Value, columns: &IndexMap<String, Column>) -> Result<Self, Diagnostic> {
+    pub fn compile(
+        document: &Value,
+        columns: &IndexMap<String, Column>,
+    ) -> Result<Self, Box<Diagnostic>> {
         let compiled = jsonschema::options()
             .with_draft(jsonschema::Draft::Draft202012)
             .should_validate_formats(true)
@@ -48,7 +51,7 @@ impl RowValidator {
                 let external = text.contains("not present in a registry")
                     || text.contains("resolve external")
                     || text.contains("retrieving it failed");
-                if external {
+                Box::new(if external {
                     Diagnostic::error(
                         "SCHEMA_REF_EXTERNAL",
                         format!(
@@ -60,7 +63,7 @@ impl RowValidator {
                 } else {
                     Diagnostic::error("SCHEMA_GRAMMAR", format!("the schema does not compile: {text}"))
                         .pointer(error.instance_path().to_string())
-                }
+                })
             })?;
         Ok(Self {
             compiled,
@@ -100,12 +103,15 @@ impl RowValidator {
         let target = self.columns.get(column)?;
         let candidate = crate::value::lossless_convert(current, target.kind())?;
         let mut replaced = row.clone();
-        replaced.as_object_mut()?.insert(column.to_string(), candidate.clone());
+        replaced
+            .as_object_mut()?
+            .insert(column.to_string(), candidate.clone());
         let pointer = format!("/{}", super::path::escape_pointer(column));
-        let still_wrong = self
-            .check(&replaced)
-            .iter()
-            .any(|d| d.pointer.as_deref().is_some_and(|p| p == pointer || p.starts_with(&format!("{pointer}/"))));
+        let still_wrong = self.check(&replaced).iter().any(|d| {
+            d.pointer
+                .as_deref()
+                .is_some_and(|p| p == pointer || p.starts_with(&format!("{pointer}/")))
+        });
         (!still_wrong).then_some(candidate)
     }
 }
@@ -127,7 +133,10 @@ fn describe(error: &jsonschema::ValidationError<'_>, row: &Value) -> Vec<Diagnos
     };
     match error.kind() {
         Kind::Required { property } if top_level => {
-            let name = property.as_str().map(String::from).unwrap_or_else(|| property.to_string());
+            let name = property
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| property.to_string());
             let mut diagnostic = Diagnostic::error(
                 "ROW_MISSING_FIELD",
                 format!("required field {name:?} is absent"),
@@ -159,18 +168,20 @@ fn describe(error: &jsonschema::ValidationError<'_>, row: &Value) -> Vec<Diagnos
                 format!("{:?} cannot be null", column.clone().unwrap_or_default()),
             ))]
         }
-        Kind::Type { kind } => vec![with_context(
-            Diagnostic::error(
-                "TYPE_MISMATCH",
-                format!(
-                    "{} is {}, but the schema requires {kind:?}",
-                    at(&pointer),
-                    json_kind(error.instance())
-                ),
+        Kind::Type { kind } => vec![
+            with_context(
+                Diagnostic::error(
+                    "TYPE_MISMATCH",
+                    format!(
+                        "{} is {}, but the schema requires {kind:?}",
+                        at(&pointer),
+                        json_kind(error.instance())
+                    ),
+                )
+                .observed(crate::canonical::compact(error.instance())),
             )
-            .observed(crate::canonical::compact(error.instance())),
-        )
-        .fix("FIX_COERCE_VALUE")],
+            .fix("FIX_COERCE_VALUE"),
+        ],
         Kind::OneOfMultipleValid { context } => {
             let matched: Vec<String> = context
                 .iter()
@@ -190,7 +201,11 @@ fn describe(error: &jsonschema::ValidationError<'_>, row: &Value) -> Vec<Diagnos
             ))]
         }
         Kind::OneOfNotValid { context } | Kind::AnyOf { context } => {
-            let keyword = if matches!(error.kind(), Kind::AnyOf { .. }) { "anyOf" } else { "oneOf" };
+            let keyword = if matches!(error.kind(), Kind::AnyOf { .. }) {
+                "anyOf"
+            } else {
+                "oneOf"
+            };
             let reasons: Vec<String> = context
                 .iter()
                 .enumerate()
@@ -212,10 +227,9 @@ fn describe(error: &jsonschema::ValidationError<'_>, row: &Value) -> Vec<Diagnos
             ))]
         }
         _ => vec![with_context(
-            Diagnostic::error("SCHEMA_VIOLATION", format!("{}: {error}", at(&pointer)))
-                .observed(crate::canonical::compact(
-                    row.pointer(&pointer).unwrap_or(error.instance()),
-                )),
+            Diagnostic::error("SCHEMA_VIOLATION", format!("{}: {error}", at(&pointer))).observed(
+                crate::canonical::compact(row.pointer(&pointer).unwrap_or(error.instance())),
+            ),
         )],
     }
 }
@@ -241,7 +255,9 @@ fn json_kind(value: &Value) -> &'static str {
 }
 
 fn lexical_row(row: &Value, columns: &IndexMap<String, Column>, out: &mut Vec<Diagnostic>) {
-    let Some(object) = row.as_object() else { return };
+    let Some(object) = row.as_object() else {
+        return;
+    };
     for (name, column) in columns {
         if let Some(value) = object.get(name) {
             let pointer = format!("/{}", super::path::escape_pointer(name));
@@ -310,7 +326,9 @@ fn lexical(value: &Value, column: &Column, pointer: &str, field: &str, out: &mut
         ColumnType::Bytes => {
             use base64::Engine;
             if let Some(text) = value.as_str()
-                && base64::engine::general_purpose::STANDARD.decode(text).is_err()
+                && base64::engine::general_purpose::STANDARD
+                    .decode(text)
+                    .is_err()
             {
                 out.push(refuse(format!("{} is not standard base64", at(pointer))));
             }
@@ -365,7 +383,11 @@ fn key_collisions(value: &Value, pointer: &str, out: &mut Vec<Diagnostic>) {
                 }
             }
             for (key, child) in members {
-                key_collisions(child, &format!("{pointer}/{}", super::path::escape_pointer(key)), out);
+                key_collisions(
+                    child,
+                    &format!("{pointer}/{}", super::path::escape_pointer(key)),
+                    out,
+                );
             }
         }
         Value::Array(items) => {
@@ -437,8 +459,14 @@ mod tests {
     /// trigger was refused, because the alternatives lost their `required`.
     #[test]
     fn test2060_one_trigger_per_rule_is_valid_and_two_or_none_are_not() {
-        assert!(codes(json!({"id": "a", "rules": [{"message": "m", "when_choice_index": 1}]})).is_empty());
-        assert!(codes(json!({"id": "a", "rules": [{"message": "m", "when_incorrect": true}]})).is_empty());
+        assert!(
+            codes(json!({"id": "a", "rules": [{"message": "m", "when_choice_index": 1}]}))
+                .is_empty()
+        );
+        assert!(
+            codes(json!({"id": "a", "rules": [{"message": "m", "when_incorrect": true}]}))
+                .is_empty()
+        );
 
         let both = items()
             .validator()
@@ -446,33 +474,61 @@ mod tests {
         assert_eq!(both.len(), 1);
         assert_eq!(both[0].code, "SCHEMA_VIOLATION");
         assert_eq!(both[0].pointer.as_deref(), Some("/rules/0"));
-        assert!(both[0].message.contains("(0, 1)"), "names the matching alternatives: {}", both[0].message);
-        assert!(both[0].fixes.is_empty(), "no coercion answers a composition miss");
+        assert!(
+            both[0].message.contains("(0, 1)"),
+            "names the matching alternatives: {}",
+            both[0].message
+        );
+        assert!(
+            both[0].fixes.is_empty(),
+            "no coercion answers a composition miss"
+        );
 
         let none = codes(json!({"id": "a", "rules": [{"message": "m"}]}));
-        assert_eq!(none, vec![("SCHEMA_VIOLATION".into(), Some("/rules/0".into()))]);
+        assert_eq!(
+            none,
+            vec![("SCHEMA_VIOLATION".into(), Some("/rules/0".into()))]
+        );
     }
 
     #[test]
     fn test2061_root_faults_get_their_own_codes() {
-        assert_eq!(codes(json!({})), vec![("ROW_MISSING_FIELD".into(), Some(String::new()))]);
+        assert_eq!(
+            codes(json!({})),
+            vec![("ROW_MISSING_FIELD".into(), Some(String::new()))]
+        );
         assert_eq!(
             codes(json!({"id": "a", "emial": 1})),
             vec![("ROW_UNKNOWN_FIELD".into(), Some("/emial".into()))]
         );
-        assert_eq!(codes(json!({"id": null})), vec![("NOT_NULL_VIOLATION".into(), Some("/id".into()))]);
-        assert_eq!(codes(json!({"id": 5})), vec![("TYPE_MISMATCH".into(), Some("/id".into()))]);
+        assert_eq!(
+            codes(json!({"id": null})),
+            vec![("NOT_NULL_VIOLATION".into(), Some("/id".into()))]
+        );
+        assert_eq!(
+            codes(json!({"id": 5})),
+            vec![("TYPE_MISMATCH".into(), Some("/id".into()))]
+        );
         // Conditionals are enforced: an `x` must carry `n`.
-        assert_eq!(codes(json!({"id": "x"})), vec![("ROW_MISSING_FIELD".into(), Some(String::new()))]);
+        assert_eq!(
+            codes(json!({"id": "x"})),
+            vec![("ROW_MISSING_FIELD".into(), Some(String::new()))]
+        );
     }
 
     #[test]
     fn test2062_lexical_types_are_enforced_where_json_schema_is_silent() {
         // JSON Schema accepts 1.0 as an integer; reldir's int is lexical.
-        assert_eq!(codes(json!({"id": "a", "n": 1.0})), vec![("TYPE_MISMATCH".into(), Some("/n".into()))]);
+        assert_eq!(
+            codes(json!({"id": "a", "n": 1.0})),
+            vec![("TYPE_MISMATCH".into(), Some("/n".into()))]
+        );
         assert_eq!(
             codes(json!({"id": "a", "rules": [{"message": "m", "when_choice_index": 2.0}]})),
-            vec![("TYPE_MISMATCH".into(), Some("/rules/0/when_choice_index".into()))]
+            vec![(
+                "TYPE_MISMATCH".into(),
+                Some("/rules/0/when_choice_index".into())
+            )]
         );
         assert!(codes(json!({"id": "a", "n": 7})).is_empty());
         // Beyond the signed 64-bit range is not an int.
@@ -497,8 +553,18 @@ mod tests {
     #[test]
     fn test2064_a_coercion_is_offered_only_when_it_satisfies_the_column() {
         let schema = items();
-        assert_eq!(schema.validator().coercion(&json!({"id": "a", "n": "7"}), "n"), Some(json!(7)));
+        assert_eq!(
+            schema
+                .validator()
+                .coercion(&json!({"id": "a", "n": "7"}), "n"),
+            Some(json!(7))
+        );
         // "07" would change the written value, so no conversion is lossless.
-        assert_eq!(schema.validator().coercion(&json!({"id": "a", "n": "07"}), "n"), None);
+        assert_eq!(
+            schema
+                .validator()
+                .coercion(&json!({"id": "a", "n": "07"}), "n"),
+            None
+        );
     }
 }

@@ -104,7 +104,9 @@ impl RefPath {
     /// Whether the path visits array elements, so one row can hold many
     /// references through it.
     pub fn iterates(&self) -> bool {
-        self.steps.iter().any(|step| !matches!(step, Step::Member(_)))
+        self.steps
+            .iter()
+            .any(|step| !matches!(step, Step::Member(_)))
     }
 
     /// The same path with its first member renamed. Used when a column is
@@ -382,10 +384,9 @@ impl Parser<'_> {
             }
         }
         let start = self.at;
-        while self
-            .peek()
-            .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E'))
-        {
+        while self.peek().is_some_and(|byte| {
+            byte.is_ascii_digit() || matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E')
+        }) {
             self.at += 1;
         }
         if start == self.at {
@@ -468,7 +469,9 @@ mod tests {
 
         let tags: Vec<_> = RefPath::parse("tags[]").unwrap().occurrences(&data);
         assert_eq!(
-            tags.iter().map(|o| (o.pointer.as_str(), o.value.as_str().unwrap())).collect::<Vec<_>>(),
+            tags.iter()
+                .map(|o| (o.pointer.as_str(), o.value.as_str().unwrap()))
+                .collect::<Vec<_>>(),
             vec![("/tags/0", "a"), ("/tags/2", "b")]
         );
         assert_eq!(tags[1].element.as_deref(), Some("/tags/2"));
@@ -477,8 +480,14 @@ mod tests {
             .unwrap()
             .occurrences(&data);
         assert_eq!(
-            lessons.iter().map(|o| o.pointer.as_str()).collect::<Vec<_>>(),
-            vec!["/modules/0/lessons/0/lesson_ref", "/modules/1/lessons/0/lesson_ref"]
+            lessons
+                .iter()
+                .map(|o| o.pointer.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/modules/0/lessons/0/lesson_ref",
+                "/modules/1/lessons/0/lesson_ref"
+            ]
         );
         // The innermost array element is what a removal takes out.
         assert_eq!(lessons[0].element.as_deref(), Some("/modules/0/lessons/0"));
@@ -487,17 +496,27 @@ mod tests {
             .unwrap()
             .occurrences(&data);
         assert_eq!(
-            requires.iter().map(|o| o.value.as_str().unwrap()).collect::<Vec<_>>(),
+            requires
+                .iter()
+                .map(|o| o.value.as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec!["x", "z"]
         );
         assert_eq!(requires[1].element.as_deref(), Some("/relations/2"));
 
-        let rubric = RefPath::parse("scoring.rubric_ref").unwrap().occurrences(&data);
+        let rubric = RefPath::parse("scoring.rubric_ref")
+            .unwrap()
+            .occurrences(&data);
         assert_eq!(rubric.len(), 1);
         assert_eq!(rubric[0].element, None, "no array was crossed");
 
         // A path whose column is absent reaches nothing.
-        assert!(RefPath::parse("missing[]").unwrap().occurrences(&data).is_empty());
+        assert!(
+            RefPath::parse("missing[]")
+                .unwrap()
+                .occurrences(&data)
+                .is_empty()
+        );
     }
 
     #[test]

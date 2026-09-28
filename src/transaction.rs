@@ -96,7 +96,9 @@ pub fn check_plan(changes: &[Change], max_transaction_size: u64) -> Result<()> {
     if bytes > max_transaction_size {
         return Err(DbError::new(
             "RESOURCE_LIMIT",
-            format!("the transaction stages {bytes} bytes, beyond the {max_transaction_size} byte limit"),
+            format!(
+                "the transaction stages {bytes} bytes, beyond the {max_transaction_size} byte limit"
+            ),
             2,
         ));
     }
@@ -105,7 +107,13 @@ pub fn check_plan(changes: &[Change], max_transaction_size: u64) -> Result<()> {
 
 /// Commit a plan through the recoverable protocol. The caller holds the writer
 /// lock and has validated the state the plan produces.
-pub fn journaled(fs: &dyn Fs, root: &Path, id: &str, origin: &str, changes: &[Change]) -> Result<()> {
+pub fn journaled(
+    fs: &dyn Fs,
+    root: &Path,
+    id: &str,
+    origin: &str,
+    changes: &[Change],
+) -> Result<()> {
     if changes.is_empty() {
         return Ok(());
     }
@@ -143,11 +151,15 @@ pub fn journaled(fs: &dyn Fs, root: &Path, id: &str, origin: &str, changes: &[Ch
     bytes.push(b'\n');
     let journal_path = dir.join("journal.json");
     let journal_temp = dir.join("journal.json.tmp");
-    fs.write(&journal_temp, &bytes).map_err(|e| io(&journal_temp, e))?;
-    fs.sync_file(&journal_temp).map_err(|e| io(&journal_temp, e))?;
-    fs.rename(&journal_temp, &journal_path).map_err(|e| io(&journal_path, e))?;
+    fs.write(&journal_temp, &bytes)
+        .map_err(|e| io(&journal_temp, e))?;
+    fs.sync_file(&journal_temp)
+        .map_err(|e| io(&journal_temp, e))?;
+    fs.rename(&journal_temp, &journal_path)
+        .map_err(|e| io(&journal_path, e))?;
     fs.sync_dir(&dir).map_err(|e| io(&dir, e))?;
-    fs.sync_dir(&transactions).map_err(|e| io(&transactions, e))?;
+    fs.sync_dir(&transactions)
+        .map_err(|e| io(&transactions, e))?;
     let marker = dir.join("COMMITTING");
     fs.write(&marker, b"commit\n").map_err(|e| io(&marker, e))?;
     fs.sync_file(&marker).map_err(|e| io(&marker, e))?;
@@ -173,7 +185,10 @@ fn apply(fs: &dyn Fs, root: &Path, dir: &Path, journal: &Journal) -> Result<()> 
                     ))
                 })?;
                 ensure_directory(fs, root, &parent)?;
-                if fs.metadata(&target).is_ok_and(|meta| meta.kind == Kind::Dir) {
+                if fs
+                    .metadata(&target)
+                    .is_ok_and(|meta| meta.kind == Kind::Dir)
+                {
                     fs.remove_dir_all(&target).map_err(|e| io(&target, e))?;
                 }
                 let temp = target.with_extension(format!("reldir-tmp-{}", journal.id));
@@ -252,13 +267,18 @@ fn ensure_directory(fs: &dyn Fs, root: &Path, directory: &Path) -> Result<()> {
 fn validate_journal(dir: &Path, journal: &Journal) -> Result<()> {
     let directory_id = dir.file_name().and_then(|name| name.to_str());
     if uuid::Uuid::parse_str(&journal.id).is_err() || directory_id != Some(journal.id.as_str()) {
-        return Err(incomplete("a transaction journal's id does not match its directory"));
+        return Err(incomplete(
+            "a transaction journal's id does not match its directory",
+        ));
     }
     if !matches!(
         journal.origin.as_str(),
         "internal" | "recovery" | "repair" | "migration" | "import" | "snapshot_restore"
     ) {
-        return Err(incomplete(format!("a transaction names the invalid origin {:?}", journal.origin)));
+        return Err(incomplete(format!(
+            "a transaction names the invalid origin {:?}",
+            journal.origin
+        )));
     }
     if journal.changes.is_empty() {
         return Err(incomplete("a transaction journal lists no changes"));
@@ -267,10 +287,16 @@ fn validate_journal(dir: &Path, journal: &Journal) -> Result<()> {
     let mut stages = BTreeSet::new();
     for change in &journal.changes {
         safe_relative(&change.path).map_err(|error| {
-            incomplete(format!("unsafe path in a transaction journal: {}", error.diagnostic.message))
+            incomplete(format!(
+                "unsafe path in a transaction journal: {}",
+                error.diagnostic.message
+            ))
         })?;
         if !paths.insert(change.path.clone()) {
-            return Err(incomplete(format!("a transaction repeats {}", change.path.display())));
+            return Err(incomplete(format!(
+                "a transaction repeats {}",
+                change.path.display()
+            )));
         }
         if let Some(stage) = &change.stage {
             let stage_path = Path::new(stage);
@@ -278,7 +304,9 @@ fn validate_journal(dir: &Path, journal: &Journal) -> Result<()> {
                 || !matches!(stage_path.components().next(), Some(Component::Normal(_)))
                 || !stages.insert(stage)
             {
-                return Err(incomplete(format!("a transaction has an unsafe or repeated staged object {stage:?}")));
+                return Err(incomplete(format!(
+                    "a transaction has an unsafe or repeated staged object {stage:?}"
+                )));
             }
         }
     }
@@ -308,7 +336,10 @@ pub fn pending(fs: &dyn Fs, root: &Path) -> Result<Pending> {
     for entry in entries {
         let meta = fs.metadata(&entry).map_err(|e| io(&entry, e))?;
         if meta.kind != Kind::Dir {
-            return Err(incomplete(format!("transaction entry {} is not a directory", entry.display())));
+            return Err(incomplete(format!(
+                "transaction entry {} is not a directory",
+                entry.display()
+            )));
         }
         if fs.metadata(&entry.join("COMMITTING")).is_ok() {
             return Ok(Pending::Materialising);
@@ -333,15 +364,24 @@ pub fn recover(fs: &dyn Fs, root: &Path) -> Result<Recovered> {
     let transactions = store(root);
     let entries = match fs.read_dir(&transactions) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Recovered::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Recovered::default());
+        }
         Err(error) => return Err(io(&transactions, error)),
     };
     let mut outcome = Recovered::default();
     for dir in entries {
-        let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         let meta = fs.metadata(&dir).map_err(|e| io(&dir, e))?;
         if meta.kind != Kind::Dir {
-            return Err(incomplete(format!("transaction entry {} is not a directory", dir.display())));
+            return Err(incomplete(format!(
+                "transaction entry {} is not a directory",
+                dir.display()
+            )));
         }
         let journal_path = dir.join("journal.json");
         let committing = fs.metadata(&dir.join("COMMITTING")).is_ok();
@@ -369,7 +409,8 @@ pub fn recover(fs: &dyn Fs, root: &Path) -> Result<Recovered> {
             }
             (_, false) => {
                 fs.remove_dir_all(&dir).map_err(|e| io(&dir, e))?;
-                fs.sync_dir(&transactions).map_err(|e| io(&transactions, e))?;
+                fs.sync_dir(&transactions)
+                    .map_err(|e| io(&transactions, e))?;
                 outcome.discarded.push(id);
             }
         }
@@ -383,16 +424,25 @@ pub fn recover(fs: &dyn Fs, root: &Path) -> Result<Recovered> {
 pub fn safe_relative(path: &Path) -> Result<()> {
     let escapes = path.is_absolute()
         || path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_) | Component::CurDir));
+        || path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+                    | Component::CurDir
+            )
+        });
     let metadata = path.starts_with(".db")
         && path != Path::new(".db/config")
         && !(path.parent() == Some(Path::new(".db/schema"))
             && path.extension().and_then(|value| value.to_str()) == Some("json"));
     if escapes || metadata {
         return Err(DbError::from_diag(
-            Diagnostic::error("PATH_VIOLATION", format!("{} is not a path a transaction may write", path.display())),
+            Diagnostic::error(
+                "PATH_VIOLATION",
+                format!("{} is not a path a transaction may write", path.display()),
+            ),
             2,
         ));
     }
@@ -411,16 +461,25 @@ mod tests {
         let sim = Sim::new();
         sim.seed(Path::new("/db/t/a.json"), b"A1");
         sim.seed(Path::new("/db/t/b.json"), b"B1");
-        sim.create_dir_all(Path::new("/db/.db/transactions")).unwrap();
+        sim.create_dir_all(Path::new("/db/.db/transactions"))
+            .unwrap();
         sim.sync_dir(Path::new("/db/.db")).unwrap();
         sim
     }
 
     fn plan() -> Vec<Change> {
         vec![
-            Change::Write { path: "t/a.json".into(), bytes: b"A2".to_vec() },
-            Change::Delete { path: "t/b.json".into() },
-            Change::Write { path: "u/c.json".into(), bytes: b"C2".to_vec() },
+            Change::Write {
+                path: "t/a.json".into(),
+                bytes: b"A2".to_vec(),
+            },
+            Change::Delete {
+                path: "t/b.json".into(),
+            },
+            Change::Write {
+                path: "u/c.json".into(),
+                bytes: b"C2".to_vec(),
+            },
         ]
     }
 
@@ -441,7 +500,10 @@ mod tests {
         assert_eq!(after[Path::new("/db/t/a.json")], b"A2");
         assert!(!after.contains_key(Path::new("/db/t/b.json")));
         assert_eq!(after[Path::new("/db/u/c.json")], b"C2");
-        assert!(sim.read_dir(&store(Path::new(ROOT))).unwrap().is_empty(), "nothing is left staged");
+        assert!(
+            sim.read_dir(&store(Path::new(ROOT))).unwrap().is_empty(),
+            "nothing is left staged"
+        );
         assert_eq!(rows(&sim.crashed()), after, "and all of it is durable");
     }
 
@@ -469,7 +531,8 @@ mod tests {
             sim.fault_at(at, Fault::Crash);
             assert!(journaled(&sim, Path::new(ROOT), ID, "internal", &plan()).is_err());
             let rebooted = sim.crashed();
-            let recovered = recover(&rebooted, Path::new(ROOT)).unwrap_or_else(|e| panic!("crash at {at}: {e:?}"));
+            let recovered = recover(&rebooted, Path::new(ROOT))
+                .unwrap_or_else(|e| panic!("crash at {at}: {e:?}"));
             let state = rows(&rebooted);
             assert!(
                 state == before || state == after,
@@ -481,11 +544,22 @@ mod tests {
             } else {
                 outcomes.insert("before");
             }
-            assert_eq!(pending(&rebooted, Path::new(ROOT)).unwrap(), Pending::None, "recovery leaves nothing pending");
+            assert_eq!(
+                pending(&rebooted, Path::new(ROOT)).unwrap(),
+                Pending::None,
+                "recovery leaves nothing pending"
+            );
             // Recovery is idempotent.
-            assert_eq!(recover(&rebooted, Path::new(ROOT)).unwrap(), Recovered::default());
+            assert_eq!(
+                recover(&rebooted, Path::new(ROOT)).unwrap(),
+                Recovered::default()
+            );
         }
-        assert_eq!(outcomes.len(), 2, "some crashes land before the commit point and some after");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "some crashes land before the commit point and some after"
+        );
     }
 
     /// A failed operation stops the protocol with an error naming the path;
@@ -507,7 +581,10 @@ mod tests {
                 match recover(&rebooted, Path::new(ROOT)) {
                     Ok(_) => {
                         let state = rows(&rebooted);
-                        assert!(state == before || state == after, "{fault:?} at {at}: {state:?}");
+                        assert!(
+                            state == before || state == after,
+                            "{fault:?} at {at}: {state:?}"
+                        );
                     }
                     // A torn journal under a durable marker cannot be rolled
                     // forward, and recovery says so rather than guessing.
@@ -519,16 +596,36 @@ mod tests {
 
     #[test]
     fn test2133_unsafe_paths_are_refused_before_anything_is_staged() {
-        for rejected in ["../escape.json", "/abs.json", "t/../../x.json", ".db/manifest.json", ".db/lock", "./t/a.json", ""] {
+        for rejected in [
+            "../escape.json",
+            "/abs.json",
+            "t/../../x.json",
+            ".db/manifest.json",
+            ".db/lock",
+            "./t/a.json",
+            "",
+        ] {
             assert!(safe_relative(Path::new(rejected)).is_err(), "{rejected:?}");
         }
-        for accepted in ["t/a.json", ".db/config", ".db/schema/t.json", "schema/t.json"] {
+        for accepted in [
+            "t/a.json",
+            ".db/config",
+            ".db/schema/t.json",
+            "schema/t.json",
+        ] {
             safe_relative(Path::new(accepted)).unwrap_or_else(|_| panic!("{accepted:?}"));
         }
         let twice = vec![
-            Change::Delete { path: "t/a.json".into() },
-            Change::Delete { path: "t/a.json".into() },
+            Change::Delete {
+                path: "t/a.json".into(),
+            },
+            Change::Delete {
+                path: "t/a.json".into(),
+            },
         ];
-        assert_eq!(check_plan(&twice, u64::MAX).unwrap_err().diagnostic.code, "MUTATION_CONFLICT");
+        assert_eq!(
+            check_plan(&twice, u64::MAX).unwrap_err().diagnostic.code,
+            "MUTATION_CONFLICT"
+        );
     }
 }

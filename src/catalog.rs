@@ -140,7 +140,11 @@ impl Catalog {
     /// discard the observation. Nothing is written: the planned bytes are read
     /// from memory, and the mirror is changed only inside a savepoint that is
     /// rolled back.
-    pub fn prospect(&self, config: &Config, source: &dyn Source) -> Result<crate::integrity::Verdict> {
+    pub fn prospect(
+        &self,
+        config: &Config,
+        source: &dyn Source,
+    ) -> Result<crate::integrity::Verdict> {
         self.mirror.savepoint("reldir_prospect")?;
         let outcome = crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut future = Self::empty(&self.root, config, Rc::clone(&self.mirror), false);
@@ -196,8 +200,14 @@ impl Catalog {
     fn load_schemas(&mut self, config: &Config, source: &dyn Source) -> Result<()> {
         let mut candidates: BTreeMap<String, (SchemaFileKind, PathBuf)> = BTreeMap::new();
         for (kind, directory) in [
-            (SchemaFileKind::Working, crate::schema_store::working_dir(&self.root)),
-            (SchemaFileKind::Pin, crate::schema_store::pin_dir(&self.root)),
+            (
+                SchemaFileKind::Working,
+                crate::schema_store::working_dir(&self.root),
+            ),
+            (
+                SchemaFileKind::Pin,
+                crate::schema_store::pin_dir(&self.root),
+            ),
         ] {
             let relative_directory = relative(&self.root, &directory);
             match source.metadata(&directory) {
@@ -216,7 +226,10 @@ impl Catalog {
                 Err(error) => return Err(DbError::io(&directory, error)),
             }
             let mut seen = BTreeSet::new();
-            for path in source.read_dir(&directory).map_err(|e| DbError::io(&directory, e))? {
+            for path in source
+                .read_dir(&directory)
+                .map_err(|e| DbError::io(&directory, e))?
+            {
                 let relative_path = relative(&self.root, &path);
                 if crate::metadata::is_in_progress_write(&path) {
                     continue;
@@ -238,8 +251,11 @@ impl Catalog {
                 }
                 if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     self.diagnostics.push(
-                        Diagnostic::error("UNEXPECTED_FILE", "a schema directory holds only .json files")
-                            .at(relative_path),
+                        Diagnostic::error(
+                            "UNEXPECTED_FILE",
+                            "a schema directory holds only .json files",
+                        )
+                        .at(relative_path),
                     );
                     continue;
                 }
@@ -247,13 +263,20 @@ impl Catalog {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "RESOURCE_LIMIT",
-                            format!("schema exceeds the {} byte file limit", config.max_json_file_size),
+                            format!(
+                                "schema exceeds the {} byte file limit",
+                                config.max_json_file_size
+                            ),
                         )
                         .at(relative_path),
                     );
                     continue;
                 }
-                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 let normalized: String = stem.nfc().flat_map(char::to_lowercase).collect();
                 if !seen.insert(normalized) {
                     self.diagnostics.push(
@@ -276,7 +299,9 @@ impl Catalog {
         }
         for (table, (kind, path)) in candidates {
             let relative_path = relative(&self.root, &path);
-            let bytes = source.read(&path).map_err(|error| DbError::io(&path, error))?;
+            let bytes = source
+                .read(&path)
+                .map_err(|error| DbError::io(&path, error))?;
             let spans = crate::locate::Spans::of(&bytes);
             match Schema::from_bytes(&bytes) {
                 Ok(schema) if schema.table() != table => self.diagnostics.push(
@@ -346,7 +371,15 @@ impl Catalog {
             self.rebuilt_tables = mirror.sync_schemas(&governed)?;
             let mut present = BTreeSet::new();
             for (table, schema) in &governed {
-                self.scan_table(table, schema, config, &ignores, seen_ns, source, &mut present)?;
+                self.scan_table(
+                    table,
+                    schema,
+                    config,
+                    &ignores,
+                    seen_ns,
+                    source,
+                    &mut present,
+                )?;
             }
             for table in governed.keys() {
                 for path in mirror.paths(table)? {
@@ -380,7 +413,9 @@ impl Catalog {
             {
                 continue;
             }
-            let is_dir = source.metadata(&entry).is_ok_and(|meta| meta.kind == Kind::Dir);
+            let is_dir = source
+                .metadata(&entry)
+                .is_ok_and(|meta| meta.kind == Kind::Dir);
             if is_dir {
                 self.ungoverned.push(name.to_string());
                 self.warnings.push(
@@ -421,16 +456,21 @@ impl Catalog {
             Ok(meta) if meta.kind == Kind::Dir => {}
             Ok(_) => {
                 self.diagnostics.push(
-                    Diagnostic::error("NON_REGULAR_FILE", "a table's path must be a real directory")
-                        .at(table)
-                        .table(table),
+                    Diagnostic::error(
+                        "NON_REGULAR_FILE",
+                        "a table's path must be a real directory",
+                    )
+                    .at(table)
+                    .table(table),
                 );
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(DbError::io(&directory, error)),
         }
-        let entries = source.read_dir(&directory).map_err(|e| DbError::io(&directory, e))?;
+        let entries = source
+            .read_dir(&directory)
+            .map_err(|e| DbError::io(&directory, e))?;
         let rebuilt = self.rebuilt_tables.iter().any(|t| t == table);
         let mut names = BTreeSet::new();
         let mut progress = crate::output::Progress::new("scanning", entries.len());
@@ -471,7 +511,11 @@ impl Catalog {
             if meta.kind != Kind::File {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        if meta.kind == Kind::Dir { "UNEXPECTED_FILE" } else { "NON_REGULAR_FILE" },
+                        if meta.kind == Kind::Dir {
+                            "UNEXPECTED_FILE"
+                        } else {
+                            "NON_REGULAR_FILE"
+                        },
                         "a table directory holds only regular .json files",
                     )
                     .at(relative_path)
@@ -489,10 +533,13 @@ impl Catalog {
             }
             if path.extension().and_then(|x| x.to_str()) != Some("json") {
                 self.diagnostics.push(
-                    Diagnostic::error("UNEXPECTED_FILE", "a table directory holds only .json files")
-                        .at(relative_path)
-                        .table(table)
-                        .help("move it out, or add it to the ignore list in .db/config"),
+                    Diagnostic::error(
+                        "UNEXPECTED_FILE",
+                        "a table directory holds only .json files",
+                    )
+                    .at(relative_path)
+                    .table(table)
+                    .help("move it out, or add it to the ignore list in .db/config"),
                 );
                 continue;
             }
@@ -508,7 +555,11 @@ impl Catalog {
                 continue;
             }
             present.insert(key.clone());
-            let cached = if rebuilt { None } else { self.mirror.file(&key)? };
+            let cached = if rebuilt {
+                None
+            } else {
+                self.mirror.file(&key)?
+            };
             if let Some(entry) = &cached
                 && entry.trusted_for(&meta.stat)
             {
@@ -582,7 +633,9 @@ impl Catalog {
 
     /// The row a table holds under a primary key, rendered as keys are.
     pub fn row_by_key(&self, table: &str, key: &str) -> Result<Option<Row>> {
-        let holders = self.mirror.holders(key, mirror::PRIMARY, &[table.to_string()])?;
+        let holders = self
+            .mirror
+            .holders(key, mirror::PRIMARY, &[table.to_string()])?;
         match holders.first() {
             Some((_, path)) => self.row_at(Path::new(path)),
             None => Ok(None),
@@ -615,7 +668,10 @@ pub fn judge_row(
             let diagnostic = if crate::json::is_depth_limit(&error) {
                 Diagnostic::error(
                     "RESOURCE_LIMIT",
-                    format!("JSON nesting exceeds the depth limit {}", config.max_nesting_depth),
+                    format!(
+                        "JSON nesting exceeds the depth limit {}",
+                        config.max_nesting_depth
+                    ),
                 )
             } else {
                 let mut diagnostic = Diagnostic::error("INVALID_JSON", error.to_string());
@@ -628,7 +684,8 @@ pub fn judge_row(
                     .nth(error.line().saturating_sub(1))
                     .map(String::from);
                 if raw.windows(7).any(|window| window == b"<<<<<<<") {
-                    diagnostic = diagnostic.help("the file holds merge-conflict markers; resolve the merge");
+                    diagnostic =
+                        diagnostic.help("the file holds merge-conflict markers; resolve the merge");
                 }
                 diagnostic
             };
@@ -677,7 +734,9 @@ pub fn judge_row(
             .expected(expected.clone())
             .observed(name)
             .fix("FIX_RENAME_TO_IDENTITY")
-            .help(format!("rename the file to {expected}; the row itself is unaffected")),
+            .help(format!(
+                "rename the file to {expected}; the row itself is unaffected"
+            )),
         ),
         Some(_) => {}
         None => out.push(
@@ -712,7 +771,10 @@ fn attach_fixes(diagnostic: &mut Diagnostic, schema: &Schema, row: &Value, missi
             }
         }
         "ROW_MISSING_FIELD" | "NOT_NULL_VIOLATION" => {
-            let column = diagnostic.field.as_deref().and_then(|name| schema.column(name));
+            let column = diagnostic
+                .field
+                .as_deref()
+                .and_then(|name| schema.column(name));
             if column.is_some_and(|column| column.default().is_some_and(|value| !value.is_null())) {
                 diagnostic.fixes.push("FIX_FILL_DEFAULT".into());
             }

@@ -158,7 +158,10 @@ pub fn exit_code_for_diagnostics(diagnostics: &[Diagnostic]) -> i32 {
     }) {
         6
     } else if errors().any(|diagnostic| {
-        matches!(diagnostic.code.as_str(), "TRANSACTION_INCOMPLETE" | "RECOVERY_REQUIRED")
+        matches!(
+            diagnostic.code.as_str(),
+            "TRANSACTION_INCOMPLETE" | "RECOVERY_REQUIRED"
+        )
     }) {
         5
     } else if errors().next().is_none() {
@@ -195,7 +198,9 @@ impl DbError {
     }
     /// Every diagnostic the error carries, the lead first.
     pub fn diagnostics(&self) -> Vec<Diagnostic> {
-        std::iter::once((*self.diagnostic).clone()).chain(self.related.iter().cloned()).collect()
+        std::iter::once((*self.diagnostic).clone())
+            .chain(self.related.iter().cloned())
+            .collect()
     }
     /// The same error, with advice on what to do about it.
     pub fn with_help(mut self, text: impl Into<String>) -> Self {

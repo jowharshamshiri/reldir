@@ -5,7 +5,14 @@ fn main() {
         Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
-            let code = if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) { 0 } else { 1 };
+            let code = if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                0
+            } else {
+                1
+            };
             let _ = error.print();
             std::process::exit(code);
         }

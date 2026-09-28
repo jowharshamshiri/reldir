@@ -19,14 +19,21 @@ pub fn statement_text(text: &str) -> Result<String> {
     }
 }
 
-pub fn sql(context: &Context, sink: &mut dyn Sink, text: &str, params: &[String]) -> Result<Finish> {
+pub fn sql(
+    context: &Context,
+    sink: &mut dyn Sink,
+    text: &str,
+    params: &[String],
+) -> Result<Finish> {
     let text = statement_text(text)?;
     let params = parse_params(params)?;
     match crate::sql::classify(&text)? {
         StatementKind::Read => {
             let Some(database) = context.open(sink, Intent::Read)? else {
-                return Err(DbError::new("UNKNOWN_TABLE", "there are no tables here to query", 4)
-                    .with_help("create a database with `reldir init`, or name one with --db"));
+                return Err(
+                    DbError::new("UNKNOWN_TABLE", "there are no tables here to query", 4)
+                        .with_help("create a database with `reldir init`, or name one with --db"),
+                );
             };
             if context.allow_invalid {
                 if !database.is_valid() {
@@ -47,7 +54,9 @@ pub fn sql(context: &Context, sink: &mut dyn Sink, text: &str, params: &[String]
                 |row| sink.record(row),
             )
             .map_err(|error| crate::sql::explain_unknown_table(&database.catalog, error))?;
-            Ok(Finish::ok(format!("{count} row(s)")).with("rows", count).with("database_valid", database.is_valid()))
+            Ok(Finish::ok(format!("{count} row(s)"))
+                .with("rows", count)
+                .with("database_valid", database.is_valid()))
         }
         StatementKind::Mutation => {
             if context.allow_invalid {
@@ -58,10 +67,14 @@ pub fn sql(context: &Context, sink: &mut dyn Sink, text: &str, params: &[String]
             }
             let mut database = context.open_database(sink, Intent::Write)?;
             require_valid(&database)?;
-            let mutation = crate::sql::mutate(&database.catalog, &text, &params, database.query_limits())
-                .map_err(|error| crate::sql::explain_unknown_table(&database.catalog, error))?;
-            let outcome = database.apply(mutation.rows, Request::internal(context.dry_run))?;
-            for row in mutation.returning {
+            let limits = database.query_limits();
+            let (outcome, returning) =
+                database.apply_with(Request::internal(context.dry_run), |catalog| {
+                    let mutation = crate::sql::mutate(catalog, &text, &params, limits)
+                        .map_err(|error| crate::sql::explain_unknown_table(catalog, error))?;
+                    Ok((mutation.rows, mutation.returning))
+                })?;
+            for row in returning {
                 let mut record = row;
                 record.insert("kind".into(), json!("returning"));
                 sink.record(record)?;
@@ -72,12 +85,22 @@ pub fn sql(context: &Context, sink: &mut dyn Sink, text: &str, params: &[String]
 }
 
 /// SQLite's plan for a statement, without running it.
-pub fn explain(context: &Context, sink: &mut dyn Sink, text: &str, params: &[String]) -> Result<Finish> {
+pub fn explain(
+    context: &Context,
+    sink: &mut dyn Sink,
+    text: &str,
+    params: &[String],
+) -> Result<Finish> {
     let text = statement_text(text)?;
     let params = parse_params(params)?;
     let database = context.open_database(sink, Intent::Read)?;
-    let steps = crate::sql::plan(&database.catalog.mirror, &database.catalog.schemas, &text, &params)
-        .map_err(|error| crate::sql::explain_unknown_table(&database.catalog, error))?;
+    let steps = crate::sql::plan(
+        &database.catalog.mirror,
+        &database.catalog.schemas,
+        &text,
+        &params,
+    )
+    .map_err(|error| crate::sql::explain_unknown_table(&database.catalog, error))?;
     let count = steps.len();
     for step in steps {
         let mut record: Map<String, serde_json::Value> = step;

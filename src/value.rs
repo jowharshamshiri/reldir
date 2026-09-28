@@ -63,11 +63,7 @@ pub fn lossless_convert(value: &Value, target: &ColumnType) -> Option<Value> {
                 .then_some(Value::Number(converted))
         }
         ColumnType::Decimal => {
-            let text = if let Some(integer) = value.as_i64() {
-                integer.to_string()
-            } else {
-                return None;
-            };
+            let text = value.as_i64()?.to_string();
             canonical_decimal(&text).then_some(Value::String(text))
         }
         ColumnType::String => match value {
@@ -192,7 +188,13 @@ pub fn textual(v: &Value, kind: &ColumnType) -> Option<String> {
         return None;
     }
     Some(match kind {
-        ColumnType::Bool => if v.as_bool()? { "true".into() } else { "false".into() },
+        ColumnType::Bool => {
+            if v.as_bool()? {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
         ColumnType::Int => v.as_i64()?.to_string(),
         ColumnType::Float => {
             let n = v.as_f64()?;
@@ -228,15 +230,27 @@ mod tests {
 
     #[test]
     fn test1109_canonical_decimal_accepts_exactly_one_spelling_per_value() {
-        for accepted in ["0", "-1", "1", "10", "1.5", "-0.5", "123456789012345678901234567890"] {
+        let pattern = regex::Regex::new(DECIMAL_PATTERN).unwrap();
+        for accepted in [
+            "0",
+            "-1",
+            "1",
+            "10",
+            "1.5",
+            "-0.5",
+            "123456789012345678901234567890",
+        ] {
             assert!(canonical_decimal(accepted), "{accepted} must be canonical");
-            assert!(regex::Regex::new(DECIMAL_PATTERN).unwrap().is_match(accepted));
+            assert!(pattern.is_match(accepted));
         }
         for rejected in [
             "", "+1", "-0", "01", "1.", ".5", "1.10", "1.0", "1..2", "1e5", "abc", "-", "1 ", " 1",
             "0x10",
         ] {
-            assert!(!canonical_decimal(rejected), "{rejected:?} must not be canonical");
+            assert!(
+                !canonical_decimal(rejected),
+                "{rejected:?} must not be canonical"
+            );
         }
     }
 
@@ -246,7 +260,10 @@ mod tests {
         let bigger = format!("1{}", "0".repeat(40));
         assert_eq!(compare_decimal(&huge, &bigger), Some(Ordering::Less));
         assert_eq!(compare_decimal(&bigger, &huge), Some(Ordering::Greater));
-        assert_eq!(compare_decimal("9007199254740993", "9007199254740992"), Some(Ordering::Greater));
+        assert_eq!(
+            compare_decimal("9007199254740993", "9007199254740992"),
+            Some(Ordering::Greater)
+        );
         assert_eq!(compare_decimal("0.5", "0.4999"), Some(Ordering::Greater));
         assert_eq!(compare_decimal("1.5", "1.5"), Some(Ordering::Equal));
         assert_eq!(compare_decimal("-100", "-2"), Some(Ordering::Less));
@@ -257,17 +274,29 @@ mod tests {
 
     #[test]
     fn test1111_lossless_convert_refuses_every_lossy_conversion() {
-        assert_eq!(lossless_convert(&json!("42"), &ColumnType::Int), Some(json!(42)));
-        assert_eq!(lossless_convert(&json!(42.0), &ColumnType::Int), Some(json!(42)));
+        assert_eq!(
+            lossless_convert(&json!("42"), &ColumnType::Int),
+            Some(json!(42))
+        );
+        assert_eq!(
+            lossless_convert(&json!(42.0), &ColumnType::Int),
+            Some(json!(42))
+        );
         assert_eq!(lossless_convert(&json!("01"), &ColumnType::Int), None);
         assert_eq!(lossless_convert(&json!(1.5), &ColumnType::Int), None);
         assert_eq!(lossless_convert(&json!("nope"), &ColumnType::Int), None);
         assert_eq!(lossless_convert(&Value::Null, &ColumnType::Int), None);
-        assert_eq!(lossless_convert(&json!("true"), &ColumnType::Bool), Some(json!(true)));
+        assert_eq!(
+            lossless_convert(&json!("true"), &ColumnType::Bool),
+            Some(json!(true))
+        );
         assert_eq!(lossless_convert(&json!("TRUE"), &ColumnType::Bool), None);
         assert_eq!(lossless_convert(&json!(1), &ColumnType::Bool), None);
         assert_eq!(
-            lossless_convert(&json!("0193B1F4-7C3A-7B1E-9C2D-3F4A5B6C7D8E"), &ColumnType::Uuid),
+            lossless_convert(
+                &json!("0193B1F4-7C3A-7B1E-9C2D-3F4A5B6C7D8E"),
+                &ColumnType::Uuid
+            ),
             Some(json!("0193b1f4-7c3a-7b1e-9c2d-3f4a5b6c7d8e")),
             "case is a spelling of a uuid, not part of its value"
         );
@@ -275,8 +304,18 @@ mod tests {
             lossless_convert(&json!("2026-09-14T12:00:00+02:00"), &ColumnType::Timestamp),
             Some(json!("2026-09-14T10:00:00Z"))
         );
-        for kind in [ColumnType::Date, ColumnType::Array, ColumnType::Object, ColumnType::Bytes, ColumnType::Enum] {
-            assert_eq!(lossless_convert(&json!("whatever"), &kind), None, "{kind:?} is never guessed at");
+        for kind in [
+            ColumnType::Date,
+            ColumnType::Array,
+            ColumnType::Object,
+            ColumnType::Bytes,
+            ColumnType::Enum,
+        ] {
+            assert_eq!(
+                lossless_convert(&json!("whatever"), &kind),
+                None,
+                "{kind:?} is never guessed at"
+            );
         }
     }
 

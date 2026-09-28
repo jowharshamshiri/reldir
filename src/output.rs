@@ -37,7 +37,8 @@ pub struct Presentation {
 impl Default for Presentation {
     fn default() -> Self {
         Self {
-            color: io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+            color: io::stderr().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
             quiet: false,
             verbose: false,
         }
@@ -96,7 +97,10 @@ impl Progress {
             return;
         }
         self.active = true;
-        eprint!("\r\u{1b}[2K{}: {} / {} files", self.label, self.scanned, self.total);
+        eprint!(
+            "\r\u{1b}[2K{}: {} / {} files",
+            self.label, self.scanned, self.total
+        );
         let _ = io::stderr().flush();
     }
 }
@@ -129,7 +133,11 @@ pub fn severity_style(severity: &Severity) -> (&'static str, &'static str) {
 }
 
 pub fn emphasis() -> (&'static str, &'static str) {
-    if presentation().color { (BOLD, RESET) } else { ("", "") }
+    if presentation().color {
+        (BOLD, RESET)
+    } else {
+        ("", "")
+    }
 }
 
 pub fn severity_label(severity: &Severity) -> &'static str {
@@ -197,7 +205,11 @@ pub struct Finish {
 
 impl Finish {
     pub fn ok(summary: impl Into<String>) -> Self {
-        Self { exit: 0, summary: summary.into(), fields: Map::new() }
+        Self {
+            exit: 0,
+            summary: summary.into(),
+            fields: Map::new(),
+        }
     }
 
     pub fn with(mut self, key: &str, value: impl Into<Value>) -> Self {
@@ -244,7 +256,12 @@ pub fn envelope(
     out.insert("records".into(), Value::Array(records));
     let mut all = diagnostics;
     if let Err(error) = outcome {
-        all.extend(error.related.iter().filter_map(|d| serde_json::to_value(d).ok()));
+        all.extend(
+            error
+                .related
+                .iter()
+                .filter_map(|d| serde_json::to_value(d).ok()),
+        );
     }
     out.insert("diagnostics".into(), Value::Array(all));
     out.insert("events".into(), Value::Array(events));
@@ -316,7 +333,13 @@ impl Terminal {
         let printed = (|| -> Result<()> {
             match self.format {
                 Format::Json => {
-                    let value = envelope(&self.command, &outcome, self.records, self.diagnostics, self.events);
+                    let value = envelope(
+                        &self.command,
+                        &outcome,
+                        self.records,
+                        self.diagnostics,
+                        self.events,
+                    );
                     let stdout = io::stdout();
                     let mut lock = stdout.lock();
                     serde_json::to_writer_pretty(&mut lock, &value).map_err(io_error)?;
@@ -367,8 +390,12 @@ impl Terminal {
                         }
                     }
                     for (index, kind) in kinds.iter().enumerate() {
-                        let group: Vec<Map<String, Value>> =
-                            self.table.iter().filter(|record| record.get("kind") == *kind).cloned().collect();
+                        let group: Vec<Map<String, Value>> = self
+                            .table
+                            .iter()
+                            .filter(|record| record.get("kind") == *kind)
+                            .cloned()
+                            .collect();
                         if index > 0 {
                             println!();
                         }
@@ -404,20 +431,31 @@ impl Sink for Terminal {
             Format::Table => self.table.push(record),
             Format::Csv => {
                 if self.csv.is_none() {
-                    let headers: Vec<String> = record.keys().filter(|key| *key != "kind").cloned().collect();
+                    let headers: Vec<String> = record
+                        .keys()
+                        .filter(|key| *key != "kind")
+                        .cloned()
+                        .collect();
                     let mut writer = csv::Writer::from_writer(io::stdout());
                     writer.write_record(&headers).map_err(io_error)?;
                     self.csv = Some((writer, headers));
                 }
                 let (writer, headers) = self.csv.as_mut().expect("set above");
-                if let Some(extra) = record.keys().find(|key| *key != "kind" && !headers.contains(key)) {
+                if let Some(extra) = record
+                    .keys()
+                    .find(|key| *key != "kind" && !headers.contains(key))
+                {
                     return Err(DbError::usage(format!(
                         "records do not share columns ({extra:?} is not among the first record's), so they \
                          cannot be one CSV table; use --format jsonl"
                     )));
                 }
                 writer
-                    .write_record(headers.iter().map(|header| csv_cell(record.get(header).unwrap_or(&Value::Null))))
+                    .write_record(
+                        headers
+                            .iter()
+                            .map(|header| csv_cell(record.get(header).unwrap_or(&Value::Null))),
+                    )
                     .map_err(io_error)?;
             }
             Format::Sarif => {}
@@ -427,7 +465,9 @@ impl Sink for Terminal {
 
     fn diagnostic(&mut self, diagnostic: &Diagnostic) -> Result<()> {
         match self.format {
-            Format::Json => self.diagnostics.push(serde_json::to_value(diagnostic).map_err(io_error)?),
+            Format::Json => self
+                .diagnostics
+                .push(serde_json::to_value(diagnostic).map_err(io_error)?),
             Format::Jsonl => write_line(&serde_json::to_value(diagnostic).map_err(io_error)?)?,
             Format::Sarif => self.sarif.push(diagnostic.clone()),
             Format::Table | Format::Csv => crate::diagnostic::render_human(diagnostic),
@@ -458,7 +498,10 @@ impl Sink for Terminal {
     fn document(&mut self, kind: &str, value: Value) -> Result<()> {
         match self.format {
             Format::Table => {
-                println!("{}", serde_json::to_string_pretty(&value).map_err(io_error)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).map_err(io_error)?
+                );
                 Ok(())
             }
             _ => {
@@ -482,7 +525,13 @@ pub struct Collect {
 
 impl Collect {
     pub fn envelope(self, command: &str, outcome: &std::result::Result<Finish, DbError>) -> Value {
-        envelope(command, outcome, self.records, self.diagnostics, self.events)
+        envelope(
+            command,
+            outcome,
+            self.records,
+            self.diagnostics,
+            self.events,
+        )
     }
 }
 
@@ -492,7 +541,8 @@ impl Sink for Collect {
         Ok(())
     }
     fn diagnostic(&mut self, diagnostic: &Diagnostic) -> Result<()> {
-        self.diagnostics.push(serde_json::to_value(diagnostic).map_err(io_error)?);
+        self.diagnostics
+            .push(serde_json::to_value(diagnostic).map_err(io_error)?);
         Ok(())
     }
     fn event(&mut self, kind: &str, detail: Value, _prose: &str) -> Result<()> {
@@ -518,7 +568,9 @@ impl Sink for Collect {
 /// Records as an aligned table. A `kind` column shared by every record says
 /// nothing and is left out.
 fn table(rows: &[Map<String, Value>]) {
-    let shared_kind = rows.windows(2).all(|pair| pair[0].get("kind") == pair[1].get("kind"));
+    let shared_kind = rows
+        .windows(2)
+        .all(|pair| pair[0].get("kind") == pair[1].get("kind"));
     let mut headers: Vec<String> = vec![];
     for row in rows {
         for key in row.keys() {
@@ -529,13 +581,23 @@ fn table(rows: &[Map<String, Value>]) {
     }
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|row| headers.iter().map(|header| table_cell(row.get(header).unwrap_or(&Value::Null))).collect())
+        .map(|row| {
+            headers
+                .iter()
+                .map(|header| table_cell(row.get(header).unwrap_or(&Value::Null)))
+                .collect()
+        })
         .collect();
     let widths: Vec<usize> = headers
         .iter()
         .enumerate()
         .map(|(index, header)| {
-            cells.iter().map(|row| row[index].chars().count()).chain([header.chars().count()]).max().unwrap_or(0)
+            cells
+                .iter()
+                .map(|row| row[index].chars().count())
+                .chain([header.chars().count()])
+                .max()
+                .unwrap_or(0)
         })
         .collect();
     let stdout = io::stdout();
@@ -551,11 +613,24 @@ fn table(rows: &[Map<String, Value>]) {
             .to_string()
     };
     let _ = writeln!(out, "{}", line(&headers));
-    let _ = writeln!(out, "{}", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("-+-"));
+    let _ = writeln!(
+        out,
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("-+-")
+    );
     for row in &cells {
         let _ = writeln!(out, "{}", line(row));
     }
-    let _ = writeln!(out, "({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+    let _ = writeln!(
+        out,
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
 }
 
 fn table_cell(value: &Value) -> String {
@@ -657,7 +732,13 @@ mod tests {
 
     #[test]
     fn test2210_the_envelope_carries_success_and_failure_alike() {
-        let ok = envelope("sql", &Ok(Finish::ok("2 rows").with("database_valid", true)), vec![json!({"id": 1})], vec![], vec![]);
+        let ok = envelope(
+            "sql",
+            &Ok(Finish::ok("2 rows").with("database_valid", true)),
+            vec![json!({"id": 1})],
+            vec![],
+            vec![],
+        );
         assert_eq!(ok["kind"], "command_result");
         assert_eq!(ok["ok"], true);
         assert_eq!(ok["database_valid"], true);
@@ -668,7 +749,10 @@ mod tests {
         assert_eq!(failed["ok"], false);
         assert_eq!(failed["exit"], 4);
         assert_eq!(failed["error"]["code"], "UNKNOWN_TABLE");
-        assert_eq!(failed["diagnostics"][0]["code"], "UNKNOWN_COLUMN", "every fault is carried");
+        assert_eq!(
+            failed["diagnostics"][0]["code"], "UNKNOWN_COLUMN",
+            "every fault is carried"
+        );
     }
 
     #[test]
@@ -677,13 +761,22 @@ mod tests {
             .at("posts/p1.json")
             .fix("FIX_RESTORE_TARGET");
         let mut located = diagnostic.clone();
-        located.location = Some(crate::diagnostic::Location { line: 3, column: 14 });
+        located.location = Some(crate::diagnostic::Location {
+            line: 3,
+            column: 14,
+        });
         let log = sarif(&[located]);
         let result = &log["runs"][0]["results"][0];
         assert_eq!(result["ruleId"], "FOREIGN_KEY_VIOLATION");
         assert_eq!(result["level"], "error");
-        assert_eq!(result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], "posts/p1.json");
-        assert_eq!(result["locations"][0]["physicalLocation"]["region"]["startLine"], 3);
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "posts/p1.json"
+        );
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["region"]["startLine"],
+            3
+        );
         assert_eq!(log["version"], "2.1.0");
     }
 }

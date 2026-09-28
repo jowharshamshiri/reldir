@@ -79,7 +79,10 @@ pub fn resolve_root(explicit: Option<&Path>) -> Result<ResolvedRoot> {
                     1,
                 ));
             }
-            return Ok(ResolvedRoot { path: current, origin: RootOrigin::Discovered });
+            return Ok(ResolvedRoot {
+                path: current,
+                origin: RootOrigin::Discovered,
+            });
         }
         if pinned_without_metadata.is_none() && holds_pins(&current) {
             pinned_without_metadata = Some(current.clone());
@@ -98,14 +101,23 @@ fn require_directory(path: &Path, source: &str) -> Result<()> {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(DbError::from_diag(
-            Diagnostic::error("PATH_NOT_DIRECTORY", format!("{source} names {}, which is not a directory", path.display()))
-                .at(path),
+            Diagnostic::error(
+                "PATH_NOT_DIRECTORY",
+                format!(
+                    "{source} names {}, which is not a directory",
+                    path.display()
+                ),
+            )
+            .at(path),
             1,
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(DbError::from_diag(
-            Diagnostic::error("PATH_NOT_FOUND", format!("{source} names {}, which does not exist", path.display()))
-                .at(path)
-                .help("check the path; `reldir init <path>` creates a new database"),
+            Diagnostic::error(
+                "PATH_NOT_FOUND",
+                format!("{source} names {}, which does not exist", path.display()),
+            )
+            .at(path)
+            .help("check the path; `reldir init <path>` creates a new database"),
             1,
         )),
         Err(error) => Err(DbError::io(path, error)),
@@ -120,14 +132,19 @@ fn holds_pins(root: &Path) -> bool {
     };
     entries.flatten().any(|entry| {
         let path = entry.path();
-        let stem = path.file_stem().and_then(|stem| stem.to_str()).map(String::from);
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(String::from);
         path.extension().and_then(|value| value.to_str()) == Some("json")
             && std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| crate::json::parse(&bytes).ok())
                 .is_some_and(|value| {
-                    value.get("$schema").and_then(Value::as_str) == Some(crate::schema::meta::DIALECT_URI)
-                        && value.pointer("/x-reldir/table").and_then(Value::as_str) == stem.as_deref()
+                    value.get("$schema").and_then(Value::as_str)
+                        == Some(crate::schema::meta::DIALECT_URI)
+                        && value.pointer("/x-reldir/table").and_then(Value::as_str)
+                            == stem.as_deref()
                 })
     })
 }
@@ -205,13 +222,23 @@ pub fn observe(root: &Path) -> Result<Observation> {
 }
 
 /// Entries of `.db/` that are derived from the files and can be rebuilt.
-const REBUILDABLE: &[&str] = &["format", "mirror.sqlite", "mirror.sqlite-journal", "transactions", "schema", "lock", ".gitignore"];
+const REBUILDABLE: &[&str] = &[
+    "format",
+    "mirror.sqlite",
+    "mirror.sqlite-journal",
+    "transactions",
+    "schema",
+    "lock",
+    ".gitignore",
+];
 
 fn irreplaceable(meta: &Path) -> Result<Vec<String>> {
     let mut out = vec![];
     for entry in std::fs::read_dir(meta).map_err(|error| DbError::io(meta, error))? {
         let path = entry.map_err(|error| DbError::io(meta, error))?.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         if REBUILDABLE.contains(&name) {
             continue;
         }
@@ -235,11 +262,15 @@ fn survey(root: &Path) -> Result<Topology> {
     for entry in entries {
         let entry = entry.map_err(|error| DbError::io(root, error))?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
         if name.starts_with('.') || name == "schema" {
             continue;
         }
-        let kind = entry.file_type().map_err(|error| DbError::io(&path, error))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| DbError::io(&path, error))?;
         if kind.is_dir() {
             let holds_json = std::fs::read_dir(&path).is_ok_and(|entries| {
                 entries.flatten().any(|child| {
@@ -250,7 +281,9 @@ fn survey(root: &Path) -> Result<Topology> {
             if holds_json {
                 topology.table_candidates.push(name.to_string());
             }
-        } else if kind.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
+        } else if kind.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("json")
+        {
             topology.loose_json.push(name.to_string());
         }
     }
@@ -271,7 +304,9 @@ fn survey(root: &Path) -> Result<Topology> {
 }
 
 fn writable(root: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(root) else { return false };
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return false;
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -307,21 +342,39 @@ pub enum Transition {
 
 impl Transition {
     pub fn describe(&self, planned: bool) -> String {
-        let (verb_init, verb_rebuild) = if planned { ("would initialize", "would rebuild") } else { ("initialized", "rebuilt") };
+        let (verb_init, verb_rebuild) = if planned {
+            ("would initialize", "would rebuild")
+        } else {
+            ("initialized", "rebuilt")
+        };
         match self {
-            Self::Bootstrapped { inferred } if inferred.is_empty() => format!("{verb_init} the database"),
-            Self::Bootstrapped { inferred } => {
-                format!("{verb_init} the database, inferring schemas for {}", inferred.join(", "))
+            Self::Bootstrapped { inferred } if inferred.is_empty() => {
+                format!("{verb_init} the database")
             }
-            Self::RebuiltMetadata(lost) if lost.is_empty() => format!("{verb_rebuild} unlabelled metadata"),
-            Self::RebuiltMetadata(lost) => format!("{verb_rebuild} unlabelled metadata, discarding {}", lost.join(", ")),
+            Self::Bootstrapped { inferred } => {
+                format!(
+                    "{verb_init} the database, inferring schemas for {}",
+                    inferred.join(", ")
+                )
+            }
+            Self::RebuiltMetadata(lost) if lost.is_empty() => {
+                format!("{verb_rebuild} unlabelled metadata")
+            }
+            Self::RebuiltMetadata(lost) => format!(
+                "{verb_rebuild} unlabelled metadata, discarding {}",
+                lost.join(", ")
+            ),
         }
     }
 
     pub fn to_json(&self, planned: bool) -> Value {
         match self {
-            Self::Bootstrapped { inferred } => json!({"transition": "bootstrapped", "inferred": inferred, "planned": planned}),
-            Self::RebuiltMetadata(lost) => json!({"transition": "metadata_rebuilt", "discarded": lost, "planned": planned}),
+            Self::Bootstrapped { inferred } => {
+                json!({"transition": "bootstrapped", "inferred": inferred, "planned": planned})
+            }
+            Self::RebuiltMetadata(lost) => {
+                json!({"transition": "metadata_rebuilt", "discarded": lost, "planned": planned})
+            }
         }
     }
 }
@@ -330,19 +383,31 @@ impl Transition {
 pub enum Opened {
     /// Nothing to govern: no metadata, no tables, no pins.
     Empty,
-    Database { database: Box<Database>, transitions: Vec<Transition>, planned: bool },
+    Database {
+        database: Box<Database>,
+        transitions: Vec<Transition>,
+        planned: bool,
+    },
 }
 
 /// Open the database at `root`, establishing it when the command may.
 pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Result<Opened> {
     let observation = observe(root)?;
-    let access = if observation.writable { opening.access } else { Access::Read };
+    let access = if observation.writable {
+        opening.access
+    } else {
+        Access::Read
+    };
     let may_write = access == Access::Write && !opening.dry_run;
     let mut transitions = vec![];
     match &observation.format {
         FormatState::Present => {
             let database = Database::open(root.to_path_buf(), access, overrides)?;
-            return Ok(Opened::Database { database: Box::new(database), transitions, planned: false });
+            return Ok(Opened::Database {
+                database: Box::new(database),
+                transitions,
+                planned: false,
+            });
         }
         FormatState::MarkerMissingUnrecoverable(lost) if !opening.rebuild_metadata => {
             return Err(DbError::from_diag(
@@ -377,8 +442,14 @@ pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Res
     }
     if !opening.establish {
         return Err(DbError::from_diag(
-            Diagnostic::error("UNINITIALIZED", format!("{} has no .db metadata", root.display()))
-                .help(format!("run `reldir init {}`, or omit --no-auto to establish it on first use", root.display())),
+            Diagnostic::error(
+                "UNINITIALIZED",
+                format!("{} has no .db metadata", root.display()),
+            )
+            .help(format!(
+                "run `reldir init {}`, or omit --no-auto to establish it on first use",
+                root.display()
+            )),
             10,
         ));
     }
@@ -405,23 +476,38 @@ pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Res
         .filter(|table| !observation.topology.pinned.contains(table))
         .cloned()
         .collect();
-    transitions.push(Transition::Bootstrapped { inferred: inferred.clone() });
+    transitions.push(Transition::Bootstrapped {
+        inferred: inferred.clone(),
+    });
     if may_write {
         let database = Database::create(root.to_path_buf(), &schemas, false, overrides)?;
-        Ok(Opened::Database { database: Box::new(database), transitions, planned: false })
+        Ok(Opened::Database {
+            database: Box::new(database),
+            transitions,
+            planned: false,
+        })
     } else {
         let database = Database::ephemeral(root.to_path_buf(), schemas, overrides)?;
-        Ok(Opened::Database { database: Box::new(database), transitions, planned: true })
+        Ok(Opened::Database {
+            database: Box::new(database),
+            transitions,
+            planned: true,
+        })
     }
 }
 
 /// Schemas inferred for the tables of a folder without metadata that nobody
 /// pinned. Pins are read by the catalog itself, so a fault in one is reported
 /// like any other schema fault.
-fn schemas_for(observation: &Observation, overrides: &ResourceOverrides) -> Result<BTreeMap<String, Schema>> {
+fn schemas_for(
+    observation: &Observation,
+    overrides: &ResourceOverrides,
+) -> Result<BTreeMap<String, Schema>> {
     let mut config = Config::default();
     config.apply_overrides(overrides);
-    config.validate().map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
+    config
+        .validate()
+        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let mut out = BTreeMap::new();
     let missing: Vec<String> = observation
         .topology
@@ -447,7 +533,9 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
-    Ok(std::env::current_dir().map_err(|error| DbError::io(Path::new("."), error))?.join(path))
+    Ok(std::env::current_dir()
+        .map_err(|error| DbError::io(Path::new("."), error))?
+        .join(path))
 }
 
 #[cfg(test)]
@@ -460,7 +548,12 @@ mod tests {
     }
 
     fn opening(access: Access) -> Opening {
-        Opening { access, establish: true, rebuild_metadata: false, dry_run: false }
+        Opening {
+            access,
+            establish: true,
+            rebuild_metadata: false,
+            dry_run: false,
+        }
     }
 
     /// The false green a mistyped `--db` used to produce: an empty, valid
@@ -469,17 +562,26 @@ mod tests {
     fn test1104_a_named_root_must_exist_and_be_a_directory() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("typo");
-        assert_eq!(resolve_root(Some(&missing)).unwrap_err().diagnostic.code, "PATH_NOT_FOUND");
+        assert_eq!(
+            resolve_root(Some(&missing)).unwrap_err().diagnostic.code,
+            "PATH_NOT_FOUND"
+        );
         write(&directory.path().join("file"), "x");
         assert_eq!(
-            resolve_root(Some(&directory.path().join("file"))).unwrap_err().diagnostic.code,
+            resolve_root(Some(&directory.path().join("file")))
+                .unwrap_err()
+                .diagnostic
+                .code,
             "PATH_NOT_DIRECTORY"
         );
         let child = directory.path().join("child");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir_all(directory.path().join(".db")).unwrap();
         let resolved = resolve_root(Some(&child)).unwrap();
-        assert_eq!(resolved.path, child, "a named root is exact, never walked upward from");
+        assert_eq!(
+            resolved.path, child,
+            "a named root is exact, never walked upward from"
+        );
         assert_eq!(resolved.origin, RootOrigin::Explicit);
     }
 
@@ -490,14 +592,23 @@ mod tests {
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
         write(&root.join("deep/nested/inside.json"), "{}\n");
         write(&root.join("empty_dir/readme.txt"), "not json\n");
-        assert_eq!(observe(root).unwrap().topology.table_candidates, vec!["users".to_string()]);
+        assert_eq!(
+            observe(root).unwrap().topology.table_candidates,
+            vec!["users".to_string()]
+        );
     }
 
     #[test]
     fn test1094_loose_root_json_is_refused_and_nothing_is_created() {
         let directory = tempfile::tempdir().unwrap();
         write(&directory.path().join("a.json"), "{\"id\":\"a\"}\n");
-        let error = open(directory.path(), opening(Access::Write), &Default::default()).err().unwrap();
+        let error = open(
+            directory.path(),
+            opening(Access::Write),
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.diagnostic.code, "ROOT_JSON_AMBIGUOUS");
         assert!(!directory.path().join(".db").exists());
     }
@@ -505,7 +616,15 @@ mod tests {
     #[test]
     fn test1097_an_empty_folder_is_empty_and_establishes_nothing() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(matches!(open(directory.path(), opening(Access::Write), &Default::default()).unwrap(), Opened::Empty));
+        assert!(matches!(
+            open(
+                directory.path(),
+                opening(Access::Write),
+                &Default::default()
+            )
+            .unwrap(),
+            Opened::Empty
+        ));
         assert!(!directory.path().join(".db").exists());
     }
 
@@ -513,18 +632,40 @@ mod tests {
     fn test1098_ungoverned_data_is_adopted_in_one_step() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        write(&root.join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"A\"}\n");
-        write(&root.join("users/u2.json"), "{\"id\":\"u2\",\"name\":\"B\"}\n");
-        let Opened::Database { database, transitions, planned } = open(root, opening(Access::Write), &Default::default()).unwrap() else {
+        write(
+            &root.join("users/u1.json"),
+            "{\"id\":\"u1\",\"name\":\"A\"}\n",
+        );
+        write(
+            &root.join("users/u2.json"),
+            "{\"id\":\"u2\",\"name\":\"B\"}\n",
+        );
+        let Opened::Database {
+            database,
+            transitions,
+            planned,
+        } = open(root, opening(Access::Write), &Default::default()).unwrap()
+        else {
             panic!("a folder with data is a database")
         };
         assert!(!planned);
-        assert_eq!(transitions, vec![Transition::Bootstrapped { inferred: vec!["users".into()] }]);
+        assert_eq!(
+            transitions,
+            vec![Transition::Bootstrapped {
+                inferred: vec!["users".into()]
+            }]
+        );
         assert!(database.is_valid(), "{:?}", database.verdict.errors);
         assert!(root.join(".db/schema/users.json").exists());
-        assert!(!root.join("schema").exists(), "adoption infers; it does not declare");
+        assert!(
+            !root.join("schema").exists(),
+            "adoption infers; it does not declare"
+        );
         assert_eq!(crate::metadata::revisions(root).unwrap(), vec![1]);
-        assert_eq!(crate::metadata::head(root).unwrap().unwrap().origin, "import");
+        assert_eq!(
+            crate::metadata::head(root).unwrap().unwrap().origin,
+            "import"
+        );
     }
 
     #[test]
@@ -538,10 +679,20 @@ mod tests {
         write(&root.join("schema/users.json"), &handwritten);
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
         write(&root.join("posts/p1.json"), "{\"id\":\"p1\"}\n");
-        let Opened::Database { database, .. } = open(root, opening(Access::Write), &Default::default()).unwrap() else { panic!() };
+        let Opened::Database { database, .. } =
+            open(root, opening(Access::Write), &Default::default()).unwrap()
+        else {
+            panic!()
+        };
         assert!(database.is_valid(), "{:?}", database.verdict.errors);
-        assert_eq!(std::fs::read_to_string(root.join("schema/users.json")).unwrap(), handwritten);
-        assert!(!root.join(".db/schema/users.json").exists(), "a pinned table has no second copy");
+        assert_eq!(
+            std::fs::read_to_string(root.join("schema/users.json")).unwrap(),
+            handwritten
+        );
+        assert!(
+            !root.join(".db/schema/users.json").exists(),
+            "a pinned table has no second copy"
+        );
         assert!(root.join(".db/schema/posts.json").exists());
     }
 
@@ -549,8 +700,18 @@ mod tests {
     fn test1100_failed_inference_writes_nothing() {
         let directory = tempfile::tempdir().unwrap();
         write(&directory.path().join("things/a.json"), "[1,2]\n");
-        let error = open(directory.path(), opening(Access::Write), &Default::default()).err().unwrap();
-        assert!(error.diagnostic.code.starts_with("INFER_"), "{}", error.diagnostic.code);
+        let error = open(
+            directory.path(),
+            opening(Access::Write),
+            &Default::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.diagnostic.code.starts_with("INFER_"),
+            "{}",
+            error.diagnostic.code
+        );
         assert!(!directory.path().join(".db").exists());
     }
 
@@ -560,27 +721,54 @@ mod tests {
         let root = directory.path();
         std::fs::create_dir_all(root.join(".db/transactions")).unwrap();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
-        let Opened::Database { transitions, .. } = open(root, opening(Access::Write), &Default::default()).unwrap() else { panic!() };
+        let Opened::Database { transitions, .. } =
+            open(root, opening(Access::Write), &Default::default()).unwrap()
+        else {
+            panic!()
+        };
         assert_eq!(transitions[0], Transition::RebuiltMetadata(vec![]));
 
         let historic = tempfile::tempdir().unwrap();
         let root = historic.path();
-        write(&root.join(".db/provenance/00000000000000000001.json"), "{}\n");
+        write(
+            &root.join(".db/provenance/00000000000000000001.json"),
+            "{}\n",
+        );
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
-        let error = open(root, opening(Access::Write), &Default::default()).err().unwrap();
+        let error = open(root, opening(Access::Write), &Default::default())
+            .err()
+            .unwrap();
         assert_eq!(error.diagnostic.code, "FORMAT_MISSING");
         assert!(error.diagnostic.message.contains("provenance"));
-        let authorized = Opening { rebuild_metadata: true, ..opening(Access::Write) };
-        let Opened::Database { transitions, .. } = open(root, authorized, &Default::default()).unwrap() else { panic!() };
-        assert_eq!(transitions[0], Transition::RebuiltMetadata(vec!["provenance".into()]));
+        let authorized = Opening {
+            rebuild_metadata: true,
+            ..opening(Access::Write)
+        };
+        let Opened::Database { transitions, .. } =
+            open(root, authorized, &Default::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            transitions[0],
+            Transition::RebuiltMetadata(vec!["provenance".into()])
+        );
     }
 
     #[test]
     fn test1103_read_access_answers_without_touching_the_folder() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        write(&root.join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"A\"}\n");
-        let Opened::Database { database, planned, .. } = open(root, opening(Access::Read), &Default::default()).unwrap() else { panic!() };
+        write(
+            &root.join("users/u1.json"),
+            "{\"id\":\"u1\",\"name\":\"A\"}\n",
+        );
+        let Opened::Database {
+            database, planned, ..
+        } = open(root, opening(Access::Read), &Default::default()).unwrap()
+        else {
+            panic!()
+        };
         assert!(planned);
         assert!(database.catalog.schemas.contains_key("users"));
         assert!(!root.join(".db").exists());

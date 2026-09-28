@@ -45,10 +45,7 @@ pub fn target_tables(catalog_schemas: &BTreeMap<String, Schema>, target: &Target
 }
 
 /// The columns of `target_table` a foreign key compares with.
-pub fn target_columns(
-    fk: &crate::schema::ForeignKey,
-    target: &Schema,
-) -> Vec<String> {
+pub fn target_columns(fk: &crate::schema::ForeignKey, target: &Schema) -> Vec<String> {
     if fk.columns().is_empty() {
         target.primary_key().to_vec()
     } else {
@@ -69,7 +66,9 @@ pub fn validate_schemas(catalog: &mut Catalog) {
     let mut out = vec![];
     let schemas = &catalog.schemas;
     let fault = |table: &str, code: &str, message: String, pointer: String| {
-        Diagnostic::error(code, message).table(table).pointer(pointer)
+        Diagnostic::error(code, message)
+            .table(table)
+            .pointer(pointer)
     };
 
     // Identity domains relate single-column keys of one type.
@@ -110,7 +109,11 @@ pub fn validate_schemas(catalog: &mut Catalog) {
                 out.push(fault(
                     table,
                     "SCHEMA_FK_TARGET_MISSING",
-                    format!("foreign key {} names {}, which no table belongs to", fk.name(), fk.to().describe()),
+                    format!(
+                        "foreign key {} names {}, which no table belongs to",
+                        fk.name(),
+                        fk.to().describe()
+                    ),
                     format!("{at}/to"),
                 ));
                 continue;
@@ -129,7 +132,10 @@ pub fn validate_schemas(catalog: &mut Catalog) {
                     out.push(fault(
                         table,
                         "SCHEMA_FK_TARGET_MISSING",
-                        format!("foreign key {} references table {target_table:?}, which has no schema", fk.name()),
+                        format!(
+                            "foreign key {} references table {target_table:?}, which has no schema",
+                            fk.name()
+                        ),
                         format!("{at}/to"),
                     ));
                     continue;
@@ -176,7 +182,9 @@ pub fn validate_schemas(catalog: &mut Catalog) {
                 }
                 for ((leaf, column), path) in leaves.iter().zip(&columns).zip(fk.from()) {
                     let Some(leaf) = leaf else { continue };
-                    let Some(target_column) = target.column(column) else { continue };
+                    let Some(target_column) = target.column(column) else {
+                        continue;
+                    };
                     if !compatible(leaf, target_column.kind()) {
                         out.push(fault(
                             table,
@@ -198,19 +206,23 @@ pub fn validate_schemas(catalog: &mut Catalog) {
     // Checks and assertions are SQL; each must compile against the tables it
     // may read.
     out.extend(crate::sql::compile_rules(schemas));
-    catalog.diagnostics.extend(out.into_iter().map(|diagnostic| {
-        match diagnostic
-            .table
-            .as_ref()
-            .and_then(|table| catalog.schema_files.get(table))
-        {
-            Some(file) => {
-                let spans = crate::locate::Spans::of(&file.bytes);
-                diagnostic.at(file.relative.clone()).locate_in(&file.bytes, &spans)
+    catalog
+        .diagnostics
+        .extend(out.into_iter().map(|diagnostic| {
+            match diagnostic
+                .table
+                .as_ref()
+                .and_then(|table| catalog.schema_files.get(table))
+            {
+                Some(file) => {
+                    let spans = crate::locate::Spans::of(&file.bytes);
+                    diagnostic
+                        .at(file.relative.clone())
+                        .locate_in(&file.bytes, &spans)
+                }
+                None => diagnostic,
             }
-            None => diagnostic,
-        }
-    }));
+        }));
 }
 
 /// Judge the observed state.
@@ -254,22 +266,31 @@ pub fn validate_through(catalog: &Catalog, source: &dyn crate::fs::Source) -> Re
             for duplicate in catalog.mirror.duplicates(&tables, &constraint, false)? {
                 let first = &duplicate.holders[0].1;
                 for (_, path) in &duplicate.holders[1..] {
-                    verdict.errors.push(located.at(
-                        Diagnostic::error(
-                            if primary { "PRIMARY_KEY_VIOLATION" } else { "UNIQUE_VIOLATION" },
-                            format!(
-                                "{table}({}) must be unique, and {} also holds {}",
-                                columns.join(","),
-                                first,
-                                duplicate.key
-                            ),
-                        )
-                        .table(table)
-                        .observed(duplicate.key.clone())
-                        .help(format!("also present in {first}")),
-                        path,
-                        Some(&format!("/{}", crate::schema::path::escape_pointer(&columns[0]))),
-                    ));
+                    verdict.errors.push(
+                        located.at(
+                            Diagnostic::error(
+                                if primary {
+                                    "PRIMARY_KEY_VIOLATION"
+                                } else {
+                                    "UNIQUE_VIOLATION"
+                                },
+                                format!(
+                                    "{table}({}) must be unique, and {} also holds {}",
+                                    columns.join(","),
+                                    first,
+                                    duplicate.key
+                                ),
+                            )
+                            .table(table)
+                            .observed(duplicate.key.clone())
+                            .help(format!("also present in {first}")),
+                            path,
+                            Some(&format!(
+                                "/{}",
+                                crate::schema::path::escape_pointer(&columns[0])
+                            )),
+                        ),
+                    );
                 }
             }
         }
@@ -278,7 +299,10 @@ pub fn validate_through(catalog: &Catalog, source: &dyn crate::fs::Source) -> Re
     let mut domains: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for schema in usable.values() {
         if let Some(domain) = schema.identity_domain() {
-            domains.entry(domain.to_string()).or_default().push(schema.table().to_string());
+            domains
+                .entry(domain.to_string())
+                .or_default()
+                .push(schema.table().to_string());
         }
     }
     for (domain, tables) in &domains {
@@ -318,7 +342,10 @@ pub fn validate_through(catalog: &Catalog, source: &dyn crate::fs::Source) -> Re
                 // one as dangling.
                 continue;
             }
-            let constraint = mirror::constraint_name(&usable[&targets[0]], &target_columns(fk, &usable[&targets[0]]));
+            let constraint = mirror::constraint_name(
+                &usable[&targets[0]],
+                &target_columns(fk, &usable[&targets[0]]),
+            );
             let rule = mirror::fk_rule(table, fk.name());
             let removable = fk.from().iter().all(|path| {
                 crate::schema::document::resolve_path(schema, path)
@@ -348,7 +375,9 @@ pub fn validate_through(catalog: &Catalog, source: &dyn crate::fs::Source) -> Re
                     fk.describe(table),
                     fk.on_delete().name()
                 ));
-                verdict.errors.push(located.at(diagnostic, &edge.path, Some(&edge.pointer)));
+                verdict
+                    .errors
+                    .push(located.at(diagnostic, &edge.path, Some(&edge.pointer)));
             }
         }
         for graph in schema.acyclic() {
@@ -357,27 +386,38 @@ pub fn validate_through(catalog: &Catalog, source: &dyn crate::fs::Source) -> Re
             for cycle in cycles(catalog, table, &edges)? {
                 let names: Vec<&str> = cycle.iter().map(|(key, _)| key.as_str()).collect();
                 let (_, path) = &cycle[0];
-                verdict.errors.push(located.at(
-                    Diagnostic::error(
-                        "CYCLE_VIOLATION",
-                        format!("{} must be acyclic, but {} forms a cycle", graph.name(), names.join(" -> ")),
-                    )
-                    .table(table)
-                    .constraint(format!("{table} acyclic {}", graph.name())),
-                    path,
-                    None,
-                ));
+                verdict.errors.push(
+                    located.at(
+                        Diagnostic::error(
+                            "CYCLE_VIOLATION",
+                            format!(
+                                "{} must be acyclic, but {} forms a cycle",
+                                graph.name(),
+                                names.join(" -> ")
+                            ),
+                        )
+                        .table(table)
+                        .constraint(format!("{table} acyclic {}", graph.name())),
+                        path,
+                        None,
+                    ),
+                );
             }
         }
         for check in schema.checks() {
             for path in crate::sql::check_violations(&catalog.mirror, schema, check)? {
-                verdict.errors.push(located.at(
-                    Diagnostic::error("CHECK_VIOLATION", format!("row violates check {:?}", check.name()))
+                verdict.errors.push(
+                    located.at(
+                        Diagnostic::error(
+                            "CHECK_VIOLATION",
+                            format!("row violates check {:?}", check.name()),
+                        )
                         .table(table)
                         .constraint(check.expr().to_string()),
-                    &path,
-                    None,
-                ));
+                        &path,
+                        None,
+                    ),
+                );
             }
         }
         for assertion in schema.assertions() {
@@ -430,7 +470,10 @@ fn cycles(
         if let Some(from) = key_of_path.get(&edge.path)
             && path_of_key.contains_key(&edge.target)
         {
-            graph.entry(from.clone()).or_default().insert(edge.target.clone());
+            graph
+                .entry(from.clone())
+                .or_default()
+                .insert(edge.target.clone());
         }
     }
     const WHITE: u8 = 0;
@@ -447,8 +490,7 @@ fn cycles(
             vec![(start.as_str(), graph[start].iter().collect(), 0)];
         let mut trail: Vec<&str> = vec![start.as_str()];
         colour.insert(start.as_str(), GREY);
-        loop {
-            let Some(top) = stack.last_mut() else { break };
+        while let Some(top) = stack.last_mut() {
             if top.2 >= top.1.len() {
                 let node = top.0;
                 colour.insert(node, BLACK);
@@ -516,13 +558,10 @@ impl<'s> Locator<'s> {
         let root = self.root.clone();
         let source = self.source;
         let entry = self.cache.entry(path.to_string()).or_insert_with(|| {
-            source
-                .read(&root.join(path))
-                .ok()
-                .map(|raw| {
-                    let spans = crate::locate::Spans::of(&raw);
-                    (raw, spans)
-                })
+            source.read(&root.join(path)).ok().map(|raw| {
+                let spans = crate::locate::Spans::of(&raw);
+                (raw, spans)
+            })
         });
         match entry {
             Some((raw, spans)) => diagnostic.locate_in(raw, spans),

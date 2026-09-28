@@ -60,13 +60,16 @@ pub struct Expansion {
 /// engine stops and says so, rather than running unbounded.
 const MAX_EVENTS: usize = 10_000_000;
 
+/// Path → what will be there after the plan (None: deleted).
+type Planned = BTreeMap<PathBuf, Option<(String, Map<String, Value>)>>;
+
 /// The working state: what each touched path will hold.
 struct State<'c> {
     catalog: &'c Catalog,
     /// Path → the row there before the plan, if one.
     before: BTreeMap<PathBuf, Row>,
     /// Path → what will be there after (None: deleted).
-    after: BTreeMap<PathBuf, Option<(String, Map<String, Value>)>>,
+    after: Planned,
 }
 
 impl<'c> State<'c> {
@@ -125,7 +128,9 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
             state.after.insert(path.clone(), None);
         }
         if let (Some(path), Some(after)) = (&after_path, change.after) {
-            state.after.insert(path.clone(), Some((change.table.clone(), after)));
+            state
+                .after
+                .insert(path.clone(), Some((change.table.clone(), after)));
         }
         pending.push_back((before_path, after_path));
     }
@@ -134,8 +139,12 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
     let mut refusals: Vec<Diagnostic> = vec![];
     let mut events = 0usize;
     while let Some((before_path, after_path)) = pending.pop_front() {
-        let Some(before_path) = before_path else { continue };
-        let Some(original) = state.original(&before_path)? else { continue };
+        let Some(before_path) = before_path else {
+            continue;
+        };
+        let Some(original) = state.original(&before_path)? else {
+            continue;
+        };
         let schema = schema_of(catalog, &original.table)?;
         let after_row = match &after_path {
             Some(path) => state.current(path)?.map(|(_, row)| row),
@@ -145,7 +154,9 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
             let Some(old_key) = mirror::key(&original.value, columns, schema) else {
                 continue;
             };
-            let new_key = after_row.as_ref().and_then(|row| mirror::key(row, columns, schema));
+            let new_key = after_row
+                .as_ref()
+                .and_then(|row| mirror::key(row, columns, schema));
             if new_key.as_deref() == Some(old_key.as_str()) {
                 continue;
             }
@@ -164,7 +175,13 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
                 replacement: after_row.clone().filter(|_| new_key.is_some()),
                 holder: before_path.clone(),
             };
-            resolve(&mut state, &vacated, &mut pending, &mut induced, &mut refusals)?;
+            resolve(
+                &mut state,
+                &vacated,
+                &mut pending,
+                &mut induced,
+                &mut refusals,
+            )?;
         }
     }
 
@@ -177,7 +194,10 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
                 .map(|d| {
                     format!(
                         "{}{}",
-                        d.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                        d.path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
                         d.pointer.as_deref().unwrap_or("")
                     )
                 })
@@ -212,7 +232,10 @@ pub fn expand(catalog: &Catalog, rows: Vec<RowChange>) -> Result<Expansion> {
 }
 
 fn schema_of<'c>(catalog: &'c Catalog, table: &str) -> Result<&'c Schema> {
-    catalog.schemas.get(table).ok_or_else(|| catalog.unknown_table(table))
+    catalog
+        .schemas
+        .get(table)
+        .ok_or_else(|| catalog.unknown_table(table))
 }
 
 /// Resolve every reference to a vacated key.
@@ -290,7 +313,8 @@ fn resolve(
                         .help("change or remove the references first, or declare an action that resolves them");
                         diagnostic.constraint = Some(constraint.clone());
                         if let Ok(raw) = std::fs::read(catalog.root.join(&path)) {
-                            diagnostic = diagnostic.locate_in(&raw, &crate::locate::Spans::of(&raw));
+                            diagnostic =
+                                diagnostic.locate_in(&raw, &crate::locate::Spans::of(&raw));
                         }
                         refusals.push(diagnostic);
                     }
@@ -317,8 +341,13 @@ fn resolve(
                         continue;
                     }
                     Action::Cascade => {
-                        let replacement = vacated.replacement.as_ref().expect("an update carries its new row");
-                        for (pointer, value) in carried(fk, &vacated.columns, replacement, &pointers) {
+                        let replacement = vacated
+                            .replacement
+                            .as_ref()
+                            .expect("an update carries its new row");
+                        for (pointer, value) in
+                            carried(fk, &vacated.columns, replacement, &pointers)
+                        {
                             set(&mut row, &pointer, value);
                         }
                     }
@@ -337,7 +366,9 @@ fn resolve(
                             set(&mut row, pointer, default);
                         }
                     }
-                    Action::Restrict | Action::NoAction => unreachable!("refusing actions return above"),
+                    Action::Restrict | Action::NoAction => {
+                        unreachable!("refusing actions return above")
+                    }
                 }
                 record(action);
                 state.original(&path)?;
@@ -354,26 +385,44 @@ fn resolve(
 }
 
 /// Whether any row of the target tables holds the key once the plan applies.
-fn still_held(state: &State<'_>, key: &str, columns: &[String], targets: &[String]) -> Result<bool> {
+fn still_held(
+    state: &State<'_>,
+    key: &str,
+    columns: &[String],
+    targets: &[String],
+) -> Result<bool> {
     let catalog = state.catalog;
     for target in targets {
-        let Some(schema) = catalog.schemas.get(target) else { continue };
-        if schema.candidate_keys().all(|candidate| candidate != columns) && columns != schema.primary_key() {
+        let Some(schema) = catalog.schemas.get(target) else {
+            continue;
+        };
+        if schema
+            .candidate_keys()
+            .all(|candidate| candidate != columns)
+            && columns != schema.primary_key()
+        {
             continue;
         }
         let constraint = mirror::constraint_name(schema, columns);
-        for (_, path) in catalog.mirror.holders(key, &constraint, std::slice::from_ref(target))? {
+        for (_, path) in catalog
+            .mirror
+            .holders(key, &constraint, std::slice::from_ref(target))?
+        {
             let path = PathBuf::from(path);
             match state.after.get(&path) {
                 None => return Ok(true),
-                Some(Some((_, row))) if mirror::key(row, columns, schema).as_deref() == Some(key) => {
+                Some(Some((_, row)))
+                    if mirror::key(row, columns, schema).as_deref() == Some(key) =>
+                {
                     return Ok(true);
                 }
                 _ => {}
             }
         }
         for planned in state.after.values().flatten() {
-            if &planned.0 == target && mirror::key(&planned.1, columns, schema).as_deref() == Some(key) {
+            if &planned.0 == target
+                && mirror::key(&planned.1, columns, schema).as_deref() == Some(key)
+            {
                 return Ok(true);
             }
         }
@@ -391,7 +440,10 @@ fn matching(schema: &Schema, fk: &ForeignKey, row: &Map<String, Value>, key: &st
         path.occurrences(row)
             .into_iter()
             .filter(|occurrence| {
-                canonical::compact(&Value::Array(vec![mirror::key_component(occurrence.value, &kind)])) == key
+                canonical::compact(&Value::Array(vec![mirror::key_component(
+                    occurrence.value,
+                    &kind,
+                )])) == key
             })
             .map(|occurrence| occurrence.pointer)
             .collect()
@@ -427,12 +479,20 @@ fn carried(
 ) -> Vec<(String, Value)> {
     if fk.from().len() == 1 {
         let value = replacement.get(&columns[0]).cloned().unwrap_or(Value::Null);
-        pointers.iter().map(|pointer| (pointer.clone(), value.clone())).collect()
+        pointers
+            .iter()
+            .map(|pointer| (pointer.clone(), value.clone()))
+            .collect()
     } else {
         pointers
             .iter()
             .zip(columns)
-            .map(|(pointer, column)| (pointer.clone(), replacement.get(column).cloned().unwrap_or(Value::Null)))
+            .map(|(pointer, column)| {
+                (
+                    pointer.clone(),
+                    replacement.get(column).cloned().unwrap_or(Value::Null),
+                )
+            })
             .collect()
     }
 }
@@ -478,13 +538,17 @@ fn compare_tokens(left: &[String], right: &[String]) -> std::cmp::Ordering {
 
 fn set(row: &mut Map<String, Value>, pointer: &str, value: Value) {
     let tokens = crate::schema::path::pointer_tokens(pointer);
-    let Some((last, parents)) = tokens.split_last() else { return };
+    let Some((last, parents)) = tokens.split_last() else {
+        return;
+    };
     let mut current: Option<&mut Value> = None;
     for (index, token) in parents.iter().enumerate() {
         current = match (index, current) {
             (0, _) => row.get_mut(token),
             (_, Some(Value::Object(object))) => object.get_mut(token),
-            (_, Some(Value::Array(items))) => token.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+            (_, Some(Value::Array(items))) => {
+                token.parse::<usize>().ok().and_then(|i| items.get_mut(i))
+            }
             _ => None,
         };
         if current.is_none() {
@@ -508,14 +572,20 @@ fn set(row: &mut Map<String, Value>, pointer: &str, value: Value) {
 }
 
 fn remove_element(row: &mut Map<String, Value>, tokens: &[String]) {
-    let Some((last, parents)) = tokens.split_last() else { return };
-    let Ok(index) = last.parse::<usize>() else { return };
+    let Some((last, parents)) = tokens.split_last() else {
+        return;
+    };
+    let Ok(index) = last.parse::<usize>() else {
+        return;
+    };
     let mut current: Option<&mut Value> = None;
     for (position, token) in parents.iter().enumerate() {
         current = match (position, current) {
             (0, _) => row.get_mut(token),
             (_, Some(Value::Object(object))) => object.get_mut(token),
-            (_, Some(Value::Array(items))) => token.parse::<usize>().ok().and_then(|i| items.get_mut(i)),
+            (_, Some(Value::Array(items))) => {
+                token.parse::<usize>().ok().and_then(|i| items.get_mut(i))
+            }
             _ => None,
         };
         if current.is_none() {
@@ -543,7 +613,10 @@ mod tests {
         let mut data = row(json!({"a": {"b": [1, {"c": 2}]}}));
         set(&mut data, "/a/b/1/c", json!(9));
         set(&mut data, "/a/b/0", json!(null));
-        assert_eq!(Value::Object(data.clone()), json!({"a": {"b": [null, {"c": 9}]}}));
+        assert_eq!(
+            Value::Object(data.clone()),
+            json!({"a": {"b": [null, {"c": 9}]}})
+        );
         remove_element(&mut data, &["a".into(), "b".into(), "0".into()]);
         assert_eq!(Value::Object(data), json!({"a": {"b": [{"c": 9}]}}));
     }

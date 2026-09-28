@@ -35,11 +35,19 @@ pub struct Migration {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     /// Declare a table with a complete schema document.
-    AddTable { table: String, schema: Box<Value> },
+    AddTable {
+        table: String,
+        schema: Box<Value>,
+    },
     /// Remove a table's schema and every row.
-    DropTable { table: String },
+    DropTable {
+        table: String,
+    },
     /// Rename a table: its schema, its directory, and every reference to it.
-    RenameTable { table: String, new: String },
+    RenameTable {
+        table: String,
+        new: String,
+    },
     /// Add a column. A column that admits no null must have a default for a
     /// table that already has rows; the default is written into every row.
     AddColumn {
@@ -52,9 +60,16 @@ pub enum Operation {
         #[serde(default)]
         default: Option<Value>,
     },
-    DropColumn { table: String, column: String },
+    DropColumn {
+        table: String,
+        column: String,
+    },
     /// Rename a column everywhere: schema, constraints, references, rows.
-    RenameColumn { table: String, column: String, new: String },
+    RenameColumn {
+        table: String,
+        column: String,
+        new: String,
+    },
     /// Change a column's type, converting every value. Without `using` a value
     /// converts only when nothing is lost; `using` is a SQL expression over the
     /// row giving the new value.
@@ -67,23 +82,46 @@ pub enum Operation {
         using: Option<String>,
     },
     /// Add a constraint, written as the schema dialect writes it.
-    AddConstraint { table: String, definition: Constraint },
-    DropConstraint { table: String, name: String },
-    AddIndex { table: String, columns: Vec<String> },
-    DropIndex { table: String, columns: Vec<String> },
+    AddConstraint {
+        table: String,
+        definition: Constraint,
+    },
+    DropConstraint {
+        table: String,
+        name: String,
+    },
+    AddIndex {
+        table: String,
+        columns: Vec<String>,
+    },
+    DropIndex {
+        table: String,
+        columns: Vec<String>,
+    },
     /// Join a table to an identity domain, or with `null` leave one.
-    SetIdentityDomain { table: String, domain: Option<String> },
+    SetIdentityDomain {
+        table: String,
+        domain: Option<String>,
+    },
 }
 
 /// A constraint, in the dialect's own spelling, tagged with its kind.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Constraint {
-    Unique { columns: Vec<String> },
+    Unique {
+        columns: Vec<String>,
+    },
     /// A `foreignKeys` entry.
     ForeignKey(Map<String, Value>),
-    Check { name: String, expr: String },
-    Acyclic { name: String, edges: Vec<String> },
+    Check {
+        name: String,
+        expr: String,
+    },
+    Acyclic {
+        name: String,
+        edges: Vec<String>,
+    },
     /// An `assertions` entry.
     Assertion(Map<String, Value>),
 }
@@ -94,19 +132,42 @@ impl Operation {
             Self::AddTable { table, .. } => format!("add table {table}"),
             Self::DropTable { table } => format!("drop table {table} and its rows"),
             Self::RenameTable { table, new } => format!("rename table {table} to {new}"),
-            Self::AddColumn { table, column, kind, .. } => format!("add column {table}.{column} ({kind})"),
+            Self::AddColumn {
+                table,
+                column,
+                kind,
+                ..
+            } => format!("add column {table}.{column} ({kind})"),
             Self::DropColumn { table, column } => format!("drop column {table}.{column}"),
-            Self::RenameColumn { table, column, new } => format!("rename column {table}.{column} to {new}"),
-            Self::ChangeType { table, column, kind, .. } => format!("change {table}.{column} to {kind}"),
+            Self::RenameColumn { table, column, new } => {
+                format!("rename column {table}.{column} to {new}")
+            }
+            Self::ChangeType {
+                table,
+                column,
+                kind,
+                ..
+            } => format!("change {table}.{column} to {kind}"),
             Self::AddConstraint { table, .. } => format!("add a constraint to {table}"),
             Self::DropConstraint { table, name } => format!("drop constraint {name} from {table}"),
             Self::AddIndex { table, columns } => format!("index {table}({})", columns.join(",")),
-            Self::DropIndex { table, columns } => format!("drop index {table}({})", columns.join(",")),
-            Self::SetIdentityDomain { table, domain: Some(domain) } => format!("join {table} to identity domain {domain}"),
-            Self::SetIdentityDomain { table, domain: None } => format!("remove {table} from its identity domain"),
+            Self::DropIndex { table, columns } => {
+                format!("drop index {table}({})", columns.join(","))
+            }
+            Self::SetIdentityDomain {
+                table,
+                domain: Some(domain),
+            } => format!("join {table} to identity domain {domain}"),
+            Self::SetIdentityDomain {
+                table,
+                domain: None,
+            } => format!("remove {table} from its identity domain"),
         }
     }
 }
+
+/// Rows an operation reshaped: each original row, and its new value.
+type Reshaped = Vec<(Option<Row>, Map<String, Value>)>;
 
 /// A table as the migration leaves it.
 struct Working {
@@ -114,7 +175,7 @@ struct Working {
     /// Where its schema is written: its pin, or its working schema.
     home: PathBuf,
     /// Its rows, when an operation reshaped them: (original row, new value).
-    rows: Option<Vec<(Option<Row>, Map<String, Value>)>>,
+    rows: Option<Reshaped>,
 }
 
 struct Plan<'c> {
@@ -130,19 +191,28 @@ fn refused(code: &str, message: impl Into<String>) -> DbError {
 
 impl<'c> Plan<'c> {
     fn table(&mut self, table: &str) -> Result<&mut Working> {
-        self.tables.get_mut(table).ok_or_else(|| self.catalog.unknown_table(table))
+        self.tables
+            .get_mut(table)
+            .ok_or_else(|| self.catalog.unknown_table(table))
     }
 
     /// The table's rows, loaded for reshaping.
-    fn rows(&mut self, table: &str) -> Result<&mut Vec<(Option<Row>, Map<String, Value>)>> {
+    fn rows(&mut self, table: &str) -> Result<&mut Reshaped> {
         let catalog = self.catalog;
-        let working = self.tables.get_mut(table).ok_or_else(|| catalog.unknown_table(table))?;
+        let working = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| catalog.unknown_table(table))?;
         if working.rows.is_none() {
             let rows = if catalog.schemas.contains_key(table) {
-                catalog.rows(table)?.into_iter().map(|row| {
-                    let value = row.value.clone();
-                    (Some(row), value)
-                }).collect()
+                catalog
+                    .rows(table)?
+                    .into_iter()
+                    .map(|row| {
+                        let value = row.value.clone();
+                        (Some(row), value)
+                    })
+                    .collect()
             } else {
                 vec![]
             };
@@ -151,7 +221,11 @@ impl<'c> Plan<'c> {
         Ok(working.rows.as_mut().expect("loaded above"))
     }
 
-    fn edit(&mut self, table: &str, change: impl FnOnce(&mut crate::schema::document::Editor) -> Result<()>) -> Result<()> {
+    fn edit(
+        &mut self,
+        table: &str,
+        change: impl FnOnce(&mut crate::schema::document::Editor) -> Result<()>,
+    ) -> Result<()> {
         let working = self.table(table)?;
         let schema = decode(table, working.document.clone())?;
         let mut editor = schema.edit();
@@ -164,7 +238,9 @@ impl<'c> Plan<'c> {
 fn decode(table: &str, document: Value) -> Result<Schema> {
     Schema::from_document(document, None).map_err(|problems| {
         let mut problems = problems.into_iter().map(|d| d.table(table));
-        let first = problems.next().unwrap_or_else(|| Diagnostic::error("SCHEMA_INVALID", "invalid schema"));
+        let first = problems
+            .next()
+            .unwrap_or_else(|| Diagnostic::error("SCHEMA_INVALID", "invalid schema"));
         DbError::from_diag(first, 2).with_related(problems.collect())
     })
 }
@@ -204,7 +280,12 @@ pub fn plan(database: &Database, migration: &Migration) -> Result<(Vec<Change>, 
     };
     for (index, operation) in migration.operations.iter().enumerate() {
         apply(&mut plan, operation).map_err(|error| {
-            let message = format!("operation {} ({}): {}", index + 1, operation.describe(), error.diagnostic.message);
+            let message = format!(
+                "operation {} ({}): {}",
+                index + 1,
+                operation.describe(),
+                error.diagnostic.message
+            );
             let mut diagnostic = (*error.diagnostic).clone();
             diagnostic.message = message;
             DbError::from_diag(diagnostic, error.exit).with_related(error.related)
@@ -217,34 +298,60 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
     match operation {
         Operation::AddTable { table, schema } => {
             if plan.tables.contains_key(table) {
-                return Err(refused("SCHEMA_TABLE_EXISTS", format!("table {table} already exists")));
+                return Err(refused(
+                    "SCHEMA_TABLE_EXISTS",
+                    format!("table {table} already exists"),
+                ));
             }
             let decoded = decode(table, (**schema).clone())?;
             if decoded.table() != table {
                 return Err(refused(
                     "SCHEMA_TABLE_NAME_MISMATCH",
-                    format!("the schema declares table {:?}, not {table:?}", decoded.table()),
+                    format!(
+                        "the schema declares table {:?}, not {table:?}",
+                        decoded.table()
+                    ),
                 ));
             }
             plan.tables.insert(
                 table.clone(),
-                Working { document: (**schema).clone(), home: crate::schema_store::working_relative(table), rows: Some(vec![]) },
+                Working {
+                    document: (**schema).clone(),
+                    home: crate::schema_store::working_relative(table),
+                    rows: Some(vec![]),
+                },
             );
         }
         Operation::DropTable { table } => {
-            let working = plan.tables.remove(table).ok_or_else(|| plan.catalog.unknown_table(table))?;
-            let rows = if plan.catalog.schemas.contains_key(table) { plan.catalog.rows(table)? } else { vec![] };
+            let working = plan
+                .tables
+                .remove(table)
+                .ok_or_else(|| plan.catalog.unknown_table(table))?;
+            let rows = if plan.catalog.schemas.contains_key(table) {
+                plan.catalog.rows(table)?
+            } else {
+                vec![]
+            };
             plan.dropped.push((working.home, rows));
         }
         Operation::RenameTable { table, new } => {
             if !crate::schema::valid_name(new) {
-                return Err(refused("SCHEMA_INVALID_TABLE_NAME", format!("{new:?} cannot be a table name")));
+                return Err(refused(
+                    "SCHEMA_INVALID_TABLE_NAME",
+                    format!("{new:?} cannot be a table name"),
+                ));
             }
             if plan.tables.contains_key(new) || plan.catalog.root.join(new).exists() {
-                return Err(refused("SCHEMA_TABLE_EXISTS", format!("{new} already exists")));
+                return Err(refused(
+                    "SCHEMA_TABLE_EXISTS",
+                    format!("{new} already exists"),
+                ));
             }
             plan.rows(table)?;
-            let mut working = plan.tables.remove(table).ok_or_else(|| plan.catalog.unknown_table(table))?;
+            let mut working = plan
+                .tables
+                .remove(table)
+                .ok_or_else(|| plan.catalog.unknown_table(table))?;
             let schema = decode(table, working.document.clone())?;
             let mut editor = schema.edit();
             editor.rename_table(new);
@@ -265,11 +372,28 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 })?;
             }
         }
-        Operation::AddColumn { table, column, kind, nullable, default } => {
+        Operation::AddColumn {
+            table,
+            column,
+            kind,
+            nullable,
+            default,
+        } => {
             let kind = column_type(kind)?;
             let has_rows = !plan.rows(table)?.is_empty();
-            if plan.table(table)?.document.pointer(&format!("/properties/{}", crate::schema::path::escape_pointer(column))).is_some() {
-                return Err(refused("SCHEMA_COLUMN_EXISTS", format!("{table}.{column} already exists")));
+            if plan
+                .table(table)?
+                .document
+                .pointer(&format!(
+                    "/properties/{}",
+                    crate::schema::path::escape_pointer(column)
+                ))
+                .is_some()
+            {
+                return Err(refused(
+                    "SCHEMA_COLUMN_EXISTS",
+                    format!("{table}.{column} already exists"),
+                ));
             }
             if !nullable && default.is_none() && has_rows {
                 return Err(DbError::from_diag(
@@ -298,7 +422,11 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
         Operation::DropColumn { table, column } => {
             plan.edit(table, |editor| {
                 if editor.column(column).is_none() {
-                    return Err(DbError::new("UNKNOWN_COLUMN", format!("{table}.{column} does not exist"), 4));
+                    return Err(DbError::new(
+                        "UNKNOWN_COLUMN",
+                        format!("{table}.{column} does not exist"),
+                        4,
+                    ));
                 }
                 editor.drop_column(column);
                 Ok(())
@@ -310,15 +438,29 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
         Operation::RenameColumn { table, column, new } => {
             plan.edit(table, |editor| {
                 if editor.column(column).is_none() {
-                    return Err(DbError::new("UNKNOWN_COLUMN", format!("{table}.{column} does not exist"), 4));
+                    return Err(DbError::new(
+                        "UNKNOWN_COLUMN",
+                        format!("{table}.{column} does not exist"),
+                        4,
+                    ));
                 }
                 if editor.column(new).is_some() {
-                    return Err(refused("SCHEMA_COLUMN_EXISTS", format!("{table}.{new} already exists")));
+                    return Err(refused(
+                        "SCHEMA_COLUMN_EXISTS",
+                        format!("{table}.{new} already exists"),
+                    ));
                 }
-                editor.rename_column(column, new, table).map_err(|message| refused("SCHEMA_CHECK_INVALID", message))?;
+                editor
+                    .rename_column(column, new, table)
+                    .map_err(|message| refused("SCHEMA_CHECK_INVALID", message))?;
                 Ok(())
             })?;
-            let names: Vec<String> = plan.tables.keys().filter(|name| *name != table).cloned().collect();
+            let names: Vec<String> = plan
+                .tables
+                .keys()
+                .filter(|name| *name != table)
+                .cloned()
+                .collect();
             for name in names {
                 plan.edit(&name, |editor| {
                     editor.rename_referenced_column(table, column, new);
@@ -331,15 +473,29 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 }
             }
         }
-        Operation::ChangeType { table, column, kind, using } => {
+        Operation::ChangeType {
+            table,
+            column,
+            kind,
+            using,
+        } => {
             let kind = column_type(kind)?;
-            let pointer = format!("/properties/{}", crate::schema::path::escape_pointer(column));
+            let pointer = format!(
+                "/properties/{}",
+                crate::schema::path::escape_pointer(column)
+            );
             let current = plan
                 .table(table)?
                 .document
                 .pointer(&pointer)
                 .cloned()
-                .ok_or_else(|| DbError::new("UNKNOWN_COLUMN", format!("{table}.{column} does not exist"), 4))?;
+                .ok_or_else(|| {
+                    DbError::new(
+                        "UNKNOWN_COLUMN",
+                        format!("{table}.{column} does not exist"),
+                        4,
+                    )
+                })?;
             let nullable = decode(table, plan.table(table)?.document.clone())?
                 .column(column)
                 .is_some_and(|c| c.nullable());
@@ -357,12 +513,20 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 Some(expression) => Some(evaluate(plan.catalog, table, expression)?),
                 None => None,
             };
-            let schema_key = plan.catalog.schemas.get(table).map(|s| s.primary_key().to_vec()).unwrap_or_default();
+            let schema_key = plan
+                .catalog
+                .schemas
+                .get(table)
+                .map(|s| s.primary_key().to_vec())
+                .unwrap_or_default();
             for (before, row) in plan.rows(table)? {
                 let source = match (&computed, before.as_ref()) {
                     (Some(values), Some(before)) => {
                         let key = crate::canonical::compact(&Value::Array(
-                            schema_key.iter().map(|k| before.value.get(k).cloned().unwrap_or(Value::Null)).collect(),
+                            schema_key
+                                .iter()
+                                .map(|k| before.value.get(k).cloned().unwrap_or(Value::Null))
+                                .collect(),
                         ));
                         values.get(&key).cloned()
                     }
@@ -376,11 +540,17 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 let converted = crate::value::lossless_convert(&value, &kind)
                     .or_else(|| value_has_type(&value, &kind).then(|| value.clone()))
                     .ok_or_else(|| {
-                        let at = before.as_ref().map(|row| row.relative.display().to_string()).unwrap_or_default();
+                        let at = before
+                            .as_ref()
+                            .map(|row| row.relative.display().to_string())
+                            .unwrap_or_default();
                         DbError::from_diag(
                             Diagnostic::error(
                                 "TYPE_MISMATCH",
-                                format!("{value} in {at} cannot become a {} without losing information", kind.name()),
+                                format!(
+                                    "{value} in {at} cannot become a {} without losing information",
+                                    kind.name()
+                                ),
                             )
                             .help("give --using with a SQL expression that computes the new value"),
                             2,
@@ -394,7 +564,10 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 match definition {
                     Constraint::Unique { columns } => {
                         if !editor.add_list("unique", columns) {
-                            return Err(refused("SCHEMA_CONSTRAINT_EXISTS", "that unique constraint already exists"));
+                            return Err(refused(
+                                "SCHEMA_CONSTRAINT_EXISTS",
+                                "that unique constraint already exists",
+                            ));
                         }
                     }
                     Constraint::ForeignKey(entry) => {
@@ -418,7 +591,11 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 if editor.drop_constraint(name) {
                     Ok(())
                 } else {
-                    Err(DbError::new("UNKNOWN_CONSTRAINT", format!("{table} has no constraint named {name:?}"), 4))
+                    Err(DbError::new(
+                        "UNKNOWN_CONSTRAINT",
+                        format!("{table} has no constraint named {name:?}"),
+                        4,
+                    ))
                 }
             })?;
         }
@@ -428,7 +605,10 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                     return Err(DbError::usage("an index needs at least one column"));
                 }
                 if !editor.add_list("indexes", columns) {
-                    return Err(refused("SCHEMA_CONSTRAINT_EXISTS", "that index already exists"));
+                    return Err(refused(
+                        "SCHEMA_CONSTRAINT_EXISTS",
+                        "that index already exists",
+                    ));
                 }
                 Ok(())
             })?;
@@ -438,7 +618,11 @@ fn apply(plan: &mut Plan<'_>, operation: &Operation) -> Result<()> {
                 if editor.remove_list("indexes", columns) {
                     Ok(())
                 } else {
-                    Err(DbError::new("UNKNOWN_CONSTRAINT", format!("{table} has no index on ({})", columns.join(",")), 4))
+                    Err(DbError::new(
+                        "UNKNOWN_CONSTRAINT",
+                        format!("{table} has no index on ({})", columns.join(",")),
+                        4,
+                    ))
                 }
             })?;
         }
@@ -459,13 +643,24 @@ fn value_has_type(value: &Value, kind: &ColumnType) -> bool {
         .column("v", subschema(kind, false), true)
         .primary_key(vec!["id".into()])
         .build();
-    probe.is_ok_and(|schema| schema.validator().is_valid(&serde_json::json!({"id": 1, "v": value})))
+    probe.is_ok_and(|schema| {
+        schema
+            .validator()
+            .is_valid(&serde_json::json!({"id": 1, "v": value}))
+    })
 }
 
 /// A SQL expression's value for every row of a table, by rendered key.
 fn evaluate(catalog: &Catalog, table: &str, expression: &str) -> Result<BTreeMap<String, Value>> {
-    let schema = catalog.schemas.get(table).ok_or_else(|| catalog.unknown_table(table))?;
-    let keys: Vec<String> = schema.primary_key().iter().map(|k| crate::mirror::quote(k)).collect();
+    let schema = catalog
+        .schemas
+        .get(table)
+        .ok_or_else(|| catalog.unknown_table(table))?;
+    let keys: Vec<String> = schema
+        .primary_key()
+        .iter()
+        .map(|k| crate::mirror::quote(k))
+        .collect();
     let text = format!(
         "SELECT json_array({}) AS \"_reldir_key\", ({expression}) AS \"_reldir_value\" FROM {}",
         keys.join(", "),
@@ -477,11 +672,23 @@ fn evaluate(catalog: &Catalog, table: &str, expression: &str) -> Result<BTreeMap
         &catalog.schemas,
         &text,
         &[],
-        crate::sql::QueryLimits { timeout: None, max_rows: usize::MAX, max_memory: 1 << 30 },
+        crate::sql::QueryLimits {
+            timeout: None,
+            max_rows: usize::MAX,
+            max_memory: 1 << 30,
+        },
         |row| {
-            let key = row.get("_reldir_key").and_then(Value::as_str).unwrap_or_default();
-            let key = crate::json::parse_str(key).map(|value| canonical::compact(&value)).unwrap_or_default();
-            out.insert(key, row.get("_reldir_value").cloned().unwrap_or(Value::Null));
+            let key = row
+                .get("_reldir_key")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key = crate::json::parse_str(key)
+                .map(|value| canonical::compact(&value))
+                .unwrap_or_default();
+            out.insert(
+                key,
+                row.get("_reldir_value").cloned().unwrap_or(Value::Null),
+            );
             Ok(())
         },
     )?;
@@ -502,12 +709,16 @@ fn render(database: &Database, plan: Plan<'_>) -> Result<(Vec<Change>, Expected)
         let schema = decode(table, working.document.clone())?;
         let original = plan.catalog.schemas.get(table);
         if original.is_none_or(|original| original.document() != schema.document()) {
-            writes.insert(working.home.clone(), canonical::pretty_with_indent(schema.document(), width));
+            writes.insert(
+                working.home.clone(),
+                canonical::pretty_with_indent(schema.document(), width),
+            );
         }
         let Some(rows) = &working.rows else { continue };
         for (before, value) in rows {
             let path = crate::plan::row_path(&schema, value)?;
-            let bytes = canonical::pretty_with_indent(&canonical::canonical_row(value, &schema), width);
+            let bytes =
+                canonical::pretty_with_indent(&canonical::canonical_row(value, &schema), width);
             if let Some(before) = before
                 && before.relative != path
             {
@@ -515,8 +726,11 @@ fn render(database: &Database, plan: Plan<'_>) -> Result<(Vec<Change>, Expected)
             }
             if writes.insert(path.clone(), bytes).is_some() {
                 return Err(DbError::from_diag(
-                    Diagnostic::error("PRIMARY_KEY_VIOLATION", format!("two rows would both be written to {}", path.display()))
-                        .at(path),
+                    Diagnostic::error(
+                        "PRIMARY_KEY_VIOLATION",
+                        format!("two rows would both be written to {}", path.display()),
+                    )
+                    .at(path),
                     2,
                 ));
             }

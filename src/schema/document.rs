@@ -31,14 +31,17 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
         diagnostic
     };
 
-    let grammar = meta::check_document(&document, source).map_err(|error| vec![*error.diagnostic])?;
+    let grammar =
+        meta::check_document(&document, source).map_err(|error| vec![*error.diagnostic])?;
     if !grammar.is_empty() {
         return Err(grammar);
     }
 
     // The table schema guarantees the shapes read below; anything it cannot
     // express is checked after the view is built.
-    let root = document.as_object().expect("the table schema requires an object");
+    let root = document
+        .as_object()
+        .expect("the table schema requires an object");
     let extension = root[meta::EXTENSION]
         .as_object()
         .expect("the table schema requires x-reldir to be an object");
@@ -88,8 +91,11 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
         };
         if name.is_empty() || name.contains('\0') {
             problems.push(
-                Diagnostic::error("SCHEMA_COLUMN_UNKNOWN", format!("invalid column name {name:?}"))
-                    .pointer(format!("/properties/{}", super::path::escape_pointer(name))),
+                Diagnostic::error(
+                    "SCHEMA_COLUMN_UNKNOWN",
+                    format!("invalid column name {name:?}"),
+                )
+                .pointer(format!("/properties/{}", super::path::escape_pointer(name))),
             );
             continue;
         }
@@ -143,7 +149,10 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
                         Some("warning") => Severity::Warning,
                         _ => Severity::Error,
                     },
-                    message: entry.get("message").and_then(Value::as_str).map(String::from),
+                    message: entry
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(String::from),
                 })
                 .collect()
         })
@@ -152,7 +161,7 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
     let validator = match row::RowValidator::compile(&document, &columns) {
         Ok(validator) => Some(validator),
         Err(problem) => {
-            problems.push(problem);
+            problems.push(*problem);
             None
         }
     };
@@ -168,7 +177,10 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
             .get("schemaVersion")
             .and_then(Value::as_u64)
             .unwrap_or(1),
-        description: root.get("description").and_then(Value::as_str).map(String::from),
+        description: root
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from),
         primary_key: names("primaryKey"),
         columns,
         unique: name_lists("unique"),
@@ -200,7 +212,13 @@ pub(super) fn decode(document: Value, source: Option<&[u8]>) -> Result<Schema, P
 fn strings(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -233,7 +251,9 @@ fn decode_foreign_keys(extension: &Map<String, Value>, problems: &mut Problems) 
     {
         let at = format!("/x-reldir/foreignKeys/{index}");
         let from = parse_paths(&entry["from"], &format!("{at}/from"), problems);
-        let to = entry["to"].as_object().expect("the dialect requires `to` to be an object");
+        let to = entry["to"]
+            .as_object()
+            .expect("the dialect requires `to` to be an object");
         let target = if let Some(table) = to.get("table").and_then(Value::as_str) {
             Target::Table(table.to_string())
         } else if let Some(tables) = to.get("tables") {
@@ -317,15 +337,28 @@ fn project(value: &Value, root: &Value, required: bool, depth: usize) -> Column 
         Some(Value::Array(names)) => {
             let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
             let nullable = names.contains(&"null");
-            (names.into_iter().filter(|name| *name != "null").collect(), nullable)
+            (
+                names.into_iter().filter(|name| *name != "null").collect(),
+                nullable,
+            )
         }
         _ => (vec![], true),
     };
     let tag = get(meta::TYPE_TAG).and_then(Value::as_str);
     let enumerated = get("enum")
         .and_then(Value::as_array)
-        .map(|members| members.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>())
-        .or_else(|| get("const").and_then(Value::as_str).map(|single| vec![single.to_string()]));
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .or_else(|| {
+            get("const")
+                .and_then(Value::as_str)
+                .map(|single| vec![single.to_string()])
+        });
     let kind = match concrete.as_slice() {
         [single] => match (*single, tag) {
             ("integer", Some("int") | None) => ColumnType::Int,
@@ -375,7 +408,12 @@ fn project(value: &Value, root: &Value, required: bool, depth: usize) -> Column 
                 .map(|(name, subschema)| {
                     (
                         name.clone(),
-                        project(subschema, root, nested_required.contains(name.as_str()), depth + 1),
+                        project(
+                            subschema,
+                            root,
+                            nested_required.contains(name.as_str()),
+                            depth + 1,
+                        ),
                     )
                 })
                 .collect()
@@ -388,7 +426,11 @@ fn project(value: &Value, root: &Value, required: bool, depth: usize) -> Column 
         required,
         default: get("default").cloned(),
         generated: None,
-        values: if kind == ColumnType::Enum { enumerated } else { None },
+        values: if kind == ColumnType::Enum {
+            enumerated
+        } else {
+            None
+        },
         items,
         properties,
         description: get("description").and_then(Value::as_str).map(String::from),
@@ -429,7 +471,10 @@ pub fn resolve_path<'a>(schema: &'a Schema, path: &RefPath) -> Result<PathLeaf<'
                         ));
                     }
                     ref other => {
-                        return Err(format!("member {name:?} is read from a {} value", other.name()));
+                        return Err(format!(
+                            "member {name:?} is read from a {} value",
+                            other.name()
+                        ));
                     }
                 };
             }
@@ -484,7 +529,10 @@ fn literal_fits(literal: &Value, column: &Column) -> bool {
             _ => false,
         },
         Value::String(text) => match column.kind {
-            ColumnType::Enum => column.values.as_ref().is_some_and(|values| values.contains(text)),
+            ColumnType::Enum => column
+                .values
+                .as_ref()
+                .is_some_and(|values| values.contains(text)),
             ColumnType::Int | ColumnType::Float | ColumnType::Bool => false,
             _ => true,
         },
@@ -548,7 +596,12 @@ fn validate_local(schema: &Schema) -> Problems {
                 .enumerate()
                 .map(|(index, list)| (format!("/x-reldir/indexes/{index}"), list)),
         )
-        .chain(schema.filename.iter().map(|list| ("/x-reldir/filename".to_string(), list)));
+        .chain(
+            schema
+                .filename
+                .iter()
+                .map(|list| ("/x-reldir/filename".to_string(), list)),
+        );
     for (at, list) in lists {
         for column in list {
             if !schema.columns.contains_key(column) {
@@ -564,7 +617,9 @@ fn validate_local(schema: &Schema) -> Problems {
     // whose own faults are reported against the key.
     if let Some(filename) = &schema.filename
         && (!(filename == &schema.primary_key || schema.unique.contains(filename))
-            || filename.iter().any(|column| schema.columns.get(column).is_some_and(|c| c.nullable)))
+            || filename
+                .iter()
+                .any(|column| schema.columns.get(column).is_some_and(|c| c.nullable)))
     {
         out.push(column_error(
             "SCHEMA_FILENAME_NOT_UNIQUE",
@@ -591,7 +646,9 @@ fn validate_local(schema: &Schema) -> Problems {
             if column.default.is_some() {
                 out.push(column_error(
                     "SCHEMA_DEFAULT_TYPE_MISMATCH",
-                    format!("{name:?} declares both a default and a generator; a value comes from one"),
+                    format!(
+                        "{name:?} declares both a default and a generator; a value comes from one"
+                    ),
                     &at,
                 ));
             }
@@ -688,7 +745,11 @@ fn validate_local(schema: &Schema) -> Problems {
                 _ => None,
             });
             if let Some(reason) = illegal {
-                out.push(column_error("SCHEMA_FK_ACTION_INVALID", reason.into(), &format!("{at}/{key}")));
+                out.push(column_error(
+                    "SCHEMA_FK_ACTION_INVALID",
+                    reason.into(),
+                    &format!("{at}/{key}"),
+                ));
             }
         }
     }
@@ -702,12 +763,18 @@ fn validate_local(schema: &Schema) -> Problems {
             ));
             continue;
         }
-        let key_kind = schema.columns.get(&schema.primary_key[0]).map(|c| c.kind.clone());
+        let key_kind = schema
+            .columns
+            .get(&schema.primary_key[0])
+            .map(|c| c.kind.clone());
         for (position, path) in graph.edges.iter().enumerate() {
             match resolve_path(schema, path) {
                 Ok(leaf) if Some(leaf.column.kind.clone()) != key_kind => out.push(column_error(
                     "SCHEMA_ACYCLIC_INVALID",
-                    format!("edge {path} reaches a {} value, not the table's key type", leaf.column.kind.name()),
+                    format!(
+                        "edge {path} reaches a {} value, not the table's key type",
+                        leaf.column.kind.name()
+                    ),
                     &format!("{at}/edges/{position}"),
                 )),
                 Ok(_) => {}
@@ -832,7 +899,8 @@ impl TableBuilder {
         self
     }
     pub fn generated(&mut self, column: &str, kind: GeneratedKind) -> &mut Self {
-        self.generated.insert(column.to_string(), json!(kind.name()));
+        self.generated
+            .insert(column.to_string(), json!(kind.name()));
         self
     }
     pub fn identity_domain(&mut self, domain: Option<String>) -> &mut Self {
@@ -877,7 +945,10 @@ impl TableBuilder {
             extension.insert("identityDomain".into(), json!(domain));
         }
         if !self.foreign_keys.is_empty() {
-            extension.insert("foreignKeys".into(), Value::Array(self.foreign_keys.clone()));
+            extension.insert(
+                "foreignKeys".into(),
+                Value::Array(self.foreign_keys.clone()),
+            );
         }
         if !self.checks.is_empty() {
             extension.insert("checks".into(), Value::Array(self.checks.clone()));
@@ -915,7 +986,9 @@ impl Editor {
     }
 
     fn root(&mut self) -> &mut Map<String, Value> {
-        self.document.as_object_mut().expect("a schema document is an object")
+        self.document
+            .as_object_mut()
+            .expect("a schema document is an object")
     }
 
     fn extension(&mut self) -> &mut Map<String, Value> {
@@ -935,10 +1008,10 @@ impl Editor {
     }
 
     fn prune(&mut self, key: &str) {
-        let empty = self
-            .extension()
-            .get(key)
-            .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty) || value.as_object().is_some_and(Map::is_empty));
+        let empty = self.extension().get(key).is_some_and(|value| {
+            value.as_array().is_some_and(Vec::is_empty)
+                || value.as_object().is_some_and(Map::is_empty)
+        });
         if empty {
             self.extension().remove(key);
         }
@@ -968,11 +1041,19 @@ impl Editor {
     /// left for [`Editor::finish`] to refuse, because dropping a constraint is
     /// a decision, not a consequence.
     pub fn drop_column(&mut self, name: &str) -> &mut Self {
-        if let Some(properties) = self.root().get_mut("properties").and_then(Value::as_object_mut) {
+        if let Some(properties) = self
+            .root()
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
             properties.shift_remove(name);
         }
         self.set_required(name, false);
-        if let Some(generated) = self.extension().get_mut("generated").and_then(Value::as_object_mut) {
+        if let Some(generated) = self
+            .extension()
+            .get_mut("generated")
+            .and_then(Value::as_object_mut)
+        {
             generated.shift_remove(name);
         }
         self.prune("generated");
@@ -980,20 +1061,33 @@ impl Editor {
     }
 
     /// Rename a column everywhere the document names it.
-    pub fn rename_column(&mut self, old: &str, new: &str, table: &str) -> Result<&mut Self, String> {
+    pub fn rename_column(
+        &mut self,
+        old: &str,
+        new: &str,
+        table: &str,
+    ) -> Result<&mut Self, String> {
         let rename = |value: &mut Value| {
             if value.as_str() == Some(old) {
                 *value = json!(new);
             }
         };
-        if let Some(properties) = self.root().get_mut("properties").and_then(Value::as_object_mut) {
+        if let Some(properties) = self
+            .root()
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
             let rebuilt: Map<String, Value> = std::mem::take(properties)
                 .into_iter()
                 .map(|(key, value)| (if key == old { new.to_string() } else { key }, value))
                 .collect();
             *properties = rebuilt;
         }
-        if let Some(required) = self.root().get_mut("required").and_then(Value::as_array_mut) {
+        if let Some(required) = self
+            .root()
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+        {
             required.iter_mut().for_each(rename);
         }
         for key in ["primaryKey", "filename"] {
@@ -1008,7 +1102,11 @@ impl Editor {
                 }
             }
         }
-        if let Some(generated) = self.extension().get_mut("generated").and_then(Value::as_object_mut) {
+        if let Some(generated) = self
+            .extension()
+            .get_mut("generated")
+            .and_then(Value::as_object_mut)
+        {
             let rebuilt: Map<String, Value> = std::mem::take(generated)
                 .into_iter()
                 .map(|(key, value)| (if key == old { new.to_string() } else { key }, value))
@@ -1023,20 +1121,31 @@ impl Editor {
             }
             Ok(())
         };
-        if let Some(keys) = self.extension().get_mut("foreignKeys").and_then(Value::as_array_mut) {
+        if let Some(keys) = self
+            .extension()
+            .get_mut("foreignKeys")
+            .and_then(Value::as_array_mut)
+        {
             for key in keys {
                 if let Some(from) = key.get_mut("from").and_then(Value::as_array_mut) {
                     for path in from {
                         rename_path(path)?;
                     }
                 }
-                let self_reference = key.pointer("/to/table").and_then(Value::as_str) == Some(table);
-                if self_reference && let Some(columns) = key.get_mut("columns").and_then(Value::as_array_mut) {
+                let self_reference =
+                    key.pointer("/to/table").and_then(Value::as_str) == Some(table);
+                if self_reference
+                    && let Some(columns) = key.get_mut("columns").and_then(Value::as_array_mut)
+                {
                     columns.iter_mut().for_each(rename);
                 }
             }
         }
-        if let Some(graphs) = self.extension().get_mut("acyclic").and_then(Value::as_array_mut) {
+        if let Some(graphs) = self
+            .extension()
+            .get_mut("acyclic")
+            .and_then(Value::as_array_mut)
+        {
             for graph in graphs {
                 if let Some(edges) = graph.get_mut("edges").and_then(Value::as_array_mut) {
                     for path in edges {
@@ -1045,7 +1154,11 @@ impl Editor {
                 }
             }
         }
-        if let Some(checks) = self.extension().get_mut("checks").and_then(Value::as_array_mut) {
+        if let Some(checks) = self
+            .extension()
+            .get_mut("checks")
+            .and_then(Value::as_array_mut)
+        {
             for check in checks {
                 let expr = check["expr"].as_str().unwrap_or_default().to_string();
                 check["expr"] = json!(crate::sql::rename_identifier(&expr, old, new)?);
@@ -1056,7 +1169,10 @@ impl Editor {
 
     /// Replace a column's subschema, keeping its place and presence.
     pub fn set_column(&mut self, name: &str, subschema: Value) -> &mut Self {
-        if let Some(properties) = self.root().get_mut("properties").and_then(Value::as_object_mut)
+        if let Some(properties) = self
+            .root()
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
             && let Some(slot) = properties.get_mut(name)
         {
             *slot = subschema;
@@ -1098,7 +1214,11 @@ impl Editor {
         {
             let mut names: Vec<String> = match kind {
                 Value::String(single) => vec![single],
-                Value::Array(many) => many.iter().filter_map(Value::as_str).map(String::from).collect(),
+                Value::Array(many) => many
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect(),
                 _ => vec![],
             };
             names.retain(|name| name != "null");
@@ -1107,7 +1227,11 @@ impl Editor {
             }
             column.insert(
                 "type".into(),
-                if names.len() == 1 { json!(names[0]) } else { json!(names) },
+                if names.len() == 1 {
+                    json!(names[0])
+                } else {
+                    json!(names)
+                },
             );
         }
         self
@@ -1158,14 +1282,16 @@ impl Editor {
     }
 
     pub fn set_additional_fields(&mut self, allow: bool) -> &mut Self {
-        self.root().insert("additionalProperties".into(), json!(allow));
+        self.root()
+            .insert("additionalProperties".into(), json!(allow));
         self
     }
 
     pub fn set_identity_domain(&mut self, domain: Option<&str>) -> &mut Self {
         match domain {
             Some(domain) => {
-                self.extension().insert("identityDomain".into(), json!(domain));
+                self.extension()
+                    .insert("identityDomain".into(), json!(domain));
             }
             None => {
                 self.extension().remove("identityDomain");
@@ -1202,12 +1328,14 @@ impl Editor {
     }
 
     pub fn add_check(&mut self, name: &str, expr: &str) -> &mut Self {
-        self.list("checks").push(json!({ "name": name, "expr": expr }));
+        self.list("checks")
+            .push(json!({ "name": name, "expr": expr }));
         self
     }
 
     pub fn add_acyclic(&mut self, name: &str, edges: &[String]) -> &mut Self {
-        self.list("acyclic").push(json!({ "name": name, "edges": edges }));
+        self.list("acyclic")
+            .push(json!({ "name": name, "edges": edges }));
         self
     }
 
@@ -1251,7 +1379,12 @@ impl Editor {
             let list = self.list("unique");
             let before = list.len();
             list.retain(|entry| {
-                let columns: Vec<&str> = entry.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let columns: Vec<&str> = entry
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
                 format!("unique_{}", columns.join("_")) != name
             });
             removed |= list.len() != before;
@@ -1262,7 +1395,11 @@ impl Editor {
 
     /// Point every reference to `old` at `new`.
     pub fn rename_referenced_table(&mut self, old: &str, new: &str) -> &mut Self {
-        if let Some(keys) = self.extension().get_mut("foreignKeys").and_then(Value::as_array_mut) {
+        if let Some(keys) = self
+            .extension()
+            .get_mut("foreignKeys")
+            .and_then(Value::as_array_mut)
+        {
             for key in keys {
                 if let Some(to) = key.get_mut("to").and_then(Value::as_object_mut) {
                     if to.get("table").and_then(Value::as_str) == Some(old) {
@@ -1283,7 +1420,11 @@ impl Editor {
 
     /// Rename a column of `target` wherever a key here names it explicitly.
     pub fn rename_referenced_column(&mut self, target: &str, old: &str, new: &str) -> &mut Self {
-        if let Some(keys) = self.extension().get_mut("foreignKeys").and_then(Value::as_array_mut) {
+        if let Some(keys) = self
+            .extension()
+            .get_mut("foreignKeys")
+            .and_then(Value::as_array_mut)
+        {
             for key in keys {
                 if key.pointer("/to/table").and_then(Value::as_str) != Some(target) {
                     continue;
@@ -1372,11 +1513,20 @@ mod tests {
         assert_eq!(rules.kind(), &ColumnType::Array);
         assert!(rules.nullable());
         let rule = rules.items().unwrap();
-        assert_eq!(rule.properties().unwrap()["when_choice_index"].kind(), &ColumnType::Int);
-        assert_eq!(schema.foreign_keys()[0].name(), "fk_feedback_rules_misconception_ref");
+        assert_eq!(
+            rule.properties().unwrap()["when_choice_index"].kind(),
+            &ColumnType::Int
+        );
+        assert_eq!(
+            schema.foreign_keys()[0].name(),
+            "fk_feedback_rules_misconception_ref"
+        );
         assert_eq!(schema.foreign_keys()[1].name(), "requires");
         assert_eq!(schema.identity_domain(), Some("lcas"));
-        assert_eq!(schema.acyclic()[0].edges()[0].to_string(), "relations[?relation='requires'].target");
+        assert_eq!(
+            schema.acyclic()[0].edges()[0].to_string(),
+            "relations[?relation='requires'].target"
+        );
     }
 
     #[test]
@@ -1384,19 +1534,32 @@ mod tests {
         let mut through_json = lcas_items();
         through_json["properties"]["blob"] = json!({});
         through_json["x-reldir"]["foreignKeys"][0]["from"] = json!(["blob.inner"]);
-        assert_eq!(codes(Schema::from_document(through_json, None)), vec!["SCHEMA_REFERENCE_PATH_INVALID"]);
+        assert_eq!(
+            codes(Schema::from_document(through_json, None)),
+            vec!["SCHEMA_REFERENCE_PATH_INVALID"]
+        );
 
         let mut to_object = lcas_items();
         to_object["x-reldir"]["foreignKeys"][0]["from"] = json!(["feedback_rules[]"]);
-        assert_eq!(codes(Schema::from_document(to_object, None)), vec!["SCHEMA_REFERENCE_PATH_INVALID"]);
+        assert_eq!(
+            codes(Schema::from_document(to_object, None)),
+            vec!["SCHEMA_REFERENCE_PATH_INVALID"]
+        );
 
         let mut bad_filter = lcas_items();
-        bad_filter["x-reldir"]["foreignKeys"][1]["from"] = json!(["relations[?relation='nonsense'].target"]);
-        assert_eq!(codes(Schema::from_document(bad_filter, None)), vec!["SCHEMA_REFERENCE_PATH_INVALID"]);
+        bad_filter["x-reldir"]["foreignKeys"][1]["from"] =
+            json!(["relations[?relation='nonsense'].target"]);
+        assert_eq!(
+            codes(Schema::from_document(bad_filter, None)),
+            vec!["SCHEMA_REFERENCE_PATH_INVALID"]
+        );
 
         let mut unparsable = lcas_items();
         unparsable["x-reldir"]["foreignKeys"][1]["from"] = json!(["relations[x]"]);
-        assert_eq!(codes(Schema::from_document(unparsable, None)), vec!["SCHEMA_REFERENCE_PATH_INVALID"]);
+        assert_eq!(
+            codes(Schema::from_document(unparsable, None)),
+            vec!["SCHEMA_REFERENCE_PATH_INVALID"]
+        );
     }
 
     #[test]
@@ -1409,9 +1572,15 @@ mod tests {
         schema["x-reldir"]["foreignKeys"] = json!([
             { "from": ["owner"], "to": { "table": "people" }, "onDelete": "remove" }
         ]);
-        assert_eq!(codes(Schema::from_document(schema.clone(), None)), vec!["SCHEMA_FK_ACTION_INVALID"]);
+        assert_eq!(
+            codes(Schema::from_document(schema.clone(), None)),
+            vec!["SCHEMA_FK_ACTION_INVALID"]
+        );
         schema["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("set_null");
-        assert_eq!(codes(Schema::from_document(schema.clone(), None)), vec!["SCHEMA_FK_ACTION_INVALID"]);
+        assert_eq!(
+            codes(Schema::from_document(schema.clone(), None)),
+            vec!["SCHEMA_FK_ACTION_INVALID"]
+        );
         schema["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("cascade");
         assert!(codes(Schema::from_document(schema, None)).is_empty());
     }
@@ -1420,15 +1589,24 @@ mod tests {
     fn test2053_primary_keys_must_identify_every_row() {
         let mut nullable = lcas_items();
         nullable["properties"]["id"]["type"] = json!(["string", "null"]);
-        assert_eq!(codes(Schema::from_document(nullable, None)), vec!["SCHEMA_PK_NULLABLE"]);
+        assert_eq!(
+            codes(Schema::from_document(nullable, None)),
+            vec!["SCHEMA_PK_NULLABLE"]
+        );
 
         let mut optional = lcas_items();
         optional["required"] = json!([]);
-        assert_eq!(codes(Schema::from_document(optional, None)), vec!["SCHEMA_PK_NOT_REQUIRED"]);
+        assert_eq!(
+            codes(Schema::from_document(optional, None)),
+            vec!["SCHEMA_PK_NOT_REQUIRED"]
+        );
 
         let mut missing = lcas_items();
         missing["x-reldir"]["primaryKey"] = json!(["ghost"]);
-        assert!(codes(Schema::from_document(missing, None)).contains(&"SCHEMA_PK_COLUMN_UNKNOWN".to_string()));
+        assert!(
+            codes(Schema::from_document(missing, None))
+                .contains(&"SCHEMA_PK_COLUMN_UNKNOWN".to_string())
+        );
     }
 
     #[test]
@@ -1438,7 +1616,10 @@ mod tests {
         assert_eq!(order, ["id", "feedback_rules", "relations"]);
         let mut stray = lcas_items();
         stray["x-reldir"]["columnOrder"] = json!(["id"]);
-        assert!(Schema::from_document(stray, None).is_err(), "x-reldir has no columnOrder member");
+        assert!(
+            Schema::from_document(stray, None).is_err(),
+            "x-reldir has no columnOrder member"
+        );
     }
 
     #[test]
@@ -1479,15 +1660,25 @@ mod tests {
         let mut builder = TableBuilder::new("people");
         builder
             .column("id", subschema(&ColumnType::Uuid, false), true)
-            .column("tags", {
-                let mut tags = subschema(&ColumnType::Array, false);
-                tags["items"] = subschema(&ColumnType::String, false);
-                tags
-            }, true)
+            .column(
+                "tags",
+                {
+                    let mut tags = subschema(&ColumnType::Array, false);
+                    tags["items"] = subschema(&ColumnType::String, false);
+                    tags
+                },
+                true,
+            )
             .primary_key(vec!["id".into()])
             .generated("id", GeneratedKind::Uuid);
         let schema = builder.build().expect("builds");
-        assert_eq!(schema.column("id").unwrap().generated(), Some(GeneratedKind::Uuid));
-        assert_eq!(schema.column("tags").unwrap().items().unwrap().kind(), &ColumnType::String);
+        assert_eq!(
+            schema.column("id").unwrap().generated(),
+            Some(GeneratedKind::Uuid)
+        );
+        assert_eq!(
+            schema.column("tags").unwrap().items().unwrap().kind(),
+            &ColumnType::String
+        );
     }
 }

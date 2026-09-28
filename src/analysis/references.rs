@@ -95,7 +95,9 @@ impl TableFacts {
                 && let Some(value) = row.get(column)
                 && !value.is_null()
             {
-                facts.keys.insert(render(&mirror::key_component(value, kind)));
+                facts
+                    .keys
+                    .insert(render(&mirror::key_component(value, kind)));
             }
             for (name, value) in row {
                 let steps = vec![Step::Member(name.clone())];
@@ -125,7 +127,9 @@ impl TableFacts {
                 self.note_other(&steps);
             }
             Value::String(_) => self.note_value(steps, value),
-            Value::Number(number) if number.as_i64().is_some() && !number.is_f64() => self.note_value(steps, value),
+            Value::Number(number) if number.as_i64().is_some() && !number.is_f64() => {
+                self.note_value(steps, value)
+            }
             Value::Number(_) | Value::Bool(_) => self.note_other(&steps),
         }
     }
@@ -160,11 +164,15 @@ impl TableFacts {
     /// places already known as leaves are marked: a path that is always an
     /// object is simply not a leaf.
     fn note_other(&mut self, steps: &[Step]) {
-        let Some(path) = RefPath::from_steps(steps.to_vec()) else { return };
+        let Some(path) = RefPath::from_steps(steps.to_vec()) else {
+            return;
+        };
         match self.leaves.get_mut(&path.to_string()) {
             Some(leaf) => leaf.other += 1,
             None => {
-                if matches!(steps.last(), Some(Step::Member(_) | Step::Each)) && self.leaves.len() < MAX_LEAVES {
+                if matches!(steps.last(), Some(Step::Member(_) | Step::Each))
+                    && self.leaves.len() < MAX_LEAVES
+                {
                     self.leaves.insert(
                         path.to_string(),
                         Leaf {
@@ -191,7 +199,11 @@ pub enum ProposedTarget {
     /// An identity domain. `join` lists tables that must be declared members
     /// for the reference to resolve; empty when the domain already exists as
     /// needed. `new` says the domain does not exist yet.
-    Domain { name: String, join: Vec<String>, new: bool },
+    Domain {
+        name: String,
+        join: Vec<String>,
+        new: bool,
+    },
 }
 
 /// A reference the data supports and no schema declares.
@@ -253,7 +265,10 @@ pub fn detect(facts: &BTreeMap<String, TableFacts>, config: &Config) -> Vec<Prop
     let mut holders: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for facts in facts.values().filter(|facts| facts.key.is_some()) {
         for key in &facts.keys {
-            holders.entry(key.as_str()).or_default().push(facts.table.as_str());
+            holders
+                .entry(key.as_str())
+                .or_default()
+                .push(facts.table.as_str());
         }
     }
     let mut new_domains: Vec<(BTreeSet<String>, String)> = vec![];
@@ -280,12 +295,20 @@ pub fn detect(facts: &BTreeMap<String, TableFacts>, config: &Config) -> Vec<Prop
                     _ => None,
                 })
                 .unwrap_or_default();
-            let named_for = |table: &str| config.reference_names(table).iter().any(|name| name == leaf_name);
+            let named_for = |table: &str| {
+                config
+                    .reference_names(table)
+                    .iter()
+                    .any(|name| name == leaf_name)
+            };
             let conventional = match &target {
                 ProposedTarget::Table(target) => named_for(target),
                 ProposedTarget::Domain { name, join, .. } => facts
                     .values()
-                    .filter(|facts| facts.domain.as_deref() == Some(name.as_str()) || join.contains(&facts.table))
+                    .filter(|facts| {
+                        facts.domain.as_deref() == Some(name.as_str())
+                            || join.contains(&facts.table)
+                    })
                     .any(|facts| named_for(&facts.table)),
             };
             out.push(Proposal {
@@ -360,13 +383,19 @@ fn resolve(
     };
     let join: Vec<String> = cover
         .iter()
-        .filter(|table| facts.get(**table).is_some_and(|facts| facts.domain.as_deref() != Some(name.as_str())))
+        .filter(|table| {
+            facts
+                .get(**table)
+                .is_some_and(|facts| facts.domain.as_deref() != Some(name.as_str()))
+        })
         .map(|table| table.to_string())
         .collect();
     // The domain, once joined, must still be one namespace: no key held twice.
     let members: Vec<&TableFacts> = facts
         .values()
-        .filter(|facts| facts.domain.as_deref() == Some(name.as_str()) || join.contains(&facts.table))
+        .filter(|facts| {
+            facts.domain.as_deref() == Some(name.as_str()) || join.contains(&facts.table)
+        })
         .collect();
     let mut seen = BTreeSet::new();
     for member in &members {
@@ -387,16 +416,26 @@ mod tests {
     use super::*;
 
     fn rows(values: &[Value]) -> Vec<Map<String, Value>> {
-        values.iter().map(|value| value.as_object().unwrap().clone()).collect()
+        values
+            .iter()
+            .map(|value| value.as_object().unwrap().clone())
+            .collect()
     }
 
     fn facts(table: &str, key: &str, data: &[Value]) -> TableFacts {
         let rows = rows(data);
-        TableFacts::gather(table, Some((key.to_string(), ColumnType::String)), None, &rows)
+        TableFacts::gather(
+            table,
+            Some((key.to_string(), ColumnType::String)),
+            None,
+            &rows,
+        )
     }
 
     fn all(list: Vec<TableFacts>) -> BTreeMap<String, TableFacts> {
-        list.into_iter().map(|facts| (facts.table.clone(), facts)).collect()
+        list.into_iter()
+            .map(|facts| (facts.table.clone(), facts))
+            .collect()
     }
 
     #[test]
@@ -406,15 +445,23 @@ mod tests {
             facts(
                 "courses",
                 "id",
-                &[json!({"id": "c1", "modules": [{"lessons": [{"lesson_ref": "l1"}, {"lesson_ref": "l2"}]}]})],
+                &[
+                    json!({"id": "c1", "modules": [{"lessons": [{"lesson_ref": "l1"}, {"lesson_ref": "l2"}]}]}),
+                ],
             ),
         ]);
         let found = detect(&catalog, &Config::default());
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].path.to_string(), "modules[].lessons[].lesson_ref");
         assert_eq!(found[0].target, ProposedTarget::Table("lessons".into()));
-        assert!(found[0].conventional, "lesson_ref is how a reference to lessons is named");
-        assert_eq!(found[0].definition()["from"][0], "modules[].lessons[].lesson_ref");
+        assert!(
+            found[0].conventional,
+            "lesson_ref is how a reference to lessons is named"
+        );
+        assert_eq!(
+            found[0].definition()["from"][0],
+            "modules[].lessons[].lesson_ref"
+        );
     }
 
     #[test]
@@ -425,26 +472,44 @@ mod tests {
             facts(
                 "items",
                 "id",
-                &[json!({"id": "item.c", "relations": [{"target": "objective.a"}, {"target": "knowledge.b"}]})],
+                &[
+                    json!({"id": "item.c", "relations": [{"target": "objective.a"}, {"target": "knowledge.b"}]}),
+                ],
             ),
         ]);
         let found = detect(&catalog, &Config::default());
-        let proposal = found.iter().find(|p| p.path.to_string() == "relations[].target").expect("found");
+        let proposal = found
+            .iter()
+            .find(|p| p.path.to_string() == "relations[].target")
+            .expect("found");
         match &proposal.target {
             ProposedTarget::Domain { join, new, .. } => {
                 assert!(*new);
-                assert_eq!(join, &vec!["knowledge".to_string(), "objectives".to_string()]);
+                assert_eq!(
+                    join,
+                    &vec!["knowledge".to_string(), "objectives".to_string()]
+                );
             }
             other => panic!("{other:?}"),
         }
-        assert!(!proposal.conventional, "`target` names no table, so inference would not declare it");
+        assert!(
+            !proposal.conventional,
+            "`target` names no table, so inference would not declare it"
+        );
     }
 
     #[test]
     fn test2172_a_value_that_resolves_nowhere_is_not_a_reference() {
         let catalog = all(vec![
             facts("users", "id", &[json!({"id": "u1"})]),
-            facts("posts", "id", &[json!({"id": "p1", "user_id": "u1"}), json!({"id": "p2", "user_id": "ghost"})]),
+            facts(
+                "posts",
+                "id",
+                &[
+                    json!({"id": "p1", "user_id": "u1"}),
+                    json!({"id": "p2", "user_id": "ghost"}),
+                ],
+            ),
         ]);
         assert!(detect(&catalog, &Config::default()).is_empty());
     }
@@ -455,23 +520,50 @@ mod tests {
             facts("users", "id", &[json!({"id": "u1"})]),
             facts("admins", "id", &[json!({"id": "u1"})]),
             facts("posts", "id", &[json!({"id": "p1", "owner": "u1"})]),
-            facts("notes", "id", &[json!({"id": "n1", "user_id": "u1"}), json!({"id": "n2", "user_id": {"x": 1}})]),
+            facts(
+                "notes",
+                "id",
+                &[
+                    json!({"id": "n1", "user_id": "u1"}),
+                    json!({"id": "n2", "user_id": {"x": 1}}),
+                ],
+            ),
         ]);
         let found = detect(&catalog, &Config::default());
-        assert!(found.iter().all(|p| p.table != "posts"), "two tables hold u1: {found:?}");
-        assert!(found.iter().all(|p| p.table != "notes"), "user_id is sometimes an object: {found:?}");
+        assert!(
+            found.iter().all(|p| p.table != "posts"),
+            "two tables hold u1: {found:?}"
+        );
+        assert!(
+            found.iter().all(|p| p.table != "notes"),
+            "user_id is sometimes an object: {found:?}"
+        );
     }
 
     #[test]
     fn test2174_declared_references_and_the_rows_own_key_are_not_proposed() {
-        let catalog = all(vec![
-            facts("users", "id", &[json!({"id": "u1", "manager_id": "u1"})]),
-        ]);
+        let catalog = all(vec![facts(
+            "users",
+            "id",
+            &[json!({"id": "u1", "manager_id": "u1"})],
+        )]);
         let found = detect(&catalog, &Config::default());
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].path.to_string(), "manager_id", "a self-reference, not the key itself");
-        let mut declared = all(vec![facts("users", "id", &[json!({"id": "u1", "manager_id": "u1"})])]);
-        declared.get_mut("users").unwrap().declared.insert("manager_id".into());
+        assert_eq!(
+            found[0].path.to_string(),
+            "manager_id",
+            "a self-reference, not the key itself"
+        );
+        let mut declared = all(vec![facts(
+            "users",
+            "id",
+            &[json!({"id": "u1", "manager_id": "u1"})],
+        )]);
+        declared
+            .get_mut("users")
+            .unwrap()
+            .declared
+            .insert("manager_id".into());
         assert!(detect(&declared, &Config::default()).is_empty());
     }
 
@@ -480,8 +572,18 @@ mod tests {
         let catalog = all(vec![
             facts("a", "id", &[json!({"id": "x"}), json!({"id": "shared"})]),
             facts("b", "id", &[json!({"id": "y"}), json!({"id": "shared"})]),
-            facts("c", "id", &[json!({"id": "c1", "target": "x"}), json!({"id": "c2", "target": "y"})]),
+            facts(
+                "c",
+                "id",
+                &[
+                    json!({"id": "c1", "target": "x"}),
+                    json!({"id": "c2", "target": "y"}),
+                ],
+            ),
         ]);
-        assert!(detect(&catalog, &Config::default()).is_empty(), "a and b both hold `shared`");
+        assert!(
+            detect(&catalog, &Config::default()).is_empty(),
+            "a and b both hold `shared`"
+        );
     }
 }

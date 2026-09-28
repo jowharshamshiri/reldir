@@ -80,9 +80,16 @@ impl History {
 #[derive(Debug, Clone)]
 pub enum Event {
     /// Interrupted transactions were rolled forward or discarded.
-    Recovered { completed: Vec<String>, discarded: Vec<String> },
+    Recovered {
+        completed: Vec<String>,
+        discarded: Vec<String>,
+    },
     /// A valid state that differed from history was recorded.
-    Recorded { revision: u64, origin: String, changes: Vec<String> },
+    Recorded {
+        revision: u64,
+        origin: String,
+        changes: Vec<String>,
+    },
     /// The mirror could not be read and was rebuilt from the files.
     MirrorRebuilt,
     /// Working schemas superseded by pins were removed.
@@ -92,16 +99,25 @@ pub enum Event {
 impl Event {
     pub fn describe(&self) -> String {
         match self {
-            Self::Recovered { completed, discarded } => format!(
+            Self::Recovered {
+                completed,
+                discarded,
+            } => format!(
                 "recovered interrupted transactions: {} rolled forward, {} discarded",
                 completed.len(),
                 discarded.len()
             ),
-            Self::Recorded { revision, origin, changes } => format!(
+            Self::Recorded {
+                revision,
+                origin,
+                changes,
+            } => format!(
                 "recorded revision {revision} ({origin}): {} change(s)",
                 changes.len()
             ),
-            Self::MirrorRebuilt => "the derived mirror was unreadable and was rebuilt from the files".into(),
+            Self::MirrorRebuilt => {
+                "the derived mirror was unreadable and was rebuilt from the files".into()
+            }
             Self::SupersededRemoved(tables) => format!(
                 "removed working schemas superseded by pins: {}",
                 tables.join(", ")
@@ -111,14 +127,23 @@ impl Event {
 
     pub fn to_json(&self) -> Value {
         match self {
-            Self::Recovered { completed, discarded } => {
+            Self::Recovered {
+                completed,
+                discarded,
+            } => {
                 json!({"kind": "recovered", "completed": completed, "discarded": discarded})
             }
-            Self::Recorded { revision, origin, changes } => {
+            Self::Recorded {
+                revision,
+                origin,
+                changes,
+            } => {
                 json!({"kind": "recorded", "revision": revision, "origin": origin, "changes": changes})
             }
             Self::MirrorRebuilt => json!({"kind": "mirror_rebuilt"}),
-            Self::SupersededRemoved(tables) => json!({"kind": "superseded_removed", "tables": tables}),
+            Self::SupersededRemoved(tables) => {
+                json!({"kind": "superseded_removed", "tables": tables})
+            }
         }
     }
 }
@@ -145,7 +170,11 @@ pub struct Request {
 
 impl Request {
     pub fn internal(dry_run: bool) -> Self {
-        Self { origin: "internal", admission: Admission::Valid, dry_run }
+        Self {
+            origin: "internal",
+            admission: Admission::Valid,
+            dry_run,
+        }
     }
 }
 
@@ -235,7 +264,12 @@ impl Database {
         })
     }
 
-    fn open_as(root: PathBuf, access: Access, overrides: &ResourceOverrides, origin: &str) -> Result<Self> {
+    fn open_as(
+        root: PathBuf,
+        access: Access,
+        overrides: &ResourceOverrides,
+        origin: &str,
+    ) -> Result<Self> {
         let started = std::time::Instant::now();
         validate_format(&root)?;
         let mut events = vec![];
@@ -285,7 +319,13 @@ impl Database {
             }
         };
         let config = configured(&root, overrides)?;
-        let catalog = Catalog::observe(&root, &config, &Disk, Rc::new(mirror), events.iter().any(|e| matches!(e, Event::MirrorRebuilt)))?;
+        let catalog = Catalog::observe(
+            &root,
+            &config,
+            &Disk,
+            Rc::new(mirror),
+            events.iter().any(|e| matches!(e, Event::MirrorRebuilt)),
+        )?;
         let mut verdict = integrity::validate(&catalog)?;
         verdict.warnings.extend(warnings);
 
@@ -346,7 +386,10 @@ impl Database {
                 Err(error) => return Err(DbError::io(&path, error)),
             }
         }
-        metadata::sync_parent(&crate::schema_store::working_path(&self.root, &superseded[0]))?;
+        metadata::sync_parent(&crate::schema_store::working_path(
+            &self.root,
+            &superseded[0],
+        ))?;
         self.events.push(Event::SupersededRemoved(superseded));
         Ok(())
     }
@@ -368,9 +411,17 @@ impl Database {
         }
         match self.access {
             Access::Write => {
-                let recovered = self.events.iter().any(|event| matches!(event, Event::Recovered { .. }));
-                let origin = if recovered && origin == "external" { "recovery" } else { origin };
-                let record = metadata::record(&self.catalog, self.history.head(), origin, None, None)?;
+                let recovered = self
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Recovered { .. }));
+                let origin = if recovered && origin == "external" {
+                    "recovery"
+                } else {
+                    origin
+                };
+                let record =
+                    metadata::record(&self.catalog, self.history.head(), origin, None, None)?;
                 self.events.push(Event::Recorded {
                     revision: record.revision,
                     origin: origin.to_string(),
@@ -437,9 +488,41 @@ impl Database {
         self.change(rows, vec![], &Expected::new(), request)
     }
 
+    /// Plan row changes under the writer lock, against the state they will
+    /// be committed to, and apply them. A statement such as
+    /// `UPDATE t SET n = n + 1` is therefore computed from the current value
+    /// even when another writer committed a moment before: concurrent writers
+    /// queue for the lock instead of refusing each other.
+    pub fn apply_with<T>(
+        &mut self,
+        request: Request,
+        plan: impl FnOnce(&Catalog) -> Result<(Vec<RowChange>, T)>,
+    ) -> Result<(Outcome, T)> {
+        let mut extra = None;
+        let outcome = self.transact(request, |database| {
+            let (rows, value) = plan(&database.catalog)?;
+            extra = Some(value);
+            if rows.is_empty() {
+                return Ok((vec![], vec![], vec![]));
+            }
+            let expansion = crate::referential::expand(&database.catalog, rows)?;
+            let changes = crate::plan::render(&database.catalog, &expansion.rows)?;
+            Ok((expansion.rows, expansion.induced, changes))
+        })?;
+        Ok((
+            outcome,
+            extra.expect("the plan ran, or the transaction failed"),
+        ))
+    }
+
     /// Commit file changes planned directly -- schemas, configuration, repairs.
     /// Every path in `expected` must still hold what it held when planned.
-    pub fn commit(&mut self, changes: Vec<Change>, expected: &Expected, request: Request) -> Result<Outcome> {
+    pub fn commit(
+        &mut self,
+        changes: Vec<Change>,
+        expected: &Expected,
+        request: Request,
+    ) -> Result<Outcome> {
         self.change(vec![], changes, expected, request)
     }
 
@@ -494,8 +577,11 @@ impl Database {
         }
         self.reobserve()?;
         if let History::Degraded(error) = &self.history {
-            return Err(DbError::from_diag((*error.diagnostic).clone(), error.exit)
-                .with_help("no change can be recorded until history is repaired; see `reldir check`"));
+            return Err(
+                DbError::from_diag((*error.diagnostic).clone(), error.exit).with_help(
+                    "no change can be recorded until history is repaired; see `reldir check`",
+                ),
+            );
         }
         // Anything valid that changed since opening is recorded before this
         // change, so the revision this change produces describes it alone.
@@ -589,7 +675,11 @@ impl Database {
     /// in `.db/provenance-quarantine/`, and the first new revision says where.
     pub fn begin_new_lineage(&mut self, reason: &str) -> Result<Provenance> {
         if self.access == Access::Read {
-            return Err(DbError::new("READ_ONLY", "a new lineage writes history; this command opened read-only", 1));
+            return Err(DbError::new(
+                "READ_ONLY",
+                "a new lineage writes history; this command opened read-only",
+                1,
+            ));
         }
         require_safe_filesystem(&self.root, &self.config)?;
         let lock = acquire(&self.root, &self.config, crate::lock::Holder::Committing)?;
@@ -602,13 +692,18 @@ impl Database {
                 .with_help("history can begin only from a valid state; repair the rows first with `reldir doctor`"));
         }
         let quarantined = metadata::quarantine_history(&self.root)?;
-        self.catalog.mirror.replace_recorded(&BTreeMap::new(), None, None)?;
+        self.catalog
+            .mirror
+            .replace_recorded(&BTreeMap::new(), None, None)?;
         let record = metadata::record(
             &self.catalog,
             None,
             "recovery",
             None,
-            Some(metadata::Lineage { quarantined, reason: reason.to_string() }),
+            Some(metadata::Lineage {
+                quarantined,
+                reason: reason.to_string(),
+            }),
         )?;
         self.history = History::Head(Box::new(record.clone()));
         drop(lock);
@@ -620,7 +715,11 @@ impl Database {
     /// be) removed.
     pub fn collect_garbage(&mut self, dry_run: bool) -> Result<Vec<PathBuf>> {
         if self.access == Access::Read {
-            return Err(DbError::new("READ_ONLY", "garbage collection deletes files; this command opened read-only", 1));
+            return Err(DbError::new(
+                "READ_ONLY",
+                "garbage collection deletes files; this command opened read-only",
+                1,
+            ));
         }
         let (History::Head(_) | History::Empty) = &self.history else {
             return Err(DbError::new(
@@ -632,7 +731,11 @@ impl Database {
         let lock = acquire(&self.root, &self.config, crate::lock::Holder::Committing)?;
         let mut referenced = BTreeSet::new();
         for revision in metadata::revisions(&self.root)? {
-            for entry in metadata::load_record(&self.root, revision)?.changes.values().flatten() {
+            for entry in metadata::load_record(&self.root, revision)?
+                .changes
+                .values()
+                .flatten()
+            {
                 referenced.insert(format!("{}.json", entry.hash));
             }
         }
@@ -641,7 +744,11 @@ impl Database {
         if objects.is_dir() {
             for entry in fs::read_dir(&objects).map_err(|error| DbError::io(&objects, error))? {
                 let path = entry.map_err(|error| DbError::io(&objects, error))?.path();
-                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
                 if !referenced.contains(&name) {
                     garbage.push(path);
                 }
@@ -650,8 +757,14 @@ impl Database {
         let snapshots = self.root.join(".db/snapshots");
         if snapshots.is_dir() {
             for entry in fs::read_dir(&snapshots).map_err(|error| DbError::io(&snapshots, error))? {
-                let path = entry.map_err(|error| DbError::io(&snapshots, error))?.path();
-                if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(".creating-")) {
+                let path = entry
+                    .map_err(|error| DbError::io(&snapshots, error))?
+                    .path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".creating-"))
+                {
                     garbage.push(path);
                 }
             }
@@ -659,7 +772,11 @@ impl Database {
         garbage.sort();
         if !dry_run {
             for path in &garbage {
-                let removed = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+                let removed = if path.is_dir() {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
                 removed.map_err(|error| DbError::io(path, error))?;
             }
             if let Some(first) = garbage.first() {
@@ -667,7 +784,14 @@ impl Database {
             }
         }
         drop(lock);
-        Ok(garbage.into_iter().map(|path| path.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or(path)).collect())
+        Ok(garbage
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(&self.root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path)
+            })
+            .collect())
     }
 
     /// The schemas this database governs, by table.
@@ -678,7 +802,10 @@ impl Database {
     /// A read's resource limits.
     pub fn query_limits(&self) -> crate::sql::QueryLimits {
         crate::sql::QueryLimits {
-            timeout: self.config.timeout_seconds.map(std::time::Duration::from_secs),
+            timeout: self
+                .config
+                .timeout_seconds
+                .map(std::time::Duration::from_secs),
             max_rows: self.config.max_result_rows,
             max_memory: self.config.max_query_memory,
         }
@@ -734,7 +861,10 @@ fn admit(admission: Admission, before: &[Diagnostic], prospective: &Verdict) -> 
     Err(DbError::from_diag(lead, 2).with_related(refused[1..].to_vec()))
 }
 
-fn overlay_parts(root: &Path, changes: &[Change]) -> (BTreeMap<PathBuf, Vec<u8>>, BTreeSet<PathBuf>) {
+fn overlay_parts(
+    root: &Path,
+    changes: &[Change],
+) -> (BTreeMap<PathBuf, Vec<u8>>, BTreeSet<PathBuf>) {
     let mut writes = BTreeMap::new();
     let mut deletes = BTreeSet::new();
     for change in changes {
@@ -770,7 +900,11 @@ fn configured(root: &Path, overrides: &ResourceOverrides) -> Result<Config> {
     let mut config = load_config(root)?;
     config.apply_overrides(overrides);
     config.validate().map_err(|message| {
-        DbError::new("RESOURCE_LIMIT", format!("invalid command-line limit: {message}"), 1)
+        DbError::new(
+            "RESOURCE_LIMIT",
+            format!("invalid command-line limit: {message}"),
+            1,
+        )
     })?;
     Ok(config)
 }
@@ -811,8 +945,11 @@ pub fn validate_format(root: &Path) -> Result<()> {
     match fs::symlink_metadata(&meta) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(DbError::from_diag(
-                Diagnostic::error("UNINITIALIZED", format!("{} has no .db metadata", root.display()))
-                    .help(format!("run `reldir init {}`", root.display())),
+                Diagnostic::error(
+                    "UNINITIALIZED",
+                    format!("{} has no .db metadata", root.display()),
+                )
+                .help(format!("run `reldir init {}`", root.display())),
                 10,
             ));
         }
@@ -841,7 +978,9 @@ pub fn validate_format(root: &Path) -> Result<()> {
 pub fn read_format(root: &Path) -> Result<u32> {
     let path = root.join(".db/format");
     require_private_regular_file(&path, "format marker")?;
-    let size = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?.len();
+    let size = fs::symlink_metadata(&path)
+        .map_err(|error| DbError::io(&path, error))?
+        .len();
     if size > 4096 {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
@@ -853,7 +992,13 @@ pub fn read_format(root: &Path) -> Result<u32> {
     text.lines()
         .find_map(|line| line.strip_prefix("format_version = "))
         .and_then(|value| value.trim().parse::<u32>().ok())
-        .ok_or_else(|| DbError::new("INTERNAL_METADATA_CORRUPT", ".db/format has no valid format_version", 6))
+        .ok_or_else(|| {
+            DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                ".db/format has no valid format_version",
+                6,
+            )
+        })
 }
 
 pub fn load_config(root: &Path) -> Result<Config> {
@@ -864,22 +1009,32 @@ pub fn load_config(root: &Path) -> Result<Config> {
         Ok(_) => {}
     }
     require_private_regular_file(&path, "configuration")?;
-    let size = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?.len();
+    let size = fs::symlink_metadata(&path)
+        .map_err(|error| DbError::io(&path, error))?
+        .len();
     if size > crate::config::BOOTSTRAP_MAX_CONFIG_SIZE {
         return Err(DbError::new(
             "CONFIG_INVALID",
-            format!(".db/config exceeds the {} byte bootstrap limit", crate::config::BOOTSTRAP_MAX_CONFIG_SIZE),
+            format!(
+                ".db/config exceeds the {} byte bootstrap limit",
+                crate::config::BOOTSTRAP_MAX_CONFIG_SIZE
+            ),
             1,
         ));
     }
     let bytes = fs::read(&path).map_err(|e| DbError::io(&path, e))?;
     let invalid = |message: String| {
-        DbError::from_diag(Diagnostic::error("CONFIG_INVALID", format!("invalid .db/config: {message}")).at(".db/config"), 1)
+        DbError::from_diag(
+            Diagnostic::error("CONFIG_INVALID", format!("invalid .db/config: {message}"))
+                .at(".db/config"),
+            1,
+        )
     };
     let value = crate::json::with_depth_limit(crate::config::BOOTSTRAP_MAX_NESTING_DEPTH, || {
         crate::json::parse(&bytes).map_err(|error| invalid(error.to_string()))
     })?;
-    let config: Config = serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
+    let config: Config =
+        serde_json::from_value(value).map_err(|error| invalid(error.to_string()))?;
     config.validate().map_err(invalid)?;
     Ok(config)
 }
@@ -895,7 +1050,10 @@ fn require_private_regular_file(path: &Path, description: &str) -> Result<()> {
     if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
         return Err(DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("{description} {} must be a private regular file", path.display()),
+            format!(
+                "{description} {} must be a private regular file",
+                path.display()
+            ),
             6,
         ));
     }
@@ -934,7 +1092,13 @@ pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
     fs::create_dir(&meta).map_err(|e| DbError::io(&meta, e))?;
     // `schema/` is the user's pin directory and appears only when they pin
     // something; reldir's working schemas live in `.db/schema`.
-    for directory in ["provenance", "objects", "transactions", "snapshots", "schema"] {
+    for directory in [
+        "provenance",
+        "objects",
+        "transactions",
+        "snapshots",
+        "schema",
+    ] {
         let path = meta.join(directory);
         fs::create_dir(&path).map_err(|e| DbError::io(&path, e))?;
     }
@@ -944,10 +1108,16 @@ pub fn init_layout(root: &Path, track_provenance: bool) -> Result<()> {
         bytes.push(b'\n');
         bytes
     })?;
-    metadata::write_bytes_atomic(&meta.join(".gitignore"), gitignore(track_provenance).as_bytes())?;
+    metadata::write_bytes_atomic(
+        &meta.join(".gitignore"),
+        gitignore(track_provenance).as_bytes(),
+    )?;
     // The format marker is written last: a `.db/` without one is a layout
     // that was never finished, which establishment recognises and rebuilds.
-    metadata::write_bytes_atomic(&meta.join("format"), format!("format_version = {FORMAT_VERSION}\n").as_bytes())?;
+    metadata::write_bytes_atomic(
+        &meta.join("format"),
+        format!("format_version = {FORMAT_VERSION}\n").as_bytes(),
+    )?;
     metadata::sync_parent(&meta)?;
     Ok(())
 }
@@ -971,8 +1141,14 @@ mod tests {
     fn database() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         init_layout(directory.path(), false).unwrap();
-        write(&directory.path().join(".db/schema/users.json"), &users_schema());
-        write(&directory.path().join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"A\"}\n");
+        write(
+            &directory.path().join(".db/schema/users.json"),
+            &users_schema(),
+        );
+        write(
+            &directory.path().join("users/u1.json"),
+            "{\"id\":\"u1\",\"name\":\"A\"}\n",
+        );
         directory
     }
 
@@ -982,24 +1158,53 @@ mod tests {
         init_layout(directory.path(), false).unwrap();
         validate_format(directory.path()).unwrap();
         for other in [FORMAT_VERSION - 1, FORMAT_VERSION + 1] {
-            fs::write(directory.path().join(".db/format"), format!("format_version = {other}\n")).unwrap();
-            assert_eq!(validate_format(directory.path()).unwrap_err().diagnostic.code, "FORMAT_UNSUPPORTED");
+            fs::write(
+                directory.path().join(".db/format"),
+                format!("format_version = {other}\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                validate_format(directory.path())
+                    .unwrap_err()
+                    .diagnostic
+                    .code,
+                "FORMAT_UNSUPPORTED"
+            );
         }
         fs::write(directory.path().join(".db/format"), "garbage\n").unwrap();
-        assert_eq!(validate_format(directory.path()).unwrap_err().diagnostic.code, "INTERNAL_METADATA_CORRUPT");
+        assert_eq!(
+            validate_format(directory.path())
+                .unwrap_err()
+                .diagnostic
+                .code,
+            "INTERNAL_METADATA_CORRUPT"
+        );
     }
 
     #[test]
     fn test1024_initialisation_writes_the_documented_layout() {
         let directory = tempfile::tempdir().unwrap();
         init_layout(directory.path(), false).unwrap();
-        for expected in [".db/format", ".db/config", ".db/.gitignore", ".db/schema", ".db/provenance", ".db/objects"] {
+        for expected in [
+            ".db/format",
+            ".db/config",
+            ".db/.gitignore",
+            ".db/schema",
+            ".db/provenance",
+            ".db/objects",
+        ] {
             assert!(directory.path().join(expected).exists(), "{expected}");
         }
-        assert!(!directory.path().join("schema").exists(), "initialisation declares nothing");
+        assert!(
+            !directory.path().join("schema").exists(),
+            "initialisation declares nothing"
+        );
         assert!(load_config(directory.path()).unwrap().validate().is_ok());
         assert_eq!(
-            init_layout(directory.path(), false).unwrap_err().diagnostic.code,
+            init_layout(directory.path(), false)
+                .unwrap_err()
+                .diagnostic
+                .code,
             "ALREADY_INITIALIZED"
         );
     }
@@ -1007,20 +1212,44 @@ mod tests {
     #[test]
     fn test1025_tracked_provenance_keeps_history_under_version_control() {
         assert!(!gitignore(false).contains("provenance"));
-        assert!(gitignore(true).contains("!provenance/**") && gitignore(true).contains("!objects/**"));
+        assert!(
+            gitignore(true).contains("!provenance/**") && gitignore(true).contains("!objects/**")
+        );
     }
 
     #[test]
     fn test2160_opening_for_write_records_a_valid_external_change_once() {
         let directory = database();
-        let first = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
+        let first = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(first.is_valid(), "{:?}", first.verdict.errors);
         let revision = first.history.head().unwrap().revision;
         drop(first);
-        let again = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
-        assert_eq!(again.history.head().unwrap().revision, revision, "an unchanged state is not re-recorded");
-        write(&directory.path().join("users/u2.json"), "{\"id\":\"u2\",\"name\":\"B\"}\n");
-        let changed = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
+        let again = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            again.history.head().unwrap().revision,
+            revision,
+            "an unchanged state is not re-recorded"
+        );
+        write(
+            &directory.path().join("users/u2.json"),
+            "{\"id\":\"u2\",\"name\":\"B\"}\n",
+        );
+        let changed = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(changed.history.head().unwrap().revision, revision + 1);
         assert!(changed.events.iter().any(|e| matches!(e, Event::Recorded { changes, .. } if changes == &vec!["A users/u2.json".to_string()])));
     }
@@ -1028,49 +1257,125 @@ mod tests {
     #[test]
     fn test2161_read_access_writes_nothing_and_says_what_it_did_not_record() {
         let directory = database();
-        drop(Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap());
-        write(&directory.path().join("users/u2.json"), "{\"id\":\"u2\",\"name\":\"B\"}\n");
+        drop(
+            Database::open(
+                directory.path().to_path_buf(),
+                Access::Write,
+                &Default::default(),
+            )
+            .unwrap(),
+        );
+        write(
+            &directory.path().join("users/u2.json"),
+            "{\"id\":\"u2\",\"name\":\"B\"}\n",
+        );
         let before = metadata::revisions(directory.path()).unwrap();
         let mirror_before = fs::read(crate::mirror::path(directory.path())).unwrap();
-        let reader = Database::open(directory.path().to_path_buf(), Access::Read, &Default::default()).unwrap();
+        let reader = Database::open(
+            directory.path().to_path_buf(),
+            Access::Read,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(metadata::revisions(directory.path()).unwrap(), before);
-        assert_eq!(fs::read(crate::mirror::path(directory.path())).unwrap(), mirror_before, "not even derived state");
-        assert!(reader.verdict.warnings.iter().any(|w| w.code == "METADATA_STALE_READONLY"));
-        assert_eq!(reader.catalog.row_count().unwrap(), 2, "the reader still sees the new row");
+        assert_eq!(
+            fs::read(crate::mirror::path(directory.path())).unwrap(),
+            mirror_before,
+            "not even derived state"
+        );
+        assert!(
+            reader
+                .verdict
+                .warnings
+                .iter()
+                .any(|w| w.code == "METADATA_STALE_READONLY")
+        );
+        assert_eq!(
+            reader.catalog.row_count().unwrap(),
+            2,
+            "the reader still sees the new row"
+        );
     }
 
     #[test]
     fn test2162_a_change_that_would_invalidate_the_database_writes_nothing() {
         let directory = database();
-        let mut database = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
+        let mut database = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
         let revision = database.history.head().unwrap().revision;
-        let bad = vec![Change::Write { path: "users/u9.json".into(), bytes: b"{\"id\":\"u9\"}\n".to_vec() }];
-        let error = database.commit(bad, &Expected::new(), Request::internal(false)).unwrap_err();
+        let bad = vec![Change::Write {
+            path: "users/u9.json".into(),
+            bytes: b"{\"id\":\"u9\"}\n".to_vec(),
+        }];
+        let error = database
+            .commit(bad, &Expected::new(), Request::internal(false))
+            .unwrap_err();
         assert_eq!(error.exit_code(), 2);
-        assert!(error.diagnostic.message.contains("nothing was written"), "{}", error.diagnostic.message);
+        assert!(
+            error.diagnostic.message.contains("nothing was written"),
+            "{}",
+            error.diagnostic.message
+        );
         assert!(!directory.path().join("users/u9.json").exists());
-        assert_eq!(metadata::head(directory.path()).unwrap().unwrap().revision, revision);
+        assert_eq!(
+            metadata::head(directory.path()).unwrap().unwrap().revision,
+            revision
+        );
     }
 
     #[test]
     fn test2163_a_commit_refuses_when_a_planned_path_moved() {
         let directory = database();
-        let mut database = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
-        let expected = Expected::from([(PathBuf::from("users/u1.json"), database.fingerprint(Path::new("users/u1.json")).unwrap())]);
-        write(&directory.path().join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"changed\"}\n");
-        let change = vec![Change::Write { path: "users/u1.json".into(), bytes: b"{\"id\":\"u1\",\"name\":\"mine\"}\n".to_vec() }];
-        let error = database.commit(change, &expected, Request::internal(false)).unwrap_err();
+        let mut database = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
+        let expected = Expected::from([(
+            PathBuf::from("users/u1.json"),
+            database.fingerprint(Path::new("users/u1.json")).unwrap(),
+        )]);
+        write(
+            &directory.path().join("users/u1.json"),
+            "{\"id\":\"u1\",\"name\":\"changed\"}\n",
+        );
+        let change = vec![Change::Write {
+            path: "users/u1.json".into(),
+            bytes: b"{\"id\":\"u1\",\"name\":\"mine\"}\n".to_vec(),
+        }];
+        let error = database
+            .commit(change, &expected, Request::internal(false))
+            .unwrap_err();
         assert_eq!(error.diagnostic.code, "CONCURRENT_MODIFICATION");
         assert_eq!(error.exit_code(), 3);
-        assert!(fs::read_to_string(directory.path().join("users/u1.json")).unwrap().contains("changed"));
+        assert!(
+            fs::read_to_string(directory.path().join("users/u1.json"))
+                .unwrap()
+                .contains("changed")
+        );
     }
 
     #[test]
     fn test2164_a_dry_run_judges_without_writing() {
         let directory = database();
-        let mut database = Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap();
-        let change = vec![Change::Write { path: "users/u2.json".into(), bytes: b"{\"id\":\"u2\",\"name\":\"B\"}\n".to_vec() }];
-        let outcome = database.commit(change, &Expected::new(), Request::internal(true)).unwrap();
+        let mut database = Database::open(
+            directory.path().to_path_buf(),
+            Access::Write,
+            &Default::default(),
+        )
+        .unwrap();
+        let change = vec![Change::Write {
+            path: "users/u2.json".into(),
+            bytes: b"{\"id\":\"u2\",\"name\":\"B\"}\n".to_vec(),
+        }];
+        let outcome = database
+            .commit(change, &Expected::new(), Request::internal(true))
+            .unwrap();
         assert!(outcome.dry_run && outcome.revision.is_none());
         assert!(!directory.path().join("users/u2.json").exists());
     }
@@ -1078,20 +1383,46 @@ mod tests {
     #[test]
     fn test2165_read_access_refuses_to_commit() {
         let directory = database();
-        drop(Database::open(directory.path().to_path_buf(), Access::Write, &Default::default()).unwrap());
-        let mut reader = Database::open(directory.path().to_path_buf(), Access::Read, &Default::default()).unwrap();
-        let error = reader.commit(vec![], &Expected::new(), Request::internal(false)).unwrap_err();
+        drop(
+            Database::open(
+                directory.path().to_path_buf(),
+                Access::Write,
+                &Default::default(),
+            )
+            .unwrap(),
+        );
+        let mut reader = Database::open(
+            directory.path().to_path_buf(),
+            Access::Read,
+            &Default::default(),
+        )
+        .unwrap();
+        let error = reader
+            .commit(vec![], &Expected::new(), Request::internal(false))
+            .unwrap_err();
         assert_eq!(error.diagnostic.code, "READ_ONLY");
     }
 
     #[test]
     fn test2166_repairs_may_leave_old_faults_but_never_add_one() {
-        let before = vec![Diagnostic::error("FOREIGN_KEY_VIOLATION", "m").at("a.json").pointer("/x")];
-        let same = Verdict { errors: before.clone(), warnings: vec![] };
+        let before = vec![
+            Diagnostic::error("FOREIGN_KEY_VIOLATION", "m")
+                .at("a.json")
+                .pointer("/x"),
+        ];
+        let same = Verdict {
+            errors: before.clone(),
+            warnings: vec![],
+        };
         admit(Admission::NoNewFaults, &before, &same).unwrap();
         assert!(admit(Admission::Valid, &before, &same).is_err());
         let worse = Verdict {
-            errors: vec![before[0].clone(), Diagnostic::error("TYPE_MISMATCH", "m").at("b.json").pointer("")],
+            errors: vec![
+                before[0].clone(),
+                Diagnostic::error("TYPE_MISMATCH", "m")
+                    .at("b.json")
+                    .pointer(""),
+            ],
             warnings: vec![],
         };
         let error = admit(Admission::NoNewFaults, &before, &worse).unwrap_err();

@@ -7,7 +7,10 @@ use crate::{
     infer::Strictness,
     migrate::{Migration, Operation},
     output::{Finish, Sink},
-    schema::{ColumnType, document::{TableBuilder, subschema}},
+    schema::{
+        ColumnType,
+        document::{TableBuilder, subschema},
+    },
     transaction::Change,
 };
 use serde_json::{Map, Value, json};
@@ -29,19 +32,30 @@ pub fn dialect(sink: &mut dyn Sink) -> Result<Finish> {
 
 /// Every fault in the schemas alone, without judging rows.
 pub fn validate(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
-    let Some(database) = context.open(sink, Intent::Read)? else { return Ok(super::empty()) };
+    let Some(database) = context.open(sink, Intent::Read)? else {
+        return Ok(super::empty());
+    };
     let faults: Vec<&Diagnostic> = database
         .verdict
         .errors
         .iter()
-        .filter(|d| d.code.starts_with("SCHEMA_") || d.path.as_deref().is_some_and(|p| crate::schema_store::schema_table(p).is_some()))
+        .filter(|d| {
+            d.code.starts_with("SCHEMA_")
+                || d.path
+                    .as_deref()
+                    .is_some_and(|p| crate::schema_store::schema_table(p).is_some())
+        })
         .collect();
     for fault in &faults {
         sink.diagnostic(fault)?;
     }
-    Ok(Finish::ok(format!("{} schema(s), {} fault(s)", database.catalog.schema_files.len(), faults.len()))
-        .exit(if faults.is_empty() { 0 } else { 2 })
-        .with("valid", faults.is_empty()))
+    Ok(Finish::ok(format!(
+        "{} schema(s), {} fault(s)",
+        database.catalog.schema_files.len(),
+        faults.len()
+    ))
+    .exit(if faults.is_empty() { 0 } else { 2 })
+    .with("valid", faults.is_empty()))
 }
 
 /// Declare a new, empty table as a pin: a string primary key `id`, nothing
@@ -49,22 +63,44 @@ pub fn validate(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
 pub fn new(context: &Context, sink: &mut dyn Sink, table: &str) -> Result<Finish> {
     let mut database = context.open_database(sink, Intent::Write)?;
     if database.catalog.schema_files.contains_key(table) {
-        return Err(DbError::new("SCHEMA_TABLE_EXISTS", format!("{table} already has a schema"), 2));
+        return Err(DbError::new(
+            "SCHEMA_TABLE_EXISTS",
+            format!("{table} already has a schema"),
+            2,
+        ));
     }
     if !crate::schema::valid_name(table) {
-        return Err(DbError::new("SCHEMA_INVALID_TABLE_NAME", format!("{table:?} cannot be a table name"), 2));
+        return Err(DbError::new(
+            "SCHEMA_INVALID_TABLE_NAME",
+            format!("{table:?} cannot be a table name"),
+            2,
+        ));
     }
     let schema = TableBuilder::new(table)
         .column("id", subschema(&ColumnType::String, false), true)
         .primary_key(vec!["id".into()])
         .build()
-        .map_err(|problems| DbError::from_diag(problems.into_iter().next().expect("a failed build reports why"), 2))?;
+        .map_err(|problems| {
+            DbError::from_diag(
+                problems
+                    .into_iter()
+                    .next()
+                    .expect("a failed build reports why"),
+                2,
+            )
+        })?;
     let path = PathBuf::from(crate::schema_store::pin_relative(table));
     let expected = Expected::from([(path.clone(), None)]);
     let outcome = database.commit(
-        vec![Change::Write { path, bytes: schema.bytes(database.config.indentation_width) }],
+        vec![Change::Write {
+            path,
+            bytes: schema.bytes(database.config.indentation_width),
+        }],
         &expected,
-        Request { origin: "migration", ..Request::internal(context.dry_run) },
+        Request {
+            origin: "migration",
+            ..Request::internal(context.dry_run)
+        },
     )?;
     super::committed(sink, &outcome, "declared")
 }
@@ -78,14 +114,23 @@ pub fn pin(context: &Context, sink: &mut dyn Sink, table: &str) -> Result<Finish
     }
     let pin = PathBuf::from(crate::schema_store::pin_relative(table));
     let working = crate::schema_store::working_relative(table);
-    let expected = Expected::from([(pin.clone(), None), (working.clone(), database.fingerprint(&working)?)]);
+    let expected = Expected::from([
+        (pin.clone(), None),
+        (working.clone(), database.fingerprint(&working)?),
+    ]);
     let outcome = database.commit(
         vec![
-            Change::Write { path: pin, bytes: schema.bytes(database.config.indentation_width) },
+            Change::Write {
+                path: pin,
+                bytes: schema.bytes(database.config.indentation_width),
+            },
             Change::Delete { path: working },
         ],
         &expected,
-        Request { origin: "migration", ..Request::internal(context.dry_run) },
+        Request {
+            origin: "migration",
+            ..Request::internal(context.dry_run)
+        },
     )?;
     super::committed(sink, &outcome, "pinned")
 }
@@ -110,7 +155,9 @@ impl OnConflict {
             "fail" => Ok(Self::Fail),
             "compare" => Ok(Self::Compare),
             "reinfer" => Ok(Self::Reinfer),
-            other => Err(DbError::usage(format!("--on-schema-conflict is ask, fail, compare or reinfer, not {other:?}"))),
+            other => Err(DbError::usage(format!(
+                "--on-schema-conflict is ask, fail, compare or reinfer, not {other:?}"
+            ))),
         }
     }
 }
@@ -129,7 +176,9 @@ pub fn parse_strictness(text: &str) -> Result<Strictness> {
         "strict" => Ok(Strictness::Strict),
         "balanced" => Ok(Strictness::Balanced),
         "loose" => Ok(Strictness::Loose),
-        other => Err(DbError::usage(format!("--strictness is strict, balanced or loose, not {other:?}"))),
+        other => Err(DbError::usage(format!(
+            "--strictness is strict, balanced or loose, not {other:?}"
+        ))),
     }
 }
 
@@ -138,7 +187,14 @@ pub fn infer(context: &Context, sink: &mut dyn Sink, options: InferOptions<'_>) 
     let root = context.root()?;
     let has_database = root.join(".db").is_dir();
     let database = if has_database {
-        Some(context.open_database(sink, if options.write { Intent::Write } else { Intent::Read })?)
+        Some(context.open_database(
+            sink,
+            if options.write {
+                Intent::Write
+            } else {
+                Intent::Read
+            },
+        )?)
     } else {
         None
     };
@@ -156,21 +212,36 @@ pub fn infer(context: &Context, sink: &mut dyn Sink, options: InferOptions<'_>) 
         options.tables.clone()
     };
     if options.primary_key.is_some() && tables.len() != 1 {
-        return Err(DbError::usage("--pk chooses one table's key; name exactly one table"));
+        return Err(DbError::usage(
+            "--pk chooses one table's key; name exactly one table",
+        ));
     }
     let governed = database.as_ref().map(|database| &database.catalog);
-    let inferred = crate::infer::infer_all(&root, &tables, options.strictness, &config, options.primary_key, governed)?;
+    let inferred = crate::infer::infer_all(
+        &root,
+        &tables,
+        options.strictness,
+        &config,
+        options.primary_key,
+        governed,
+    )?;
     if !options.write {
         for schema in inferred.values() {
             sink.document("schema", schema.document().clone())?;
         }
-        return Ok(Finish::ok(format!("inferred {} schema(s); add --write to keep them", inferred.len())));
+        return Ok(Finish::ok(format!(
+            "inferred {} schema(s); add --write to keep them",
+            inferred.len()
+        )));
     }
     let Some(mut database) = database else {
         // Nothing governs this folder yet: establishing the database infers
         // and records exactly this.
         let established = context.open_database(sink, Intent::Write)?;
-        return Ok(Finish::ok(format!("established the database with {} table(s)", established.catalog.schemas.len())));
+        return Ok(Finish::ok(format!(
+            "established the database with {} table(s)",
+            established.catalog.schemas.len()
+        )));
     };
     let mut changes = vec![];
     let mut expected = Expected::new();
@@ -191,14 +262,21 @@ pub fn infer(context: &Context, sink: &mut dyn Sink, options: InferOptions<'_>) 
                     ));
                 }
                 OnConflict::Compare => {
-                    for change in crate::command::history::document_diff("", current.document(), schema.document()) {
+                    for change in crate::command::history::document_diff(
+                        "",
+                        current.document(),
+                        schema.document(),
+                    ) {
                         let mut record = change;
                         record.insert("table".into(), json!(table));
                         sink.record(record)?;
                     }
                     continue;
                 }
-                OnConflict::Ask => super::confirm(context, &format!("replace the schema of {table} with the inferred one"))?,
+                OnConflict::Ask => super::confirm(
+                    context,
+                    &format!("replace the schema of {table} with the inferred one"),
+                )?,
                 OnConflict::Reinfer => {}
             }
             if database.catalog.pinned.contains(table) {
@@ -211,7 +289,10 @@ pub fn infer(context: &Context, sink: &mut dyn Sink, options: InferOptions<'_>) 
             crate::schema_store::working_relative(table)
         };
         expected.insert(path.clone(), database.fingerprint(&path)?);
-        changes.push(Change::Write { path, bytes: schema.bytes(database.config.indentation_width) });
+        changes.push(Change::Write {
+            path,
+            bytes: schema.bytes(database.config.indentation_width),
+        });
     }
     if options.on_conflict == OnConflict::Compare && changes.is_empty() {
         return Ok(Finish::ok("compared; nothing was written"));
@@ -220,13 +301,23 @@ pub fn infer(context: &Context, sink: &mut dyn Sink, options: InferOptions<'_>) 
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "DECISION_REQUIRED",
-                format!("re-inferring would replace the pinned declaration of {}", replaced_pins.join(", ")),
+                format!(
+                    "re-inferring would replace the pinned declaration of {}",
+                    replaced_pins.join(", ")
+                ),
             )
             .help("a pin is what someone wrote; pass --allow-destructive to replace it"),
             9,
         ));
     }
-    let outcome = database.commit(changes, &expected, Request { origin: "migration", ..Request::internal(context.dry_run) })?;
+    let outcome = database.commit(
+        changes,
+        &expected,
+        Request {
+            origin: "migration",
+            ..Request::internal(context.dry_run)
+        },
+    )?;
     super::committed(sink, &outcome, "inferred")
 }
 
@@ -237,7 +328,12 @@ pub fn migrate(context: &Context, sink: &mut dyn Sink, migration: Migration) -> 
     let destructive: Vec<String> = migration
         .operations
         .iter()
-        .filter(|operation| matches!(operation, Operation::DropTable { .. } | Operation::DropColumn { .. }))
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::DropTable { .. } | Operation::DropColumn { .. }
+            )
+        })
         .map(Operation::describe)
         .collect();
     let (changes, expected) = crate::migrate::plan(&database, &migration)?;
@@ -248,12 +344,19 @@ pub fn migrate(context: &Context, sink: &mut dyn Sink, migration: Migration) -> 
         sink.record(record)?;
     }
     if !destructive.is_empty() {
-        super::confirm(context, &format!("this discards data: {}; continue", destructive.join("; ")))?;
+        super::confirm(
+            context,
+            &format!("this discards data: {}; continue", destructive.join("; ")),
+        )?;
     }
     let outcome = database.commit(
         changes,
         &expected,
-        Request { origin: "migration", admission: Admission::Valid, dry_run: context.dry_run },
+        Request {
+            origin: "migration",
+            admission: Admission::Valid,
+            dry_run: context.dry_run,
+        },
     )?;
     super::committed(sink, &outcome, "migrated")
 }
@@ -261,6 +364,8 @@ pub fn migrate(context: &Context, sink: &mut dyn Sink, migration: Migration) -> 
 /// A migration file, read and checked.
 pub fn read_migration(path: &str) -> Result<Migration> {
     let text = super::read_input(path, 64 * 1024 * 1024)?;
-    let value: Value = crate::json::parse_str(&text).map_err(|error| DbError::usage(format!("{path} is not JSON: {error}")))?;
-    serde_json::from_value(value).map_err(|error| DbError::usage(format!("{path} is not a migration: {error}")))
+    let value: Value = crate::json::parse_str(&text)
+        .map_err(|error| DbError::usage(format!("{path} is not JSON: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| DbError::usage(format!("{path} is not a migration: {error}")))
 }

@@ -89,9 +89,17 @@ impl Context {
         };
         match crate::state::open(&root, opening, &self.overrides)? {
             Opened::Empty => Ok(None),
-            Opened::Database { database, transitions, planned } => {
+            Opened::Database {
+                database,
+                transitions,
+                planned,
+            } => {
                 for transition in &transitions {
-                    sink.event("state_transition", transition.to_json(planned), &transition.describe(planned))?;
+                    sink.event(
+                        "state_transition",
+                        transition.to_json(planned),
+                        &transition.describe(planned),
+                    )?;
                 }
                 for event in &database.events {
                     let value = event.to_json();
@@ -107,8 +115,11 @@ impl Context {
     pub fn open_database(&self, sink: &mut dyn Sink, intent: Intent) -> Result<Database> {
         self.open(sink, intent)?.ok_or_else(|| {
             DbError::from_diag(
-                Diagnostic::error("UNINITIALIZED", "there is no database here: no .db/, no tables, no pins")
-                    .help("create one with `reldir init`, or name one with --db"),
+                Diagnostic::error(
+                    "UNINITIALIZED",
+                    "there is no database here: no .db/, no tables, no pins",
+                )
+                .help("create one with `reldir init`, or name one with --db"),
                 10,
             )
         })
@@ -141,13 +152,20 @@ pub fn require_valid(database: &Database) -> Result<()> {
 }
 
 pub fn schema_of<'d>(database: &'d Database, table: &str) -> Result<&'d Schema> {
-    database.catalog.schemas.get(table).ok_or_else(|| database.catalog.unknown_table(table))
+    database
+        .catalog
+        .schemas
+        .get(table)
+        .ok_or_else(|| database.catalog.unknown_table(table))
 }
 
 /// The row a key names. A single-column key is given as its value -- JSON, or
 /// bare text for a string -- and a composite key as a JSON array.
-pub fn find_row(database: &Database, table: &str, text: &str) -> Result<Row> {
-    let schema = schema_of(database, table)?;
+pub fn find_row(catalog: &crate::catalog::Catalog, table: &str, text: &str) -> Result<Row> {
+    let schema = catalog
+        .schemas
+        .get(table)
+        .ok_or_else(|| catalog.unknown_table(table))?;
     let key = schema.primary_key();
     let candidates: Vec<Vec<Value>> = if key.len() == 1 {
         let mut out = vec![];
@@ -157,7 +175,9 @@ pub fn find_row(database: &Database, table: &str, text: &str) -> Result<Row> {
         out.push(vec![Value::String(text.to_string())]);
         out
     } else {
-        let parsed = crate::json::parse_str(text).ok().and_then(|value| value.as_array().cloned());
+        let parsed = crate::json::parse_str(text)
+            .ok()
+            .and_then(|value| value.as_array().cloned());
         match parsed {
             Some(values) if values.len() == key.len() => vec![values],
             _ => {
@@ -172,12 +192,16 @@ pub fn find_row(database: &Database, table: &str, text: &str) -> Result<Row> {
     for values in candidates {
         let probe: Map<String, Value> = key.iter().cloned().zip(values).collect();
         if let Some(rendered) = crate::mirror::key(&probe, key, schema)
-            && let Some(row) = database.catalog.row_by_key(table, &rendered)?
+            && let Some(row) = catalog.row_by_key(table, &rendered)?
         {
             return Ok(row);
         }
     }
-    Err(DbError::new("UNKNOWN_ROW", format!("{table} has no row with key {text}"), 4))
+    Err(DbError::new(
+        "UNKNOWN_ROW",
+        format!("{table} has no row with key {text}"),
+        4,
+    ))
 }
 
 /// Parameters for a SQL statement: `value` for the next positional one, or
@@ -187,12 +211,16 @@ pub fn parse_params(texts: &[String]) -> Result<Vec<crate::sql::SqlParam>> {
         .iter()
         .map(|text| {
             let (name, raw) = match text.split_once('=') {
-                Some((name, raw)) if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                Some((name, raw))
+                    if !name.is_empty()
+                        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+                {
                     (Some(name.to_string()), raw)
                 }
                 _ => (None, text.as_str()),
             };
-            let value = crate::json::parse_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+            let value =
+                crate::json::parse_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
             Ok(crate::sql::SqlParam { name, value })
         })
         .collect()
@@ -241,7 +269,9 @@ pub fn committed(sink: &mut dyn Sink, outcome: &crate::db::Outcome, verb: &str) 
         (false, Some(revision)) => format!("{verb}: {files} file(s), revision {revision}"),
         (false, None) => "no change".to_string(),
     };
-    let mut finish = Finish::ok(summary).with("files", files).with("dry_run", outcome.dry_run);
+    let mut finish = Finish::ok(summary)
+        .with("files", files)
+        .with("dry_run", outcome.dry_run);
     if let Some(revision) = outcome.revision {
         finish = finish.with("revision", revision);
     }
@@ -258,19 +288,29 @@ pub fn confirm(context: &Context, question: &str) -> Result<()> {
     }
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Err(DbError::from_diag(
-            Diagnostic::error("DECISION_REQUIRED", format!("{question} -- this needs a decision"))
-                .help("pass --yes to confirm, or --dry-run to see exactly what would change"),
+            Diagnostic::error(
+                "DECISION_REQUIRED",
+                format!("{question} -- this needs a decision"),
+            )
+            .help("pass --yes to confirm, or --dry-run to see exactly what would change"),
             9,
         ));
     }
     eprint!("{question} [y/N] ");
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer).map_err(|error| DbError::io(std::path::Path::new("stdin"), error))?;
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|error| DbError::io(std::path::Path::new("stdin"), error))?;
     if matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
         Ok(())
     } else {
-        Err(DbError::new("DECISION_REQUIRED", "declined; nothing was changed", 9))
+        Err(DbError::new(
+            "DECISION_REQUIRED",
+            "declined; nothing was changed",
+            9,
+        ))
     }
 }
 
@@ -281,10 +321,16 @@ pub fn read_input(source: &str, limit: u64) -> Result<String> {
         (Box::new(std::io::stdin().lock()), PathBuf::from("stdin"))
     } else {
         let path = PathBuf::from(source);
-        (Box::new(std::fs::File::open(&path).map_err(|error| DbError::io(&path, error))?), path)
+        (
+            Box::new(std::fs::File::open(&path).map_err(|error| DbError::io(&path, error))?),
+            path,
+        )
     };
     let mut bytes = vec![];
-    reader.take(limit.saturating_add(1)).read_to_end(&mut bytes).map_err(|error| DbError::io(&path, error))?;
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| DbError::io(&path, error))?;
     if bytes.len() as u64 > limit {
         return Err(DbError::new(
             "RESOURCE_LIMIT",
@@ -292,5 +338,6 @@ pub fn read_input(source: &str, limit: u64) -> Result<String> {
             2,
         ));
     }
-    String::from_utf8(bytes).map_err(|error| DbError::usage(format!("{} is not UTF-8: {error}", path.display())))
+    String::from_utf8(bytes)
+        .map_err(|error| DbError::usage(format!("{} is not UTF-8: {error}", path.display())))
 }

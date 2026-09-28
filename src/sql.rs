@@ -27,7 +27,10 @@ use crate::{
     plan::RowChange,
     schema::{Assertion, Check, Schema},
 };
-use rusqlite::{Connection, hooks::{AuthAction, AuthContext, Authorization}};
+use rusqlite::{
+    Connection,
+    hooks::{AuthAction, AuthContext, Authorization},
+};
 use serde_json::{Map, Value};
 use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
 use std::{
@@ -63,7 +66,10 @@ pub enum StatementKind {
 pub fn classify(text: &str) -> Result<StatementKind> {
     let dialect = SQLiteDialect {};
     let failed = |message: String, location: Option<crate::diagnostic::Location>| {
-        let mut diagnostic = Diagnostic::error("QUERY_UNSUPPORTED", format!("SQL does not parse: {message}"));
+        let mut diagnostic = Diagnostic::error(
+            "QUERY_UNSUPPORTED",
+            format!("SQL does not parse: {message}"),
+        );
         diagnostic.source_line = location
             .as_ref()
             .and_then(|location| text.lines().nth(location.line.saturating_sub(1)))
@@ -83,18 +89,24 @@ pub fn classify(text: &str) -> Result<StatementKind> {
             if start.line == 0 {
                 start = parser.get_previous_token().span.start;
             }
-            let location = (start.line > 0).then(|| crate::diagnostic::Location {
+            let location = (start.line > 0).then_some(crate::diagnostic::Location {
                 line: start.line as usize,
                 column: start.column as usize,
             });
             let message = error.to_string();
-            return Err(failed(message.clone(), sql_error_location(&message).or(location)));
+            return Err(failed(
+                message.clone(),
+                sql_error_location(&message).or(location),
+            ));
         }
     };
     let [statement] = statements.as_slice() else {
         return Err(DbError::new(
             "QUERY_UNSUPPORTED",
-            format!("exactly one SQL statement is required; {} were given", statements.len()),
+            format!(
+                "exactly one SQL statement is required; {} were given",
+                statements.len()
+            ),
             4,
         ));
     };
@@ -105,7 +117,9 @@ pub fn classify(text: &str) -> Result<StatementKind> {
             | sqlparser::ast::SetExpr::Delete(_) => StatementKind::Mutation,
             _ => StatementKind::Read,
         }),
-        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Ok(StatementKind::Mutation),
+        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => {
+            Ok(StatementKind::Mutation)
+        }
         Statement::Explain { .. } | Statement::ExplainTable { .. } => Ok(StatementKind::Read),
         other => {
             let keyword = other
@@ -134,7 +148,9 @@ fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
     let start = message.find(marker)? + marker.len();
     let rest = &message[start..];
     let (line, rest) = rest.split_once(", Column: ")?;
-    let column = rest.split(|character: char| !character.is_ascii_digit()).next()?;
+    let column = rest
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?;
     Some(crate::diagnostic::Location {
         line: line.parse().ok()?,
         column: column.parse().ok()?,
@@ -222,15 +238,26 @@ fn uninstall(connection: &Connection) {
 
 /// Prepare a statement under a policy, turning a refusal into a diagnostic that
 /// names what was refused.
-fn prepare<'c>(connection: &'c Connection, text: &str, policy: &Policy) -> Result<rusqlite::Statement<'c>> {
+fn prepare<'c>(
+    connection: &'c Connection,
+    text: &str,
+    policy: &Policy,
+) -> Result<rusqlite::Statement<'c>> {
     install(connection, policy);
     let prepared = connection.prepare(text);
     uninstall(connection);
     prepared.map_err(|error| {
-        let refused = policy.refused.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let refused = policy
+            .refused
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         match refused {
             Some(reason) => DbError::from_diag(
-                Diagnostic::error("QUERY_UNSUPPORTED", format!("the statement is refused: {reason}")),
+                Diagnostic::error(
+                    "QUERY_UNSUPPORTED",
+                    format!("the statement is refused: {reason}"),
+                ),
                 4,
             ),
             None => query_err(error),
@@ -241,7 +268,11 @@ fn prepare<'c>(connection: &'c Connection, text: &str, policy: &Policy) -> Resul
 fn policy(schemas: &BTreeMap<String, Schema>, mutation: bool, deterministic: bool) -> Policy {
     let tables: BTreeSet<String> = schemas.keys().cloned().collect();
     Policy {
-        writable: if mutation { tables.clone() } else { BTreeSet::new() },
+        writable: if mutation {
+            tables.clone()
+        } else {
+            BTreeSet::new()
+        },
         readable: tables,
         deterministic,
         refused: Arc::new(Mutex::new(None)),
@@ -290,11 +321,19 @@ pub fn query(
     bind(&mut statement, params)?;
     limit(connection, &limits)?;
     let outcome = (|| -> Result<usize> {
-        let names: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+        let names: Vec<String> = statement
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
         let declared: Vec<Option<String>> = statement
             .columns()
             .into_iter()
-            .map(|column| column.decl_type().map(|t| t.split_whitespace().next().unwrap_or("").to_string()))
+            .map(|column| {
+                column
+                    .decl_type()
+                    .map(|t| t.split_whitespace().next().unwrap_or("").to_string())
+            })
             .collect();
         let mut rows = statement.raw_query();
         let mut emitted = 0usize;
@@ -313,7 +352,10 @@ pub fn query(
             let mut object = Map::new();
             for (index, name) in names.iter().enumerate() {
                 let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
-                object.insert(name.clone(), mirror::decode_declared(value, declared[index].as_deref())?);
+                object.insert(
+                    name.clone(),
+                    mirror::decode_declared(value, declared[index].as_deref())?,
+                );
             }
             emit(object)?;
             emitted += 1;
@@ -343,9 +385,18 @@ pub fn plan(
     let mut out = vec![];
     while let Some(row) = rows.next().map_err(query_err)? {
         let mut step = Map::new();
-        step.insert("id".into(), mirror::from_sql(row.get_ref(0).map_err(query_err)?));
-        step.insert("parent".into(), mirror::from_sql(row.get_ref(1).map_err(query_err)?));
-        step.insert("detail".into(), mirror::from_sql(row.get_ref(3).map_err(query_err)?));
+        step.insert(
+            "id".into(),
+            mirror::from_sql(row.get_ref(0).map_err(query_err)?),
+        );
+        step.insert(
+            "parent".into(),
+            mirror::from_sql(row.get_ref(1).map_err(query_err)?),
+        );
+        step.insert(
+            "detail".into(),
+            mirror::from_sql(row.get_ref(3).map_err(query_err)?),
+        );
         out.push(step);
     }
     Ok(out)
@@ -400,11 +451,19 @@ pub fn mutate(
         let mut statement = prepare(connection, text, &policy)?;
         bind(&mut statement, params)?;
         limit(connection, &limits)?;
-        let names: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+        let names: Vec<String> = statement
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
         let declared: Vec<Option<String>> = statement
             .columns()
             .into_iter()
-            .map(|column| column.decl_type().map(|t| t.split_whitespace().next().unwrap_or("").to_string()))
+            .map(|column| {
+                column
+                    .decl_type()
+                    .map(|t| t.split_whitespace().next().unwrap_or("").to_string())
+            })
             .collect();
         let mut returning = vec![];
         {
@@ -413,7 +472,10 @@ pub fn mutate(
                 let mut object = Map::new();
                 for (index, name) in names.iter().enumerate() {
                     let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
-                    object.insert(name.clone(), mirror::decode_declared(value, declared[index].as_deref())?);
+                    object.insert(
+                        name.clone(),
+                        mirror::decode_declared(value, declared[index].as_deref())?,
+                    );
                 }
                 returning.push(object);
             }
@@ -434,7 +496,9 @@ fn captured(catalog: &crate::catalog::Catalog) -> Result<Vec<RowChange>> {
     let mut per_table: BTreeMap<String, (BTreeSet<i64>, BTreeSet<i64>)> = BTreeMap::new();
     {
         let mut statement = connection
-            .prepare("SELECT tbl, op, old_rowid, new_rowid FROM temp._reldir_changes ORDER BY rowid")
+            .prepare(
+                "SELECT tbl, op, old_rowid, new_rowid FROM temp._reldir_changes ORDER BY rowid",
+            )
             .map_err(query_err)?;
         let mut rows = statement.query([]).map_err(query_err)?;
         while let Some(row) = rows.next().map_err(query_err)? {
@@ -460,7 +524,11 @@ fn captured(catalog: &crate::catalog::Catalog) -> Result<Vec<RowChange>> {
         let names: Vec<&String> = schema.columns().keys().collect();
         let select = format!(
             "SELECT {} FROM {} WHERE rowid = ?1",
-            names.iter().map(|n| mirror::quote(n)).collect::<Vec<_>>().join(", "),
+            names
+                .iter()
+                .map(|n| mirror::quote(n))
+                .collect::<Vec<_>>()
+                .join(", "),
             mirror::quote(&table)
         );
         let mut next_sequence: BTreeMap<String, i64> = BTreeMap::new();
@@ -565,7 +633,10 @@ pub fn sequence_start(connection: &Connection, table: &str, column: &str) -> Res
 pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
     let mut out = vec![];
     let Ok(scratch) = Mirror::open_memory() else {
-        return vec![Diagnostic::error("INTERNAL_METADATA_CORRUPT", "cannot open a scratch database")];
+        return vec![Diagnostic::error(
+            "INTERNAL_METADATA_CORRUPT",
+            "cannot open a scratch database",
+        )];
     };
     if let Err(error) = scratch.sync_schemas(schemas) {
         out.push(*error.diagnostic);
@@ -581,9 +652,12 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
             let text = format!("SELECT ({}) FROM {}", check.expr(), mirror::quote(table));
             if let Some(reason) = refuses_clock(check.expr()) {
                 out.push(
-                    Diagnostic::error("SCHEMA_CHECK_INVALID", format!("check {:?}: {reason}", check.name()))
-                        .table(table)
-                        .pointer(format!("/x-reldir/checks/{index}/expr")),
+                    Diagnostic::error(
+                        "SCHEMA_CHECK_INVALID",
+                        format!("check {:?}: {reason}", check.name()),
+                    )
+                    .table(table)
+                    .pointer(format!("/x-reldir/checks/{index}/expr")),
                 );
                 continue;
             }
@@ -606,9 +680,12 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
             let at = format!("/x-reldir/assertions/{index}/query");
             if let Some(reason) = refuses_clock(assertion.query()) {
                 out.push(
-                    Diagnostic::error("SCHEMA_ASSERTION_INVALID", format!("assertion {:?}: {reason}", assertion.name()))
-                        .table(table)
-                        .pointer(at),
+                    Diagnostic::error(
+                        "SCHEMA_ASSERTION_INVALID",
+                        format!("assertion {:?}: {reason}", assertion.name()),
+                    )
+                    .table(table)
+                    .pointer(at),
                 );
                 continue;
             }
@@ -631,13 +708,21 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
                 Err(error) => out.push(
                     Diagnostic::error(
                         "SCHEMA_ASSERTION_INVALID",
-                        format!("assertion {:?} does not compile: {}", assertion.name(), error.diagnostic.message),
+                        format!(
+                            "assertion {:?} does not compile: {}",
+                            assertion.name(),
+                            error.diagnostic.message
+                        ),
                     )
                     .table(table)
                     .pointer(at),
                 ),
                 Ok(statement) => {
-                    let columns: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+                    let columns: Vec<String> = statement
+                        .column_names()
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
                     if columns != schema.primary_key() {
                         out.push(
                             Diagnostic::error(
@@ -666,7 +751,9 @@ fn refuses_clock(text: &str) -> Option<String> {
     let lowered = text.to_ascii_lowercase();
     for keyword in ["current_timestamp", "current_date", "current_time"] {
         if lowered.contains(keyword) {
-            return Some(format!("{keyword} reads the clock, and validity cannot change with time"));
+            return Some(format!(
+                "{keyword} reads the clock, and validity cannot change with time"
+            ));
         }
     }
     if lowered.contains("'now'") {
@@ -694,7 +781,11 @@ pub fn check_violations(mirror: &Mirror, schema: &Schema, check: &Check) -> Resu
 }
 
 /// The files whose rows an assertion names.
-pub fn assertion_violations(mirror: &Mirror, schema: &Schema, assertion: &Assertion) -> Result<Vec<String>> {
+pub fn assertion_violations(
+    mirror: &Mirror,
+    schema: &Schema,
+    assertion: &Assertion,
+) -> Result<Vec<String>> {
     let connection = mirror.connection();
     let mut statement = connection.prepare(assertion.query()).map_err(query_err)?;
     let count = statement.column_count();
@@ -703,7 +794,10 @@ pub fn assertion_violations(mirror: &Mirror, schema: &Schema, assertion: &Assert
     while let Some(row) = rows.next().map_err(query_err)? {
         let mut values = Map::new();
         for (index, column) in schema.primary_key().iter().enumerate().take(count) {
-            let kind = schema.column(column).map(|c| c.kind().clone()).unwrap_or(crate::schema::ColumnType::Json);
+            let kind = schema
+                .column(column)
+                .map(|c| c.kind().clone())
+                .unwrap_or(crate::schema::ColumnType::Json);
             let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
             values.insert(column.clone(), mirror::decode_typed(value, &kind)?);
         }
@@ -723,7 +817,11 @@ pub fn assertion_violations(mirror: &Mirror, schema: &Schema, assertion: &Assert
 
 /// Rename a column wherever an expression names it, leaving strings, function
 /// names and other identifiers alone.
-pub fn rename_identifier(expression: &str, old: &str, new: &str) -> std::result::Result<String, String> {
+pub fn rename_identifier(
+    expression: &str,
+    old: &str,
+    new: &str,
+) -> std::result::Result<String, String> {
     let chars: Vec<char> = expression.chars().collect();
     let simple = |name: &str| {
         let mut characters = name.chars();
@@ -763,7 +861,11 @@ pub fn rename_identifier(expression: &str, old: &str, new: &str) -> std::result:
                 let mut identifier = String::new();
                 loop {
                     match chars.get(i) {
-                        None => return Err(format!("unterminated quoted identifier in {expression:?}")),
+                        None => {
+                            return Err(format!(
+                                "unterminated quoted identifier in {expression:?}"
+                            ));
+                        }
                         Some('"') if chars.get(i + 1) == Some(&'"') => {
                             identifier.push('"');
                             i += 2;
@@ -872,11 +974,14 @@ pub fn query_err(error: rusqlite::Error) -> DbError {
         });
         if let Some((code, exit)) = code {
             let message = match code {
-                "RESOURCE_LIMIT" if failure.code == rusqlite::ffi::ErrorCode::OperationInterrupted => {
+                "RESOURCE_LIMIT"
+                    if failure.code == rusqlite::ffi::ErrorCode::OperationInterrupted =>
+                {
                     "the statement exceeded the configured timeout and was stopped".to_string()
                 }
                 "RESOURCE_LIMIT" => {
-                    "the statement exceeded the configured query-memory limit and was stopped".to_string()
+                    "the statement exceeded the configured query-memory limit and was stopped"
+                        .to_string()
                 }
                 _ => message,
             };
@@ -922,15 +1027,34 @@ mod tests {
             classify("WITH x AS (SELECT 1 AS a) SELECT a FROM x UNION SELECT 2").unwrap(),
             StatementKind::Read
         );
-        assert_eq!(classify("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2").unwrap(), StatementKind::Mutation);
-        assert_eq!(classify("DELETE FROM t WHERE a = 1 RETURNING a").unwrap(), StatementKind::Mutation);
-        for refused in ["CREATE TABLE x (a)", "DROP TABLE t", "PRAGMA foreign_keys", "ATTACH 'x' AS y", "BEGIN", "VACUUM"] {
+        assert_eq!(
+            classify("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2").unwrap(),
+            StatementKind::Mutation
+        );
+        assert_eq!(
+            classify("DELETE FROM t WHERE a = 1 RETURNING a").unwrap(),
+            StatementKind::Mutation
+        );
+        for refused in [
+            "CREATE TABLE x (a)",
+            "DROP TABLE t",
+            "PRAGMA foreign_keys",
+            "ATTACH 'x' AS y",
+            "BEGIN",
+            "VACUUM",
+        ] {
             let error = classify(refused).expect_err(refused);
             assert_eq!(error.diagnostic.code, "QUERY_UNSUPPORTED", "{refused}");
         }
-        assert!(classify("SELECT 1; SELECT 2").is_err(), "one statement at a time");
+        assert!(
+            classify("SELECT 1; SELECT 2").is_err(),
+            "one statement at a time"
+        );
         let located = classify("SELECT\n  FROM").unwrap_err();
-        assert!(located.diagnostic.location.is_some(), "a parse error points at the fault");
+        assert!(
+            located.diagnostic.location.is_some(),
+            "a parse error points at the fault"
+        );
     }
 
     fn catalog(rows: &[(&str, &str)]) -> (tempfile::TempDir, crate::catalog::Catalog) {
@@ -956,28 +1080,59 @@ mod tests {
         (directory, catalog)
     }
 
-    const LIMITS: QueryLimits = QueryLimits { timeout: None, max_rows: 1000, max_memory: 1 << 28 };
+    const LIMITS: QueryLimits = QueryLimits {
+        timeout: None,
+        max_rows: 1000,
+        max_memory: 1 << 28,
+    };
 
     /// Every kind of row change a statement makes is captured, and the mirror
     /// is left exactly as it was.
     #[test]
     fn test2103_mutations_are_captured_and_never_applied_to_the_mirror() {
-        let (_directory, catalog) = catalog(&[("a.json", r#"{"id":"a","n":1}"#), ("b.json", r#"{"id":"b","n":2}"#)]);
+        let (_directory, catalog) = catalog(&[
+            ("a.json", r#"{"id":"a","n":1}"#),
+            ("b.json", r#"{"id":"b","n":2}"#),
+        ]);
         let deleted = mutate(&catalog, "DELETE FROM t WHERE id = 'a'", &[], LIMITS).unwrap();
         assert_eq!(deleted.rows.len(), 1);
         assert!(deleted.rows[0].after.is_none());
-        let updated = mutate(&catalog, "UPDATE t SET n = n + 10 RETURNING id, n", &[], LIMITS).unwrap();
+        let updated = mutate(
+            &catalog,
+            "UPDATE t SET n = n + 10 RETURNING id, n",
+            &[],
+            LIMITS,
+        )
+        .unwrap();
         assert_eq!(updated.rows.len(), 2);
         assert_eq!(updated.returning.len(), 2);
-        assert!(updated.rows.iter().all(|change| change.after.as_ref().unwrap()["n"].as_i64().unwrap() > 10));
-        let inserted = mutate(&catalog, "INSERT INTO t (id, n) VALUES ('c', 3)", &[], LIMITS).unwrap();
+        assert!(
+            updated
+                .rows
+                .iter()
+                .all(|change| change.after.as_ref().unwrap()["n"].as_i64().unwrap() > 10)
+        );
+        let inserted = mutate(
+            &catalog,
+            "INSERT INTO t (id, n) VALUES ('c', 3)",
+            &[],
+            LIMITS,
+        )
+        .unwrap();
         assert_eq!(inserted.rows.len(), 1);
         assert!(inserted.rows[0].before.is_none());
         let mut left = 0;
-        query(&catalog.mirror, &catalog.schemas, "SELECT id FROM t", &[], LIMITS, |_| {
-            left += 1;
-            Ok(())
-        })
+        query(
+            &catalog.mirror,
+            &catalog.schemas,
+            "SELECT id FROM t",
+            &[],
+            LIMITS,
+            |_| {
+                left += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(left, 2, "the mirror still holds exactly the files");
     }
@@ -985,11 +1140,22 @@ mod tests {
     #[test]
     fn test2101_renaming_leaves_strings_and_function_names_alone() {
         assert_eq!(
-            rename_identifier("count > 0 AND count(x) > 1 AND name = 'count'", "count", "total").unwrap(),
+            rename_identifier(
+                "count > 0 AND count(x) > 1 AND name = 'count'",
+                "count",
+                "total"
+            )
+            .unwrap(),
             "total > 0 AND count(x) > 1 AND name = 'count'"
         );
-        assert_eq!(rename_identifier("\"a b\" <> ''", "a b", "c").unwrap(), "\"c\" <> ''");
-        assert_eq!(rename_identifier("x = 1", "x", "new name").unwrap(), "\"new name\" = 1");
+        assert_eq!(
+            rename_identifier("\"a b\" <> ''", "a b", "c").unwrap(),
+            "\"c\" <> ''"
+        );
+        assert_eq!(
+            rename_identifier("x = 1", "x", "new name").unwrap(),
+            "\"new name\" = 1"
+        );
         assert!(rename_identifier("\"open", "a", "b").is_err());
     }
 

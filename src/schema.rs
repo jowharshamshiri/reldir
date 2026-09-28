@@ -291,7 +291,12 @@ impl ForeignKey {
         if self.columns.is_empty() {
             format!("{table}.{} -> {}", from.join(","), self.to.describe())
         } else {
-            format!("{table}.{} -> {}({})", from.join(","), self.to.describe(), self.columns.join(","))
+            format!(
+                "{table}.{} -> {}({})",
+                from.join(","),
+                self.to.describe(),
+                self.columns.join(",")
+            )
         }
     }
 }
@@ -519,9 +524,28 @@ pub fn valid_name(s: &str) -> bool {
         && s != "schema"
         && !matches!(
             s,
-            "con" | "prn" | "aux" | "nul"
-                | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
-                | "lpt1" | "lpt2" | "lpt3" | "lpt4" | "lpt5" | "lpt6" | "lpt7" | "lpt8" | "lpt9"
+            "con"
+                | "prn"
+                | "aux"
+                | "nul"
+                | "com1"
+                | "com2"
+                | "com3"
+                | "com4"
+                | "com5"
+                | "com6"
+                | "com7"
+                | "com8"
+                | "com9"
+                | "lpt1"
+                | "lpt2"
+                | "lpt3"
+                | "lpt4"
+                | "lpt5"
+                | "lpt6"
+                | "lpt7"
+                | "lpt8"
+                | "lpt9"
         )
 }
 
@@ -535,8 +559,21 @@ mod tests {
             assert!(valid_name(accepted), "{accepted} should be a valid name");
         }
         for rejected in [
-            "", "Users", "1users", "_users", "user-items", "user.items", "üsers", "con", "prn",
-            "aux", "nul", "com1", "lpt9", ".hidden", "schema",
+            "",
+            "Users",
+            "1users",
+            "_users",
+            "user-items",
+            "user.items",
+            "üsers",
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "lpt9",
+            ".hidden",
+            "schema",
         ] {
             assert!(!valid_name(rejected), "{rejected:?} must be rejected");
         }
@@ -545,20 +582,39 @@ mod tests {
     #[test]
     fn test2040_type_and_action_names_round_trip() {
         for kind in [
-            ColumnType::Bool, ColumnType::Int, ColumnType::Float, ColumnType::Decimal,
-            ColumnType::String, ColumnType::Bytes, ColumnType::Date, ColumnType::Timestamp,
-            ColumnType::Uuid, ColumnType::Ulid, ColumnType::Enum, ColumnType::Array,
-            ColumnType::Object, ColumnType::Json,
+            ColumnType::Bool,
+            ColumnType::Int,
+            ColumnType::Float,
+            ColumnType::Decimal,
+            ColumnType::String,
+            ColumnType::Bytes,
+            ColumnType::Date,
+            ColumnType::Timestamp,
+            ColumnType::Uuid,
+            ColumnType::Ulid,
+            ColumnType::Enum,
+            ColumnType::Array,
+            ColumnType::Object,
+            ColumnType::Json,
         ] {
             assert_eq!(ColumnType::from_name(kind.name()), Some(kind));
         }
         for action in [
-            Action::Restrict, Action::NoAction, Action::Cascade, Action::Remove,
-            Action::SetNull, Action::SetDefault,
+            Action::Restrict,
+            Action::NoAction,
+            Action::Cascade,
+            Action::Remove,
+            Action::SetNull,
+            Action::SetDefault,
         ] {
             assert_eq!(Action::from_name(action.name()), Some(action));
         }
-        for generated in [GeneratedKind::Uuid, GeneratedKind::Ulid, GeneratedKind::Now, GeneratedKind::Sequence] {
+        for generated in [
+            GeneratedKind::Uuid,
+            GeneratedKind::Ulid,
+            GeneratedKind::Now,
+            GeneratedKind::Sequence,
+        ] {
             assert_eq!(GeneratedKind::from_name(generated.name()), Some(generated));
         }
     }
