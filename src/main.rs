@@ -5,32 +5,10 @@ fn main() {
         Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
-            let code = if matches!(
-                error.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
-            ) {
-                0
-            } else {
-                1
-            };
+            let code = if matches!(error.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) { 0 } else { 1 };
             let _ = error.print();
             std::process::exit(code);
         }
     };
-    let machine = cli.machine_error_format().map(String::from);
-    match reldir::cli::run(cli) {
-        Ok(code) => std::process::exit(code),
-        Err(error) => {
-            if machine.is_some() {
-                eprintln!(
-                    "{}",
-                    serde_json::to_string(&error.diagnostic)
-                        .expect("diagnostic serialization cannot fail")
-                );
-            } else {
-                error.render_human();
-            }
-            std::process::exit(error.exit_code());
-        }
-    }
+    std::process::exit(reldir::cli::run(cli));
 }

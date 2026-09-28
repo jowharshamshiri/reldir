@@ -1,258 +1,69 @@
-use crate::{
-    canonical,
-    catalog::Catalog,
-    diagnostic::{DbError, Diagnostic, Result},
-    schema::{Action, ColumnType},
-    transaction::Change,
-};
-use rusqlite::{
-    Connection,
-    types::{Value as SqlValue, ValueRef},
-};
-use serde_json::{Map, Number, Value};
-use sqlparser::{
-    ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, UnaryOperator},
-    dialect::GenericDialect,
-    parser::Parser,
-};
-use std::{collections::BTreeMap, path::PathBuf};
+//! SQL over the governed directory.
+//!
+//! SQL runs on the mirror's typed tables, one per governed table, in SQLite's
+//! dialect. What a statement may touch is enforced by SQLite's authorizer at
+//! the moment it is compiled -- not guessed from its text:
+//!
+//! - a query reads governed tables and the `json_each` / `json_tree`
+//!   table-valued functions, with any function, subquery, CTE, window or
+//!   compound it likes;
+//! - a mutation (`INSERT`, including `ON CONFLICT` upserts and `REPLACE`;
+//!   `UPDATE`; `DELETE`; each with `RETURNING`) may also write governed tables;
+//! - nothing may read reldir's own bookkeeping, attach a database, run a
+//!   pragma, define or drop anything, or control a transaction.
+//!
+//! A mutation never writes the mirror. It runs inside a savepoint with capture
+//! triggers recording every row it touches, the resulting rows are read back
+//! as JSON, and the savepoint is rolled back. What the statement *would* do
+//! becomes a plan of row changes, which the one mutation path turns into
+//! files -- after referential actions and full validation.
+//!
+//! Checks and assertions are SQL too, held to a stricter rule: they must be
+//! deterministic, because validity cannot depend on the clock or on chance.
 
-pub struct SqlResult {
-    pub rows: Vec<Map<String, Value>>,
-    pub changes: Vec<Change>,
-    pub mutation: bool,
-}
-#[derive(Clone)]
+use crate::{
+    diagnostic::{DbError, Diagnostic, Result},
+    mirror::{self, Mirror},
+    plan::RowChange,
+    schema::{Assertion, Check, Schema},
+};
+use rusqlite::{Connection, hooks::{AuthAction, AuthContext, Authorization}};
+use serde_json::{Map, Value};
+use sqlparser::{ast::Statement, dialect::SQLiteDialect, parser::Parser};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone, Debug)]
 pub struct SqlParam {
     pub name: Option<String>,
     pub value: Value,
 }
 
-#[derive(Clone, Copy)]
+/// What a query may consume.
+#[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     pub timeout: Option<std::time::Duration>,
     pub max_rows: usize,
+    /// Bytes of memory SQLite may allocate while the statement runs, including
+    /// sorting and temporary storage, which are kept in memory.
     pub max_memory: u64,
-    pub max_sort_memory: u64,
-    pub max_temporary_disk: u64,
 }
 
-impl QueryLimits {
-    fn unbounded(timeout: Option<std::time::Duration>) -> Self {
-        Self {
-            timeout,
-            max_rows: usize::MAX,
-            max_memory: u64::MAX,
-            max_sort_memory: u64::MAX,
-            max_temporary_disk: u64::MAX,
-        }
-    }
+/// Whether a statement reads or writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    Read,
+    Mutation,
 }
 
-pub fn execute(catalog: &Catalog, text: &str, params: &[Value]) -> Result<SqlResult> {
-    let params: Vec<_> = params
-        .iter()
-        .cloned()
-        .map(|value| SqlParam { name: None, value })
-        .collect();
-    execute_params(catalog, text, &params)
-}
-
-pub fn execute_with_limits(
-    catalog: &Catalog,
-    text: &str,
-    params: &[Value],
-    limits: QueryLimits,
-) -> Result<SqlResult> {
-    let params = params
-        .iter()
-        .cloned()
-        .map(|value| SqlParam { name: None, value })
-        .collect::<Vec<_>>();
-    execute_params_with_limits(catalog, text, &params, limits)
-}
-
-pub fn execute_params(catalog: &Catalog, text: &str, params: &[SqlParam]) -> Result<SqlResult> {
-    execute_params_with_limits(catalog, text, params, QueryLimits::unbounded(None))
-}
-pub fn execute_params_with_limits(
-    catalog: &Catalog,
-    text: &str,
-    params: &[SqlParam],
-    limits: QueryLimits,
-) -> Result<SqlResult> {
-    execute_params_inner(catalog, text, params, limits)
-        .map_err(|error| explain_unknown_table(catalog, error))
-}
-
-fn execute_params_inner(
-    catalog: &Catalog,
-    text: &str,
-    params: &[SqlParam],
-    limits: QueryLimits,
-) -> Result<SqlResult> {
-    let token = statement_kind(text)?;
-    enforce_query_workspace(catalog, text, &limits)?;
-    let mut conn = load(catalog, true)?;
-    if let Some(limit) = limits.timeout {
-        let start = std::time::Instant::now();
-        conn.progress_handler(1000, Some(move || start.elapsed() >= limit));
-    }
-    if matches!(token.as_str(), "SELECT" | "WITH" | "EXPLAIN") {
-        let rows = query(&conn, text, params, limits.max_rows, limits.max_memory)?;
-        return Ok(SqlResult {
-            rows,
-            changes: vec![],
-            mutation: false,
-        });
-    }
-    if !matches!(token.as_str(), "INSERT" | "UPDATE" | "DELETE") {
-        return Err(DbError::new(
-            "QUERY_UNSUPPORTED",
-            format!("unsupported SQL statement {token}"),
-            4,
-        ));
-    }
-    let existing_rowids = snapshot_rowids(&conn, catalog)?;
-    execute_bound(&mut conn, text, params)?;
-    let after = dump(&conn, catalog, &existing_rowids)?;
-    let changes = diff(catalog, &after)?;
-    Ok(SqlResult {
-        rows: vec![],
-        changes,
-        mutation: true,
-    })
-}
-
-pub fn is_read_statement(text: &str) -> Result<bool> {
-    Ok(matches!(
-        statement_kind(text)?.as_str(),
-        "SELECT" | "WITH" | "EXPLAIN"
-    ))
-}
-
-pub fn query_each_timeout<F>(
-    catalog: &Catalog,
-    text: &str,
-    params: &[SqlParam],
-    limits: QueryLimits,
-    emit: F,
-) -> Result<usize>
-where
-    F: FnMut(Map<String, Value>) -> Result<()>,
-{
-    query_each_inner(catalog, text, params, limits, emit)
-        .map_err(|error| explain_unknown_table(catalog, error))
-}
-
-fn query_each_inner<F>(
-    catalog: &Catalog,
-    text: &str,
-    params: &[SqlParam],
-    limits: QueryLimits,
-    mut emit: F,
-) -> Result<usize>
-where
-    F: FnMut(Map<String, Value>) -> Result<()>,
-{
-    if !is_read_statement(text)? {
-        return Err(DbError::new(
-            "QUERY_UNSUPPORTED",
-            "streaming execution requires a read-only SQL statement",
-            4,
-        ));
-    }
-    enforce_query_workspace(catalog, text, &limits)?;
-    let conn = load(catalog, true)?;
-    if let Some(limit) = limits.timeout {
-        let start = std::time::Instant::now();
-        conn.progress_handler(1000, Some(move || start.elapsed() >= limit));
-    }
-    let mut statement = conn.prepare(text).map_err(query_err)?;
-    bind(&mut statement, params)?;
-    let count = statement.column_count();
-    let names: Vec<_> = (0..count)
-        .map(|index| statement.column_name(index).unwrap_or("").to_string())
-        .collect();
-    let declared: Vec<_> = statement
-        .columns()
-        .into_iter()
-        .map(|column| column.decl_type().map(String::from))
-        .collect();
-    let mut cursor = statement.raw_query();
-    let mut emitted = 0usize;
-    while let Some(row) = cursor.next().map_err(query_err)? {
-        if emitted == limits.max_rows {
-            return Err(DbError::new(
-                "RESOURCE_LIMIT",
-                format!(
-                    "query exceeds the configured limit of {} result rows",
-                    limits.max_rows
-                ),
-                4,
-            ));
-        }
-        let mut object = Map::new();
-        for (index, name) in names.iter().enumerate() {
-            let value = from_ref(row.get_ref(index).map_err(query_err)?);
-            object.insert(
-                name.clone(),
-                decode_declared(value, declared[index].as_deref())?,
-            );
-        }
-        let row_size = serde_json::to_vec(&object)
-            .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))?
-            .len() as u64;
-        if row_size > limits.max_memory {
-            return Err(DbError::new(
-                "RESOURCE_LIMIT",
-                format!(
-                    "one result row exceeds the configured {} byte query-memory limit",
-                    limits.max_memory
-                ),
-                4,
-            ));
-        }
-        emit(object)?;
-        emitted += 1;
-    }
-    Ok(emitted)
-}
-
-/// The table SQLite says is missing, from the message it says it in.
-///
-/// SQLite reports `no such table: users`, or `no such table: main.users` where
-/// the statement qualified it. Reading the name from that one shape is
-/// deliberate: the alternative is walking the parsed statement for every
-/// relation position -- FROM, JOIN, subquery, CTE, mutation target -- to guess
-/// which one the engine meant, and a second opinion about that is a second
-/// source of truth. Anything this does not recognize yields no name, and the
-/// error is passed through exactly as SQLite phrased it.
-fn missing_table(message: &str) -> Option<&str> {
-    let name = message.strip_prefix("no such table: ")?;
-    Some(name.strip_prefix("main.").unwrap_or(name))
-}
-
-/// Point an unknown table at the directory it is probably sitting in.
-///
-/// A folder of rows beside the database that no schema governs is the one case
-/// where `UNKNOWN_TABLE` has an answer rather than just a refusal, and it is
-/// the case a user hits immediately after adding a directory. Where the name
-/// matches nothing on disk it is simply wrong, and the error stays as it was.
-fn explain_unknown_table(catalog: &Catalog, error: DbError) -> DbError {
-    if error.diagnostic.code != "UNKNOWN_TABLE" {
-        return error;
-    }
-    match missing_table(&error.diagnostic.message) {
-        Some(table) => catalog.unknown_table(table),
-        None => error,
-    }
-}
-
-fn statement_kind(text: &str) -> Result<String> {
-    let ast = Parser::parse_sql(&GenericDialect {}, text).map_err(|error| {
+/// Parse and classify one statement, refusing anything outside the supported
+/// surface with the reason and where it lies.
+pub fn classify(text: &str) -> Result<StatementKind> {
+    let statements = Parser::parse_sql(&SQLiteDialect {}, text).map_err(|error| {
         let message = error.to_string();
-        let mut diagnostic = Diagnostic::error("QUERY_UNSUPPORTED", &message);
+        let mut diagnostic = Diagnostic::error("QUERY_UNSUPPORTED", format!("SQL does not parse: {message}"));
         diagnostic.location = sql_error_location(&message);
         diagnostic.source_line = diagnostic
             .location
@@ -261,31 +72,42 @@ fn statement_kind(text: &str) -> Result<String> {
             .map(String::from);
         DbError::from_diag(diagnostic, 4)
     })?;
-    if ast.len() != 1 {
+    let [statement] = statements.as_slice() else {
         return Err(DbError::new(
             "QUERY_UNSUPPORTED",
-            "exactly one SQL statement is required",
+            format!("exactly one SQL statement is required; {} were given", statements.len()),
             4,
         ));
+    };
+    match statement {
+        Statement::Query(query) => Ok(match query.body.as_ref() {
+            sqlparser::ast::SetExpr::Insert(_)
+            | sqlparser::ast::SetExpr::Update(_)
+            | sqlparser::ast::SetExpr::Delete(_) => StatementKind::Mutation,
+            _ => StatementKind::Read,
+        }),
+        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => Ok(StatementKind::Mutation),
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => Ok(StatementKind::Read),
+        other => {
+            let keyword = other
+                .to_string()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            Err(DbError::from_diag(
+                Diagnostic::error(
+                    "QUERY_UNSUPPORTED",
+                    format!(
+                        "{keyword} is not supported: SQL here reads and changes rows; the structure \
+                         of the database is its schemas"
+                    ),
+                )
+                .help("change a schema with `reldir migrate`, or by editing its file"),
+                4,
+            ))
+        }
     }
-    Ok(match &ast[0] {
-        Statement::Query(query) => match query.body.as_ref() {
-            SetExpr::Insert(_) => "INSERT".into(),
-            SetExpr::Update(_) => "UPDATE".into(),
-            SetExpr::Delete(_) => "DELETE".into(),
-            _ => "SELECT".into(),
-        },
-        Statement::Insert(_) => "INSERT".into(),
-        Statement::Update { .. } => "UPDATE".into(),
-        Statement::Delete(_) => "DELETE".into(),
-        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN".into(),
-        statement => statement
-            .to_string()
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase(),
-    })
 }
 
 fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
@@ -293,1173 +115,820 @@ fn sql_error_location(message: &str) -> Option<crate::diagnostic::Location> {
     let start = message.find(marker)? + marker.len();
     let rest = &message[start..];
     let (line, rest) = rest.split_once(", Column: ")?;
-    let column = rest
-        .split(|character: char| !character.is_ascii_digit())
-        .next()?;
+    let column = rest.split(|character: char| !character.is_ascii_digit()).next()?;
     Some(crate::diagnostic::Location {
         line: line.parse().ok()?,
         column: column.parse().ok()?,
     })
 }
 
-fn enforce_query_workspace(catalog: &Catalog, text: &str, limits: &QueryLimits) -> Result<()> {
-    if limits.max_memory == 0 || limits.max_sort_memory == 0 || limits.max_temporary_disk == 0 {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            "query resource limits must be greater than zero",
-            4,
-        ));
-    }
-    let workspace = catalog
-        .rows
-        .values()
-        .flatten()
-        .try_fold(0u64, |total, row| {
-            total
-                .checked_add(row.raw.len() as u64)
-                .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "query workspace size overflow", 4))
-        })?;
-    if workspace > limits.max_memory {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!(
-                "query requires {workspace} bytes of relational workspace, exceeding the configured {} byte query-memory limit",
-                limits.max_memory
-            ),
-            4,
-        ));
-    }
-    let normalized = normalized_statement(text)?.to_ascii_uppercase();
-    let may_sort = normalized.contains(" ORDER BY ")
-        || normalized.contains(" GROUP BY ")
-        || normalized.contains(" DISTINCT ")
-        || normalized.starts_with("SELECT DISTINCT ");
-    if may_sort && workspace > limits.max_sort_memory {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!(
-                "sort may require {workspace} bytes, exceeding the configured {} byte sort-memory limit",
-                limits.max_sort_memory
-            ),
-            4,
-        ));
-    }
-    // SQLite temporary storage is forced to memory for this ephemeral engine,
-    // so query execution consumes zero temporary-disk bytes.
-    Ok(())
+/// What an authorizer admits.
+#[derive(Clone)]
+struct Policy {
+    /// Tables that may be read.
+    readable: BTreeSet<String>,
+    /// Tables that may be written.
+    writable: BTreeSet<String>,
+    /// Whether functions must be deterministic.
+    deterministic: bool,
+    /// The first refused action, to name in the error.
+    refused: Arc<Mutex<Option<String>>>,
 }
 
-fn load(c: &Catalog, enforce: bool) -> Result<Connection> {
-    let conn = Connection::open_in_memory().map_err(query_err)?;
-    conn.create_collation("RELDIR_DECIMAL", |left, right| {
-        match crate::value::compare_decimal(left, right) {
-            Some(ordering) => ordering,
-            // Invalid decimal text cannot occur in a valid catalog. Retaining a
-            // total order here keeps SQLite's collation callback infallible.
-            None => left.cmp(right),
+/// Functions whose result depends on something other than their arguments.
+const NONDETERMINISTIC: &[&str] = &[
+    "random",
+    "randomblob",
+    "changes",
+    "total_changes",
+    "last_insert_rowid",
+    "sqlite_offset",
+];
+
+fn install(connection: &Connection, policy: &Policy) {
+    let policy = policy.clone();
+    connection.authorizer(Some(move |context: AuthContext<'_>| {
+        if context.accessor.is_some_and(|name| name.starts_with("_reldir_capture_")) {
+            return Authorization::Allow;
+        }
+        let decision = match context.action {
+            AuthAction::Select | AuthAction::Recursive => Ok(()),
+            AuthAction::Read { table_name, .. } => {
+                if policy.readable.contains(table_name) || matches!(table_name, "json_each" | "json_tree") {
+                    Ok(())
+                } else {
+                    Err(format!("reading {table_name:?}, which is not a governed table"))
+                }
+            }
+            AuthAction::Function { function_name } => {
+                if policy.deterministic && NONDETERMINISTIC.contains(&function_name.to_ascii_lowercase().as_str()) {
+                    Err(format!("{function_name}() is not deterministic, and validity cannot depend on chance"))
+                } else {
+                    Ok(())
+                }
+            }
+            AuthAction::Insert { table_name }
+            | AuthAction::Delete { table_name }
+            | AuthAction::Update { table_name, .. } => {
+                if policy.writable.contains(table_name) {
+                    Ok(())
+                } else {
+                    Err(format!("writing {table_name:?}"))
+                }
+            }
+            AuthAction::Pragma { pragma_name, .. } => Err(format!("PRAGMA {pragma_name}")),
+            AuthAction::Attach { .. } => Err("ATTACH".into()),
+            AuthAction::Detach { .. } => Err("DETACH".into()),
+            AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                Err("transaction control; every statement is its own transaction".into())
+            }
+            other => Err(format!("{other:?}")),
+        };
+        match decision {
+            Ok(()) => Authorization::Allow,
+            Err(reason) => {
+                let mut refused = policy.refused.lock().unwrap_or_else(|p| p.into_inner());
+                if refused.is_none() {
+                    *refused = Some(reason);
+                }
+                Authorization::Deny
+            }
+        }
+    }));
+}
+
+fn uninstall(connection: &Connection) {
+    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+}
+
+/// Prepare a statement under a policy, turning a refusal into a diagnostic that
+/// names what was refused.
+fn prepare<'c>(connection: &'c Connection, text: &str, policy: &Policy) -> Result<rusqlite::Statement<'c>> {
+    install(connection, policy);
+    let prepared = connection.prepare(text);
+    uninstall(connection);
+    prepared.map_err(|error| {
+        let refused = policy.refused.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match refused {
+            Some(reason) => DbError::from_diag(
+                Diagnostic::error("QUERY_UNSUPPORTED", format!("the statement is refused: {reason}")),
+                4,
+            ),
+            None => query_err(error),
         }
     })
-    .map_err(query_err)?;
-    conn.execute_batch(
-        "PRAGMA foreign_keys=OFF; PRAGMA case_sensitive_like=ON; PRAGMA temp_store=MEMORY;",
-    )
-    .map_err(query_err)?;
-    for (table, s) in &c.schemas {
-        let mut defs: Vec<_> = s
-            .columns
-            .iter()
-            .map(|(n, col)| {
-                let mut definition = format!("{} {}", q(n), sqlite_type(&col.kind));
-                if !col.nullable && col.generated.is_none() {
-                    definition.push_str(" NOT NULL");
-                }
-                if let Some(default) = &col.default {
-                    definition.push_str(" DEFAULT ");
-                    definition.push_str(&sql_literal(&to_sql(default, col)));
-                }
-                definition
-            })
-            .collect();
-        if enforce {
-            defs.push(format!(
-                "PRIMARY KEY ({})",
-                s.primary_key
-                    .iter()
-                    .map(|x| q(x))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-            defs.extend(s.unique.iter().map(|u| {
-                format!(
-                    "UNIQUE ({})",
-                    u.iter().map(|x| q(x)).collect::<Vec<_>>().join(",")
-                )
-            }));
-            for fk in &s.foreign_keys {
-                defs.push(format!(
-                    "FOREIGN KEY ({}) REFERENCES {} ({}) ON DELETE {} ON UPDATE {}",
-                    fk.columns
-                        .iter()
-                        .map(|x| q(x))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    q(&fk.references.table),
-                    fk.references
-                        .columns
-                        .iter()
-                        .map(|x| q(x))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    action(fk.delete_action()),
-                    action(fk.update_action())
-                ));
-            }
-            for check in &s.check {
-                defs.push(format!(
-                    "CONSTRAINT {} CHECK ({})",
-                    q(&check.name),
-                    check.expr
-                ));
-            }
-        }
-        conn.execute(
-            &format!("CREATE TABLE {} ({})", q(table), defs.join(",")),
-            [],
-        )
+}
+
+fn policy(schemas: &BTreeMap<String, Schema>, mutation: bool, deterministic: bool) -> Policy {
+    let tables: BTreeSet<String> = schemas.keys().cloned().collect();
+    Policy {
+        writable: if mutation { tables.clone() } else { BTreeSet::new() },
+        readable: tables,
+        deterministic,
+        refused: Arc::new(Mutex::new(None)),
+    }
+}
+
+/// Apply the resource limits to a connection for the duration of a statement.
+fn limit(connection: &Connection, limits: &QueryLimits) -> Result<()> {
+    connection
+        .execute_batch(&format!(
+            "PRAGMA temp_store=MEMORY; PRAGMA hard_heap_limit={};",
+            limits.max_memory
+        ))
         .map_err(query_err)?;
-    }
-    for (table, rows) in &c.rows {
-        let s = &c.schemas[table];
-        let names: Vec<_> = s.columns.keys().collect();
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            q(table),
-            names.iter().map(|x| q(x)).collect::<Vec<_>>().join(","),
-            vec!["?"; names.len()].join(",")
-        );
-        for row in rows {
-            let vals: Vec<_> = names
-                .iter()
-                .map(|n| {
-                    to_sql(
-                        row.value
-                            .get(*n)
-                            .or(s.columns[*n].default.as_ref())
-                            .unwrap_or(&Value::Null),
-                        &s.columns[*n],
-                    )
-                })
-                .collect();
-            conn.execute(&sql, rusqlite::params_from_iter(vals))
-                .map_err(query_err)?;
-        }
-    }
-    for (table, schema) in &c.schemas {
-        for columns in &schema.indexes {
-            conn.execute(
-                &format!(
-                    "CREATE INDEX {} ON {} ({})",
-                    q(&index_name(table, columns)),
-                    q(table),
-                    columns
-                        .iter()
-                        .map(|column| q(column))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-                [],
-            )
-            .map_err(query_err)?;
-        }
-    }
-    if enforce {
-        conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(query_err)?
-    }
-    Ok(conn)
-}
-fn query(
-    conn: &Connection,
-    text: &str,
-    params: &[SqlParam],
-    max_rows: usize,
-    max_memory: u64,
-) -> Result<Vec<Map<String, Value>>> {
-    let mut st = conn.prepare(text).map_err(query_err)?;
-    bind(&mut st, params)?;
-    let count = st.column_count();
-    let names: Vec<_> = (0..count)
-        .map(|i| st.column_name(i).unwrap_or("").to_string())
-        .collect();
-    let declared: Vec<_> = st
-        .columns()
-        .into_iter()
-        .map(|column| column.decl_type().map(String::from))
-        .collect();
-    let mut cursor = st.raw_query();
-    let mut out = vec![];
-    let mut memory = 0u64;
-    while let Some(row) = cursor.next().map_err(query_err)? {
-        if out.len() == max_rows {
-            return Err(DbError::new(
-                "RESOURCE_LIMIT",
-                format!("query exceeds the configured limit of {max_rows} result rows"),
-                4,
-            ));
-        }
-        let mut obj = Map::new();
-        for (i, n) in names.iter().enumerate() {
-            let value = from_ref(row.get_ref(i).map_err(query_err)?);
-            obj.insert(n.clone(), decode_declared(value, declared[i].as_deref())?);
-        }
-        memory = memory
-            .checked_add(
-                serde_json::to_vec(&obj)
-                    .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))?
-                    .len() as u64,
-            )
-            .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "query-memory accounting overflow", 4))?;
-        if memory > max_memory {
-            return Err(DbError::new(
-                "RESOURCE_LIMIT",
-                format!("query results exceed the configured {max_memory} byte memory limit"),
-                4,
-            ));
-        }
-        out.push(obj)
-    }
-    Ok(out)
-}
-fn execute_bound(conn: &mut Connection, text: &str, params: &[SqlParam]) -> Result<usize> {
-    let mut st = conn.prepare(text).map_err(query_err)?;
-    bind(&mut st, params)?;
-    st.raw_execute().map_err(query_err)
-}
-fn bind(st: &mut rusqlite::Statement<'_>, params: &[SqlParam]) -> Result<()> {
-    if st.parameter_count() != params.len() {
-        return Err(DbError::new(
-            "QUERY_TYPE_ERROR",
-            format!(
-                "query requires {} parameters but {} were supplied",
-                st.parameter_count(),
-                params.len()
-            ),
-            4,
-        ));
-    }
-    let mut used = std::collections::BTreeSet::new();
-    let mut positional = 1;
-    for p in params {
-        let index = if let Some(name) = &p.name {
-            [format!(":{name}"), format!("@{name}"), format!("${name}")]
-                .iter()
-                .find_map(|n| st.parameter_index(n).ok().flatten())
-                .ok_or_else(|| {
-                    DbError::new(
-                        "QUERY_TYPE_ERROR",
-                        format!("query has no parameter named {name:?}"),
-                        4,
-                    )
-                })?
-        } else {
-            while used.contains(&positional) {
-                positional += 1
-            }
-            let i = positional;
-            positional += 1;
-            i
-        };
-        used.insert(index);
-        st.raw_bind_parameter(index, to_sql_generic(&p.value))
-            .map_err(query_err)?
+    if let Some(timeout) = limits.timeout {
+        let started = std::time::Instant::now();
+        connection.progress_handler(1000, Some(move || started.elapsed() >= timeout));
     }
     Ok(())
 }
 
-fn snapshot_rowids(
-    conn: &Connection,
-    catalog: &Catalog,
-) -> Result<BTreeMap<String, std::collections::BTreeSet<i64>>> {
-    let mut all = BTreeMap::new();
-    for table in catalog.schemas.keys() {
-        let mut statement = conn
-            .prepare(&format!("SELECT rowid FROM {}", q(table)))
-            .map_err(query_err)?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(query_err)?
-            .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()
-            .map_err(query_err)?;
-        all.insert(table.clone(), ids);
-    }
-    Ok(all)
+fn unlimit(connection: &Connection) {
+    let _ = connection.execute_batch("PRAGMA hard_heap_limit=0;");
+    connection.progress_handler(0, None::<fn() -> bool>);
 }
 
-fn dump(
-    conn: &Connection,
-    c: &Catalog,
-    existing_rowids: &BTreeMap<String, std::collections::BTreeSet<i64>>,
-) -> Result<BTreeMap<String, Vec<Map<String, Value>>>> {
-    let mut all = BTreeMap::new();
-    for (table, s) in &c.schemas {
-        let names: Vec<_> = s.columns.keys().cloned().collect();
-        let sql = format!(
-            "SELECT rowid, {} FROM {}",
-            names.iter().map(|x| q(x)).collect::<Vec<_>>().join(","),
-            q(table)
-        );
-        let mut st = conn.prepare(&sql).map_err(query_err)?;
-        let mut cursor = st.query([]).map_err(query_err)?;
-        let mut rows = vec![];
-        let mut next_sequence = s
-            .columns
-            .iter()
-            .filter(|(_, column)| {
-                column.generated.as_ref().is_some_and(|generated| {
-                    matches!(generated.kind, crate::schema::GeneratedKind::Sequence)
-                })
-            })
-            .flat_map(|(name, _)| {
-                c.rows[table]
-                    .iter()
-                    .filter_map(move |row| row.value.get(name).and_then(Value::as_i64))
-            })
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "generated sequence exhausted i64", 2))?;
-        while let Some(r) = cursor.next().map_err(query_err)? {
-            let rowid = r.get::<_, i64>(0).map_err(query_err)?;
-            let existing = existing_rowids[table].contains(&rowid);
-            let mut obj = Map::new();
-            for (i, n) in names.iter().enumerate() {
-                let mut v = from_ref(r.get_ref(i + 1).map_err(query_err)?);
-                let col = &s.columns[n];
-                if v.is_null() {
-                    if !existing && let Some(generated) = &col.generated {
-                        let sequence = next_sequence;
-                        if matches!(generated.kind, crate::schema::GeneratedKind::Sequence) {
-                            next_sequence = next_sequence.checked_add(1).ok_or_else(|| {
-                                DbError::new(
-                                    "RESOURCE_LIMIT",
-                                    "generated sequence exhausted i64",
-                                    2,
-                                )
-                            })?;
-                        }
-                        if let Some(generated) = crate::value::generate(col, sequence) {
-                            v = generated;
-                        }
-                    }
-                } else {
-                    v = decode(v, col)?;
-                }
-                obj.insert(n.clone(), v);
-            }
-            rows.push(obj)
-        }
-        all.insert(table.clone(), rows);
+/// Run a read statement, handing each result row to `emit` as it is produced.
+pub fn query(
+    mirror: &Mirror,
+    schemas: &BTreeMap<String, Schema>,
+    text: &str,
+    params: &[SqlParam],
+    limits: QueryLimits,
+    mut emit: impl FnMut(Map<String, Value>) -> Result<()>,
+) -> Result<usize> {
+    if classify(text)? != StatementKind::Read {
+        return Err(DbError::new(
+            "QUERY_UNSUPPORTED",
+            "a query must not change rows; run the mutation as its own statement",
+            4,
+        ));
     }
-    Ok(all)
-}
-fn diff(c: &Catalog, after: &BTreeMap<String, Vec<Map<String, Value>>>) -> Result<Vec<Change>> {
-    let mut out = vec![];
-    for (table, s) in &c.schemas {
-        let mut old: BTreeMap<String, (&Map<String, Value>, PathBuf)> = BTreeMap::new();
-        for r in &c.rows[table] {
-            if let Some(k) = crate::integrity::key(&r.value, &s.primary_key, s) {
-                old.insert(k, (&r.value, r.relative.clone()));
-            }
-        }
-        let mut new = BTreeMap::new();
-        for r in &after[table] {
-            let k = crate::integrity::key(r, &s.primary_key, s).ok_or_else(|| {
-                DbError::new(
-                    "NOT_NULL_VIOLATION",
-                    "SQL mutation produced a null primary key",
-                    2,
-                )
-            })?;
-            new.insert(k, r);
-        }
-        for (k, (_, path)) in &old {
-            if !new.contains_key(k) {
-                out.push(Change::Delete { path: path.clone() })
-            }
-        }
-        for (k, row) in new {
-            let path = PathBuf::from(table).join(canonical::filename(s, row).ok_or_else(|| {
-                DbError::new("IDENTITY_MISMATCH", "cannot derive row filename", 2)
-            })?);
-            match old.get(&k) {
-                Some((oldrow, oldpath)) if *oldrow == row && *oldpath == path => {}
-                Some((_, oldpath)) => {
-                    if *oldpath != path {
-                        out.push(Change::Delete {
-                            path: oldpath.clone(),
-                        })
-                    }
-                    out.push(Change::Write {
-                        path,
-                        bytes: canonical::pretty_with_indent(
-                            &canonical::canonical_row(row, s),
-                            c.indentation_width,
-                        ),
-                    })
-                }
-                None => out.push(Change::Write {
-                    path,
-                    bytes: canonical::pretty_with_indent(
-                        &canonical::canonical_row(row, s),
-                        c.indentation_width,
+    let connection = mirror.connection();
+    let policy = policy(schemas, false, false);
+    let mut statement = prepare(connection, text, &policy)?;
+    bind(&mut statement, params)?;
+    limit(connection, &limits)?;
+    let outcome = (|| -> Result<usize> {
+        let names: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+        let declared: Vec<Option<String>> = statement
+            .columns()
+            .into_iter()
+            .map(|column| column.decl_type().map(|t| t.split_whitespace().next().unwrap_or("").to_string()))
+            .collect();
+        let mut rows = statement.raw_query();
+        let mut emitted = 0usize;
+        while let Some(row) = rows.next().map_err(query_err)? {
+            if emitted == limits.max_rows {
+                return Err(DbError::new(
+                    "RESOURCE_LIMIT",
+                    format!(
+                        "the query produces more than {} rows, the configured limit; nothing past it \
+                         is returned, so no partial answer is mistaken for a whole one",
+                        limits.max_rows
                     ),
-                }),
+                    4,
+                ));
+            }
+            let mut object = Map::new();
+            for (index, name) in names.iter().enumerate() {
+                let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
+                object.insert(name.clone(), mirror::decode_declared(value, declared[index].as_deref())?);
+            }
+            emit(object)?;
+            emitted += 1;
+        }
+        Ok(emitted)
+    })();
+    drop(statement);
+    unlimit(connection);
+    outcome
+}
+
+/// A read statement's plan, as SQLite states it.
+pub fn plan(
+    mirror: &Mirror,
+    schemas: &BTreeMap<String, Schema>,
+    text: &str,
+    params: &[SqlParam],
+) -> Result<Vec<Map<String, Value>>> {
+    classify(text)?;
+    let connection = mirror.connection();
+    let policy = policy(schemas, true, false);
+    // The plan of a statement is taken without running it, so preparing it
+    // under the mutation policy is safe: nothing is stepped.
+    let mut statement = prepare(connection, &format!("EXPLAIN QUERY PLAN {text}"), &policy)?;
+    bind(&mut statement, params)?;
+    let mut rows = statement.raw_query();
+    let mut out = vec![];
+    while let Some(row) = rows.next().map_err(query_err)? {
+        let mut step = Map::new();
+        step.insert("id".into(), mirror::from_sql(row.get_ref(0).map_err(query_err)?));
+        step.insert("parent".into(), mirror::from_sql(row.get_ref(1).map_err(query_err)?));
+        step.insert("detail".into(), mirror::from_sql(row.get_ref(3).map_err(query_err)?));
+        out.push(step);
+    }
+    Ok(out)
+}
+
+/// What a mutation would do.
+#[derive(Debug, Default)]
+pub struct Mutation {
+    /// Every row the statement inserts, changes or deletes.
+    pub rows: Vec<RowChange>,
+    /// Rows the statement's `RETURNING` clause produced.
+    pub returning: Vec<Map<String, Value>>,
+}
+
+/// Work out what a mutation would do, without doing it.
+pub fn mutate(
+    catalog: &crate::catalog::Catalog,
+    text: &str,
+    params: &[SqlParam],
+    limits: QueryLimits,
+) -> Result<Mutation> {
+    if classify(text)? != StatementKind::Mutation {
+        return Err(DbError::new("QUERY_UNSUPPORTED", "not a mutation", 4));
+    }
+    let mirror = &catalog.mirror;
+    let connection = mirror.connection();
+    mirror.savepoint("reldir_mutation")?;
+    let outcome = (|| -> Result<Mutation> {
+        connection
+            .execute_batch(
+                "PRAGMA recursive_triggers=ON; \
+                 CREATE TEMP TABLE IF NOT EXISTS _reldir_changes \
+                 (tbl TEXT NOT NULL, op TEXT NOT NULL, old_rowid INTEGER, new_rowid INTEGER); \
+                 DELETE FROM temp._reldir_changes;",
+            )
+            .map_err(query_err)?;
+        for table in catalog.schemas.keys() {
+            let quoted = mirror::quote(table);
+            let literal = table.replace('\'', "''");
+            connection
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER \"_reldir_capture_{table}_i\" AFTER INSERT ON main.{quoted} BEGIN \
+                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'insert', NULL, NEW.rowid); END; \
+                     CREATE TEMP TRIGGER \"_reldir_capture_{table}_u\" AFTER UPDATE ON main.{quoted} BEGIN \
+                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'update', OLD.rowid, NEW.rowid); END; \
+                     CREATE TEMP TRIGGER \"_reldir_capture_{table}_d\" AFTER DELETE ON main.{quoted} BEGIN \
+                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'delete', OLD.rowid, NULL); END;"
+                ))
+                .map_err(query_err)?;
+        }
+        let policy = policy(&catalog.schemas, true, false);
+        let mut statement = prepare(connection, text, &policy)?;
+        bind(&mut statement, params)?;
+        limit(connection, &limits)?;
+        let names: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+        let declared: Vec<Option<String>> = statement
+            .columns()
+            .into_iter()
+            .map(|column| column.decl_type().map(|t| t.split_whitespace().next().unwrap_or("").to_string()))
+            .collect();
+        let mut returning = vec![];
+        {
+            let mut rows = statement.raw_query();
+            while let Some(row) = rows.next().map_err(query_err)? {
+                let mut object = Map::new();
+                for (index, name) in names.iter().enumerate() {
+                    let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
+                    object.insert(name.clone(), mirror::decode_declared(value, declared[index].as_deref())?);
+                }
+                returning.push(object);
+            }
+        }
+        drop(statement);
+        unlimit(connection);
+        let rows = captured(catalog)?;
+        Ok(Mutation { rows, returning })
+    })();
+    unlimit(connection);
+    mirror.rollback_to("reldir_mutation")?;
+    outcome
+}
+
+/// The row changes the capture triggers recorded, read back as JSON.
+fn captured(catalog: &crate::catalog::Catalog) -> Result<Vec<RowChange>> {
+    let connection = catalog.mirror.connection();
+    let mut per_table: BTreeMap<String, (BTreeSet<i64>, BTreeSet<i64>)> = BTreeMap::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT tbl, op, old_rowid, new_rowid FROM temp._reldir_changes ORDER BY rowid")
+            .map_err(query_err)?;
+        let mut rows = statement.query([]).map_err(query_err)?;
+        while let Some(row) = rows.next().map_err(query_err)? {
+            let table: String = row.get(0).map_err(query_err)?;
+            let op: String = row.get(1).map_err(query_err)?;
+            let old: Option<i64> = row.get(2).map_err(query_err)?;
+            let new: Option<i64> = row.get(3).map_err(query_err)?;
+            let entry = per_table.entry(table).or_default();
+            match op.as_str() {
+                "delete" => {
+                    entry.0.extend(old);
+                }
+                _ => {
+                    entry.1.extend(old);
+                    entry.1.extend(new);
+                }
+            }
+        }
+    }
+    let mut out = vec![];
+    for (table, (deleted, touched)) in per_table {
+        let schema = &catalog.schemas[&table];
+        let names: Vec<&String> = schema.columns().keys().collect();
+        let select = format!(
+            "SELECT {} FROM {} WHERE rowid = ?1",
+            names.iter().map(|n| mirror::quote(n)).collect::<Vec<_>>().join(", "),
+            mirror::quote(&table)
+        );
+        let mut next_sequence: BTreeMap<String, i64> = BTreeMap::new();
+        for rowid in deleted.union(&touched) {
+            // The file this rowid held before the statement, if any: the
+            // capture changed only the typed table, never the file index.
+            let before_path = catalog.mirror.path_of_rowid(&table, *rowid)?;
+            let before = match &before_path {
+                Some(path) => catalog.row_at(std::path::Path::new(path))?,
+                None => None,
+            };
+            let current: Option<Vec<Value>> = connection
+                .query_row(&select, [rowid], |row| {
+                    (0..names.len())
+                        .map(|index| row.get_ref(index).map(mirror::from_sql))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .map(Some)
+                .or_else(|error| match error {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })
+                .map_err(query_err)?;
+            let replaced = deleted.contains(rowid);
+            let after = match current {
+                None => None,
+                Some(values) => {
+                    // A rowid deleted and then reused by an insert holds a new
+                    // row; it inherits nothing from the one it replaced.
+                    let mut row = match (&before, replaced) {
+                        (Some(before), false) => before.value.clone(),
+                        _ => Map::new(),
+                    };
+                    let inserted = before.is_none() || replaced;
+                    for ((name, column), value) in schema.columns().iter().zip(values) {
+                        let decoded = mirror::decode_typed(value, column.kind())?;
+                        if decoded.is_null()
+                            && inserted
+                            && let Some(generated) = column.generated()
+                        {
+                            let sequence = match next_sequence.get(name) {
+                                Some(next) => *next,
+                                None => sequence_start(connection, &table, name)?,
+                            };
+                            next_sequence.insert(name.clone(), sequence + 1);
+                            row.insert(name.clone(), crate::value::generate(generated, sequence));
+                        } else if decoded.is_null() && !row.contains_key(name) {
+                            // An absent member stays absent rather than
+                            // becoming an explicit null the row never said.
+                        } else {
+                            row.insert(name.clone(), decoded);
+                        }
+                    }
+                    Some(row)
+                }
+            };
+            match (&before, replaced, &after) {
+                (Some(before), true, Some(after)) => {
+                    out.push(RowChange::delete(before.clone()));
+                    out.push(RowChange::insert(&table, after.clone()));
+                }
+                (Some(before), _, None) => out.push(RowChange::delete(before.clone())),
+                (Some(before), false, Some(after)) => {
+                    if &before.value != after {
+                        out.push(RowChange::update(before.clone(), after.clone()));
+                    }
+                }
+                (None, _, Some(after)) => out.push(RowChange::insert(&table, after.clone())),
+                (None, _, None) => {}
             }
         }
     }
     Ok(out)
 }
 
-fn to_sql(v: &Value, c: &crate::schema::Column) -> SqlValue {
-    if v.is_null() {
-        return SqlValue::Null;
-    }
-    if !crate::value::matches_column(v, c) {
-        return to_sql_generic(v);
-    }
-    match c.kind {
-        ColumnType::Bool => v
-            .as_bool()
-            .map(|value| SqlValue::Integer(i64::from(value)))
-            .unwrap_or_else(|| to_sql_generic(v)),
-        ColumnType::Int => v
-            .as_i64()
-            .map(SqlValue::Integer)
-            .unwrap_or_else(|| to_sql_generic(v)),
-        ColumnType::Float => v
-            .as_f64()
-            .map(SqlValue::Real)
-            .unwrap_or_else(|| to_sql_generic(v)),
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => {
-            SqlValue::Text(canonical::compact(v))
-        }
-        ColumnType::Timestamp => crate::value::textual(v, c)
-            .map(SqlValue::Text)
-            .unwrap_or_else(|| to_sql_generic(v)),
-        _ => v
-            .as_str()
-            .map(|value| SqlValue::Text(value.into()))
-            .unwrap_or_else(|| to_sql_generic(v)),
-    }
-}
-fn to_sql_generic(v: &Value) -> SqlValue {
-    match v {
-        Value::Null => SqlValue::Null,
-        Value::Bool(x) => SqlValue::Integer(*x as i64),
-        Value::Number(n) => n
-            .as_i64()
-            .map(SqlValue::Integer)
-            .or_else(|| n.as_f64().map(SqlValue::Real))
-            .unwrap_or(SqlValue::Null),
-        Value::String(s) => SqlValue::Text(s.clone()),
-        _ => SqlValue::Text(canonical::compact(v)),
-    }
-}
-fn from_ref(v: ValueRef<'_>) -> Value {
-    match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(x) => Value::Number(x.into()),
-        ValueRef::Real(x) => Number::from_f64(x)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        ValueRef::Text(x) => Value::String(String::from_utf8_lossy(x).into()),
-        ValueRef::Blob(x) => Value::String(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            x,
-        )),
-    }
-}
-fn decode(v: Value, c: &crate::schema::Column) -> Result<Value> {
-    if v.is_null() {
-        return Ok(v);
-    }
-    let decoded = match c.kind {
-        ColumnType::Bool => match v.as_i64() {
-            Some(0) => Value::Bool(false),
-            Some(1) => Value::Bool(true),
-            _ => {
-                return Err(DbError::new(
-                    "TYPE_MISMATCH",
-                    "SQLite returned a non-boolean value for a bool column",
-                    4,
-                ));
-            }
-        },
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => {
-            let text = v.as_str().ok_or_else(|| {
-                DbError::new(
-                    "TYPE_MISMATCH",
-                    "SQLite returned non-text encoded structured JSON",
-                    4,
-                )
-            })?;
-            crate::json::parse_str(text).map_err(|error| {
-                DbError::new(
-                    "TYPE_MISMATCH",
-                    format!("SQLite returned invalid encoded JSON: {error}"),
-                    4,
-                )
-            })?
-        }
-        _ => v,
-    };
-    if crate::value::matches_column(&decoded, c) {
-        Ok(decoded)
-    } else {
-        Err(DbError::new(
-            "TYPE_MISMATCH",
-            "SQLite returned a value incompatible with its declared column type",
-            4,
-        ))
-    }
-}
-fn decode_declared(v: Value, declared: Option<&str>) -> Result<Value> {
-    if v.is_null() {
-        return Ok(v);
-    }
-    match declared {
-        Some("RELDIR_BLOB_BOOL") => match v.as_i64() {
-            Some(0) => Ok(Value::Bool(false)),
-            Some(1) => Ok(Value::Bool(true)),
-            _ => Err(DbError::new(
-                "QUERY_TYPE_ERROR",
-                "SQLite returned a non-boolean value for a bool result column",
-                4,
-            )),
-        },
-        Some(kind @ ("RELDIR_BLOB_ARRAY" | "RELDIR_BLOB_OBJECT" | "RELDIR_BLOB_JSON")) => {
-            let text = v.as_str().ok_or_else(|| {
-                DbError::new(
-                    "QUERY_TYPE_ERROR",
-                    format!("SQLite returned non-text encoded data for {kind}"),
-                    4,
-                )
-            })?;
-            let decoded = crate::json::parse_str(text).map_err(|error| {
-                DbError::new(
-                    "QUERY_TYPE_ERROR",
-                    format!("SQLite returned invalid encoded JSON: {error}"),
-                    4,
-                )
-            })?;
-            let correct_shape = match kind {
-                "RELDIR_BLOB_ARRAY" => decoded.is_array(),
-                "RELDIR_BLOB_OBJECT" => decoded.is_object(),
-                _ => true,
-            };
-            if correct_shape {
-                Ok(decoded)
-            } else {
-                Err(DbError::new(
-                    "QUERY_TYPE_ERROR",
-                    format!("SQLite returned the wrong JSON shape for {kind}"),
-                    4,
-                ))
-            }
-        }
-        _ => Ok(v),
-    }
-}
-fn sqlite_type(kind: &ColumnType) -> &'static str {
-    match kind {
-        // BLOB affinity deliberately preserves the storage class supplied by
-        // SQL and bound parameters. SQLite's numeric/text affinities otherwise
-        // coerce values silently before reldir can enforce its strict type system.
-        ColumnType::Bool => "RELDIR_BLOB_BOOL",
-        ColumnType::Int => "RELDIR_BLOB_I64",
-        ColumnType::Float => "RELDIR_BLOB_F64",
-        ColumnType::Decimal => "RELDIR_BLOB_DECIMAL COLLATE RELDIR_DECIMAL",
-        ColumnType::String => "RELDIR_BLOB_STRING",
-        ColumnType::Bytes => "RELDIR_BLOB_BYTES",
-        ColumnType::Date => "RELDIR_BLOB_DATE",
-        ColumnType::Timestamp => "RELDIR_BLOB_TIMESTAMP",
-        ColumnType::Uuid => "RELDIR_BLOB_UUID",
-        ColumnType::Ulid => "RELDIR_BLOB_ULID",
-        ColumnType::Enum => "RELDIR_BLOB_ENUM",
-        ColumnType::Array => "RELDIR_BLOB_ARRAY",
-        ColumnType::Object => "RELDIR_BLOB_OBJECT",
-        ColumnType::Json => "RELDIR_BLOB_JSON",
-    }
-}
-fn sql_literal(value: &SqlValue) -> String {
-    match value {
-        SqlValue::Null => "NULL".into(),
-        SqlValue::Integer(value) => value.to_string(),
-        SqlValue::Real(value) => value.to_string(),
-        SqlValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
-        SqlValue::Blob(value) => format!("X'{}'", hex::encode(value)),
-    }
-}
-fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-pub fn index_name(table: &str, columns: &[String]) -> String {
-    let mut identity = String::new();
-    for column in columns {
-        identity.push_str(&column.len().to_string());
-        identity.push(':');
-        identity.push_str(column);
-        identity.push(';');
-    }
-    format!(
-        "reldir_{table}_{}",
-        &crate::canonical::hash_bytes(identity.as_bytes())[..12]
-    )
+/// The next value a sequence-generated column hands out: one past the largest
+/// integer the table holds there.
+pub fn sequence_start(connection: &Connection, table: &str, column: &str) -> Result<i64> {
+    let max: Option<i64> = connection
+        .query_row(
+            &format!(
+                "SELECT max({}) FROM {} WHERE typeof({}) = 'integer'",
+                mirror::quote(column),
+                mirror::quote(table),
+                mirror::quote(column)
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(query_err)?;
+    max.unwrap_or(0).checked_add(1).ok_or_else(|| {
+        DbError::new(
+            "RESOURCE_LIMIT",
+            format!("the sequence for {table}.{column} has reached the largest int"),
+            2,
+        )
+    })
 }
 
-pub fn normalized_statement(text: &str) -> Result<String> {
-    let ast = Parser::parse_sql(&GenericDialect {}, text).map_err(|error| {
-        DbError::from_diag(Diagnostic::error("QUERY_UNSUPPORTED", error.to_string()), 4)
-    })?;
-    if ast.len() != 1 {
-        return Err(DbError::new(
-            "QUERY_UNSUPPORTED",
-            "exactly one SQL statement is required",
-            4,
-        ));
-    }
-    Ok(ast[0].to_string())
-}
-
-pub fn check_expression_is_boolean(schema: &crate::schema::Schema, expression: &str) -> bool {
-    let wrapper = format!("SELECT ({expression}) FROM {}", q(&schema.table));
-    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, &wrapper) else {
-        return false;
-    };
-    let Some(Statement::Query(query)) = statements.first() else {
-        return false;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    let Some(SelectItem::UnnamedExpr(expression)) = select.projection.first() else {
-        return false;
-    };
-    boolean_expression(schema, expression)
-}
-
-fn boolean_expression(schema: &crate::schema::Schema, expression: &Expr) -> bool {
-    expression_kind(schema, expression) == Some(ExpressionKind::Bool)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExpressionKind {
-    Bool,
-    Numeric,
-    Text,
-    Json,
-    Null,
-}
-
-fn expression_kind(schema: &crate::schema::Schema, expression: &Expr) -> Option<ExpressionKind> {
-    match expression {
-        Expr::Identifier(identifier) => schema
-            .columns
-            .get(&identifier.value)
-            .map(|column| column_expression_kind(&column.kind)),
-        Expr::CompoundIdentifier(parts) => {
-            if parts.len() == 2 && parts[0].value != schema.table {
-                return None;
-            }
-            parts
-                .last()
-                .and_then(|identifier| schema.columns.get(&identifier.value))
-                .map(|column| column_expression_kind(&column.kind))
-        }
-        Expr::Value(value) => match &value.value {
-            sqlparser::ast::Value::Boolean(_) => Some(ExpressionKind::Bool),
-            sqlparser::ast::Value::Number(_, _) => Some(ExpressionKind::Numeric),
-            sqlparser::ast::Value::Null => Some(ExpressionKind::Null),
-            sqlparser::ast::Value::SingleQuotedString(_)
-            | sqlparser::ast::Value::DoubleQuotedString(_)
-            | sqlparser::ast::Value::TripleSingleQuotedString(_)
-            | sqlparser::ast::Value::TripleDoubleQuotedString(_)
-            | sqlparser::ast::Value::EscapedStringLiteral(_)
-            | sqlparser::ast::Value::NationalStringLiteral(_)
-            | sqlparser::ast::Value::HexStringLiteral(_)
-            | sqlparser::ast::Value::SingleQuotedByteStringLiteral(_)
-            | sqlparser::ast::Value::DoubleQuotedByteStringLiteral(_)
-            | sqlparser::ast::Value::TripleSingleQuotedByteStringLiteral(_)
-            | sqlparser::ast::Value::TripleDoubleQuotedByteStringLiteral(_) => {
-                Some(ExpressionKind::Text)
-            }
-            _ => None,
-        },
-        Expr::Nested(expression) => expression_kind(schema, expression),
-        Expr::UnaryOp { op, expr } => match op {
-            UnaryOperator::Not | UnaryOperator::BangNot
-                if expression_kind(schema, expr) == Some(ExpressionKind::Bool) =>
-            {
-                Some(ExpressionKind::Bool)
-            }
-            UnaryOperator::Plus | UnaryOperator::Minus
-                if expression_kind(schema, expr) == Some(ExpressionKind::Numeric) =>
-            {
-                Some(ExpressionKind::Numeric)
-            }
-            _ => None,
-        },
-        Expr::BinaryOp { left, op, right } => {
-            let left = expression_kind(schema, left)?;
-            let right = expression_kind(schema, right)?;
-            match op {
-                BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Xor
-                    if left == ExpressionKind::Bool && right == ExpressionKind::Bool =>
-                {
-                    Some(ExpressionKind::Bool)
-                }
-                BinaryOperator::Eq
-                | BinaryOperator::NotEq
-                | BinaryOperator::Gt
-                | BinaryOperator::GtEq
-                | BinaryOperator::Lt
-                | BinaryOperator::LtEq
-                | BinaryOperator::Spaceship
-                    if comparable_kinds(left, right) =>
-                {
-                    Some(ExpressionKind::Bool)
-                }
-                BinaryOperator::Plus
-                | BinaryOperator::Minus
-                | BinaryOperator::Multiply
-                | BinaryOperator::Divide
-                | BinaryOperator::Modulo
-                    if left == ExpressionKind::Numeric && right == ExpressionKind::Numeric =>
-                {
-                    Some(ExpressionKind::Numeric)
-                }
-                BinaryOperator::StringConcat
-                    if left == ExpressionKind::Text && right == ExpressionKind::Text =>
-                {
-                    Some(ExpressionKind::Text)
-                }
-                _ => None,
-            }
-        }
-        Expr::IsFalse(inner)
-        | Expr::IsNotFalse(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsUnknown(inner)
-        | Expr::IsNotUnknown(inner)
-            if expression_kind(schema, inner) == Some(ExpressionKind::Bool) =>
-        {
-            Some(ExpressionKind::Bool)
-        }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            expression_kind(schema, inner).map(|_| ExpressionKind::Bool)
-        }
-        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
-            let left = expression_kind(schema, left)?;
-            let right = expression_kind(schema, right)?;
-            comparable_kinds(left, right).then_some(ExpressionKind::Bool)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            let value = expression_kind(schema, expr)?;
-            let low = expression_kind(schema, low)?;
-            let high = expression_kind(schema, high)?;
-            (comparable_kinds(value, low) && comparable_kinds(value, high))
-                .then_some(ExpressionKind::Bool)
-        }
-        Expr::InList { expr, list, .. } => {
-            let value = expression_kind(schema, expr)?;
-            list.iter()
-                .map(|item| expression_kind(schema, item))
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .all(|item| comparable_kinds(value, item))
-                .then_some(ExpressionKind::Bool)
-        }
-        Expr::Like { expr, pattern, .. }
-        | Expr::ILike { expr, pattern, .. }
-        | Expr::SimilarTo { expr, pattern, .. }
-        | Expr::RLike { expr, pattern, .. }
-            if expression_kind(schema, expr) == Some(ExpressionKind::Text)
-                && expression_kind(schema, pattern) == Some(ExpressionKind::Text) =>
-        {
-            Some(ExpressionKind::Bool)
-        }
-        _ => None,
-    }
-}
-
-fn column_expression_kind(kind: &ColumnType) -> ExpressionKind {
-    match kind {
-        ColumnType::Bool => ExpressionKind::Bool,
-        ColumnType::Int | ColumnType::Float | ColumnType::Decimal => ExpressionKind::Numeric,
-        ColumnType::String
-        | ColumnType::Bytes
-        | ColumnType::Date
-        | ColumnType::Timestamp
-        | ColumnType::Uuid
-        | ColumnType::Ulid
-        | ColumnType::Enum => ExpressionKind::Text,
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => ExpressionKind::Json,
-    }
-}
-
-fn comparable_kinds(left: ExpressionKind, right: ExpressionKind) -> bool {
-    left == ExpressionKind::Null || right == ExpressionKind::Null || left == right
-}
-fn action(a: Action) -> &'static str {
-    match a {
-        Action::Restrict => "RESTRICT",
-        Action::Cascade => "CASCADE",
-        Action::SetNull => "SET NULL",
-        Action::SetDefault => "SET DEFAULT",
-        Action::NoAction => "NO ACTION",
-    }
-}
-fn query_err(e: rusqlite::Error) -> DbError {
-    let msg = e.to_string();
-    if let rusqlite::Error::SqliteFailure(error, _) = &e {
-        let code = match error.extended_code {
-            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => Some("PRIMARY_KEY_VIOLATION"),
-            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => Some("UNIQUE_VIOLATION"),
-            rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL => Some("NOT_NULL_VIOLATION"),
-            rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY => Some("FOREIGN_KEY_VIOLATION"),
-            rusqlite::ffi::SQLITE_CONSTRAINT_CHECK => Some("CHECK_VIOLATION"),
-            // SQLite enforces RESTRICT referential actions through internal
-            // triggers, so a blocked RESTRICT surfaces as SQLITE_CONSTRAINT_TRIGGER
-            // carrying SQLite's foreign-key message rather than as
-            // SQLITE_CONSTRAINT_FOREIGNKEY. It is a referential violation
-            // (Section 37), not a query type error, so it must carry the
-            // FOREIGN_KEY_VIOLATION code and the INVALID exit status.
-            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
-                if msg.contains("FOREIGN KEY constraint failed") =>
-            {
-                Some("FOREIGN_KEY_VIOLATION")
-            }
-            _ => None,
-        };
-        if let Some(code) = code {
-            return DbError::new(code, msg, 2);
-        }
-    }
-    let interrupted = matches!(
-        &e,
-        rusqlite::Error::SqliteFailure(error, _)
-            if error.code == rusqlite::ffi::ErrorCode::OperationInterrupted
-    );
-    let code = if interrupted {
-        "RESOURCE_LIMIT"
-    } else if msg.contains("syntax error") {
-        "QUERY_UNSUPPORTED"
-    } else if msg.contains("no such table") {
-        "UNKNOWN_TABLE"
-    } else if msg.contains("no such column") {
-        "UNKNOWN_COLUMN"
-    } else {
-        "QUERY_TYPE_ERROR"
-    };
-    DbError::new(code, msg, 4)
-}
-
-pub fn validate_checks(c: &Catalog) -> Vec<Diagnostic> {
-    if !c.schemas.values().any(|s| !s.check.is_empty()) {
-        return vec![];
-    }
-    let conn = match load(c, false) {
-        Ok(connection) => connection,
-        Err(error) => return vec![*error.diagnostic],
-    };
+/// Compile every check and assertion against the tables they may read,
+/// reporting each that cannot be compiled or is not deterministic.
+pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
     let mut out = vec![];
-    for (table, s) in &c.schemas {
-        for check in &s.check {
-            let sql = format!(
-                "SELECT {} FROM {} WHERE NOT ({})",
-                s.primary_key
-                    .iter()
-                    .map(|column| q(column))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                q(table),
-                check.expr
-            );
-            match conn.prepare(&sql) {
-                Err(e) => out.push(
+    let Ok(scratch) = Mirror::open_memory() else {
+        return vec![Diagnostic::error("INTERNAL_METADATA_CORRUPT", "cannot open a scratch database")];
+    };
+    if let Err(error) = scratch.sync_schemas(schemas) {
+        out.push(*error.diagnostic);
+        return out;
+    }
+    let connection = scratch.connection();
+    for (table, schema) in schemas {
+        for (index, check) in schema.checks().iter().enumerate() {
+            let only_this: BTreeMap<String, Schema> =
+                BTreeMap::from([(table.clone(), schema.clone())]);
+            let mut rule = policy(&only_this, false, true);
+            rule.readable = BTreeSet::from([table.clone()]);
+            let text = format!("SELECT ({}) FROM {}", check.expr(), mirror::quote(table));
+            if let Some(reason) = refuses_clock(check.expr()) {
+                out.push(
+                    Diagnostic::error("SCHEMA_CHECK_INVALID", format!("check {:?}: {reason}", check.name()))
+                        .table(table)
+                        .pointer(format!("/x-reldir/checks/{index}/expr")),
+                );
+                continue;
+            }
+            if let Err(error) = prepare(connection, &text, &rule) {
+                out.push(
                     Diagnostic::error(
                         "SCHEMA_CHECK_INVALID",
-                        format!("check {:?} is invalid: {e}", check.name),
+                        format!(
+                            "check {:?} is not a valid expression over {table}'s columns: {}",
+                            check.name(),
+                            error.diagnostic.message
+                        ),
                     )
-                    .table(table),
+                    .table(table)
+                    .pointer(format!("/x-reldir/checks/{index}/expr")),
+                );
+            }
+        }
+        for (index, assertion) in schema.assertions().iter().enumerate() {
+            let at = format!("/x-reldir/assertions/{index}/query");
+            if let Some(reason) = refuses_clock(assertion.query()) {
+                out.push(
+                    Diagnostic::error("SCHEMA_ASSERTION_INVALID", format!("assertion {:?}: {reason}", assertion.name()))
+                        .table(table)
+                        .pointer(at),
+                );
+                continue;
+            }
+            match classify(assertion.query()) {
+                Ok(StatementKind::Read) => {}
+                _ => {
+                    out.push(
+                        Diagnostic::error(
+                            "SCHEMA_ASSERTION_INVALID",
+                            format!("assertion {:?} must be a single SELECT", assertion.name()),
+                        )
+                        .table(table)
+                        .pointer(at),
+                    );
+                    continue;
+                }
+            }
+            let rule = policy(schemas, false, true);
+            match prepare(connection, assertion.query(), &rule) {
+                Err(error) => out.push(
+                    Diagnostic::error(
+                        "SCHEMA_ASSERTION_INVALID",
+                        format!("assertion {:?} does not compile: {}", assertion.name(), error.diagnostic.message),
+                    )
+                    .table(table)
+                    .pointer(at),
                 ),
-                Ok(mut statement) => match statement.query([]) {
-                    Err(error) => out.push(
-                        Diagnostic::error("SCHEMA_CHECK_INVALID", error.to_string()).table(table),
-                    ),
-                    Ok(mut rows) => {
-                        let by_key = crate::integrity::rows_by_key(c, table);
-                        loop {
-                            match rows.next() {
-                                Err(error) => {
-                                    out.push(
-                                        Diagnostic::error(
-                                            "SCHEMA_CHECK_INVALID",
-                                            error.to_string(),
-                                        )
-                                        .table(table),
-                                    );
-                                    break;
-                                }
-                                Ok(None) => break,
-                                Ok(Some(result)) => {
-                                    let mut key_row = Map::new();
-                                    let mut failed = false;
-                                    for (index, column) in s.primary_key.iter().enumerate() {
-                                        match result.get_ref(index) {
-                                            Ok(value) => {
-                                                match decode(from_ref(value), &s.columns[column]) {
-                                                    Ok(value) => {
-                                                        key_row.insert(column.clone(), value);
-                                                    }
-                                                    Err(error) => {
-                                                        out.push(
-                                                            Diagnostic::error(
-                                                                "SCHEMA_CHECK_INVALID",
-                                                                error.to_string(),
-                                                            )
-                                                            .table(table),
-                                                        );
-                                                        failed = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                out.push(
-                                                    Diagnostic::error(
-                                                        "SCHEMA_CHECK_INVALID",
-                                                        error.to_string(),
-                                                    )
-                                                    .table(table),
-                                                );
-                                                failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if failed {
-                                        break;
-                                    }
-                                    if let Some(key) =
-                                        crate::integrity::key(&key_row, &s.primary_key, s)
-                                        && let Some(row) = by_key.get(&key)
-                                    {
-                                        let mut diagnostic = Diagnostic::error(
-                                            "CHECK_VIOLATION",
-                                            format!("row violates check {:?}", check.name),
-                                        )
-                                        .at(row.relative.clone())
-                                        .table(table);
-                                        diagnostic.constraint = Some(check.expr.clone());
-                                        out.push(diagnostic);
-                                    }
-                                }
-                            }
-                        }
+                Ok(statement) => {
+                    let columns: Vec<String> = statement.column_names().into_iter().map(String::from).collect();
+                    if columns != schema.primary_key() {
+                        out.push(
+                            Diagnostic::error(
+                                "SCHEMA_ASSERTION_INVALID",
+                                format!(
+                                    "assertion {:?} returns ({}), but it names violating rows by the \
+                                     table's primary key ({})",
+                                    assertion.name(),
+                                    columns.join(", "),
+                                    schema.primary_key().join(", ")
+                                ),
+                            )
+                            .table(table)
+                            .pointer(at),
+                        );
                     }
-                },
+                }
             }
         }
     }
     out
 }
 
-pub fn export_sqlite(c: &Catalog, table: &str, path: &std::path::Path) -> Result<()> {
-    if path.exists() {
-        return Err(DbError::usage(format!(
-            "refusing to overwrite {}",
-            path.display()
-        )));
+/// A rule that reads the clock is not a rule about the data.
+fn refuses_clock(text: &str) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+    for keyword in ["current_timestamp", "current_date", "current_time"] {
+        if lowered.contains(keyword) {
+            return Some(format!("{keyword} reads the clock, and validity cannot change with time"));
+        }
     }
-    let mut one = c.clone();
-    one.schemas.retain(|name, _| name == table);
-    one.rows.retain(|name, _| name == table);
-    let conn = load(&one, true)?;
-    let target = path.to_string_lossy().replace('\'', "''");
-    conn.execute_batch(&format!("VACUUM INTO '{target}'"))
+    if lowered.contains("'now'") {
+        return Some("'now' reads the clock, and validity cannot change with time".into());
+    }
+    None
+}
+
+/// The files whose rows fail a check.
+pub fn check_violations(mirror: &Mirror, schema: &Schema, check: &Check) -> Result<Vec<String>> {
+    let connection = mirror.connection();
+    let text = format!(
+        "SELECT f.path FROM {table} t JOIN _reldir_files f ON f.tbl = ?1 AND f.trow = t.rowid \
+         WHERE NOT ({expr}) ORDER BY f.path",
+        table = mirror::quote(schema.table()),
+        expr = check.expr()
+    );
+    let mut statement = connection.prepare(&text).map_err(query_err)?;
+    let found = statement
+        .query_map([schema.table()], |row| row.get::<_, String>(0))
+        .map_err(query_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(query_err)?;
+    Ok(found)
+}
+
+/// The files whose rows an assertion names.
+pub fn assertion_violations(mirror: &Mirror, schema: &Schema, assertion: &Assertion) -> Result<Vec<String>> {
+    let connection = mirror.connection();
+    let mut statement = connection.prepare(assertion.query()).map_err(query_err)?;
+    let count = statement.column_count();
+    let mut rows = statement.query([]).map_err(query_err)?;
+    let mut keys = BTreeSet::new();
+    while let Some(row) = rows.next().map_err(query_err)? {
+        let mut values = Map::new();
+        for (index, column) in schema.primary_key().iter().enumerate().take(count) {
+            let kind = schema.column(column).map(|c| c.kind().clone()).unwrap_or(crate::schema::ColumnType::Json);
+            let value = mirror::from_sql(row.get_ref(index).map_err(query_err)?);
+            values.insert(column.clone(), mirror::decode_typed(value, &kind)?);
+        }
+        if let Some(key) = mirror::key(&values, schema.primary_key(), schema) {
+            keys.insert(key);
+        }
+    }
+    let mut paths = vec![];
+    for key in keys {
+        for (_, path) in mirror.holders(&key, mirror::PRIMARY, &[schema.table().to_string()])? {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Rename a column wherever an expression names it, leaving strings, function
+/// names and other identifiers alone.
+pub fn rename_identifier(expression: &str, old: &str, new: &str) -> std::result::Result<String, String> {
+    let chars: Vec<char> = expression.chars().collect();
+    let simple = |name: &str| {
+        let mut characters = name.chars();
+        matches!(characters.next(), Some(c) if c.is_alphabetic() || c == '_')
+            && characters.all(|c| c.is_alphanumeric() || c == '_')
+    };
+    let render = |name: &str| {
+        if simple(name) {
+            name.to_string()
+        } else {
+            mirror::quote(name)
+        }
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                out.push('\'');
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            out.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                i += 1;
+                let mut identifier = String::new();
+                loop {
+                    match chars.get(i) {
+                        None => return Err(format!("unterminated quoted identifier in {expression:?}")),
+                        Some('"') if chars.get(i + 1) == Some(&'"') => {
+                            identifier.push('"');
+                            i += 2;
+                        }
+                        Some('"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(c) => {
+                            identifier.push(*c);
+                            i += 1;
+                        }
+                    }
+                }
+                if identifier == old {
+                    out.push_str(&mirror::quote(new));
+                } else {
+                    out.push_str(&mirror::quote(&identifier));
+                }
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let mut lookahead = i;
+                while chars.get(lookahead).is_some_and(|c| c.is_whitespace()) {
+                    lookahead += 1;
+                }
+                let is_call = chars.get(lookahead) == Some(&'(');
+                if word == old && !is_call {
+                    out.push_str(&render(new));
+                } else {
+                    out.push_str(&word);
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn bind(statement: &mut rusqlite::Statement<'_>, params: &[SqlParam]) -> Result<()> {
+    if statement.parameter_count() != params.len() {
+        return Err(DbError::new(
+            "QUERY_TYPE_ERROR",
+            format!(
+                "the statement takes {} parameter(s) but {} were supplied",
+                statement.parameter_count(),
+                params.len()
+            ),
+            4,
+        ));
+    }
+    let mut used = BTreeSet::new();
+    let mut positional = 1;
+    for parameter in params {
+        let index = if let Some(name) = &parameter.name {
+            [format!(":{name}"), format!("@{name}"), format!("${name}")]
+                .iter()
+                .find_map(|spelled| statement.parameter_index(spelled).ok().flatten())
+                .ok_or_else(|| {
+                    DbError::new(
+                        "QUERY_TYPE_ERROR",
+                        format!("the statement has no parameter named {name:?}"),
+                        4,
+                    )
+                })?
+        } else {
+            while used.contains(&positional) {
+                positional += 1;
+            }
+            let index = positional;
+            positional += 1;
+            index
+        };
+        used.insert(index);
+        statement
+            .raw_bind_parameter(index, mirror::to_sql_generic(&parameter.value))
+            .map_err(query_err)?;
+    }
     Ok(())
+}
+
+/// Classify a SQLite error: a constraint failure is a relational violation of
+/// the database; running out of an allowance is a resource limit; the rest is
+/// a fault in the statement.
+pub fn query_err(error: rusqlite::Error) -> DbError {
+    let message = error.to_string();
+    if let rusqlite::Error::SqliteFailure(failure, _) = &error {
+        let code = match failure.extended_code {
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => Some(("PRIMARY_KEY_VIOLATION", 2)),
+            rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => Some(("UNIQUE_VIOLATION", 2)),
+            rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL => Some(("NOT_NULL_VIOLATION", 2)),
+            rusqlite::ffi::SQLITE_CONSTRAINT_CHECK => Some(("CHECK_VIOLATION", 2)),
+            _ => None,
+        }
+        .or(match failure.code {
+            rusqlite::ffi::ErrorCode::OperationInterrupted => Some(("RESOURCE_LIMIT", 4)),
+            rusqlite::ffi::ErrorCode::OutOfMemory => Some(("RESOURCE_LIMIT", 4)),
+            _ => None,
+        });
+        if let Some((code, exit)) = code {
+            let message = match code {
+                "RESOURCE_LIMIT" if failure.code == rusqlite::ffi::ErrorCode::OperationInterrupted => {
+                    "the statement exceeded the configured timeout and was stopped".to_string()
+                }
+                "RESOURCE_LIMIT" => {
+                    "the statement exceeded the configured query-memory limit and was stopped".to_string()
+                }
+                _ => message,
+            };
+            return DbError::new(code, message, exit);
+        }
+    }
+    let code = if message.contains("no such table") {
+        "UNKNOWN_TABLE"
+    } else if message.contains("no such column") {
+        "UNKNOWN_COLUMN"
+    } else if message.contains("syntax error") {
+        "QUERY_UNSUPPORTED"
+    } else {
+        "QUERY_TYPE_ERROR"
+    };
+    DbError::new(code, message, 4)
+}
+
+/// Point an unknown table at what it probably is.
+pub fn explain_unknown_table(catalog: &crate::catalog::Catalog, error: DbError) -> DbError {
+    if error.diagnostic.code != "UNKNOWN_TABLE" {
+        return error;
+    }
+    match error
+        .diagnostic
+        .message
+        .strip_prefix("no such table: ")
+        .map(|name| name.strip_prefix("main.").unwrap_or(name))
+    {
+        Some(table) => catalog.unknown_table(table),
+        None => error,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn failure(extended_code: std::os::raw::c_int, message: &str) -> rusqlite::Error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(extended_code),
-            Some(message.to_string()),
-        )
-    }
-
-    /// Sections 51 and 75: a constraint failure is a relational violation of the
-    /// database, so it carries its own stable code and the INVALID exit status,
-    /// never the generic query-error status.
     #[test]
-    fn test1088_constraint_failures_map_to_relational_codes() {
-        for (extended_code, expected) in [
-            (
-                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
-                "PRIMARY_KEY_VIOLATION",
-            ),
-            (rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE, "UNIQUE_VIOLATION"),
-            (
-                rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
-                "NOT_NULL_VIOLATION",
-            ),
-            (
-                rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
-                "FOREIGN_KEY_VIOLATION",
-            ),
-            (rusqlite::ffi::SQLITE_CONSTRAINT_CHECK, "CHECK_VIOLATION"),
-        ] {
-            let error = query_err(failure(extended_code, "constraint failed"));
-            assert_eq!(error.diagnostic.code, expected);
-            assert_eq!(error.exit, 2, "{expected} is a database-invalid condition");
-        }
-    }
-
-    /// Section 37: SQLite enforces a RESTRICT referential action with an
-    /// internal trigger, so a blocked RESTRICT arrives as a trigger constraint
-    /// carrying SQLite's foreign-key message. It is a referential violation and
-    /// must not be reported as a query type error.
-    #[test]
-    fn test1089_restrict_violations_are_classified_as_referential_violations() {
-        let error = query_err(failure(
-            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
-            "FOREIGN KEY constraint failed",
-        ));
-        assert_eq!(error.diagnostic.code, "FOREIGN_KEY_VIOLATION");
-        assert_eq!(error.exit, 2);
-
-        // A trigger failure that is not a foreign-key message keeps the generic
-        // classification: the mapping is deliberately narrow.
-        let other = query_err(failure(
-            rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
-            "some other trigger aborted",
-        ));
-        assert_ne!(other.diagnostic.code, "FOREIGN_KEY_VIOLATION");
-    }
-
-    /// Section 25 and 51: query faults are distinguished so a caller can tell a
-    /// malformed query from an unknown name, and all use the query exit status.
-    #[test]
-    fn test1090_query_faults_are_classified_by_kind() {
-        for (message, expected) in [
-            (r#"near "SELCT": syntax error"#, "QUERY_UNSUPPORTED"),
-            ("no such table: ghosts", "UNKNOWN_TABLE"),
-            ("no such column: ghost", "UNKNOWN_COLUMN"),
-            ("datatype mismatch", "QUERY_TYPE_ERROR"),
-        ] {
-            let error = query_err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(message.to_string()),
-            ));
-            assert_eq!(error.diagnostic.code, expected, "for message {message:?}");
-            assert_eq!(error.exit, 4);
-        }
-    }
-
-    /// The name is read from SQLite's own phrasing, so both the bare and the
-    /// schema-qualified form must yield the same table. A message this does not
-    /// recognize yields nothing rather than a guess: the error then passes
-    /// through as SQLite wrote it instead of carrying advice about a table
-    /// nobody named.
-    #[test]
-    fn test1117_the_missing_table_is_read_from_sqlites_own_message() {
-        assert_eq!(missing_table("no such table: users"), Some("users"));
-        assert_eq!(missing_table("no such table: main.users"), Some("users"));
+    fn test2100_only_queries_and_row_mutations_are_statements() {
+        assert_eq!(classify("SELECT 1").unwrap(), StatementKind::Read);
         assert_eq!(
-            missing_table("no such table: main.order_items"),
-            Some("order_items")
+            classify("WITH x AS (SELECT 1 AS a) SELECT a FROM x UNION SELECT 2").unwrap(),
+            StatementKind::Read
         );
-
-        // Not a missing-table message at all.
-        assert_eq!(missing_table("no such column: users.name"), None);
-        assert_eq!(missing_table("syntax error near \"FROM\""), None);
-        assert_eq!(missing_table(""), None);
+        assert_eq!(classify("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = 2").unwrap(), StatementKind::Mutation);
+        assert_eq!(classify("DELETE FROM t WHERE a = 1 RETURNING a").unwrap(), StatementKind::Mutation);
+        for refused in ["CREATE TABLE x (a)", "DROP TABLE t", "PRAGMA foreign_keys", "ATTACH 'x' AS y", "BEGIN", "VACUUM"] {
+            let error = classify(refused).expect_err(refused);
+            assert_eq!(error.diagnostic.code, "QUERY_UNSUPPORTED", "{refused}");
+        }
+        assert!(classify("SELECT 1; SELECT 2").is_err(), "one statement at a time");
+        let located = classify("SELECT\n  FROM").unwrap_err();
+        assert!(located.diagnostic.location.is_some(), "a parse error points at the fault");
     }
 
-    /// Advice is attached only where it applies. A catalog that knows of an
-    /// ungoverned directory says how to govern it; one that does not leaves the
-    /// error exactly as it was, because there is nothing on disk to infer from.
     #[test]
-    fn test1118_only_an_ungoverned_directory_earns_inference_advice() {
-        let mut catalog = Catalog {
-            root: PathBuf::from("/tmp"),
-            ungoverned: vec!["posts".into()],
-            pinned: std::collections::BTreeSet::new(),
-            schemas: BTreeMap::new(),
-            schema_sources: BTreeMap::new(),
-            rows: BTreeMap::new(),
-            diagnostics: vec![],
-            warnings: vec![],
-            indentation_width: 2,
-        };
-
-        let bare = DbError::new("UNKNOWN_TABLE", "no such table: posts", 4);
-        let explained = explain_unknown_table(&catalog, bare);
-        assert_eq!(explained.diagnostic.code, "UNKNOWN_TABLE");
-        assert_eq!(explained.exit, 4);
+    fn test2101_renaming_leaves_strings_and_function_names_alone() {
         assert_eq!(
-            explained.diagnostic.help.as_deref(),
-            Some("run `reldir infer posts --write` or add it to .db/config ignore"),
-            "an ungoverned directory earns the command that governs it"
+            rename_identifier("count > 0 AND count(x) > 1 AND name = 'count'", "count", "total").unwrap(),
+            "total > 0 AND count(x) > 1 AND name = 'count'"
         );
-
-        // A name matching nothing on disk keeps the plain error.
-        let ghost = DbError::new("UNKNOWN_TABLE", "no such table: ghosts", 4);
-        assert_eq!(explain_unknown_table(&catalog, ghost).diagnostic.help, None);
-
-        // And with nothing ungoverned, even a real directory name gets nothing.
-        catalog.ungoverned.clear();
-        let posts = DbError::new("UNKNOWN_TABLE", "no such table: posts", 4);
-        assert_eq!(explain_unknown_table(&catalog, posts).diagnostic.help, None);
+        assert_eq!(rename_identifier("\"a b\" <> ''", "a b", "c").unwrap(), "\"c\" <> ''");
+        assert_eq!(rename_identifier("x = 1", "x", "new name").unwrap(), "\"new name\" = 1");
+        assert!(rename_identifier("\"open", "a", "b").is_err());
     }
 
-    /// Enrichment is scoped to the one code it explains. A different failure
-    /// carrying a similar message must not acquire advice about inference.
     #[test]
-    fn test1119_other_errors_are_passed_through_untouched() {
-        let catalog = Catalog {
-            root: PathBuf::from("/tmp"),
-            ungoverned: vec!["posts".into()],
-            pinned: std::collections::BTreeSet::new(),
-            schemas: BTreeMap::new(),
-            schema_sources: BTreeMap::new(),
-            rows: BTreeMap::new(),
-            diagnostics: vec![],
-            warnings: vec![],
-            indentation_width: 2,
-        };
-        let other = DbError::new("QUERY_UNSUPPORTED", "no such table: posts", 4);
-        let passed = explain_unknown_table(&catalog, other);
-        assert_eq!(passed.diagnostic.code, "QUERY_UNSUPPORTED");
-        assert_eq!(passed.diagnostic.help, None);
-    }
-
-    /// Section 61: an interrupted statement is a resource-limit outcome (the
-    /// timeout fired), not a malformed query.
-    #[test]
-    fn test1091_interrupted_statements_report_a_resource_limit() {
-        let error = query_err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
-            Some("interrupted".to_string()),
-        ));
-        assert_eq!(error.diagnostic.code, "RESOURCE_LIMIT");
+    fn test2102_clock_readers_are_not_rules() {
+        assert!(refuses_clock("created < CURRENT_TIMESTAMP").is_some());
+        assert!(refuses_clock("date(created) < date('now')").is_some());
+        assert!(refuses_clock("date(start) <= date(finish)").is_none());
     }
 }

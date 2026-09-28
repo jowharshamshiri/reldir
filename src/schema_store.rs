@@ -1,35 +1,29 @@
 //! Where schemas live, and what the two locations mean.
 //!
-//! A database has one working schema per table and may have a pin for it.
+//! A table's schema is one document, in one of two places:
 //!
-//! The working schema lives in `.db/schema/<table>.json`. It is what every
-//! other subsystem validates against, queries through, and reports on. reldir owns
-//! it: inference writes it, maintenance updates it, and deleting `.db/`
-//! discards it exactly as it discards an index, because it can be rebuilt.
+//! - `schema/<table>.json`, a **pin**: a declaration the user keeps beside
+//!   their data and in version control. A pinned table's schema *is* its pin;
+//!   reldir reads it where it lies, and a change reldir makes to a pinned
+//!   table's schema (a migration, an applied fix) is written to the pin.
+//! - `.db/schema/<table>.json`, a **working schema**: one reldir inferred for a
+//!   table nobody pinned. It is reconstructible from the rows it describes, so
+//!   deleting `.db/` loses nothing a pin would keep.
 //!
-//! The pin lives in `schema/<table>.json`. It is optional, and it is the user's
-//! declaration rather than reldir's derivation: a schema they wrote, or one they
-//! promoted from inference with `reldir schema pin`. A pinned table's working
-//! schema is copied from the pin instead of inferred from data, so pinning is
-//! how a refinement inference could never re-derive -- an enum, a check, a
-//! foreign key whose column name breaks the convention -- survives `rm -rf
-//! .db`.
+//! A working schema left beside a pin for the same table is a stale copy from
+//! before the pin existed. It governs nothing, and a writing command removes
+//! it.
 //!
-//! Where both exist they are expected to agree, and when they do not the pin
-//! wins: it is the declaration, and the working copy is derived state that is
-//! rebuilt from it. That is what makes `schema/` worth keeping in version
-//! control and `.db/` safe to delete at any time.
+//! Recorded history names every table's schema `schema/<table>.json`,
+//! whichever place it lives in: where a schema is kept is not part of what the
+//! database says, so pinning a table does not change the state.
 
 use crate::{
-    canonical,
+    catalog::Catalog,
     diagnostic::{DbError, Diagnostic, Result},
-    schema::{self, Schema},
+    schema::{Schema, SchemaFileKind},
 };
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// The directory holding working schemas, which reldir maintains.
 pub fn working_dir(root: &Path) -> PathBuf {
@@ -52,278 +46,115 @@ pub fn pin_path(root: &Path, table: &str) -> PathBuf {
 }
 
 /// The working schema's path relative to the database root, as transactions
-/// and change plans name it.
-pub fn working_relative(table: &str) -> String {
-    format!(".db/schema/{table}.json")
+/// name it.
+pub fn working_relative(table: &str) -> PathBuf {
+    PathBuf::from(format!(".db/schema/{table}.json"))
 }
 
-/// The pin's path relative to the database root, as provenance and the manifest
-/// record it.
+/// A table's schema as recorded history names it, wherever it lives.
 pub fn pin_relative(table: &str) -> String {
     format!("schema/{table}.json")
 }
 
-/// Whether a relative path names a working schema.
-///
-/// Distinct from [`is_pin_relative`] because `.db/schema/x.json` also ends in
-/// `schema/x.json`: a prefix test that did not know the difference would count
-/// reldir's own copy as the user's declaration.
-fn is_working_relative(path: &str) -> bool {
-    path.starts_with(".db/schema/") && path.ends_with(".json")
+/// The file a table's schema is written to: its pin when it has one, its
+/// working schema otherwise. Relative to the database root.
+pub fn home(catalog: &Catalog, table: &str) -> PathBuf {
+    match catalog.schema_files.get(table).map(|file| file.kind) {
+        Some(SchemaFileKind::Pin) => PathBuf::from(pin_relative(table)),
+        _ => working_relative(table),
+    }
 }
 
-/// Whether a relative path names either schema location.
-pub fn is_schema_relative(path: &str) -> bool {
-    is_working_relative(path) || is_pin_relative(path)
+/// The table a relative path's schema file governs, if it is one.
+pub fn schema_table(path: &Path) -> Option<&str> {
+    let parent = path.parent()?;
+    if parent != Path::new("schema") && parent != Path::new(".db/schema") {
+        return None;
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        return None;
+    }
+    path.file_stem().and_then(|stem| stem.to_str())
 }
 
-/// The table a working-schema path names, if it is one.
-pub fn working_table(path: &str) -> Option<&str> {
-    path.strip_prefix(".db/schema/")?.strip_suffix(".json")
-}
-
-/// Whether a relative path names a pin.
-pub fn is_pin_relative(path: &str) -> bool {
-    path.starts_with("schema/") && path.ends_with(".json")
-}
-
-/// Write a working schema, creating `.db/schema/` if this is the first.
-///
-/// Writing here needs no authorization: the working schema is derived state,
-/// reconstructible from the rows it describes or from the pin that fixes it.
-pub fn write_working(root: &Path, schema: &Schema, indentation_width: usize) -> Result<()> {
-    let directory = working_dir(root);
-    fs::create_dir_all(&directory).map_err(|error| DbError::io(&directory, error))?;
-    // One serialization for both locations. A schema reldir writes must read back
-    // exactly as the pin it came from would: two renderings of the same
-    // declaration differ in nesting and byte length, so a limit one form passes
-    // the other can fail.
-    let bytes = canonical_bytes(schema, indentation_width)?;
-    crate::metadata::write_bytes_atomic(&working_path(root, &schema.table), &bytes)
-}
-
-/// The tables that have a pin.
-///
-/// An absent `schema/` is the ordinary case -- pinning is opt-in -- and yields
-/// no tables rather than an error.
-pub fn pinned_tables(root: &Path) -> Result<BTreeSet<String>> {
-    let directory = pin_dir(root);
-    let mut out = BTreeSet::new();
-    let metadata = match fs::symlink_metadata(&directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-        Err(error) => return Err(DbError::io(&directory, error)),
-    };
-    if !metadata.file_type().is_dir() {
+/// Read a schema file that is expected to exist, reporting its first fault as
+/// an error at its path.
+pub fn load(path: &Path) -> Result<Schema> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| DbError::io(path, error))?;
+    if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
         return Err(DbError::from_diag(
-            Diagnostic::error("NON_REGULAR_FILE", "schema/ must be a real directory").at("schema"),
+            Diagnostic::error("NON_REGULAR_FILE", "schema files must be private regular files").at(path),
             2,
         ));
     }
-    for entry in fs::read_dir(&directory).map_err(|error| DbError::io(&directory, error))? {
-        let path = entry
-            .map_err(|error| DbError::io(&directory, error))?
-            .path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-            out.insert(stem.to_string());
-        }
-    }
-    Ok(out)
+    let bytes = std::fs::read(path).map_err(|error| DbError::io(path, error))?;
+    Schema::from_bytes(&bytes).map_err(|problems| {
+        let first = problems
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Diagnostic::error("SCHEMA_INVALID", "the schema could not be read"));
+        DbError::from_diag(first.at(path), 2)
+    })
 }
 
-/// Read a pin, if the table has one.
-pub fn load_pin(root: &Path, table: &str) -> Result<Option<Schema>> {
-    let path = pin_path(root, table);
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() && !has_multiple_links(&metadata) => {
-            schema::load(&path).map(Some)
-        }
-        Ok(_) => Err(DbError::from_diag(
-            Diagnostic::error(
-                "NON_REGULAR_FILE",
-                "pinned schemas must be private regular files",
-            )
-            .at(pin_relative(table)),
-            2,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(DbError::io(&path, error)),
-    }
-}
-
-/// The canonical bytes of a schema, as both locations store it and as the
-/// manifest hashes it. One rendering, so that a pin and the working copy taken
-/// from it compare equal byte for byte.
-pub fn canonical_bytes(schema: &Schema, indentation_width: usize) -> Result<Vec<u8>> {
-    let value = schema::json_schema::encode(schema);
-    Ok(canonical::pretty_with_indent(&value, indentation_width))
-}
-
-/// Whether two schemas are the same declaration.
-///
-/// Compared as canonical values rather than as bytes, so that indentation or
-/// key order -- neither of which changes what the schema says -- is not
-/// mistaken for divergence.
-pub fn equivalent(left: &Schema, right: &Schema) -> Result<bool> {
-    let left = schema::json_schema::encode(left);
-    let right = schema::json_schema::encode(right);
-    Ok(canonical::normalize(&left) == canonical::normalize(&right))
-}
-
-#[cfg(unix)]
-fn has_multiple_links(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() > 1
-}
-
-#[cfg(not(unix))]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
-    false
+/// Whether two schemas impose the same rules. Formatting, member order and
+/// annotations are not rules.
+pub fn equivalent(left: &Schema, right: &Schema) -> bool {
+    left.identity() == right.identity()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AdditionalFields, Column, ColumnType};
-    use indexmap::IndexMap;
+    use serde_json::json;
 
-    fn schema(table: &str) -> Schema {
-        let mut columns = IndexMap::new();
-        columns.insert(
-            "id".to_string(),
-            Column {
-                kind: ColumnType::String,
-                nullable: false,
-                description: None,
-                values: None,
-                items: None,
-                properties: None,
-                pattern: None,
-                additional_properties: true,
-                required: Default::default(),
-                min_size: None,
-                max_size: None,
-                minimum: None,
-                maximum: None,
-                exclusive_minimum: None,
-                exclusive_maximum: None,
-                multiple_of: None,
-                unique_items: false,
-                composition: None,
-                generated: None,
-                default: None,
-                annotations: Default::default(),
-            },
-        );
-        Schema {
-            table: table.into(),
-            schema_version: 1,
-            schema_format: None,
-            description: None,
-            primary_key: vec!["id".into()],
-            columns,
-            unique: vec![],
-            foreign_keys: vec![],
-            check: vec![],
-            indexes: vec![],
-            storage: None,
-            additional_fields: AdditionalFields::Reject,
-            annotations: Default::default(),
+    fn schema(extra_annotation: Option<&str>, allow_additional: bool) -> Schema {
+        let mut document = json!({
+            "$schema": crate::schema::meta::DIALECT_URI,
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "additionalProperties": allow_additional,
+            "x-reldir": { "table": "users", "primaryKey": ["id"] }
+        });
+        if let Some(text) = extra_annotation {
+            document["description"] = json!(text);
         }
+        Schema::from_document(document, None).unwrap()
     }
 
-    /// The two locations are distinct and neither is inside the other's tree:
-    /// the working schema is metadata, the pin is a file the user keeps in
-    /// version control beside their data.
     #[test]
     fn test1120_working_schemas_and_pins_occupy_separate_locations() {
         let root = Path::new("/db");
-        assert_eq!(
-            working_path(root, "users"),
-            root.join(".db/schema/users.json")
-        );
+        assert_eq!(working_path(root, "users"), root.join(".db/schema/users.json"));
         assert_eq!(pin_path(root, "users"), root.join("schema/users.json"));
         assert!(working_path(root, "users").starts_with(root.join(".db")));
         assert!(!pin_path(root, "users").starts_with(root.join(".db")));
     }
 
-    /// Provenance records pins, never working schemas: the working copy is
-    /// derived, so recording it would make a rebuild look like a change.
     #[test]
-    fn test1121_only_pins_have_a_recorded_relative_path() {
-        assert_eq!(pin_relative("users"), "schema/users.json");
-        assert!(is_pin_relative("schema/users.json"));
-
-        // Working schemas live under `.db/` and are not manifest paths. The
-        // two spellings share a suffix, so a prefix test that did not know the
-        // difference would record reldir's own copy as the user's declaration.
-        assert_eq!(working_relative("users"), ".db/schema/users.json");
-        assert!(!is_pin_relative(".db/schema/users.json"));
-        assert!(is_schema_relative(".db/schema/users.json"));
-        assert!(!is_pin_relative("users/u1.json"));
-        assert!(!is_schema_relative("users/u1.json"));
-        assert!(!is_pin_relative("schema/users.txt"));
+    fn test1121_schema_paths_are_recognised_in_both_locations_only() {
+        assert_eq!(schema_table(Path::new("schema/users.json")), Some("users"));
+        assert_eq!(schema_table(Path::new(".db/schema/users.json")), Some("users"));
+        for other in ["users/u1.json", "schema/users.txt", "x/schema/users.json", ".db/config"] {
+            assert_eq!(schema_table(Path::new(other)), None, "{other}");
+        }
     }
 
-    /// Equivalence is about what the schema says, not how it was written. A pin
-    /// re-serialized at a different indentation still fixes the same schema.
     #[test]
-    fn test1122_equivalence_ignores_formatting_but_not_meaning() {
-        let left = schema("users");
-        let mut right = schema("users");
-        assert!(equivalent(&left, &right).unwrap());
-
-        right.additional_fields = AdditionalFields::Allow;
-        assert!(
-            !equivalent(&left, &right).unwrap(),
-            "a different rule is a different schema"
-        );
-
-        // Canonical bytes at different widths render differently but mean the
-        // same thing, which is exactly what `equivalent` must see through.
-        let narrow = canonical_bytes(&left, 2).unwrap();
-        let wide = canonical_bytes(&left, 4).unwrap();
-        assert_ne!(narrow, wide);
-        let from_narrow = schema::load_bytes(&narrow).unwrap();
-        let from_wide = schema::load_bytes(&wide).unwrap();
-        assert!(equivalent(&from_narrow, &from_wide).unwrap());
+    fn test1122_equivalence_is_identity_ignoring_annotations_but_not_rules() {
+        let plain = schema(None, false);
+        assert!(equivalent(&plain, &schema(Some("people we know"), false)), "an annotation is not a rule");
+        assert!(!equivalent(&plain, &schema(None, true)), "a different rule is a different schema");
+        let wide = Schema::from_bytes(&plain.bytes(4)).unwrap();
+        assert!(equivalent(&plain, &wide), "formatting is not a rule");
     }
 
-    /// An absent `schema/` means nothing is pinned, which is the ordinary state
-    /// of a database nobody has pinned yet -- not a fault.
     #[test]
-    fn test1123_an_absent_pin_directory_means_nothing_is_pinned() {
+    fn test1124_a_schema_file_that_is_not_a_regular_file_is_refused() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(pinned_tables(directory.path()).unwrap().is_empty());
-        assert!(load_pin(directory.path(), "users").unwrap().is_none());
-
-        fs::create_dir(directory.path().join("schema")).unwrap();
-        fs::write(
-            directory.path().join("schema/users.json"),
-            canonical_bytes(&schema("users"), 2).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            pinned_tables(directory.path()).unwrap(),
-            BTreeSet::from(["users".to_string()])
-        );
-        assert_eq!(
-            load_pin(directory.path(), "users").unwrap().unwrap().table,
-            "users"
-        );
-    }
-
-    /// A file where `schema/` should be is refused rather than read around: a
-    /// database whose pin directory is a regular file is not one reldir can
-    /// interpret, and guessing would mean ignoring a declaration the user made.
-    #[test]
-    fn test1124_a_pin_directory_that_is_not_a_directory_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("schema"), b"not a directory").unwrap();
-        let error = pinned_tables(directory.path()).expect_err("must refuse");
+        std::fs::create_dir_all(directory.path().join("schema/users.json")).unwrap();
+        let error = load(&directory.path().join("schema/users.json")).unwrap_err();
         assert_eq!(error.diagnostic.code, "NON_REGULAR_FILE");
     }
 }

@@ -1,185 +1,244 @@
-//! The RELDIR dialect of JSON Schema 2020-12.
+//! The reldir dialect of JSON Schema 2020-12.
 //!
-//! reldir's schemas are JSON Schema documents, but reldir does not accept arbitrary
-//! JSON Schema: a document that says `oneOf` is asking for a semantics reldir has
-//! no relational meaning for, and quietly ignoring it would make the file and
-//! the database disagree. So the accepted surface is a dialect -- 2020-12 plus
-//! one vocabulary of reldir's own -- and it is declared as such rather than merely
-//! documented.
+//! A reldir table schema is a JSON Schema 2020-12 document. Every standard
+//! keyword has its standard meaning and is enforced on every row, and one
+//! vocabulary is added for what JSON Schema has no keyword for: row identity,
+//! uniqueness, references between rows, and rules over sets of rows. Those
+//! live under `x-reldir`, and `x-reldir-type` marks the three column types a
+//! standard keyword cannot distinguish (`int`, `decimal`, `ulid`).
 //!
-//! Declaring `$vocabulary` is what makes the restriction honest. A conforming
-//! implementation reading one of these documents learns that
-//! `https://reldir.dev/vocab/reldir-1` is required, and therefore that it cannot
-//! fully process the schema without understanding reldir's keywords. Without that
-//! declaration a generic validator would silently ignore `x-reldir` and conclude a
-//! schema was satisfied when reldir's own rules were never checked.
+//! The dialect is *closed*: a member of a subschema that is neither a 2020-12
+//! keyword, a reldir keyword, nor an `x-` annotation of someone else's is
+//! refused, at every depth. JSON Schema itself ignores unknown keywords, which
+//! means a typo such as `minLenght` silently stops constraining anything; a
+//! database cannot accept a file that claims a rule it does not apply.
 //!
-//! The URI is an identifier, not a location. This binary never fetches it: the
-//! meta-schema is compiled in below and registered offline. reldir should also
-//! serve it at that address so editors can complete these documents, but
-//! nothing here depends on the network.
+//! The closure is written the way JSON Schema defines dialects: the meta-schema
+//! carries `$dynamicAnchor: "meta"`, so the standard meta-schema's recursion
+//! into `properties`, `items`, `oneOf` and every other applicator comes back to
+//! this document and applies the closure again.
 //!
-//! One caveat the documentation must not overstate: in 2020-12 `format` is an
-//! annotation unless the format-assertion vocabulary is enabled, which this
-//! dialect does not enable. A generic validator therefore understands the
-//! structure of a reldir schema and checks its shape, while reldir remains the
-//! authority on what a `uuid`, `ulid`, `decimal`, or `timestamp` actually
-//! admits.
+//! The identifiers are URIs, not locations. Nothing here touches the network:
+//! both documents are compiled in, and the standard 2020-12 meta-schemas ship
+//! inside the validator.
 
-use crate::diagnostic::{DbError, Result};
-use serde_json::Value;
+use crate::diagnostic::{DbError, Diagnostic, Result};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
-/// The dialect's identifier, and the value of `$schema` in every reldir schema.
-pub const DIALECT_URI: &str = "https://reldir.dev/schema/reldir-1";
+/// The dialect's identifier, and the value of `$schema` in every table schema.
+pub const DIALECT_URI: &str = "https://reldir.dev/schema/reldir-2";
+
+/// The identifier of the table-document schema: the dialect plus what a table
+/// schema's root must say.
+pub const TABLE_URI: &str = "https://reldir.dev/schema/reldir-2/table";
 
 /// The vocabulary that carries reldir's relational keywords.
-pub const VOCABULARY_URI: &str = "https://reldir.dev/vocab/reldir-1";
+pub const VOCABULARY_URI: &str = "https://reldir.dev/vocab/reldir-2";
 
-/// The namespace holding every relational fact that JSON Schema has no keyword
-/// for. One object, so that a reader can see at a glance which parts of a
-/// document are reldir's and which are standard.
+/// The namespace holding every relational fact JSON Schema has no keyword for.
 pub const EXTENSION: &str = "x-reldir";
 
-/// The per-subschema type tag.
-///
-/// Used only where a standard keyword cannot distinguish two reldir types: reldir's
-/// `int` is lexical where JSON Schema's `integer` is mathematical, and
-/// `decimal` and `ulid` are strings carrying application semantics. It sits on
-/// the subschema it describes rather than in a root-level map, so it works at
-/// any nesting depth -- `array<decimal>` has no name to key such a map by.
+/// The per-subschema tag for types a standard keyword cannot distinguish.
 pub const TYPE_TAG: &str = "x-reldir-type";
 
-/// The meta-schema, compiled in.
-///
-/// It describes the shape of `x-reldir` and constrains the standard keywords to
-/// the subset the codec accepts. It is deliberately not a complete description
-/// of every rule reldir enforces: cross-schema facts such as foreign-key targets
-/// cannot be expressed in a single document, and `json_schema::decode` reports
-/// those with their own diagnostics.
+/// Every keyword of JSON Schema 2020-12, by vocabulary.
+pub const STANDARD_KEYWORDS: &[&str] = &[
+    // core
+    "$schema",
+    "$id",
+    "$ref",
+    "$anchor",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "$vocabulary",
+    "$comment",
+    "$defs",
+    // applicator
+    "prefixItems",
+    "items",
+    "contains",
+    "additionalProperties",
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "propertyNames",
+    "if",
+    "then",
+    "else",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    // unevaluated
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    // validation
+    "type",
+    "const",
+    "enum",
+    "multipleOf",
+    "maximum",
+    "exclusiveMaximum",
+    "minimum",
+    "exclusiveMinimum",
+    "maxLength",
+    "minLength",
+    "pattern",
+    "maxItems",
+    "minItems",
+    "uniqueItems",
+    "maxContains",
+    "minContains",
+    "maxProperties",
+    "minProperties",
+    "required",
+    "dependentRequired",
+    // meta-data
+    "title",
+    "description",
+    "default",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "examples",
+    // format and content
+    "format",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+];
+
+/// The keywords reldir adds.
+pub const RELDIR_KEYWORDS: &[&str] = &[EXTENSION, TYPE_TAG];
+
+/// Every member name a subschema may carry, other than third-party `x-`
+/// annotations.
+pub fn known_keywords() -> impl Iterator<Item = &'static str> {
+    STANDARD_KEYWORDS
+        .iter()
+        .chain(RELDIR_KEYWORDS.iter())
+        .copied()
+}
+
+/// The dialect meta-schema: 2020-12, closed over its keywords.
 pub fn meta_schema() -> &'static Value {
     static META: OnceLock<Value> = OnceLock::new();
     META.get_or_init(|| {
-        serde_json::json!({
+        let keywords: Vec<Value> = known_keywords().map(Value::from).collect();
+        json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": DIALECT_URI,
+            "$dynamicAnchor": "meta",
             "$vocabulary": {
                 "https://json-schema.org/draft/2020-12/vocab/core": true,
                 "https://json-schema.org/draft/2020-12/vocab/applicator": true,
+                "https://json-schema.org/draft/2020-12/vocab/unevaluated": true,
                 "https://json-schema.org/draft/2020-12/vocab/validation": true,
                 "https://json-schema.org/draft/2020-12/vocab/meta-data": true,
-                "https://json-schema.org/draft/2020-12/vocab/format-annotation": true,
+                "https://json-schema.org/draft/2020-12/vocab/format-assertion": true,
                 "https://json-schema.org/draft/2020-12/vocab/content": true,
-                // Required: a reader that does not understand reldir's relational
-                // keywords cannot claim to have processed the document.
-                "https://reldir.dev/vocab/reldir-1": true,
+                VOCABULARY_URI: true,
             },
-            "title": "reldir table schema",
-            "type": "object",
-            "required": ["type", "properties", "x-reldir"],
-            "properties": {
-                "$schema": { "const": DIALECT_URI },
-                "type": { "const": "object" },
-                "title": { "type": "string" },
-                "description": { "type": "string" },
-                "properties": {
-                    "type": "object",
-                    "minProperties": 1,
-                    "additionalProperties": { "$ref": "#/$defs/column" },
-                },
-                "required": { "type": "array", "items": { "type": "string" } },
-                "additionalProperties": { "type": "boolean" },
-                "x-reldir": { "$ref": "#/$defs/extension" },
-            },
+            "title": "reldir schema dialect",
+            "allOf": [
+                { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+                { "$ref": "#/$defs/closed" }
+            ],
             "$defs": {
-                // One column. Recursive through `items` and `properties`,
-                // because nested shape is part of a column's type: an
-                // array<decimal> and an array<string> are different columns.
-                "column": {
-                    "type": "object",
-                    "properties": {
-                        "type": {
-                            "anyOf": [
-                                { "enum": ["boolean", "integer", "number", "string", "array", "object", "null"] },
-                                {
-                                    "type": "array",
-                                    "items": { "enum": ["boolean", "integer", "number", "string", "array", "object", "null"] },
-                                },
-                            ],
-                        },
-                        // Present only where a standard keyword cannot tell two
-                        // reldir types apart.
-                        "x-reldir-type": { "enum": ["int", "decimal", "ulid"] },
-                        "format": { "type": "string" },
-                        "pattern": { "type": "string" },
-                        "contentEncoding": { "type": "string" },
-                        "enum": { "type": "array", "minItems": 1 },
-                        "default": true,
-                        "description": { "type": "string" },
-                        "items": { "$ref": "#/$defs/column" },
-                        "properties": {
-                            "type": "object",
-                            "additionalProperties": { "$ref": "#/$defs/column" },
-                        },
-                        "required": { "type": "array", "items": { "type": "string" } },
-                        "additionalProperties": { "type": "boolean" },
-                        "x-reldir-column-order": { "type": "array", "items": { "type": "string" } },
-                        // Size bounds. Which spelling is legal for a column is
-                        // decided by its type, which a meta-schema cannot see,
-                        // so all three are declared and `validate_column`
-                        // refuses one stated for the wrong shape.
-                        "minLength": { "type": "integer", "minimum": 0 },
-                        "maxLength": { "type": "integer", "minimum": 0 },
-                        "minItems": { "type": "integer", "minimum": 0 },
-                        "maxItems": { "type": "integer", "minimum": 0 },
-                        "minProperties": { "type": "integer", "minimum": 0 },
-                        "maxProperties": { "type": "integer", "minimum": 0 },
-                        // Numeric bounds.
-                        "minimum": { "type": "number" },
-                        "maximum": { "type": "number" },
-                        "exclusiveMinimum": { "type": "number" },
-                        "exclusiveMaximum": { "type": "number" },
-                        "multipleOf": { "type": "number", "exclusiveMinimum": 0 },
-                        "uniqueItems": { "type": "boolean" },
-                        // Composition. A column declares at most one of these.
-                        "oneOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
-                        "anyOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
-                        "allOf": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
-                        "not": { "$ref": "#/$defs/column" },
-                        "const": { "type": "string" },
-                        // Standard annotations carry no relational meaning and
-                        // are preserved verbatim rather than rejected.
-                        "title": { "type": "string" },
-                        "$comment": { "type": "string" },
-                        "examples": { "type": "array" },
-                        "readOnly": { "type": "boolean" },
-                        "deprecated": { "type": "boolean" },
+                "closed": {
+                    "type": ["object", "boolean"],
+                    "propertyNames": {
+                        "anyOf": [
+                            { "enum": keywords },
+                            { "pattern": "^x-(?!reldir)" }
+                        ]
                     },
-                    // Closed, so a generic validator refuses exactly what the
-                    // binary refuses. Left open, the dialect called a document
-                    // with `patternProperties` conforming while reldir rejected
-                    // it -- two answers to one question.
+                    "properties": {
+                        "x-reldir-type": { "enum": ["int", "decimal", "ulid"] }
+                    }
+                },
+                "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+                "column": { "type": "string", "minLength": 1 },
+                "columnList": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": { "$ref": "#/$defs/column" }
+                },
+                "columnLists": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/columnList" }
+                },
+                "path": { "type": "string", "minLength": 1 },
+                "action": {
+                    "enum": ["restrict", "cascade", "remove", "set_null", "set_default", "no_action"]
+                },
+                "target": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["table"],
+                            "additionalProperties": false,
+                            "properties": { "table": { "$ref": "#/$defs/name" } }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["tables"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "tables": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "uniqueItems": true,
+                                    "items": { "$ref": "#/$defs/name" }
+                                }
+                            }
+                        },
+                        {
+                            "type": "object",
+                            "required": ["domain"],
+                            "additionalProperties": false,
+                            "properties": { "domain": { "$ref": "#/$defs/name" } }
+                        }
+                    ]
+                },
+                "foreignKey": {
+                    "type": "object",
+                    "required": ["from", "to"],
                     "additionalProperties": false,
+                    "properties": {
+                        "name": { "$ref": "#/$defs/name" },
+                        "from": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "$ref": "#/$defs/path" }
+                        },
+                        "to": { "$ref": "#/$defs/target" },
+                        "columns": { "$ref": "#/$defs/columnList" },
+                        "onDelete": { "$ref": "#/$defs/action" },
+                        "onUpdate": { "$ref": "#/$defs/action" }
+                    }
                 },
                 "extension": {
                     "type": "object",
-                    "required": ["table", "primaryKey", "columnOrder"],
+                    "required": ["table", "primaryKey"],
                     "additionalProperties": false,
                     "properties": {
-                        "table": { "type": "string" },
-                        "schemaVersion": { "type": "integer", "minimum": 0 },
-                        "schemaFormat": { "type": "integer", "minimum": 0 },
+                        "table": { "$ref": "#/$defs/name" },
+                        "schemaVersion": { "type": "integer", "minimum": 1 },
                         "primaryKey": { "$ref": "#/$defs/columnList" },
-                        // Column order is logical state: rows are written in it,
-                        // so two schemas ordering their columns differently are
-                        // different schemas. JSON object members are unordered,
-                        // so the order is carried explicitly.
-                        "columnOrder": { "$ref": "#/$defs/columnList" },
                         "unique": { "$ref": "#/$defs/columnLists" },
                         "indexes": { "$ref": "#/$defs/columnLists" },
+                        "filename": { "$ref": "#/$defs/columnList" },
+                        "generated": {
+                            "type": "object",
+                            "additionalProperties": { "enum": ["uuid", "ulid", "now", "sequence"] }
+                        },
+                        "identityDomain": { "$ref": "#/$defs/name" },
                         "foreignKeys": {
                             "type": "array",
-                            "items": { "$ref": "#/$defs/foreignKey" },
+                            "items": { "$ref": "#/$defs/foreignKey" }
                         },
                         "checks": {
                             "type": "array",
@@ -188,391 +247,334 @@ pub fn meta_schema() -> &'static Value {
                                 "required": ["name", "expr"],
                                 "additionalProperties": false,
                                 "properties": {
-                                    "name": { "type": "string", "minLength": 1 },
-                                    "expr": { "type": "string", "minLength": 1 },
-                                },
-                            },
+                                    "name": { "$ref": "#/$defs/name" },
+                                    "expr": { "type": "string", "minLength": 1 }
+                                }
+                            }
                         },
-                        "generated": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "enum": ["uuid", "ulid", "now", "sequence"],
-                            },
+                        "acyclic": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["name", "edges"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "name": { "$ref": "#/$defs/name" },
+                                    "edges": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "items": { "$ref": "#/$defs/path" }
+                                    }
+                                }
+                            }
                         },
-                        "filename": { "$ref": "#/$defs/columnList" },
-                    },
-                },
-                // A foreign key is not a `$ref`. `$ref` means "apply this schema
-                // here" -- composition -- and cannot express a composite key, a
-                // referential action, or the existence of a row elsewhere.
-                // Using it would make the format look standard while making its
-                // meaning false.
-                "foreignKey": {
-                    "type": "object",
-                    "required": ["columns", "references"],
-                    "additionalProperties": false,
-                    "properties": {
-                        "columns": { "$ref": "#/$defs/keyColumnList" },
-                        "references": {
-                            "type": "object",
-                            "required": ["table", "columns"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "table": { "type": "string" },
-                                "columns": { "$ref": "#/$defs/columnList" },
-                            },
-                        },
-                        "onDelete": { "$ref": "#/$defs/action" },
-                        "onUpdate": { "$ref": "#/$defs/action" },
-                    },
-                },
-                "action": {
-                    "enum": ["restrict", "cascade", "set_null", "set_default", "no_action"],
-                },
-                "columnList": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "type": "string" },
-                },
-                // A foreign key's referencing side may address each element of
-                // an array column, written with a trailing `[]`. The target
-                // side never does: it names columns of a row.
-                "keyColumnList": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\[\\])?$" },
-                },
-                "columnLists": {
-                    "type": "array",
-                    "items": { "$ref": "#/$defs/columnList" },
-                },
-            },
+                        "assertions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["name", "query"],
+                                "additionalProperties": false,
+                                "properties": {
+                                    "name": { "$ref": "#/$defs/name" },
+                                    "query": { "type": "string", "minLength": 1 },
+                                    "severity": { "enum": ["error", "warning"] },
+                                    "message": { "type": "string", "minLength": 1 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         })
     })
 }
 
-/// The compiled validator for the dialect.
+/// The schema every table document must satisfy: the dialect, plus what a
+/// table's root must say.
+pub fn table_schema() -> &'static Value {
+    static TABLE: OnceLock<Value> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": TABLE_URI,
+            "title": "reldir table schema",
+            "allOf": [
+                { "$ref": DIALECT_URI },
+                {
+                    "type": "object",
+                    "required": ["$schema", "type", "properties", "additionalProperties", EXTENSION],
+                    "properties": {
+                        "$schema": { "const": DIALECT_URI },
+                        "type": { "const": "object" },
+                        "properties": { "type": "object", "minProperties": 1 },
+                        "additionalProperties": { "type": "boolean" },
+                        EXTENSION: { "$ref": format!("{DIALECT_URI}#/$defs/extension") }
+                    }
+                }
+            ]
+        })
+    })
+}
+
+fn registry() -> std::result::Result<&'static jsonschema::Registry<'static>, String> {
+    static REGISTRY: OnceLock<std::result::Result<jsonschema::Registry<'static>, String>> =
+        OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            jsonschema::Registry::new()
+                .add(
+                    DIALECT_URI,
+                    jsonschema::Resource::from_contents(meta_schema().clone()),
+                )
+                .map_err(|error| error.to_string())?
+                .prepare()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// The compiled validator for table documents.
 ///
-/// Built once. The registry is populated from the compiled-in document, so
-/// construction never touches the network; a failure here is a defect in this
-/// file rather than a condition a user can provoke, and is reported as an
-/// internal fault rather than a schema diagnostic.
-pub fn validator() -> Result<&'static jsonschema::Validator> {
+/// A failure to build it is a defect in this file, not a condition a user can
+/// provoke, and is reported as an internal fault.
+pub fn table_validator() -> Result<&'static jsonschema::Validator> {
     static VALIDATOR: OnceLock<std::result::Result<jsonschema::Validator, String>> =
         OnceLock::new();
-    match VALIDATOR.get_or_init(build) {
-        Ok(validator) => Ok(validator),
-        Err(error) => Err(DbError::new(
+    let built = VALIDATOR.get_or_init(|| {
+        let registry = registry()?;
+        jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .with_registry(registry)
+            .build(table_schema())
+            .map_err(|error| error.to_string())
+    });
+    built.as_ref().map_err(|error| {
+        DbError::new(
             "INTERNAL_METADATA_CORRUPT",
-            format!("the bundled reldir dialect is not a valid meta-schema: {error}"),
+            format!("the bundled reldir dialect does not compile: {error}"),
             6,
-        )),
+        )
+    })
+}
+
+/// Everything wrong with a document as a table schema, as located diagnostics.
+///
+/// Locations are resolved against `source` when the caller has the bytes the
+/// document came from, so a fault points at the line a person has to edit.
+pub fn check_document(document: &Value, source: Option<&[u8]>) -> Result<Vec<Diagnostic>> {
+    let validator = table_validator()?;
+    let spans = source.map(crate::locate::Spans::of);
+    let mut out = vec![];
+    for error in validator.iter_errors(document) {
+        let pointer = error.instance_path().to_string();
+        let mut diagnostic = describe(&error, &pointer);
+        diagnostic.pointer = Some(pointer.clone());
+        if let Some(spans) = &spans {
+            diagnostic.location = spans.location(&pointer);
+        }
+        out.push(diagnostic);
+    }
+    // The dialect cannot say "only at the root" about `x-reldir`, so a nested
+    // one is refused here: it would be a relational declaration in a place
+    // that governs no table.
+    nested_extension(document, "", true, &mut out);
+    if let Some(spans) = &spans {
+        for diagnostic in &mut out {
+            if diagnostic.location.is_none()
+                && let Some(pointer) = &diagnostic.pointer
+            {
+                diagnostic.location = spans.location(pointer);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn nested_extension(value: &Value, pointer: &str, root: bool, out: &mut Vec<Diagnostic>) {
+    match value {
+        Value::Object(members) => {
+            for (key, child) in members {
+                let at = format!("{pointer}/{}", crate::schema::path::escape_pointer(key));
+                if key == EXTENSION && !root {
+                    let mut diagnostic = Diagnostic::error(
+                        "SCHEMA_UNKNOWN_KEY",
+                        format!("{EXTENSION} is only meaningful at the root of a table schema"),
+                    );
+                    diagnostic.pointer = Some(at.clone());
+                    out.push(diagnostic);
+                }
+                // Instance data and the extension itself are not subschemas.
+                if matches!(key.as_str(), "enum" | "const" | "default" | "examples" | EXTENSION) {
+                    continue;
+                }
+                nested_extension(child, &at, false, out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                nested_extension(item, &format!("{pointer}/{index}"), false, out);
+            }
+        }
+        _ => {}
     }
 }
 
-fn build() -> std::result::Result<jsonschema::Validator, String> {
-    // Every `$ref` in the document points inside it, so compilation resolves
-    // them without consulting a registry and without touching the network.
-    jsonschema::options()
-        .with_draft(jsonschema::Draft::Draft202012)
-        .build(meta_schema())
-        .map_err(|error| error.to_string())
+/// One validation error against the dialect, stated for a schema author.
+fn describe(error: &jsonschema::ValidationError<'_>, pointer: &str) -> Diagnostic {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let at = if pointer.is_empty() { "/" } else { pointer };
+    match error.kind() {
+        // The closure: a member name that is no keyword. Name the nearest one,
+        // because nearly every such error is a typo.
+        Kind::AnyOf { .. }
+            if error.schema_path().to_string().contains("propertyNames") =>
+        {
+            let name = error
+                .instance()
+                .as_str()
+                .map(String::from)
+                .unwrap_or_default();
+            let nearest = known_keywords()
+                .min_by_key(|candidate| strsim::levenshtein(&name, candidate))
+                .filter(|candidate| strsim::levenshtein(&name, candidate) <= 3);
+            let message = match nearest {
+                Some(nearest) => format!(
+                    "{name:?} is not a JSON Schema or reldir keyword (did you mean {nearest:?}?); \
+                     an unknown keyword would constrain nothing"
+                ),
+                None => format!(
+                    "{name:?} is not a JSON Schema or reldir keyword; an unknown keyword would \
+                     constrain nothing (prefix third-party annotations with \"x-\")"
+                ),
+            };
+            Diagnostic::error("SCHEMA_UNKNOWN_KEY", message).field(name)
+        }
+        Kind::Required { property } => Diagnostic::error(
+            "SCHEMA_MISSING_REQUIRED",
+            format!(
+                "{at}: {} is required",
+                property.as_str().map_or_else(|| property.to_string(), |p| format!("{p:?}"))
+            ),
+        ),
+        Kind::AdditionalProperties { unexpected } => Diagnostic::error(
+            "SCHEMA_UNKNOWN_KEY",
+            format!("{at}: unknown member(s) {}", unexpected.join(", ")),
+        ),
+        _ => Diagnostic::error("SCHEMA_GRAMMAR", format!("{at}: {error}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    /// A document in the shape the codec emits, used to check that the dialect
-    /// accepts what reldir actually writes.
     fn users() -> Value {
         json!({
             "$schema": DIALECT_URI,
             "type": "object",
             "properties": {
                 "id": { "type": "string", "format": "uuid" },
-                "email": { "type": "string" },
+                "email": { "type": "string", "format": "email" },
                 "role": { "type": "string", "enum": ["admin", "member"], "default": "member" },
                 "team_id": { "type": ["string", "null"], "format": "uuid" },
                 "amounts": {
                     "type": "array",
-                    "items": { "type": "string", "x-reldir-type": "decimal", "pattern": "^-?[0-9]+$" },
+                    "items": { "type": "string", "x-reldir-type": "decimal" }
                 },
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "a": { "type": "integer", "x-reldir-type": "int" } },
+                        "oneOf": [{ "required": ["a"] }, { "not": { "required": ["a"] } }]
+                    }
+                }
             },
             "required": ["id", "email", "amounts"],
             "additionalProperties": false,
+            "if": { "properties": { "role": { "const": "admin" } }, "required": ["role"] },
+            "then": { "required": ["team_id"] },
             "x-reldir": {
                 "table": "users",
-                "schemaVersion": 1,
                 "primaryKey": ["id"],
-                "columnOrder": ["id", "email", "role", "team_id", "amounts"],
                 "unique": [["email"]],
-                "indexes": [["team_id"]],
+                "identityDomain": "people",
                 "foreignKeys": [{
-                    "columns": ["team_id"],
-                    "references": { "table": "teams", "columns": ["id"] },
-                    "onDelete": "set_null",
-                    "onUpdate": "restrict",
+                    "from": ["team_id"],
+                    "to": { "table": "teams" },
+                    "onDelete": "set_null"
                 }],
                 "checks": [{ "name": "email_has_at", "expr": "email LIKE '%@%'" }],
-                "generated": { "id": "uuid" },
-            },
+                "assertions": [{ "name": "one_admin", "query": "SELECT id FROM users", "severity": "warning" }],
+                "generated": { "id": "uuid" }
+            }
         })
     }
 
-    /// The dialect describes the documents reldir writes.
-    ///
-    /// A meta-schema that compiles is not thereby correct: it has to accept a
-    /// real schema and reject a malformed one. Without both halves a later
-    /// codec test would be calibrated against a broken dialect and would
-    /// confirm whatever the dialect happened to say.
-    #[test]
-    fn test1128_the_dialect_accepts_a_schema_reldir_would_write() {
-        let validator = validator().expect("the bundled dialect compiles");
-        let document = users();
-        let errors: Vec<String> = validator
-            .iter_errors(&document)
-            .map(|error| format!("{} at {}", error, error.instance_path()))
-            .collect();
-        assert!(
-            errors.is_empty(),
-            "the dialect must accept what the codec emits: {errors:?}"
-        );
-    }
-
-    /// Each rejection is a distinct way a document could fail to describe a
-    /// table, and each must be caught rather than passed through.
-    #[test]
-    fn test1129_the_dialect_rejects_documents_that_cannot_describe_a_table() {
-        let validator = validator().expect("the bundled dialect compiles");
-
-        // Without `x-reldir` there is no table, no primary key, no column order:
-        // valid JSON Schema, but not a relation.
-        let mut missing_extension = users();
-        missing_extension.as_object_mut().unwrap().remove("x-reldir");
-        assert!(
-            !validator.is_valid(&missing_extension),
-            "a document with no x-reldir names no table"
-        );
-
-        // Column order is logical state, so a document that omits it does not
-        // determine the bytes its rows would be written in.
-        let mut no_order = users();
-        no_order["x-reldir"]
-            .as_object_mut()
+    fn codes(document: &Value) -> Vec<String> {
+        check_document(document, None)
             .unwrap()
-            .remove("columnOrder");
-        assert!(
-            !validator.is_valid(&no_order),
-            "columnOrder is required: rows are written in it"
-        );
-
-        // An unknown key inside `x-reldir` is a relational claim reldir has no
-        // meaning for, and silently ignoring it would let the file and the
-        // database disagree.
-        let mut unknown = users();
-        unknown["x-reldir"]["cascadeEverything"] = json!(true);
-        assert!(
-            !validator.is_valid(&unknown),
-            "unknown x-reldir keys must be refused, not ignored"
-        );
-
-        // Referential actions are a closed set; anything else has no defined
-        // behaviour.
-        let mut bad_action = users();
-        bad_action["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode");
-        assert!(
-            !validator.is_valid(&bad_action),
-            "an undefined referential action must be refused"
-        );
-
-        // The root of a table schema describes an object with named columns.
-        let mut not_object = users();
-        not_object["type"] = json!("array");
-        assert!(
-            !validator.is_valid(&not_object),
-            "a table is an object of columns"
-        );
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
     }
 
-    /// The two validators must not disagree.
-    ///
-    /// `decode` and the bundled meta-schema are independent judgements of the
-    /// same question, and a document the dialect accepts but the codec refuses
-    /// -- or the reverse -- means one of them is lying about what a reldir schema
-    /// is. The meta-schema may legitimately be more permissive, because
-    /// cross-schema facts cannot be expressed in one document; it must never be
-    /// more *restrictive* than the codec.
     #[test]
-    fn test1141_the_dialect_never_refuses_what_the_codec_accepts() {
-        let validator = validator().expect("the dialect compiles");
-        for (label, document) in [
-            ("minimal", users()),
-            ("no optional members", json!({
-                "$schema": DIALECT_URI,
-                "type": "object",
-                "properties": { "id": { "type": "string" } },
-                "required": ["id"],
-                "additionalProperties": false,
-                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
-            })),
-            ("nested array of decimal", json!({
-                "$schema": DIALECT_URI,
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "v": { "type": "array", "items": {
-                        "type": "array", "items": {
-                            "type": "string", "x-reldir-type": "decimal" } } },
-                },
-                "required": ["id", "v"],
-                "additionalProperties": false,
-                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id", "v"] },
-            })),
-            ("annotations at depth", json!({
-                "$schema": DIALECT_URI,
-                "type": "object",
-                "$comment": "top",
-                "properties": {
-                    "id": { "type": "string", "$comment": "the key", "deprecated": false },
-                },
-                "required": ["id"],
-                "additionalProperties": false,
-                "x-reldir": { "table": "t", "primaryKey": ["id"], "columnOrder": ["id"] },
-            })),
+    fn test2020_the_dialect_accepts_every_standard_keyword_reldir_holds() {
+        let found = check_document(&users(), None).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn test2021_unknown_keywords_are_refused_at_every_depth_with_a_suggestion() {
+        let mut typo = users();
+        typo["properties"]["rules"]["items"]["oneOf"][0]["requird"] = json!(["a"]);
+        let found = check_document(&typo, None).unwrap();
+        let hit = found
+            .iter()
+            .find(|d| d.code == "SCHEMA_UNKNOWN_KEY")
+            .expect("a typo deep in a composition is caught");
+        assert!(hit.message.contains("\"required\""), "{}", hit.message);
+        assert_eq!(hit.pointer.as_deref(), Some("/properties/rules/items/oneOf/0"));
+
+        // Third-party annotations remain welcome; reldir's own namespace does not
+        // tolerate a typo.
+        let mut annotated = users();
+        annotated["properties"]["id"]["x-ui-width"] = json!(3);
+        assert!(codes(&annotated).is_empty());
+        annotated["properties"]["id"]["x-reldir-tpye"] = json!("int");
+        assert!(codes(&annotated).contains(&"SCHEMA_UNKNOWN_KEY".to_string()));
+    }
+
+    #[test]
+    fn test2022_table_roots_must_state_what_a_table_needs() {
+        for (label, mutate) in [
+            ("no x-reldir", (|d: &mut Value| { d.as_object_mut().unwrap().remove("x-reldir"); }) as fn(&mut Value)),
+            ("no additionalProperties", |d: &mut Value| { d.as_object_mut().unwrap().remove("additionalProperties"); }),
+            ("wrong dialect", |d: &mut Value| d["$schema"] = json!("https://json-schema.org/draft/2020-12/schema")),
+            ("array root", |d: &mut Value| d["type"] = json!("array")),
+            ("unknown x-reldir key", |d: &mut Value| d["x-reldir"]["cascadeEverything"] = json!(true)),
+            ("bad action", |d: &mut Value| d["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode")),
+            ("two targets", |d: &mut Value| d["x-reldir"]["foreignKeys"][0]["to"] = json!({"table": "a", "domain": "b"})),
+            ("nested x-reldir", |d: &mut Value| d["properties"]["id"]["x-reldir"] = json!({})),
+            ("bad tag", |d: &mut Value| d["properties"]["id"]["x-reldir-type"] = json!("bogus")),
+            ("negative bound", |d: &mut Value| d["properties"]["email"]["minLength"] = json!(-1)),
         ] {
-            let decoded = crate::schema::json_schema::decode(&document);
-            let dialect_errors: Vec<String> = validator
-                .iter_errors(&document)
-                .map(|error| format!("{error} at {}", error.instance_path()))
-                .collect();
-            assert!(
-                decoded.is_ok(),
-                "{label}: the codec must accept this document"
-            );
-            assert!(
-                dialect_errors.is_empty(),
-                "{label}: the codec accepted a document the dialect refuses: {dialect_errors:?}"
-            );
+            let mut document = users();
+            mutate(&mut document);
+            assert!(!codes(&document).is_empty(), "{label} must be refused");
         }
     }
 
-    /// The example the documentation publishes is a schema reldir accepts.
-    ///
-    /// `docs/schemas.md` prints a worked example, and it is the first thing
-    /// anyone writing a schema by hand will copy. An illustration that would
-    /// not load is worse than none, so it is decoded and validated here
-    /// exactly as a schema file would be.
-    ///
-    /// It also must not omit a relational keyword the tests exercise: the two
-    /// documents serve different purposes and their columns differ on purpose,
-    /// but a keyword covered by the fixture and missing from the illustration
-    /// means the format grew somewhere a reader cannot see it.
     #[test]
-    fn test1144_the_documented_example_is_the_dialect_the_tests_exercise() {
-        let published = std::fs::read_to_string("docs/schemas.md")
-            .expect("the schema documentation is part of the repository");
-        let block = published
-            .split("```json")
-            .filter_map(|rest| rest.split("```").next())
-            .find(|body| body.contains("\"x-reldir\""))
-            .expect("the documentation publishes a worked example");
-        let documented: Value =
-            serde_json::from_str(block).expect("the published example is valid JSON");
-
-        // It must be a schema reldir would accept, not merely valid JSON.
-        let decoded = crate::schema::json_schema::decode(&documented)
-            .expect("the published example must decode");
-        let validator = validator().expect("the dialect compiles");
-        let errors: Vec<String> = validator
-            .iter_errors(&documented)
-            .map(|error| format!("{error} at {}", error.instance_path()))
-            .collect();
-        assert!(errors.is_empty(), "the published example must conform: {errors:?}");
-
-        // And it must exercise the same surface the fixture does, so that a
-        // keyword gaining coverage here does not silently leave the docs behind.
-        let fixture = users();
-        let keys = |document: &Value| -> Vec<String> {
-            document["x-reldir"]
-                .as_object()
-                .expect("x-reldir is an object")
-                .keys()
-                .cloned()
-                .collect()
-        };
-        for key in keys(&fixture) {
-            assert!(
-                keys(&documented).contains(&key),
-                "the documentation omits {key:?}, which the tests exercise"
-            );
-        }
-        assert_eq!(decoded.table, "users");
-    }
-
-    /// Neither validator may be the permissive one.
-    ///
-    /// `test1141` fixes one direction: the dialect never refuses what the codec
-    /// accepts. This fixes the other, which is the dangerous one -- a document
-    /// the dialect rejects but the codec reads would mean the file says one
-    /// thing and the database believes another.
-    #[test]
-    fn test1143_the_codec_never_accepts_what_the_dialect_refuses() {
-        let validator = validator().expect("the dialect compiles");
-        let refused = [
-            ("no x-reldir", {
-                let mut d = users();
-                d.as_object_mut().unwrap().remove("x-reldir");
-                d
-            }),
-            ("no columnOrder", {
-                let mut d = users();
-                d["x-reldir"].as_object_mut().unwrap().remove("columnOrder");
-                d
-            }),
-            ("unknown x-reldir key", {
-                let mut d = users();
-                d["x-reldir"]["cascadeEverything"] = json!(true);
-                d
-            }),
-            ("undefined referential action", {
-                let mut d = users();
-                d["x-reldir"]["foreignKeys"][0]["onDelete"] = json!("explode");
-                d
-            }),
-            ("root is not an object", {
-                let mut d = users();
-                d["type"] = json!("array");
-                d
-            }),
-        ];
-        for (label, document) in refused {
-            assert!(
-                !validator.is_valid(&document),
-                "{label}: the fixture must actually be refused by the dialect"
-            );
-            assert!(
-                crate::schema::json_schema::decode(&document).is_err(),
-                "{label}: the codec accepted a document the dialect refuses"
-            );
-        }
-    }
-
-    /// The dialect declares its own vocabulary as required, which is what tells
-    /// a generic validator that it cannot fully process these documents on its
-    /// own. Without the declaration `x-reldir` would look like an ignorable
-    /// extension and a schema could be reported satisfied while none of reldir's
-    /// rules had been checked.
-    #[test]
-    fn test1130_the_dialect_declares_its_vocabulary_as_required() {
-        let vocabularies = meta_schema()["$vocabulary"]
-            .as_object()
-            .expect("the dialect declares $vocabulary");
+    fn test2023_the_dialect_declares_its_vocabularies_and_asserts_format() {
+        let vocabularies = meta_schema()["$vocabulary"].as_object().unwrap();
+        assert_eq!(vocabularies.get(VOCABULARY_URI), Some(&json!(true)));
         assert_eq!(
-            vocabularies.get(VOCABULARY_URI),
+            vocabularies.get("https://json-schema.org/draft/2020-12/vocab/format-assertion"),
             Some(&json!(true)),
-            "reldir's own vocabulary must be declared required"
+            "format asserts in this dialect"
         );
         assert_eq!(meta_schema()["$id"], json!(DIALECT_URI));
     }

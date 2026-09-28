@@ -5,21 +5,31 @@
 // dialect.
 #![recursion_limit = "256"]
 
+pub mod analysis;
 pub mod canonical;
 pub mod catalog;
 pub mod cli;
+pub mod command;
 pub mod config;
 pub mod db;
 pub mod diagnostic;
 pub mod doctor;
-pub mod index;
+pub mod fs;
 pub mod infer;
 pub mod integrity;
 pub mod json;
 pub mod lint;
+pub mod locate;
 pub mod lock;
+pub mod mcp;
 pub mod metadata;
+pub mod migrate;
+pub mod mirror;
+pub mod snapshot;
 pub mod output;
+pub mod plan;
+pub mod probe;
+pub mod referential;
 pub mod schema;
 pub mod schema_store;
 pub mod sql;
@@ -28,4 +38,7 @@ pub mod transaction;
 pub mod value;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const FORMAT_VERSION: u32 = 1;
+
+/// The on-disk format this binary reads and writes. Any other version is
+/// refused, never interpreted.
+pub const FORMAT_VERSION: u32 = 2;

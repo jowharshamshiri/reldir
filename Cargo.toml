@@ -36,7 +36,7 @@ default-features = false
 version = "0.49.9"
 
 [dependencies.rusqlite]
-features = ["bundled", "hooks", "collation", "column_decltype"]
+features = ["bundled", "backup", "hooks", "collation", "column_decltype"]
 version = "0.37"
 
 [dependencies.serde]
@@ -47,19 +47,45 @@ version = "1"
 features = ["preserve_order", "unbounded_depth"]
 version = "1"
 
+[dependencies.rmcp]
+features = ["server", "transport-io", "macros"]
+version = "3.5"
+
+[dependencies.tokio]
+features = ["rt", "io-std", "macros"]
+version = "1"
+
 [dependencies.uuid]
 features = ["v4", "serde"]
 version = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+features = ["Win32_Storage_FileSystem"]
+version = "0.61"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+proptest = "1.11"
+trycmd = "1.2"
+
+[dev-dependencies.rmcp]
+features = ["client", "transport-io"]
+version = "3.5"
+
+[dev-dependencies.tokio]
+features = ["rt", "io-std", "io-util", "macros"]
+version = "1"
 
 [package]
 categories = ["command-line-utilities", "database-implementations"]
 description = "A filesystem-native relational JSON database"
 documentation = "https://jowharshamshiri.github.io/reldir/"
 edition = "2024"
+rust-version = "1.88"
 homepage = "https://jowharshamshiri.github.io/reldir/"
 keywords = ["database", "json", "sql", "filesystem", "schema"]
 license = "MIT"

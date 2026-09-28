@@ -1,864 +1,520 @@
+//! Repairs: what can be done about each fault and finding, least destructive
+//! first.
+//!
+//! Every error `check` reports and every lint finding with a remedy becomes one
+//! or more *alternatives*, each a concrete change computed here -- the exact
+//! schema documents, row values or renames it would write. Where several could
+//! resolve one fault they are ordered from least to most destructive, and the
+//! first is the default: a dangling reference is first answered by restoring
+//! the row it named from recorded history, then by removing the reference,
+//! and only when asked by deleting the row that holds it.
+//!
+//! Doctor never decides what a person must: a fault with no safe repair is
+//! reported as `manual`, with what to look at.
+
 use crate::{
-    canonical, db::Database, diagnostic::Result, lint, schema::ColumnType, transaction::Change,
+    catalog::{Catalog, Row},
+    db::Database,
+    diagnostic::{DbError, Diagnostic, Result},
+    lint::{self, Remedy},
+    plan::RowChange,
+    schema::path::pointer_tokens,
+    transaction::Change,
 };
-use std::path::PathBuf;
+use serde_json::{Map, Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug, Clone, serde::Serialize)]
+/// What a fix touches, which decides when it may be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Class {
+    /// Schema documents, including creating a pin.
+    Schema,
+    /// File names; contents unchanged.
+    Layout,
+    /// Row contents.
+    Data,
+    /// Nothing: a person must decide.
+    Manual,
+}
+
+impl Class {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::Layout => "layout",
+            Self::Data => "data",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// One way to resolve one problem.
+#[derive(Debug, Clone)]
 pub struct Fix {
-    pub id: String,
-    pub class: String,
+    pub id: &'static str,
+    pub class: Class,
     pub description: String,
-    pub paths: Vec<PathBuf>,
-}
-pub fn plan(db: &Database) -> Vec<Fix> {
-    let mut out = vec![];
-    for d in &db.diagnostics {
-        match d.code.as_str() {
-            "IDENTITY_MISMATCH" => {
-                if let (Some(p), Some(expected)) = (&d.path, &d.expected) {
-                    out.push(Fix {
-                        id: "FIX_RENAME_TO_IDENTITY".into(),
-                        class: "layout".into(),
-                        description: format!("rename {} to {expected}", p.display()),
-                        paths: vec![p.clone()],
-                    });
-                }
-            }
-            "ROW_UNKNOWN_FIELD" => {
-                if let Some(p) = &d.path {
-                    let rename = near_field(db, d);
-                    out.push(Fix {
-                        id: if rename.is_some() {
-                            "FIX_RENAME_FIELD"
-                        } else {
-                            "FIX_DROP_UNKNOWN_FIELD"
-                        }
-                        .into(),
-                        class: "data".into(),
-                        description: if let Some(to) = rename {
-                            format!(
-                                "rename unknown field {} to {to} in {}",
-                                d.field.as_deref().unwrap_or("?"),
-                                p.display()
-                            )
-                        } else {
-                            format!(
-                                "remove unknown field {} from {}",
-                                d.field.as_deref().unwrap_or("?"),
-                                p.display()
-                            )
-                        },
-                        paths: vec![p.clone()],
-                    });
-                }
-            }
-            "TYPE_MISMATCH" => {
-                if let (Some(path), Some(field)) = (&d.path, &d.field)
-                    && let Some(row) = db
-                        .catalog
-                        .rows
-                        .values()
-                        .flatten()
-                        .find(|r| &r.relative == path)
-                    && lossless_coerce(
-                        row.value.get(field).unwrap_or(&serde_json::Value::Null),
-                        &db.catalog.schemas[&row.table].columns[field],
-                    )
-                    .is_some()
-                {
-                    out.push(Fix {
-                        id: "FIX_COERCE_VALUE".into(),
-                        class: "data".into(),
-                        description: format!("losslessly coerce {} in {}", field, path.display()),
-                        paths: vec![path.clone()],
-                    });
-                    continue;
-                }
-                if let Some(path) = &d.path {
-                    out.push(Fix {
-                        id: "TYPE_MISMATCH".into(),
-                        class: "manual".into(),
-                        description: d.message.clone(),
-                        paths: vec![path.clone()],
-                    });
-                }
-            }
-            "FOREIGN_KEY_VIOLATION" => {
-                if let Some(p) = &d.path {
-                    if d.fixes.iter().any(|x| x == "FIX_ORPHAN_SET_NULL") {
-                        out.push(Fix {
-                            id: "FIX_ORPHAN_SET_NULL".into(),
-                            class: "data".into(),
-                            description: format!(
-                                "set orphan foreign key to null in {}",
-                                p.display()
-                            ),
-                            paths: vec![p.clone()],
-                        });
-                    }
-                    out.push(Fix {
-                        id: "FIX_ORPHAN_DELETE_ROW".into(),
-                        class: "data".into(),
-                        description: format!("delete orphan row {}", p.display()),
-                        paths: vec![p.clone()],
-                    });
-                }
-            }
-            _ => {
-                if let Some(p) = &d.path {
-                    out.push(Fix {
-                        id: d.code.clone(),
-                        class: "manual".into(),
-                        description: d.message.clone(),
-                        paths: vec![p.clone()],
-                    });
-                }
-            }
-        }
-    }
-    for d in lint::lint(&db.catalog, &db.config, false) {
-        match d.code.as_str() {
-            "LINT_SCHEMA_UNPINNED" => out.push(Fix {
-                id: "FIX_PIN_SCHEMA".into(),
-                class: "schema".into(),
-                description: format!("pin schema {}", d.table.as_deref().unwrap()),
-                paths: vec![PathBuf::from(crate::schema_store::pin_relative(
-                    d.table.as_deref().unwrap(),
-                ))],
-            }),
-            "LINT_NULLABLE_NEVER_NULL" => out.push(Fix {
-                id: "FIX_TIGHTEN_NULLABLE".into(),
-                class: "schema".into(),
-                description: format!(
-                    "make {}.{} NOT NULL",
-                    d.table.as_deref().unwrap(),
-                    d.field.as_deref().unwrap()
-                ),
-                paths: vec![PathBuf::from(crate::schema_store::working_relative(
-                    &d.table.unwrap(),
-                ))],
-            }),
-            "LINT_FK_NO_INDEX" => out.push(Fix {
-                id: "FIX_ADD_INDEX".into(),
-                class: "schema".into(),
-                description: d.message,
-                paths: vec![PathBuf::from(crate::schema_store::working_relative(
-                    &d.table.unwrap(),
-                ))],
-            }),
-            "LINT_WIDER_TYPE"
-            | "LINT_ENUM_CANDIDATE"
-            | "LINT_UNIQUE_CANDIDATE"
-            | "LINT_FK_CANDIDATE"
-            | "LINT_CHECK_CANDIDATE"
-            | "LINT_PK_NOT_GENERATED" => {
-                // Named exhaustively rather than through a wildcard: a
-                // seventh code added to the arm above would otherwise be
-                // labelled FIX_ADD_GENERATOR and offer the wrong remedy.
-                let id = match d.code.as_str() {
-                    "LINT_WIDER_TYPE" => "FIX_NARROW_TYPE",
-                    "LINT_ENUM_CANDIDATE" => "FIX_ADD_ENUM",
-                    "LINT_UNIQUE_CANDIDATE" => "FIX_ADD_UNIQUE",
-                    "LINT_FK_CANDIDATE" => "FIX_ADD_FK",
-                    "LINT_CHECK_CANDIDATE" => "FIX_ADD_CHECK",
-                    "LINT_PK_NOT_GENERATED" => "FIX_ADD_GENERATOR",
-                    other => unreachable!(
-                        "{other} reaches the schema-fix arm without a fix id; add one"
-                    ),
-                };
-                out.push(Fix {
-                    id: id.into(),
-                    class: "schema".into(),
-                    description: d.message,
-                    paths: vec![PathBuf::from(crate::schema_store::working_relative(
-                        &d.table.unwrap(),
-                    ))],
-                });
-            }
-            "LINT_NON_CANONICAL_FORMATTING" => out.push(Fix {
-                id: "FIX_CANONICALIZE".into(),
-                class: "data".into(),
-                description: d.message,
-                paths: db.catalog.rows[d.table.as_ref().unwrap()]
-                    .iter()
-                    .map(|r| r.relative.clone())
-                    .collect(),
-            }),
-            _ => {}
-        }
-    }
-    if db.manifest.is_none() || db.manifest_needs_rebuild {
-        out.push(Fix {
-            id: "FIX_MANIFEST".into(),
-            class: "derived".into(),
-            description: "rebuild manifest".into(),
-            paths: vec![PathBuf::from(".db/manifest.json")],
-        });
-    }
-    if db
-        .catalog
-        .warnings
-        .iter()
-        .any(|warning| warning.code == "INDEX_STALE")
-    {
-        out.push(Fix {
-            id: "FIX_REINDEX".into(),
-            class: "derived".into(),
-            description: "rebuild stale or corrupt indexes".into(),
-            paths: vec![PathBuf::from(".db/indexes")],
-        });
-    }
-    out
-}
-pub fn schema_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> {
-    let findings = lint::lint(&db.catalog, &db.config, false);
-    let mut schemas = db.catalog.schemas.clone();
-    for d in findings {
-        if only.is_some_and(|x| x != d.code && !d.fixes.iter().any(|f| f == x)) {
-            continue;
-        }
-        let Some(t) = d.table.as_ref() else { continue };
-        let s = schemas.get_mut(t).unwrap();
-        match d.code.as_str() {
-            "LINT_NULLABLE_NEVER_NULL" => {
-                if let Some(f) = d.field.as_ref() {
-                    s.columns[f].nullable = false
-                }
-            }
-            "LINT_FK_NO_INDEX" => {
-                if let Some(fk) = s
-                    .foreign_keys
-                    .iter()
-                    .find(|fk| !s.indexes.contains(&fk.columns))
-                {
-                    s.indexes.push(fk.columns.clone())
-                }
-            }
-            "LINT_WIDER_TYPE" => {
-                if let Some(f) = d.field.as_ref() {
-                    if s.columns[f].kind == ColumnType::Float {
-                        s.columns[f].kind = ColumnType::Int;
-                        continue;
-                    }
-                    let vals: Vec<_> = db.catalog.rows[t]
-                        .iter()
-                        .filter_map(|r| r.value.get(f).and_then(|v| v.as_str()))
-                        .collect();
-                    s.columns[f].kind = if !vals.is_empty()
-                        && vals.iter().all(|x| uuid::Uuid::parse_str(x).is_ok())
-                    {
-                        ColumnType::Uuid
-                    } else if !vals.is_empty()
-                        && vals.iter().all(|x| ulid::Ulid::from_string(x).is_ok())
-                    {
-                        ColumnType::Ulid
-                    } else if !vals.is_empty()
-                        && vals
-                            .iter()
-                            .all(|x| chrono::NaiveDate::parse_from_str(x, "%Y-%m-%d").is_ok())
-                    {
-                        ColumnType::Date
-                    } else {
-                        ColumnType::Timestamp
-                    }
-                }
-            }
-            "LINT_ENUM_CANDIDATE" => {
-                if let Some(f) = &d.field {
-                    let mut values: Vec<_> = db.catalog.rows[t]
-                        .iter()
-                        .filter_map(|r| r.value.get(f).and_then(|v| v.as_str()).map(String::from))
-                        .collect();
-                    values.sort();
-                    values.dedup();
-                    s.columns[f].kind = ColumnType::Enum;
-                    s.columns[f].values = Some(values);
-                }
-            }
-            "LINT_UNIQUE_CANDIDATE" => {
-                if let Some(f) = &d.field {
-                    let cols = vec![f.clone()];
-                    if !s.unique.contains(&cols) {
-                        s.unique.push(cols)
-                    }
-                }
-            }
-            "LINT_CHECK_CANDIDATE" => {
-                if let Some(f) = &d.field {
-                    let expr = if s.columns[f].kind == ColumnType::Int {
-                        format!("\"{}\" >= 0", f.replace('"', "\"\""))
-                    } else {
-                        format!("\"{}\" <> ''", f.replace('"', "\"\""))
-                    };
-                    let name = format!("{}_inferred_check", f);
-                    if !s.check.iter().any(|c| c.name == name) {
-                        s.check.push(crate::schema::Check { name, expr })
-                    }
-                }
-            }
-            "LINT_PK_NOT_GENERATED" => {
-                for f in &s.primary_key {
-                    let col = &mut s.columns[f];
-                    if col.generated.is_none() {
-                        col.generated = Some(crate::schema::Generated {
-                            kind: if col.kind == ColumnType::Uuid {
-                                crate::schema::GeneratedKind::Uuid
-                            } else {
-                                crate::schema::GeneratedKind::Ulid
-                            },
-                        })
-                    }
-                }
-            }
-            "LINT_FK_CANDIDATE" => {
-                if let Some(f) = &d.field {
-                    for (target, ts) in &db.catalog.schemas {
-                        // A target whose primary key does not resolve to a
-                        // declared column is already reported as
-                        // SCHEMA_PK_COLUMN_UNKNOWN; it cannot be a foreign-key
-                        // target and must not be indexed blindly here.
-                        if target == t
-                            || ts.primary_key.len() != 1
-                            || !ts.columns.contains_key(&ts.primary_key[0])
-                            || ts.columns[&ts.primary_key[0]].kind != s.columns[f].kind
-                        {
-                            continue;
-                        }
-                        let targets: std::collections::HashSet<_> = db.catalog.rows[target]
-                            .iter()
-                            .filter_map(|r| r.value.get(&ts.primary_key[0]).map(canonical::compact))
-                            .collect();
-                        if db.catalog.rows[t]
-                            .iter()
-                            .filter_map(|r| r.value.get(f))
-                            .filter(|v| !v.is_null())
-                            .all(|v| targets.contains(&canonical::compact(v)))
-                        {
-                            s.foreign_keys.push(crate::schema::ForeignKey {
-                                columns: vec![f.clone()],
-                                references: crate::schema::Reference {
-                                    table: target.clone(),
-                                    columns: ts.primary_key.clone(),
-                                },
-                                on_delete: Some(crate::schema::Action::Restrict),
-                                on_update: Some(crate::schema::Action::Restrict),
-                            });
-                            s.indexes.push(vec![f.clone()]);
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = vec![];
-    for (t, s) in schemas {
-        let old = crate::schema::json_schema::encode(&db.catalog.schemas[&t]);
-        let new = crate::schema::json_schema::encode(&s);
-        if old != new {
-            out.push(Change::Write {
-                path: PathBuf::from(crate::schema_store::working_relative(&t)),
-                bytes: canonical::pretty_with_indent(&new, db.config.indentation_width),
-            })
-        }
-    }
-    Ok(out)
+    /// The code of the fault or finding it resolves.
+    pub resolves: String,
+    /// Where that fault or finding is.
+    pub at: Option<PathBuf>,
+    /// 0 for the default alternative; higher is more destructive.
+    pub rank: usize,
+    /// Whether it loses data a person wrote: a deleted row, a removed value.
+    pub destructive: bool,
+    pub action: Action,
 }
 
-/// Promote unpinned working schemas into declarations.
-///
-/// `LINT_SCHEMA_UNPINNED` says a table's schema exists only under `.db/`, where
-/// deleting the directory discards any refinement inference cannot re-derive.
-/// The remedy is to copy it to `schema/`, which is what `reldir schema pin` does --
-/// so the fix performs that copy rather than editing the schema, which is why
-/// it lives here and not in the lint-driven rewriting above.
-///
-/// A table that already has a pin never raises the finding, so this can only
-/// ever create a declaration, never replace one. Replacing a pin discards
-/// something a person wrote and stays an explicit `reldir schema pin --overwrite`.
-fn pin_changes(db: &Database, only: Option<&str>) -> Result<Vec<Change>> {
-    let mut out = vec![];
-    for d in lint::lint(&db.catalog, &db.config, false) {
-        if d.code != "LINT_SCHEMA_UNPINNED"
-            || !only.is_none_or(|x| x == d.code || d.fixes.iter().any(|f| f == x))
-        {
-            continue;
-        }
-        let Some(table) = d.table.as_ref() else {
-            continue;
-        };
-        let Some(schema) = db.catalog.schemas.get(table) else {
-            continue;
-        };
-        out.push(Change::Write {
-            path: PathBuf::from(crate::schema_store::pin_relative(table)),
-            bytes: crate::schema_store::canonical_bytes(schema, db.config.indentation_width)?,
-        });
-    }
-    Ok(out)
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// New documents for these tables' schemas.
+    Schemas(BTreeMap<String, Value>),
+    /// Make the table's working schema its pin.
+    Pin(String),
+    Rename { from: PathBuf, to: PathBuf },
+    /// Row edits, completed by referential actions when applied.
+    Rows(Vec<RowChange>),
+    /// Rewrite files in canonical form.
+    Canonicalize(Vec<PathBuf>),
+    Manual,
 }
 
-pub fn repair_changes(db: &Database, only: Option<&str>, allow_data: bool) -> Result<Vec<Change>> {
-    let mut out = schema_changes(db, only)?;
-    out.extend(pin_changes(db, only)?);
-    if allow_data && only == Some("FIX_CANONICALIZE") {
-        for (table, rows) in &db.catalog.rows {
-            let s = &db.catalog.schemas[table];
-            for row in rows {
-                let bytes = canonical::pretty_with_indent(
-                    &canonical::canonical_row(&row.value, s),
-                    db.config.indentation_width,
-                );
-                if bytes != row.raw {
-                    out.push(Change::Write {
-                        path: row.relative.clone(),
-                        bytes,
-                    });
-                }
-            }
-        }
-    }
-    for d in &db.diagnostics {
-        if d.code == "IDENTITY_MISMATCH"
-            && only.is_none_or(|x| x == "IDENTITY_MISMATCH" || x == "FIX_RENAME_TO_IDENTITY")
-            && let (Some(old), Some(expected)) = (&d.path, &d.expected)
-            && !expected.contains('/')
-        {
-            let new = old
-                .parent()
-                .unwrap_or(std::path::Path::new(""))
-                .join(expected);
-            let bytes = std::fs::read(db.root.join(old))
-                .map_err(|e| crate::diagnostic::DbError::io(&db.root.join(old), e))?;
-            out.push(Change::Delete { path: old.clone() });
-            out.push(Change::Write { path: new, bytes });
-        }
-        if !allow_data {
-            continue;
-        }
-        if d.code == "ROW_UNKNOWN_FIELD"
-            && only.is_none_or(|x| {
-                x == "ROW_UNKNOWN_FIELD" || x == "FIX_DROP_UNKNOWN_FIELD" || x == "FIX_RENAME_FIELD"
-            })
-        {
-            if only == Some("FIX_RENAME_FIELD") && near_field(db, d).is_none() {
-                continue;
-            }
-            if let (Some(path), Some(field)) = (&d.path, &d.field)
-                && let Some(row) = db
-                    .catalog
-                    .rows
-                    .values()
-                    .flatten()
-                    .find(|r| &r.relative == path)
-            {
-                let s = &db.catalog.schemas[&row.table];
-                let mut value = row.value.clone();
-                let old = value.remove(field).unwrap_or(serde_json::Value::Null);
-                if only != Some("FIX_DROP_UNKNOWN_FIELD")
-                    && let Some(to) = near_field(db, d)
-                {
-                    value.insert(to, old);
-                }
-                out.push(Change::Write {
-                    path: path.clone(),
-                    bytes: canonical::pretty_with_indent(
-                        &canonical::canonical_row(&value, s),
-                        db.config.indentation_width,
-                    ),
-                });
-            }
-        }
-        if d.code == "TYPE_MISMATCH"
-            && only.is_none_or(|x| x == "TYPE_MISMATCH" || x == "FIX_COERCE_VALUE")
-            && let (Some(path), Some(field)) = (&d.path, &d.field)
-            && let Some(row) = db
-                .catalog
-                .rows
-                .values()
-                .flatten()
-                .find(|r| &r.relative == path)
-        {
-            let s = &db.catalog.schemas[&row.table];
-            if let Some(value) = lossless_coerce(
-                row.value.get(field).unwrap_or(&serde_json::Value::Null),
-                &s.columns[field],
-            ) {
-                let mut body = row.value.clone();
-                body.insert(field.clone(), value);
-                out.push(Change::Write {
-                    path: path.clone(),
-                    bytes: canonical::pretty_with_indent(
-                        &canonical::canonical_row(&body, s),
-                        db.config.indentation_width,
-                    ),
-                });
-            }
-        }
-        if d.code == "FOREIGN_KEY_VIOLATION"
-            && only.is_none_or(|x| x == "FIX_ORPHAN_SET_NULL")
-            && let (Some(path), Some(fields)) = (&d.path, &d.field)
-            && let Some(row) = db
-                .catalog
-                .rows
-                .values()
-                .flatten()
-                .find(|r| &r.relative == path)
-        {
-            let s = &db.catalog.schemas[&row.table];
-            let names: Vec<_> = fields.split(',').collect();
-            if names
+impl Fix {
+    /// The paths the fix writes, relative to the root.
+    pub fn paths(&self, catalog: &Catalog) -> Vec<PathBuf> {
+        match &self.action {
+            Action::Schemas(documents) => documents.keys().map(|table| crate::schema_store::home(catalog, table)).collect(),
+            Action::Pin(table) => vec![PathBuf::from(crate::schema_store::pin_relative(table))],
+            Action::Rename { from, to } => vec![from.clone(), to.clone()],
+            Action::Rows(rows) => rows
                 .iter()
-                .all(|f| s.columns.get(*f).is_some_and(|c| c.nullable))
-            {
-                let mut value = row.value.clone();
-                for f in names {
-                    value.insert(f.into(), serde_json::Value::Null);
-                }
-                out.push(Change::Write {
-                    path: path.clone(),
-                    bytes: canonical::pretty_with_indent(
-                        &canonical::canonical_row(&value, s),
-                        db.config.indentation_width,
-                    ),
-                });
-            }
-        }
-        if d.code == "FOREIGN_KEY_VIOLATION"
-            && (only.is_some_and(|x| x == "FOREIGN_KEY_VIOLATION" || x == "FIX_ORPHAN_DELETE_ROW")
-                || (only.is_none() && !d.fixes.iter().any(|x| x == "FIX_ORPHAN_SET_NULL")))
-            && let Some(path) = &d.path
-            && let Some(row) = db
-                .catalog
-                .rows
-                .values()
-                .flatten()
-                .find(|r| &r.relative == path)
-        {
-            let s = &db.catalog.schemas[&row.table];
-            let where_sql = s
-                .primary_key
-                .iter()
-                .map(|c| format!("\"{}\" = ?", c.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            let query = format!(
-                "DELETE FROM \"{}\" WHERE {where_sql}",
-                row.table.replace('"', "\"\"")
-            );
-            let params: Vec<_> = s
-                .primary_key
-                .iter()
-                .map(|c| row.value.get(c).cloned().unwrap_or(serde_json::Value::Null))
-                .collect();
-            out.extend(crate::sql::execute(&db.catalog, &query, &params)?.changes);
+                .filter_map(|change| {
+                    change.before.as_ref().map(|row| row.relative.clone()).or_else(|| {
+                        let schema = catalog.schemas.get(&change.table)?;
+                        crate::plan::row_path(schema, change.after.as_ref()?).ok()
+                    })
+                })
+                .collect(),
+            Action::Canonicalize(paths) => paths.clone(),
+            Action::Manual => self.at.iter().cloned().collect(),
         }
     }
-    let mut moves = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
-    for diagnostic in &db.diagnostics {
-        if diagnostic.code != "IDENTITY_MISMATCH"
-            || !only.is_none_or(|value| {
-                value == "IDENTITY_MISMATCH" || value == "FIX_RENAME_TO_IDENTITY"
-            })
-        {
-            continue;
-        }
-        if let (Some(old), Some(expected)) = (&diagnostic.path, &diagnostic.expected)
-            && !expected.contains('/')
-        {
-            moves.insert(
-                old.clone(),
-                old.parent()
-                    .unwrap_or(std::path::Path::new(""))
-                    .join(expected),
-            );
-        }
-    }
-    // Merge independent, lossless edits to the same row relative to the
-    // observed body. This prevents one safe fix from silently undoing another.
-    let mut dedup = std::collections::BTreeMap::<PathBuf, Change>::new();
-    for change in out {
-        match change {
-            Change::Delete { path } => {
-                dedup.insert(path.clone(), Change::Delete { path });
-            }
-            Change::Write { path, bytes } => {
-                let effective = moves.get(&path).cloned().unwrap_or(path.clone());
-                let source = moves
-                    .iter()
-                    .find_map(|(old, new)| (new == &effective).then_some(old))
-                    .unwrap_or(&path);
-                let original = db
-                    .catalog
-                    .rows
-                    .values()
-                    .flatten()
-                    .find(|row| &row.relative == source);
-                let merged = match (dedup.get(&effective), original) {
-                    (Some(Change::Write { bytes: prior, .. }), Some(original)) => merge_row_edits(
-                        prior,
-                        &bytes,
-                        &original.value,
-                        &db.catalog.schemas[&original.table],
-                        db.config.indentation_width,
-                    )?,
-                    _ => bytes,
-                };
-                dedup.insert(
-                    effective.clone(),
-                    Change::Write {
-                        path: effective,
-                        bytes: merged,
-                    },
-                );
-            }
-        }
-    }
-    Ok(dedup.into_values().collect())
-}
-fn merge_row_edits(
-    prior: &[u8],
-    next: &[u8],
-    original: &serde_json::Map<String, serde_json::Value>,
-    schema: &crate::schema::Schema,
-    indentation_width: usize,
-) -> Result<Vec<u8>> {
-    let mut merged = crate::json::parse(prior)
-        .map_err(|error| {
-            crate::diagnostic::DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("doctor generated invalid JSON: {error}"),
-                6,
-            )
-        })?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| {
-            crate::diagnostic::DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                "doctor generated a non-object row",
-                6,
-            )
-        })?;
-    let next = crate::json::parse(next)
-        .map_err(|error| {
-            crate::diagnostic::DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("doctor generated invalid JSON: {error}"),
-                6,
-            )
-        })?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| {
-            crate::diagnostic::DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                "doctor generated a non-object row",
-                6,
-            )
-        })?;
-    let keys = original
-        .keys()
-        .chain(next.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    for key in keys {
-        if next.get(&key) != original.get(&key) {
-            if let Some(value) = next.get(&key) {
-                merged.insert(key, value.clone());
-            } else {
-                merged.remove(&key);
-            }
-        }
-    }
-    Ok(canonical::pretty_with_indent(
-        &canonical::canonical_row(&merged, schema),
-        indentation_width,
-    ))
-}
-fn lossless_coerce(
-    value: &serde_json::Value,
-    column: &crate::schema::Column,
-) -> Option<serde_json::Value> {
-    crate::value::lossless_convert(value, column)
-}
-fn near_field(db: &Database, d: &crate::diagnostic::Diagnostic) -> Option<String> {
-    let table = d.table.as_ref()?;
-    let unknown = d.field.as_ref()?;
-    let row = db.catalog.rows[table]
-        .iter()
-        .find(|r| d.path.as_ref() == Some(&r.relative))?;
-    nearest_missing_column(&db.catalog.schemas[table], &row.value, unknown)
-}
 
-/// The schema column that an unknown field most plausibly misspells, if any.
-///
-/// A rename is only proposed when the intent is unambiguous: the column must be
-/// within a small edit distance, must not already be present in the row (which
-/// would make the rename destructive), and must be strictly closer than every
-/// other candidate. A tie is not a typo this can resolve on the user's behalf
-/// (Section 14).
-fn nearest_missing_column(
-    schema: &crate::schema::Schema,
-    row: &serde_json::Map<String, serde_json::Value>,
-    unknown: &str,
-) -> Option<String> {
-    let mut candidates = schema
-        .columns
-        .keys()
-        .filter(|name| !row.contains_key(*name))
-        .filter_map(|name| {
-            let distance = strsim::levenshtein(unknown, name);
-            (distance <= 2).then_some((distance, name.clone()))
+    pub fn to_json(&self, catalog: &Catalog) -> Value {
+        json!({
+            "kind": "fix",
+            "id": self.id,
+            "class": self.class.name(),
+            "description": self.description,
+            "resolves": self.resolves,
+            "at": self.at,
+            "default": self.rank == 0,
+            "destructive": self.destructive,
+            "paths": self.paths(catalog),
         })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    if candidates.len() == 1
-        || candidates
-            .first()
-            .zip(candidates.get(1))
-            .is_some_and(|(a, b)| a.0 < b.0)
-    {
-        candidates.first().map(|x| x.1.clone())
-    } else {
-        None
     }
+}
+
+/// Every fix doctor could apply now, each problem's alternatives in order.
+pub fn plan(database: &Database) -> Result<Vec<Fix>> {
+    let catalog = &database.catalog;
+    let mut out = vec![];
+    for diagnostic in &database.verdict.errors {
+        out.extend(fixes_for(database, diagnostic)?);
+    }
+    // Schema refinements are offered only for a valid database: tightening a
+    // schema over rows that already break it would bury the faults under
+    // more of them.
+    if database.is_valid() {
+        for finding in lint::lint(catalog, &database.config, false)? {
+            let Some(remedy) = finding.remedy else { continue };
+            let Some(id) = finding.diagnostic.fixes.first().map(|fix| fix_id(fix)) else { continue };
+            let action = match remedy {
+                Remedy::Edit(documents) => Action::Schemas(documents),
+                Remedy::Pin(table) => Action::Pin(table),
+                Remedy::Canonicalize(paths) => Action::Canonicalize(paths),
+            };
+            out.push(Fix {
+                id,
+                class: if matches!(action, Action::Canonicalize(_)) { Class::Data } else { Class::Schema },
+                description: finding.diagnostic.message.clone(),
+                resolves: finding.diagnostic.code.clone(),
+                at: finding.diagnostic.path.clone(),
+                rank: 0,
+                destructive: false,
+                action,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A fix id as a `'static` name, from the fixed catalogue.
+fn fix_id(text: &str) -> &'static str {
+    FIXES
+        .iter()
+        .find(|(id, _)| *id == text)
+        .map(|(id, _)| *id)
+        .unwrap_or("FIX_MANUAL")
+}
+
+/// Every fix, and what it does. The catalogue `doctor --explain` reads.
+pub const FIXES: &[(&str, &str)] = &[
+    ("FIX_RESTORE_TARGET", "restores the row a dangling reference names, exactly as recorded history last had it"),
+    ("FIX_REMOVE_REFERENCE", "removes the dangling reference: the array element that holds it, or -- where no array holds it -- the value, which becomes null"),
+    ("FIX_ORPHAN_DELETE_ROW", "deletes the row holding a dangling reference, with whatever its own referrers' actions require"),
+    ("FIX_RENAME_TO_IDENTITY", "renames a row file to the name its key gives it; its contents are unchanged"),
+    ("FIX_RENAME_FIELD", "renames an unknown member to the missing column it is an unambiguous misspelling of"),
+    ("FIX_DROP_UNKNOWN_FIELD", "removes a member the schema does not declare"),
+    ("FIX_COERCE_VALUE", "replaces a value with the same value written as its column's type, where the conversion loses nothing"),
+    ("FIX_FILL_DEFAULT", "sets an absent or null column to the default its schema declares"),
+    ("FIX_PIN_SCHEMA", "moves an inferred working schema to schema/, making it the table's declaration"),
+    ("FIX_TIGHTEN_NULLABLE", "removes null from a column's type"),
+    ("FIX_NARROW_TYPE", "narrows a column to the type every value already has"),
+    ("FIX_ADD_ENUM", "restricts a column to the values it holds"),
+    ("FIX_ADD_UNIQUE", "declares a column unique"),
+    ("FIX_ADD_FK", "declares a reference the data already satisfies, joining tables to an identity domain where needed"),
+    ("FIX_ADD_CHECK", "declares a check every row already passes"),
+    ("FIX_ADD_GENERATOR", "generates a uuid or ulid key when an insert supplies none"),
+    ("FIX_CANONICALIZE", "rewrites row files in canonical formatting; the rows are unchanged"),
+    ("FIX_MANUAL", "nothing: the fault needs a person's decision"),
+];
+
+fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
+    let catalog = &database.catalog;
+    let base = |id: &'static str, class: Class, description: String, rank: usize, destructive: bool, action: Action| Fix {
+        id,
+        class,
+        description,
+        resolves: diagnostic.code.clone(),
+        at: diagnostic.path.clone(),
+        rank,
+        destructive,
+        action,
+    };
+    let manual = || {
+        vec![base(
+            "FIX_MANUAL",
+            Class::Manual,
+            diagnostic.help.clone().unwrap_or_else(|| diagnostic.message.clone()),
+            0,
+            false,
+            Action::Manual,
+        )]
+    };
+    let Some(path) = diagnostic.path.clone() else { return Ok(manual()) };
+    let row = catalog.row_at(&path)?;
+    let offered = |fix: &str| diagnostic.fixes.iter().any(|offered| offered == fix);
+    let mut out = vec![];
+    match diagnostic.code.as_str() {
+        "IDENTITY_MISMATCH" if offered("FIX_RENAME_TO_IDENTITY") => {
+            if let Some(expected) = &diagnostic.expected {
+                let to = path.parent().unwrap_or(Path::new("")).join(expected);
+                if catalog.mirror.file(&crate::catalog::slash(&to))?.is_none() {
+                    out.push(base(
+                        "FIX_RENAME_TO_IDENTITY",
+                        Class::Layout,
+                        format!("rename {} to {}", path.display(), to.display()),
+                        0,
+                        false,
+                        Action::Rename { from: path.clone(), to },
+                    ));
+                }
+            }
+        }
+        "FOREIGN_KEY_VIOLATION" => {
+            let Some(row) = row else { return Ok(manual()) };
+            if let Some(restore) = restoration(database, diagnostic)? {
+                out.push(base(
+                    "FIX_RESTORE_TARGET",
+                    Class::Data,
+                    format!(
+                        "restore {} from revision {}, which {} still names",
+                        restore.1.display(),
+                        restore.2,
+                        path.display()
+                    ),
+                    out.len(),
+                    false,
+                    Action::Rows(vec![RowChange::insert(&restore.0, restore.3)]),
+                ));
+            }
+            if offered("FIX_REMOVE_REFERENCE")
+                && let Some(pointer) = &diagnostic.pointer
+                && let Some(edited) = remove_reference(&row.value, pointer)
+            {
+                out.push(base(
+                    "FIX_REMOVE_REFERENCE",
+                    Class::Data,
+                    format!("remove the reference at {pointer} in {}", path.display()),
+                    out.len(),
+                    true,
+                    Action::Rows(vec![RowChange::update(row.clone(), edited)]),
+                ));
+            }
+            out.push(base(
+                "FIX_ORPHAN_DELETE_ROW",
+                Class::Data,
+                format!("delete {}, which holds the dangling reference", path.display()),
+                out.len(),
+                true,
+                Action::Rows(vec![RowChange::delete(row)]),
+            ));
+        }
+        "ROW_UNKNOWN_FIELD" => {
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            if offered("FIX_RENAME_FIELD")
+                && let Some(to) = &diagnostic.expected
+            {
+                let mut edited = row.value.clone();
+                if let Some(value) = edited.shift_remove(&field) {
+                    edited.insert(to.clone(), value);
+                }
+                out.push(base(
+                    "FIX_RENAME_FIELD",
+                    Class::Data,
+                    format!("rename member {field:?} to {to:?} in {}", path.display()),
+                    out.len(),
+                    false,
+                    Action::Rows(vec![RowChange::update(row.clone(), edited)]),
+                ));
+            }
+            let mut edited = row.value.clone();
+            edited.shift_remove(&field);
+            out.push(base(
+                "FIX_DROP_UNKNOWN_FIELD",
+                Class::Data,
+                format!("remove member {field:?} from {}", path.display()),
+                out.len(),
+                true,
+                Action::Rows(vec![RowChange::update(row, edited)]),
+            ));
+        }
+        "TYPE_MISMATCH" if offered("FIX_COERCE_VALUE") => {
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            let schema = &catalog.schemas[&row.table];
+            if let Some(value) = schema.validator().coercion(&Value::Object(row.value.clone()), &field) {
+                let mut edited = row.value.clone();
+                edited.insert(field.clone(), value.clone());
+                out.push(base(
+                    "FIX_COERCE_VALUE",
+                    Class::Data,
+                    format!("write {field} in {} as {value}", path.display()),
+                    0,
+                    false,
+                    Action::Rows(vec![RowChange::update(row, edited)]),
+                ));
+            }
+        }
+        "ROW_MISSING_FIELD" | "NOT_NULL_VIOLATION" if offered("FIX_FILL_DEFAULT") => {
+            let (Some(row), Some(field)) = (row, diagnostic.field.clone()) else { return Ok(manual()) };
+            let schema = &catalog.schemas[&row.table];
+            if let Some(default) = schema.column(&field).and_then(|column| column.default()).cloned() {
+                let mut edited = row.value.clone();
+                edited.insert(field.clone(), default.clone());
+                out.push(base(
+                    "FIX_FILL_DEFAULT",
+                    Class::Data,
+                    format!("set {field} in {} to its default {default}", path.display()),
+                    0,
+                    false,
+                    Action::Rows(vec![RowChange::update(row, edited)]),
+                ));
+            }
+        }
+        _ => {}
+    }
+    if out.is_empty() {
+        return Ok(manual());
+    }
+    Ok(out)
+}
+
+/// The row a dangling reference names, as recorded history last had it:
+/// (table, path, revision, row).
+fn restoration(database: &Database, diagnostic: &Diagnostic) -> Result<Option<(String, PathBuf, u64, Map<String, Value>)>> {
+    let catalog = &database.catalog;
+    let (Some(observed), Some(table)) = (&diagnostic.observed, &diagnostic.table) else {
+        return Ok(None);
+    };
+    let Some(schema) = catalog.schemas.get(table) else { return Ok(None) };
+    let Some(fk) = schema.foreign_keys().iter().find(|fk| {
+        diagnostic
+            .constraint
+            .as_deref()
+            .is_some_and(|constraint| constraint.starts_with(&fk.describe(table)))
+    }) else {
+        return Ok(None);
+    };
+    let Ok(Value::Array(key)) = serde_json::from_str::<Value>(observed) else { return Ok(None) };
+    for target in crate::integrity::target_tables(&catalog.schemas, fk.to()) {
+        let Some(target_schema) = catalog.schemas.get(&target) else { continue };
+        let columns = crate::integrity::target_columns(fk, target_schema);
+        if columns != target_schema.primary_key() || columns.len() != key.len() {
+            continue;
+        }
+        let probe: Map<String, Value> = columns.iter().cloned().zip(key.iter().cloned()).collect();
+        let Ok(relative) = crate::plan::row_path(target_schema, &probe) else { continue };
+        if let Some((revision, Value::Object(row))) = crate::metadata::last_known(&database.root, &crate::catalog::slash(&relative))? {
+            return Ok(Some((target, relative, revision, row)));
+        }
+    }
+    Ok(None)
+}
+
+/// A row with the reference at `pointer` removed: the array element holding
+/// it, when the reference sits inside an array, else the value set to null.
+fn remove_reference(row: &Map<String, Value>, pointer: &str) -> Option<Map<String, Value>> {
+    let tokens = pointer_tokens(pointer);
+    let mut root = Value::Object(row.clone());
+    // The deepest array element on the way to the value.
+    let mut element: Option<usize> = None;
+    {
+        let mut at = &root;
+        for (depth, token) in tokens.iter().enumerate() {
+            at = match at {
+                Value::Array(items) => {
+                    element = Some(depth);
+                    items.get(token.parse::<usize>().ok()?)?
+                }
+                Value::Object(members) => members.get(token)?,
+                _ => return None,
+            };
+        }
+    }
+    match element {
+        Some(depth) => {
+            let parent: String = tokens[..depth].iter().map(|t| format!("/{}", crate::schema::path::escape_pointer(t))).collect();
+            let index: usize = tokens[depth].parse().ok()?;
+            root.pointer_mut(&parent)?.as_array_mut()?.remove(index);
+        }
+        None => *root.pointer_mut(pointer)? = Value::Null,
+    }
+    match root {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }
+}
+
+/// The fixes a run applies: the chosen alternative of each problem, never two
+/// that touch the same file. Returns what was chosen and what was deferred to
+/// a later run because it touches a file another chosen fix changes.
+pub fn select<'f>(
+    catalog: &Catalog,
+    fixes: &'f [Fix],
+    only: Option<&str>,
+    allow_data: bool,
+) -> (Vec<&'f Fix>, Vec<&'f Fix>) {
+    let mut chosen = vec![];
+    let mut deferred = vec![];
+    let mut touched: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut resolved: BTreeSet<(String, Option<PathBuf>, String)> = BTreeSet::new();
+    for fix in fixes {
+        if fix.class == Class::Manual {
+            continue;
+        }
+        let selected = match only {
+            // Naming an alternative chooses it over the default.
+            Some(only) => only == fix.id || (only == fix.resolves && fix.rank == 0),
+            None => fix.rank == 0,
+        };
+        if !selected || (fix.class == Class::Data && !allow_data) {
+            continue;
+        }
+        let problem = (fix.resolves.clone(), fix.at.clone(), fix.description.clone());
+        if !resolved.insert(problem) {
+            continue;
+        }
+        let paths = fix.paths(catalog);
+        if paths.iter().any(|path| touched.contains(path)) {
+            deferred.push(fix);
+            continue;
+        }
+        touched.extend(paths);
+        chosen.push(fix);
+    }
+    (chosen, deferred)
+}
+
+/// The changes a set of fixes amounts to, ready for one transaction.
+pub fn changes(database: &Database, fixes: &[&Fix]) -> Result<(Vec<RowChange>, Vec<Change>)> {
+    let catalog = &database.catalog;
+    let width = database.config.indentation_width;
+    let mut rows = vec![];
+    let mut files = vec![];
+    for fix in fixes {
+        match &fix.action {
+            Action::Schemas(documents) => {
+                for (table, document) in documents {
+                    files.push(Change::Write {
+                        path: crate::schema_store::home(catalog, table),
+                        bytes: crate::canonical::pretty_with_indent(document, width),
+                    });
+                }
+            }
+            Action::Pin(table) => {
+                let schema = catalog.schemas.get(table).ok_or_else(|| catalog.unknown_table(table))?;
+                files.push(Change::Write {
+                    path: PathBuf::from(crate::schema_store::pin_relative(table)),
+                    bytes: schema.bytes(width),
+                });
+                files.push(Change::Delete { path: crate::schema_store::working_relative(table) });
+            }
+            Action::Rename { from, to } => {
+                let bytes = std::fs::read(database.root.join(from)).map_err(|e| DbError::io(&database.root.join(from), e))?;
+                files.push(Change::Delete { path: from.clone() });
+                files.push(Change::Write { path: to.clone(), bytes });
+            }
+            Action::Rows(changes) => rows.extend(changes.iter().cloned()),
+            Action::Canonicalize(paths) => {
+                for path in paths {
+                    let row: Row = catalog
+                        .row_at(path)?
+                        .ok_or_else(|| DbError::new("CONCURRENT_MODIFICATION", format!("{} is gone", path.display()), 3))?;
+                    let schema = &catalog.schemas[&row.table];
+                    files.push(Change::Write {
+                        path: path.clone(),
+                        bytes: crate::canonical::pretty_with_indent(&crate::canonical::canonical_row(&row.value, schema), width),
+                    });
+                }
+            }
+            Action::Manual => {}
+        }
+    }
+    Ok((rows, files))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AdditionalFields, Column, ColumnType, Schema};
-    use indexmap::IndexMap;
-    use serde_json::json;
 
-    fn column(kind: ColumnType) -> Column {
-        Column {
-            kind,
-            nullable: false,
-            default: None,
-            generated: None,
-            values: None,
-            items: None,
-            properties: None,
-            pattern: None,
-            additional_properties: true,
-            required: Default::default(),
-            min_size: None,
-            max_size: None,
-            minimum: None,
-            maximum: None,
-            exclusive_minimum: None,
-            exclusive_maximum: None,
-            multiple_of: None,
-            unique_items: false,
-            composition: None,
-            description: None,
-            annotations: Default::default(),
-        }
-    }
-
-    fn schema(columns: &[(&str, ColumnType)]) -> Schema {
-        let mut map = IndexMap::new();
-        for (name, kind) in columns {
-            map.insert((*name).to_string(), column(kind.clone()));
-        }
-        Schema {
-            table: "t".into(),
-            schema_version: 1,
-            schema_format: None,
-            description: None,
-            primary_key: vec!["id".into()],
-            columns: map,
-            unique: vec![],
-            foreign_keys: vec![],
-            check: vec![],
-            indexes: vec![],
-            storage: None,
-            additional_fields: AdditionalFields::Reject,
-            annotations: Default::default(),
-        }
-    }
-
-    /// Section 14: FIX_COERCE_VALUE applies only lossless coercions. Doctor must
-    /// never guess at a conversion that would change the logical value, because
-    /// the fix rewrites authoritative data.
     #[test]
-    fn test1030_value_coercion_offered_by_doctor_is_always_lossless() {
-        // Representational corrections that preserve the value.
-        assert_eq!(
-            lossless_coerce(&json!("42"), &column(ColumnType::Int)),
-            Some(json!(42))
-        );
-        assert_eq!(
-            lossless_coerce(&json!("true"), &column(ColumnType::Bool)),
-            Some(json!(true))
-        );
-
-        // Conversions that would lose or invent information are refused, so no
-        // fix is offered and doctor classifies the violation as manual instead.
-        assert_eq!(lossless_coerce(&json!(1.5), &column(ColumnType::Int)), None);
-        assert_eq!(
-            lossless_coerce(&json!("01"), &column(ColumnType::Int)),
-            None
-        );
-        assert_eq!(
-            lossless_coerce(&json!("yes"), &column(ColumnType::Bool)),
-            None
-        );
-        assert_eq!(
-            lossless_coerce(&json!("not-a-uuid"), &column(ColumnType::Uuid)),
-            None
-        );
+    fn test2200_removing_a_reference_removes_the_deepest_array_element_holding_it() {
+        let row: Map<String, Value> = serde_json::from_value(json!({
+            "id": "c1",
+            "modules": [{"lessons": [{"lesson_ref": "l1"}, {"lesson_ref": "gone"}]}],
+            "owner": "ghost"
+        }))
+        .unwrap();
+        let edited = remove_reference(&row, "/modules/0/lessons/1/lesson_ref").unwrap();
+        assert_eq!(edited["modules"], json!([{"lessons": [{"lesson_ref": "l1"}]}]));
+        let nulled = remove_reference(&row, "/owner").unwrap();
+        assert_eq!(nulled["owner"], Value::Null, "with no array, the value itself is removed");
+        assert!(remove_reference(&row, "/missing").is_none());
     }
 
-    /// Section 14: FIX_RENAME_FIELD is offered when an unknown field is a near
-    /// miss for a schema column that the row is missing. The match must be
-    /// unambiguous: a tie between two equally close columns is not a typo that
-    /// doctor may resolve on the user's behalf.
     #[test]
-    fn test1031_field_rename_suggestions_require_an_unambiguous_near_match() {
-        let s = schema(&[
-            ("id", ColumnType::String),
-            ("email", ColumnType::String),
-            ("name", ColumnType::String),
-        ]);
-
-        // "emial" is distance 2 from "email" and far from everything else.
-        let row = json!({"id": "a", "emial": "x"});
-        let row = row.as_object().unwrap().clone();
-        assert_eq!(
-            nearest_missing_column(&s, &row, "emial"),
-            Some("email".to_string())
-        );
-
-        // A column already present in the row is not a rename target: renaming
-        // onto it would destroy the value that is already there.
-        let occupied = json!({"id": "a", "email": "real", "emial": "x"});
-        assert_eq!(
-            nearest_missing_column(&s, occupied.as_object().unwrap(), "emial"),
-            None
-        );
-
-        // Too distant to be a typo.
-        let distant = json!({"id": "a", "telephone": "x"});
-        assert_eq!(
-            nearest_missing_column(&s, distant.as_object().unwrap(), "telephone"),
-            None
-        );
-
-        // An exact tie between two candidates is ambiguous and must be refused.
-        let tied = schema(&[
-            ("id", ColumnType::String),
-            ("ax", ColumnType::String),
-            ("bx", ColumnType::String),
-        ]);
-        let row = json!({"id": "a", "cx": "v"});
-        assert_eq!(
-            nearest_missing_column(&tied, row.as_object().unwrap(), "cx"),
-            None,
-            "a tie must not be resolved by chance ordering"
-        );
+    fn test2201_every_fix_has_an_explanation_and_is_documented() {
+        let documentation = std::fs::read_to_string("docs/validation.md").unwrap();
+        for (id, explanation) in FIXES {
+            assert!(!explanation.is_empty());
+            assert!(documentation.contains(&format!("`{id}`")), "{id} is not documented");
+        }
+        assert_eq!(fix_id("FIX_ADD_FK"), "FIX_ADD_FK");
+        assert_eq!(fix_id("FIX_NOT_A_FIX"), "FIX_MANUAL");
     }
 }

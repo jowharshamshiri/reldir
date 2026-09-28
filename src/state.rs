@@ -1,38 +1,33 @@
-//! Folder resolution: root discovery, observation, and prerequisite
-//! establishment.
+//! Finding the database, and establishing it where it does not exist yet.
 //!
-//! The filesystem is the database, so opening one is not a ceremony the user
-//! performs — it is a state the binary establishes. This module observes a
-//! folder without side effects, decides what the requested command needs, and
-//! performs only those transitions that cannot destroy authoritative intent.
-//!
-//! The division is by what a transition does, not by whether it writes:
-//! creating a schema that does not exist is additive, replacing one a human
-//! wrote is not. Everything additive happens silently; everything replacing
-//! requires a decision.
+//! The filesystem is the database, so opening one is not a ceremony: the binary
+//! observes the folder without side effects, decides what the command needs,
+//! and performs only transitions that cannot destroy anything a person wrote.
+//! Creating metadata that does not exist is additive and happens on its own;
+//! discarding metadata that holds history requires an explicit decision.
 
 use crate::{
-    config::Config,
+    config::{Config, ResourceOverrides},
+    db::{Access, Database},
     diagnostic::{DbError, Diagnostic, Result},
-    infer,
     schema::Schema,
 };
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
-/// How a root was selected, for `--verbose` reporting and for diagnostics that
-/// must name the directory they are talking about.
+/// How the root was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootOrigin {
     /// `--db` named it.
     Explicit,
-    /// `DB_DIR` named it.
+    /// `RELDIR_DB` named it.
     Environment,
-    /// An ancestor carried `.db/`.
-    DiscoveredMetadata,
-    /// An ancestor carried a recognizable `schema/`.
-    DiscoveredSchema,
-    /// Nothing was found; the working directory is the candidate.
+    /// An ancestor of the working directory holds `.db/`.
+    Discovered,
+    /// Nothing declares a database; the working directory is the candidate.
     WorkingDirectory,
 }
 
@@ -42,329 +37,164 @@ pub struct ResolvedRoot {
     pub origin: RootOrigin,
 }
 
-/// Whether `.db/` exists and can be interpreted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FormatState {
-    /// No `.db/` at all. A normal bootstrap condition, not a fault.
-    Absent,
-    /// `.db/` exists and declares a format this binary reads.
-    Supported,
-    /// `.db/` exists without a format marker, but holds nothing that cannot be
-    /// rebuilt. Recoverable without asking: discarding a manifest or an index
-    /// loses nothing the rows do not already say.
-    MarkerMissingRecoverable,
-    /// `.db/` exists without a format marker and holds state that is not
-    /// reconstructible -- recorded history, user configuration, snapshots, or
-    /// an entry this binary does not recognize. Guessing a format could misread
-    /// every byte; discarding it would destroy something only this directory
-    /// holds. The named entries are what the user must account for.
-    MarkerMissingUnrecoverable(Vec<String>),
-    /// `.db/` exists and declares a format this binary cannot read.
-    Unsupported(String),
-}
-
-/// What the folder contains, judged only from its immediate children.
-///
-/// Recursive discovery is deliberately not performed: a `node_modules` deep in
-/// a project is not a table, and a tool that guessed otherwise would be worse
-/// than one that asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Topology {
-    /// Immediate child directories holding at least one `.json` file.
-    pub table_candidates: Vec<String>,
-    /// `.json` files sitting directly in the root, which have no table
-    /// identity and cannot be adopted without a decision.
-    pub loose_json: Vec<String>,
-    /// Tables named by a schema file, whether or not rows exist yet.
-    pub declared_tables: Vec<String>,
-}
-
-impl Topology {
-    /// A folder with nothing for the binary to govern.
-    pub fn is_empty(&self) -> bool {
-        self.table_candidates.is_empty()
-            && self.loose_json.is_empty()
-            && self.declared_tables.is_empty()
-    }
-}
-
-/// A folder as observed, without having changed anything.
-#[derive(Debug, Clone)]
-pub struct Observation {
-    pub root: PathBuf,
-    pub format: FormatState,
-    pub topology: Topology,
-    /// Whether the root can be written to. Advisory only: every actual write
-    /// still handles denial, races, and quota exhaustion on its own.
-    pub writable: bool,
-}
-
-impl Observation {
-    /// Tables that have rows on disk but no schema to interpret them by.
-    pub fn tables_needing_schema(&self) -> Vec<String> {
-        self.topology
-            .table_candidates
-            .iter()
-            .filter(|candidate| !self.topology.declared_tables.contains(candidate))
-            .cloned()
-            .collect()
-    }
-
-    /// Pinned tables to rebuild a working schema for, when there is no working
-    /// schema directory at all.
-    ///
-    /// A pin is a declaration the user owns; the working schema is the file
-    /// every subsystem actually reads. Deleting `.db/` is documented as safe
-    /// precisely because the pin can rebuild it, so pins beside an absent
-    /// `.db/schema/` are a missing prerequisite rather than tables that do not
-    /// exist. Answering "0 tables" there would be a false report.
-    ///
-    /// Scoped deliberately to that case. A pin appearing beside a *populated*
-    /// `.db/schema/` is ordinary adoption, which the catalog already performs:
-    /// it loads the declaration, validates it as strictly as a working schema,
-    /// and reports any disagreement against the pin's own path. Reconstructing
-    /// there would copy the declaration in before the catalog ever saw it,
-    /// relocating every diagnostic to `.db/schema/` and making establishment a
-    /// second adopter of pins -- two sources of truth for one fact.
-    pub fn pins_needing_working_copy(&self) -> Result<Vec<String>> {
-        if crate::schema_store::working_dir(&self.root).exists() {
-            return Ok(vec![]);
-        }
-        Ok(self.topology.declared_tables.clone())
-    }
-}
-
-/// What a command needs before it can run.
-///
-/// Declared per command rather than inferred, so adding a command forces the
-/// question to be answered rather than defaulting to the most permissive
-/// behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Requirements {
-    /// The command reads or writes relations, so schemas must exist.
-    pub relational_model: bool,
-    /// The command may persist state to satisfy its own prerequisites.
-    pub may_establish: bool,
-}
-
-impl Requirements {
-    /// Reads and writes over the relational model: they need schemas, and in
-    /// auto mode they may be established.
-    pub const fn functional() -> Self {
-        Self {
-            relational_model: true,
-            may_establish: true,
-        }
-    }
-
-    /// Commands that operate on the folder itself rather than on relations.
-    pub const fn structural() -> Self {
-        Self {
-            relational_model: false,
-            may_establish: false,
-        }
-    }
-}
-
-/// A transition the planner selected, reported after it is performed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Transition {
-    /// Created `.db/` and its metadata where none existed.
-    Bootstrapped,
-    /// Inferred and wrote schemas for tables that had none.
-    InferredSchemas(Vec<String>),
-    /// Discarded an uninterpretable `.db/` and rebuilt it from the rows.
-    ///
-    /// Carries what was destroyed, because a rebuild that silently dropped
-    /// recorded history would be indistinguishable from one that had nothing to
-    /// drop.
-    RebuiltMetadata(Vec<String>),
-    /// Rebuilt a working schema from the pin that declares it.
-    ///
-    /// Distinct from `InferredSchemas`: nothing was guessed from the rows. The
-    /// user's own declaration was copied to where the runtime reads it.
-    RestoredSchemas(Vec<String>),
-}
-
-impl Transition {
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Bootstrapped => "initialized database".into(),
-            Self::InferredSchemas(tables) => {
-                format!("inferred schemas for {}", tables.join(", "))
-            }
-            Self::RebuiltMetadata(discarded) if discarded.is_empty() => {
-                "rebuilt unreadable metadata".into()
-            }
-            Self::RebuiltMetadata(discarded) => {
-                format!("rebuilt unreadable metadata, discarding {}", discarded.join(", "))
-            }
-            Self::RestoredSchemas(tables) => {
-                format!("restored working schemas from pins for {}", tables.join(", "))
-            }
-        }
-    }
-
-    /// The same transition stated as something that has not happened yet.
-    ///
-    /// A plan that reads like a report would be worse than no plan at all: the
-    /// user must be able to tell what `--dry-run` did from what it merely
-    /// intends.
-    pub fn describe_planned(&self) -> String {
-        match self {
-            Self::Bootstrapped => "would initialize metadata and record initial provenance".into(),
-            Self::InferredSchemas(tables) => tables
-                .iter()
-                .map(|table| format!("would infer .db/schema/{table}.json"))
-                .collect::<Vec<_>>()
-                .join("; "),
-            Self::RebuiltMetadata(discarded) if discarded.is_empty() => {
-                "would rebuild unreadable metadata".into()
-            }
-            Self::RebuiltMetadata(discarded) => format!(
-                "would rebuild unreadable metadata, discarding {}",
-                discarded.join(", ")
-            ),
-            Self::RestoredSchemas(tables) => tables
-                .iter()
-                .map(|table| format!("would restore .db/schema/{table}.json from its pin"))
-                .collect::<Vec<_>>()
-                .join("; "),
-        }
-    }
-
-    /// The machine-readable name, part of the structured output contract.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Bootstrapped => "bootstrapped",
-            Self::InferredSchemas(_) => "schemas_inferred",
-            Self::RebuiltMetadata(_) => "metadata_rebuilt",
-            Self::RestoredSchemas(_) => "schemas_restored",
-        }
-    }
-}
-
 /// Resolve the database root.
 ///
-/// An explicitly named root is exact: the binary never walks upward from a path
-/// the user supplied and silently operates on a different database. Discovery
-/// walks upward only when nothing was named, and the nearest credible marker
-/// wins so that a nested database is never skipped in favour of an outer one.
+/// A named root is exact and must exist: a mistyped `--db` is an error, never
+/// an empty database that reports itself valid. Discovery walks upward from the
+/// working directory to the nearest `.db/`, and refuses to guess when a folder
+/// of pins without metadata sits inside another database.
 pub fn resolve_root(explicit: Option<&Path>) -> Result<ResolvedRoot> {
-    if let Some(path) = explicit {
-        return Ok(ResolvedRoot {
-            path: absolute(path)?,
-            origin: RootOrigin::Explicit,
-        });
-    }
-    if let Some(value) = std::env::var_os("DB_DIR") {
-        return Ok(ResolvedRoot {
-            path: absolute(Path::new(&value))?,
-            origin: RootOrigin::Environment,
-        });
+    let named = match explicit {
+        Some(path) => Some((path.to_path_buf(), RootOrigin::Explicit, "--db")),
+        None => std::env::var_os("RELDIR_DB")
+            .filter(|value| !value.is_empty())
+            .map(|value| (PathBuf::from(value), RootOrigin::Environment, "RELDIR_DB")),
+    };
+    if let Some((path, origin, source)) = named {
+        let path = absolute(&path)?;
+        require_directory(&path, source)?;
+        return Ok(ResolvedRoot { path, origin });
     }
     let start = std::env::current_dir().map_err(|error| DbError::io(Path::new("."), error))?;
+    let mut pinned_without_metadata: Option<PathBuf> = None;
     let mut current = start.clone();
     loop {
         if current.join(".db").is_dir() {
-            return Ok(ResolvedRoot {
-                path: current,
-                origin: RootOrigin::DiscoveredMetadata,
-            });
+            if let Some(inner) = pinned_without_metadata {
+                return Err(DbError::from_diag(
+                    Diagnostic::error(
+                        "ROOT_AMBIGUOUS",
+                        format!(
+                            "{} holds reldir schemas but no .db/, inside the database at {}; it could be a \
+                             table of that database or a database of its own",
+                            inner.display(),
+                            current.display()
+                        ),
+                    )
+                    .help(format!(
+                        "name the one you mean: --db {} or --db {}",
+                        current.display(),
+                        inner.display()
+                    )),
+                    1,
+                ));
+            }
+            return Ok(ResolvedRoot { path: current, origin: RootOrigin::Discovered });
         }
-        if holds_recognizable_schema(&current)? {
-            return Ok(ResolvedRoot {
-                path: current,
-                origin: RootOrigin::DiscoveredSchema,
-            });
+        if pinned_without_metadata.is_none() && holds_pins(&current) {
+            pinned_without_metadata = Some(current.clone());
         }
         if !current.pop() {
             break;
         }
     }
-    // Nothing above declares a database, so this directory is the candidate.
-    // Absence of metadata is a state to establish, not a failure to report.
     Ok(ResolvedRoot {
-        path: start,
+        path: pinned_without_metadata.unwrap_or(start),
         origin: RootOrigin::WorkingDirectory,
     })
 }
 
-/// Whether `schema/` here holds at least one file that is actually a schema.
-///
-/// The test is structural rather than positional: a directory named `schema`
-/// full of JSON Schema documents, API definitions, or migrations is not a
-/// database root, and re-rooting onto one would silently operate on the wrong
-/// directory.
-fn holds_recognizable_schema(root: &Path) -> Result<bool> {
-    let directory = root.join("schema");
-    if !directory.is_dir() {
-        return Ok(false);
+fn require_directory(path: &Path, source: &str) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(DbError::from_diag(
+            Diagnostic::error("PATH_NOT_DIRECTORY", format!("{source} names {}, which is not a directory", path.display()))
+                .at(path),
+            1,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(DbError::from_diag(
+            Diagnostic::error("PATH_NOT_FOUND", format!("{source} names {}, which does not exist", path.display()))
+                .at(path)
+                .help("check the path; `reldir init <path>` creates a new database"),
+            1,
+        )),
+        Err(error) => Err(DbError::io(path, error)),
     }
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        // An unreadable directory is not evidence of a database.
-        Err(_) => return Ok(false),
-    };
-    for entry in entries {
-        let path = match entry {
-            Ok(entry) => entry.path(),
-            Err(_) => continue,
-        };
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(value) = crate::json::parse(&bytes) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        // The dialect's own identifier is the discriminator. A directory of
-        // ordinary JSON Schema documents is not a database root, and since reldir's
-        // schemas *are* JSON Schema documents, only the declared dialect tells
-        // the two apart.
-        let speaks_the_dialect = object.get("$schema").and_then(|s| s.as_str())
-            == Some(crate::schema::meta::DIALECT_URI);
-        let extension = object.get(crate::schema::meta::EXTENSION).and_then(|x| x.as_object());
-        let names_its_file = extension
-            .and_then(|x| x.get("table"))
-            .and_then(|t| t.as_str())
-            == Some(stem);
-        let has_key = extension
-            .and_then(|x| x.get("primaryKey"))
-            .and_then(|k| k.as_array())
-            .is_some_and(|k| !k.is_empty());
-        let has_columns = object
-            .get("properties")
-            .and_then(|c| c.as_object())
-            .is_some_and(|c| !c.is_empty());
-        if speaks_the_dialect && names_its_file && has_key && has_columns {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
-/// Observe a folder. Performs no writes.
+/// Whether `schema/` here holds at least one document in reldir's dialect whose
+/// table matches its file. Ordinary JSON Schema documents are not pins.
+fn holds_pins(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join("schema")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).map(String::from);
+        path.extension().and_then(|value| value.to_str()) == Some("json")
+            && std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| crate::json::parse(&bytes).ok())
+                .is_some_and(|value| {
+                    value.get("$schema").and_then(Value::as_str) == Some(crate::schema::meta::DIALECT_URI)
+                        && value.pointer("/x-reldir/table").and_then(Value::as_str) == stem.as_deref()
+                })
+    })
+}
+
+/// Whether `.db/` exists and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatState {
+    Absent,
+    /// A format marker is present; [`Database::open`] judges its version.
+    Present,
+    /// No marker, and nothing that could not be rebuilt from the files.
+    MarkerMissingRecoverable,
+    /// No marker, and state only this directory holds: history, snapshots,
+    /// configuration, or entries reldir does not recognise.
+    MarkerMissingUnrecoverable(Vec<String>),
+}
+
+/// The folder's immediate contents. Discovery is not recursive: a
+/// `node_modules` deep in a project is not a table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Topology {
+    /// Child directories holding at least one `.json` file.
+    pub table_candidates: Vec<String>,
+    /// `.json` files directly in the root, which belong to no table.
+    pub loose_json: Vec<String>,
+    /// Tables declared by a pin.
+    pub pinned: Vec<String>,
+}
+
+impl Topology {
+    pub fn is_empty(&self) -> bool {
+        self.table_candidates.is_empty() && self.loose_json.is_empty() && self.pinned.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Observation {
+    pub root: PathBuf,
+    pub format: FormatState,
+    pub topology: Topology,
+    /// Whether the root's permissions allow writing. Advisory: every write
+    /// still handles refusal on its own.
+    pub writable: bool,
+}
+
+/// Observe a folder. Writes nothing.
 pub fn observe(root: &Path) -> Result<Observation> {
-    let metadata_directory = root.join(".db");
-    let format = if !metadata_directory.exists() {
-        FormatState::Absent
-    } else if !metadata_directory.is_dir() {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            ".db must be a real directory, not a symlink or special file",
-            6,
-        ));
-    } else {
-        classify_format(&metadata_directory)?
+    let meta = root.join(".db");
+    let format = match std::fs::symlink_metadata(&meta) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FormatState::Absent,
+        Err(error) => return Err(DbError::io(&meta, error)),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(DbError::new(
+                "INTERNAL_METADATA_CORRUPT",
+                ".db must be a real directory, not a symlink or special file",
+                6,
+            ));
+        }
+        Ok(_) if meta.join("format").exists() => FormatState::Present,
+        Ok(_) => {
+            let lost = irreplaceable(&meta)?;
+            if lost.is_empty() {
+                FormatState::MarkerMissingRecoverable
+            } else {
+                FormatState::MarkerMissingUnrecoverable(lost)
+            }
+        }
     };
     Ok(Observation {
         root: root.to_path_buf(),
@@ -374,169 +204,74 @@ pub fn observe(root: &Path) -> Result<Observation> {
     })
 }
 
-/// Entries under `.db/` that are reconstructible from the user's files.
-///
-/// Everything else -- recorded history, the object store behind it, user
-/// configuration, snapshots, and anything unrecognized -- is state this
-/// directory is the only copy of.
-const REBUILDABLE_METADATA: &[&str] = &[
-    "format",
-    "manifest.json",
-    "catalog",
-    "indexes",
-    "statistics",
-    "transactions",
-    "schema",
-    "lock",
-    ".gitignore",
-];
+/// Entries of `.db/` that are derived from the files and can be rebuilt.
+const REBUILDABLE: &[&str] = &["format", "mirror.sqlite", "mirror.sqlite-journal", "transactions", "schema", "lock", ".gitignore"];
 
-/// What in `.db/` could not be rebuilt if the directory were discarded.
-fn irreplaceable_metadata(metadata_directory: &Path) -> Result<Vec<String>> {
+fn irreplaceable(meta: &Path) -> Result<Vec<String>> {
     let mut out = vec![];
-    for entry in std::fs::read_dir(metadata_directory)
-        .map_err(|error| DbError::io(metadata_directory, error))?
-    {
-        let path = entry
-            .map_err(|error| DbError::io(metadata_directory, error))?
-            .path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if REBUILDABLE_METADATA.contains(&name) {
+    for entry in std::fs::read_dir(meta).map_err(|error| DbError::io(meta, error))? {
+        let path = entry.map_err(|error| DbError::io(meta, error))?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+        if REBUILDABLE.contains(&name) {
             continue;
         }
-        // An empty history or snapshot directory holds nothing to lose.
-        if matches!(name, "provenance" | "objects" | "snapshots")
-            && std::fs::read_dir(&path)
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(false)
-        {
-            continue;
+        let empty_directory = matches!(name, "provenance" | "objects" | "snapshots")
+            && std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none());
+        if !empty_directory {
+            out.push(name.to_string());
         }
-        out.push(name.to_string());
     }
     out.sort();
     Ok(out)
 }
 
-fn classify_format(metadata_directory: &Path) -> Result<FormatState> {
-    let marker = metadata_directory.join("format");
-    if !marker.exists() {
-        return marker_missing(metadata_directory);
-    }
-    let text = std::fs::read_to_string(&marker).map_err(|error| DbError::io(&marker, error))?;
-    let declared = text
-        .lines()
-        .find_map(|line| line.strip_prefix("format_version = "))
-        .and_then(|value| value.trim().parse::<u32>().ok());
-    match declared {
-        Some(version) if version == crate::FORMAT_VERSION => Ok(FormatState::Supported),
-        Some(version) => Ok(FormatState::Unsupported(version.to_string())),
-        None => marker_missing(metadata_directory),
-    }
-}
-
-/// Classify an unlabelled `.db/` by what would be lost in rebuilding it.
-fn marker_missing(metadata_directory: &Path) -> Result<FormatState> {
-    let irreplaceable = irreplaceable_metadata(metadata_directory)?;
-    if irreplaceable.is_empty() {
-        Ok(FormatState::MarkerMissingRecoverable)
-    } else {
-        Ok(FormatState::MarkerMissingUnrecoverable(irreplaceable))
-    }
-}
-
-/// Survey the immediate children of the root.
 fn survey(root: &Path) -> Result<Topology> {
-    let mut table_candidates = vec![];
-    let mut loose_json = vec![];
-    let mut declared_tables = vec![];
-
+    let mut topology = Topology::default();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Topology {
-                table_candidates,
-                loose_json,
-                declared_tables,
-            });
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(topology),
         Err(error) => return Err(DbError::io(root, error)),
     };
-
     for entry in entries {
         let entry = entry.map_err(|error| DbError::io(root, error))?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
         if name.starts_with('.') || name == "schema" {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| DbError::io(&path, error))?;
-        if file_type.is_dir() {
-            if directory_holds_json(&path)? {
-                table_candidates.push(name.to_string());
+        let kind = entry.file_type().map_err(|error| DbError::io(&path, error))?;
+        if kind.is_dir() {
+            let holds_json = std::fs::read_dir(&path).is_ok_and(|entries| {
+                entries.flatten().any(|child| {
+                    child.path().extension().and_then(|value| value.to_str()) == Some("json")
+                        && child.file_type().is_ok_and(|kind| kind.is_file())
+                })
+            });
+            if holds_json {
+                topology.table_candidates.push(name.to_string());
             }
-        } else if file_type.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some("json")
-        {
-            loose_json.push(name.to_string());
+        } else if kind.is_file() && path.extension().and_then(|value| value.to_str()) == Some("json") {
+            topology.loose_json.push(name.to_string());
         }
     }
-
-    let schema_directory = root.join("schema");
-    if schema_directory.is_dir() {
-        for entry in std::fs::read_dir(&schema_directory)
-            .map_err(|error| DbError::io(&schema_directory, error))?
-        {
-            let path = entry
-                .map_err(|error| DbError::io(&schema_directory, error))?
-                .path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
+    if let Ok(entries) = std::fs::read_dir(crate::schema_store::pin_dir(root)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                topology.pinned.push(stem.to_string());
             }
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            declared_tables.push(stem.to_string());
         }
     }
-
-    table_candidates.sort();
-    loose_json.sort();
-    declared_tables.sort();
-    Ok(Topology {
-        table_candidates,
-        loose_json,
-        declared_tables,
-    })
-}
-
-fn directory_holds_json(directory: &Path) -> Result<bool> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(false),
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("json")
-            && entry.file_type().is_ok_and(|kind| kind.is_file())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    topology.table_candidates.sort();
+    topology.loose_json.sort();
+    topology.pinned.sort();
+    Ok(topology)
 }
 
 fn writable(root: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(root) else {
-        return false;
-    };
+    let Ok(metadata) = std::fs::metadata(root) else { return false };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -548,291 +283,165 @@ fn writable(root: &Path) -> bool {
     }
 }
 
-/// Establish what the command needs, performing only additive transitions.
-///
-/// Returns the transitions performed, for reporting. An empty result means the
-/// folder already satisfied the command.
-pub fn establish(
-    observation: &Observation,
-    requirements: Requirements,
-    overrides: &crate::config::ResourceOverrides,
-    rebuild_metadata: bool,
-) -> Result<Vec<Transition>> {
-    establish_inner(observation, requirements, overrides, rebuild_metadata, true)
+/// How a command wants the database opened.
+#[derive(Debug, Clone, Copy)]
+pub struct Opening {
+    pub access: Access,
+    /// May establish a database where none exists.
+    pub establish: bool,
+    /// May discard a `.db/` whose format marker is missing even though it holds
+    /// history -- the user's explicit decision.
+    pub rebuild_metadata: bool,
+    /// Report what establishing would do without doing it.
+    pub dry_run: bool,
 }
 
-fn establish_inner(
-    observation: &Observation,
-    requirements: Requirements,
-    overrides: &crate::config::ResourceOverrides,
-    rebuild_metadata: bool,
-    execute: bool,
-) -> Result<Vec<Transition>> {
-    if !requirements.relational_model || !requirements.may_establish {
-        return Ok(vec![]);
+/// Something establishing did, or -- in a dry run -- would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transition {
+    /// Created `.db/`, inferring schemas for these tables.
+    Bootstrapped { inferred: Vec<String> },
+    /// Discarded an unlabelled `.db/`, and what it held.
+    RebuiltMetadata(Vec<String>),
+}
+
+impl Transition {
+    pub fn describe(&self, planned: bool) -> String {
+        let (verb_init, verb_rebuild) = if planned { ("would initialize", "would rebuild") } else { ("initialized", "rebuilt") };
+        match self {
+            Self::Bootstrapped { inferred } if inferred.is_empty() => format!("{verb_init} the database"),
+            Self::Bootstrapped { inferred } => {
+                format!("{verb_init} the database, inferring schemas for {}", inferred.join(", "))
+            }
+            Self::RebuiltMetadata(lost) if lost.is_empty() => format!("{verb_rebuild} unlabelled metadata"),
+            Self::RebuiltMetadata(lost) => format!("{verb_rebuild} unlabelled metadata, discarding {}", lost.join(", ")),
+        }
     }
-    // A folder with nothing in it has nothing to establish. Reporting that it
-    // is empty is the correct answer, and creating metadata to say so would be
-    // ceremony for its own sake.
-    if observation.topology.is_empty() && observation.format == FormatState::Absent {
-        return Ok(vec![]);
+
+    pub fn to_json(&self, planned: bool) -> Value {
+        match self {
+            Self::Bootstrapped { inferred } => json!({"transition": "bootstrapped", "inferred": inferred, "planned": planned}),
+            Self::RebuiltMetadata(lost) => json!({"transition": "metadata_rebuilt", "discarded": lost, "planned": planned}),
+        }
     }
-    if !observation.writable {
-        // A read-only medium is not a failure for a read; the caller operates
-        // from an in-memory model instead.
-        return Ok(vec![]);
-    }
+}
+
+/// What opening found.
+pub enum Opened {
+    /// Nothing to govern: no metadata, no tables, no pins.
+    Empty,
+    Database { database: Box<Database>, transitions: Vec<Transition>, planned: bool },
+}
+
+/// Open the database at `root`, establishing it when the command may.
+pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Result<Opened> {
+    let observation = observe(root)?;
+    let access = if observation.writable { opening.access } else { Access::Read };
+    let may_write = access == Access::Write && !opening.dry_run;
+    let mut transitions = vec![];
     match &observation.format {
-        FormatState::Unsupported(version) => {
-            return Err(DbError::new(
-                "FORMAT_UNSUPPORTED",
-                format!(
-                    "format {version} is unsupported; this binary supports format {}",
-                    crate::FORMAT_VERSION
-                ),
-                6,
-            ));
+        FormatState::Present => {
+            let database = Database::open(root.to_path_buf(), access, overrides)?;
+            return Ok(Opened::Database { database: Box::new(database), transitions, planned: false });
         }
-        FormatState::MarkerMissingRecoverable => {
-            // `.db/` does not say what it is, but holds nothing that cannot be
-            // rebuilt from the rows. Rebuilding is derived work, so it needs no
-            // authorization -- the same rule that lets any command refresh a
-            // stale index.
-            if !execute {
-                return Ok(vec![Transition::RebuiltMetadata(vec![])]);
-            }
-            std::fs::remove_dir_all(observation.root.join(".db"))
-                .map_err(|error| DbError::io(&observation.root.join(".db"), error))?;
-            let mut transitions = vec![Transition::RebuiltMetadata(vec![])];
-            transitions.extend(establish_inner(
-                &observe(&observation.root)?,
-                requirements,
-                overrides,
-                rebuild_metadata,
-                execute,
-            )?);
-            return Ok(transitions);
-        }
-        FormatState::MarkerMissingUnrecoverable(entries) if rebuild_metadata => {
-            // Authorized: this is the user saying "discard it", and it does
-            // exactly what removing `.db/` by hand would do, so there is one
-            // recovery path rather than two that could drift apart.
-            if !execute {
-                return Ok(vec![Transition::RebuiltMetadata(entries.clone())]);
-            }
-            std::fs::remove_dir_all(observation.root.join(".db"))
-                .map_err(|error| DbError::io(&observation.root.join(".db"), error))?;
-            let mut transitions = vec![Transition::RebuiltMetadata(entries.clone())];
-            transitions.extend(establish_inner(
-                &observe(&observation.root)?,
-                requirements,
-                overrides,
-                rebuild_metadata,
-                execute,
-            )?);
-            return Ok(transitions);
-        }
-        FormatState::MarkerMissingUnrecoverable(entries) => {
-            // Guessing a format could misread every byte; discarding the
-            // directory would destroy history, configuration, or snapshots that
-            // exist nowhere else. Neither is the binary's decision to make.
+        FormatState::MarkerMissingUnrecoverable(lost) if !opening.rebuild_metadata => {
             return Err(DbError::from_diag(
                 Diagnostic::error(
                     "FORMAT_MISSING",
-                    format!(
-                        ".db declares no format version and holds state that cannot be rebuilt: {}",
-                        entries.join(", ")
-                    ),
+                    format!(".db declares no format version and holds state that cannot be rebuilt: {}", lost.join(", ")),
                 )
-                .help(
-                    "restore .db/format, or pass --rebuild-metadata to discard .db and \
-                     re-establish it from your files",
-                ),
+                .help("restore .db/format, or pass --rebuild-metadata to discard .db and establish it again from your files"),
                 6,
             ));
         }
-        FormatState::Absent | FormatState::Supported => {}
+        FormatState::MarkerMissingRecoverable | FormatState::MarkerMissingUnrecoverable(_) => {
+            let lost = match &observation.format {
+                FormatState::MarkerMissingUnrecoverable(lost) => lost.clone(),
+                _ => vec![],
+            };
+            if !may_write || !opening.establish {
+                return Err(DbError::from_diag(
+                    Diagnostic::error("FORMAT_MISSING", ".db declares no format version")
+                        .help("run a writing command without --readonly or --no-auto to rebuild it from your files"),
+                    6,
+                ));
+            }
+            let meta = root.join(".db");
+            std::fs::remove_dir_all(&meta).map_err(|error| DbError::io(&meta, error))?;
+            transitions.push(Transition::RebuiltMetadata(lost));
+        }
+        FormatState::Absent => {}
     }
-
-    let bootstrapping = observation.format == FormatState::Absent;
-
-    // Rows sitting at the root have no table identity, and inventing one would
-    // be a guess about the user's intent that cannot be undone. This applies
-    // only while bootstrapping: in an established database a root-level JSON
-    // file is an ordinary file -- a migration document, a note -- and refusing
-    // to operate because one exists would govern files the database never
-    // claimed.
-    if bootstrapping && !observation.topology.loose_json.is_empty() {
+    if observation.topology.is_empty() {
+        return Ok(Opened::Empty);
+    }
+    if !opening.establish {
+        return Err(DbError::from_diag(
+            Diagnostic::error("UNINITIALIZED", format!("{} has no .db metadata", root.display()))
+                .help(format!("run `reldir init {}`, or omit --no-auto to establish it on first use", root.display())),
+            10,
+        ));
+    }
+    if !observation.topology.loose_json.is_empty() {
         return Err(DbError::from_diag(
             Diagnostic::error(
                 "ROOT_JSON_AMBIGUOUS",
                 format!(
-                    "{} JSON file(s) at the database root have no table identity",
-                    observation.topology.loose_json.len()
+                    "{} JSON file(s) sit at the database root and belong to no table: {}",
+                    observation.topology.loose_json.len(),
+                    observation.topology.loose_json.join(", ")
                 ),
             )
-            .at(observation.root.clone())
-            .help("move them into a named table directory, then rerun"),
+            .at(root)
+            .help("move them into a table directory, or add them to .db/config's ignore list after init"),
             1,
         ));
     }
-
-    let mut config = Config::default();
-    config.apply_overrides(overrides);
-    config
-        .validate()
-        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-
-    // Inference applies only while bootstrapping. Once a database exists its
-    // table set is authoritative intent: a new JSON-bearing directory beside it
-    // is an ungoverned sibling the user may or may not want governed, so it is
-    // surfaced as UNGOVERNED_DIRECTORY rather than silently adopted. Inferring
-    // there would let an unrelated folder dropped into the tree quietly become
-    // part of the database.
-    let missing = if bootstrapping {
-        observation.tables_needing_schema()
+    let schemas = schemas_for(&observation, overrides)?;
+    let inferred: Vec<String> = observation
+        .topology
+        .table_candidates
+        .iter()
+        .filter(|table| !observation.topology.pinned.contains(table))
+        .cloned()
+        .collect();
+    transitions.push(Transition::Bootstrapped { inferred: inferred.clone() });
+    if may_write {
+        let only_inferred: BTreeMap<String, Schema> =
+            schemas.into_iter().filter(|(table, _)| inferred.contains(table)).collect();
+        let database = Database::create(root.to_path_buf(), &only_inferred, false, overrides)?;
+        Ok(Opened::Database { database: Box::new(database), transitions, planned: false })
     } else {
-        vec![]
-    };
-
-    // Inference runs before anything is written, so a folder that cannot be
-    // interpreted leaves no partial database behind.
-    let inferred = if missing.is_empty() {
-        BTreeMap::new()
-    } else {
-        let references = crate::catalog::Catalog::observe(&observation.root, &config)?;
-        infer::infer_all_with_references(
-            &observation.root,
-            &missing,
-            infer::Strictness::Balanced,
-            &config,
-            None,
-            Some(&references),
-        )?
-    };
-
-    // Computed before the plan is returned so that `plan` and `establish`
-    // report the same work: a plan that omitted reconstruction would promise a
-    // read the following establish would have to perform a write to keep.
-    let pins_to_reconstruct = observation.pins_needing_working_copy()?;
-
-    let mut transitions = vec![];
-    if bootstrapping {
-        transitions.push(Transition::Bootstrapped);
+        let database = Database::ephemeral(root.to_path_buf(), schemas, overrides)?;
+        Ok(Opened::Database { database: Box::new(database), transitions, planned: true })
     }
-    if !inferred.is_empty() {
-        transitions.push(Transition::InferredSchemas(
-            inferred.keys().cloned().collect(),
-        ));
-    }
-    if !bootstrapping && !pins_to_reconstruct.is_empty() {
-        transitions.push(Transition::RestoredSchemas(pins_to_reconstruct.clone()));
-    }
-
-    if !execute {
-        // Inference already ran, so the plan reflects what would actually
-        // happen rather than what is merely intended. Nothing is written.
-        return Ok(transitions);
-    }
-
-    if bootstrapping {
-        crate::db::init_layout(&observation.root, false)?;
-    }
-
-    for schema in inferred.values() {
-        crate::schema_store::write_working(&observation.root, schema, config.indentation_width)?;
-    }
-
-    // A pinned table is not inferred -- its schema is declared -- but it still
-    // needs a working copy, because that is the file every subsystem reads.
-    //
-    // Only the pins whose working copy is missing are written. Rewriting every
-    // pin on every invocation would have each concurrent command rewrite the
-    // same bytes outside the writer lock, turning a read into a write; but
-    // refusing to write any outside bootstrap left `rm -rf .db` unrecoverable
-    // in place, with `check` reporting zero tables while the declarations sat
-    // in `schema/`. Reconstruction is establishment satisfying a prerequisite,
-    // which is what establishment is for.
-    for table in pins_to_reconstruct {
-        if let Some(pinned) = crate::schema_store::load_pin(&observation.root, &table)? {
-            crate::schema_store::write_working(
-                &observation.root,
-                &pinned,
-                config.indentation_width,
-            )?;
-        }
-    }
-
-    if bootstrapping {
-        // The first revision records what was adopted, with no predecessor it
-        // cannot substantiate.
-        let catalog = crate::catalog::Catalog::observe(&observation.root, &config)?;
-        let (hash, entries) = crate::metadata::state(&catalog)?;
-        crate::metadata::record(&catalog, None, hash, entries, "import", None)?;
-        // Establishment leaves derived state complete. `init_layout` creates an
-        // empty `.db/indexes`, which is not the same thing as a built one: the
-        // next read would find an index missing for every table, class the
-        // database as needing repair, and announce a rebuild of what had never
-        // been built. Derived state is either current or it is a fault, and a
-        // database this binary just created must not be born a fault.
-        crate::index::rebuild(&observation.root, &catalog)?;
-    }
-
-    Ok(transitions)
 }
 
-/// The transitions establishment would perform, without performing any of them.
-///
-/// Inference still runs, so a folder that cannot be interpreted reports that
-/// failure here exactly as it would when establishing: a plan that ignored the
-/// reason establishment is impossible would be a false promise.
-pub fn plan(
-    observation: &Observation,
-    requirements: Requirements,
-    overrides: &crate::config::ResourceOverrides,
-    rebuild_metadata: bool,
-) -> Result<Vec<Transition>> {
-    establish_inner(observation, requirements, overrides, rebuild_metadata, false)
-}
-
-/// Schemas a read needs but that must not be persisted.
-///
-/// Used where the command promises not to write: the relational model is built
-/// in memory so the read can be answered, and the folder is left untouched.
-pub fn ephemeral_schemas(
-    observation: &Observation,
-    overrides: &crate::config::ResourceOverrides,
-) -> Result<BTreeMap<String, Schema>> {
-    let missing = observation.tables_needing_schema();
-    // A pin whose working copy is absent is reconstructed in memory rather
-    // than inferred: its schema is declared, so guessing one from the rows
-    // would answer with a different schema than the one the user wrote. This
-    // is the read-only half of what establishment does by writing the file.
-    let pinned = observation.pins_needing_working_copy()?;
-    if missing.is_empty() && pinned.is_empty() {
-        return Ok(BTreeMap::new());
-    }
+/// The schemas a folder without metadata has: its pins, and schemas inferred
+/// for tables nobody pinned.
+fn schemas_for(observation: &Observation, overrides: &ResourceOverrides) -> Result<BTreeMap<String, Schema>> {
     let mut config = Config::default();
     config.apply_overrides(overrides);
-    config
-        .validate()
-        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-
+    config.validate().map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let mut out = BTreeMap::new();
-    for table in pinned {
-        if let Some(schema) = crate::schema_store::load_pin(&observation.root, &table)? {
-            out.insert(table, schema);
-        }
+    for table in &observation.topology.pinned {
+        out.insert(table.clone(), crate::schema_store::load(&crate::schema_store::pin_path(&observation.root, table))?);
     }
+    let missing: Vec<String> = observation
+        .topology
+        .table_candidates
+        .iter()
+        .filter(|table| !out.contains_key(*table))
+        .cloned()
+        .collect();
     if !missing.is_empty() {
-        let references = crate::catalog::Catalog::observe(&observation.root, &config)?;
-        out.extend(infer::infer_all_with_references(
+        out.extend(crate::infer::infer_all(
             &observation.root,
             &missing,
-            infer::Strictness::Balanced,
+            crate::infer::Strictness::Balanced,
             &config,
             None,
-            Some(&references),
+            None,
         )?);
     }
     Ok(out)
@@ -842,9 +451,7 @@ fn absolute(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
-    Ok(std::env::current_dir()
-        .map_err(|error| DbError::io(Path::new("."), error))?
-        .join(path))
+    Ok(std::env::current_dir().map_err(|error| DbError::io(Path::new("."), error))?.join(path))
 }
 
 #[cfg(test)]
@@ -852,348 +459,134 @@ mod tests {
     use super::*;
 
     fn write(path: &Path, contents: &str) {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
     }
 
-    fn schema_json(table: &str) -> String {
-        format!(
-            r#"{{"$schema":"https://reldir.dev/schema/reldir-1","type":"object","properties":{{"id":{{"type":"string"}}}},"required":["id"],"x-reldir":{{"table":"{table}","primaryKey":["id"],"columnOrder":["id"]}}}}"#
-        )
+    fn opening(access: Access) -> Opening {
+        Opening { access, establish: true, rebuild_metadata: false, dry_run: false }
     }
 
-    /// A folder with nothing in it is a legitimate state, not a fault. The
-    /// observation must say so rather than reporting an error a user would
-    /// have to resolve before asking their first question.
+    /// The false green a mistyped `--db` used to produce: an empty, valid
+    /// database where the user meant their data.
     #[test]
-    fn test1092_an_empty_folder_observes_as_empty() {
+    fn test1104_a_named_root_must_exist_and_be_a_directory() {
         let directory = tempfile::tempdir().unwrap();
-        let observed = observe(directory.path()).unwrap();
-        assert_eq!(observed.format, FormatState::Absent);
-        assert!(observed.topology.is_empty());
-        assert!(observed.tables_needing_schema().is_empty());
+        let missing = directory.path().join("typo");
+        assert_eq!(resolve_root(Some(&missing)).unwrap_err().diagnostic.code, "PATH_NOT_FOUND");
+        write(&directory.path().join("file"), "x");
+        assert_eq!(
+            resolve_root(Some(&directory.path().join("file"))).unwrap_err().diagnostic.code,
+            "PATH_NOT_DIRECTORY"
+        );
+        let child = directory.path().join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(directory.path().join(".db")).unwrap();
+        let resolved = resolve_root(Some(&child)).unwrap();
+        assert_eq!(resolved.path, child, "a named root is exact, never walked upward from");
+        assert_eq!(resolved.origin, RootOrigin::Explicit);
     }
 
-    /// Table candidates are immediate children holding JSON. Nested JSON deeper
-    /// in a project is not a table: a tool that recursively adopted arbitrary
-    /// files would consume directories the user never meant to govern.
     #[test]
     fn test1093_table_candidates_are_immediate_children_only() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
-        write(&root.join("deep/nested/inside.json"), "{\"id\":\"x\"}\n");
+        write(&root.join("deep/nested/inside.json"), "{}\n");
         write(&root.join("empty_dir/readme.txt"), "not json\n");
-
-        let observed = observe(root).unwrap();
-        assert_eq!(
-            observed.topology.table_candidates,
-            vec!["users".to_string()]
-        );
-        assert!(!observed.topology.table_candidates.contains(&"deep".into()));
-        assert!(
-            !observed
-                .topology
-                .table_candidates
-                .contains(&"empty_dir".into())
-        );
+        assert_eq!(observe(root).unwrap().topology.table_candidates, vec!["users".to_string()]);
     }
 
-    /// Rows at the root have no table identity. Inventing a name would be an
-    /// irreversible guess, so establishment refuses and explains instead.
     #[test]
-    fn test1094_loose_root_json_is_refused_rather_than_guessed() {
+    fn test1094_loose_root_json_is_refused_and_nothing_is_created() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write(&root.join("a.json"), "{\"id\":\"a\"}\n");
-
-        let observed = observe(root).unwrap();
-        assert_eq!(observed.topology.loose_json, vec!["a.json".to_string()]);
-
-        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
-            .expect_err("loose rows cannot be adopted");
+        write(&directory.path().join("a.json"), "{\"id\":\"a\"}\n");
+        let error = open(directory.path(), opening(Access::Write), &Default::default()).err().unwrap();
         assert_eq!(error.diagnostic.code, "ROOT_JSON_AMBIGUOUS");
-        // Nothing was created while refusing.
-        assert!(!root.join(".db").exists());
-    }
-
-    /// A directory named `schema` only re-roots discovery when it actually
-    /// holds reldir's schemas.
-    ///
-    /// This is sharper than it used to be. reldir's schemas are themselves JSON
-    /// Schema documents, so "looks like a schema" no longer distinguishes a
-    /// database from any project that keeps its API contracts in `schema/`.
-    /// The dialect's own identifier is what separates them, which is precisely
-    /// what a declared `$vocabulary` is for.
-    #[test]
-    fn test1095_schema_marker_recognition_is_structural() {
-        let unrelated = tempfile::tempdir().unwrap();
-        write(
-            &unrelated.path().join("schema/openapi.json"),
-            r#"{"openapi":"3.0.0","paths":{}}"#,
-        );
-        assert!(
-            !holds_recognizable_schema(unrelated.path()).unwrap(),
-            "unrelated JSON must not be taken for a schema"
-        );
-
-        // An ordinary JSON Schema document is the case that matters now: it has
-        // `properties` and a `$schema`, and is still not a reldir table.
-        let foreign = tempfile::tempdir().unwrap();
-        write(
-            &foreign.path().join("schema/users.json"),
-            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"id":{"type":"string"}}}"#,
-        );
-        assert!(
-            !holds_recognizable_schema(foreign.path()).unwrap(),
-            "a JSON Schema document in another dialect is not a reldir schema"
-        );
-
-        // A file whose `table` disagrees with its name is not a schema either.
-        let mismatched = tempfile::tempdir().unwrap();
-        write(
-            &mismatched.path().join("schema/users.json"),
-            &schema_json("other"),
-        );
-        assert!(!holds_recognizable_schema(mismatched.path()).unwrap());
-
-        let real = tempfile::tempdir().unwrap();
-        write(
-            &real.path().join("schema/users.json"),
-            &schema_json("users"),
-        );
-        assert!(holds_recognizable_schema(real.path()).unwrap());
-    }
-
-    /// `--no-auto` is the only posture that establishes nothing while still
-    /// needing a relational model: a diagnosis no longer refuses to bootstrap,
-    /// because `.db/` is reconstructible and refusing left `lint` unable to
-    /// answer about a folder it could describe perfectly well.
-    #[test]
-    fn test1096_structural_requirements_establish_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
-
-        let observed = observe(root).unwrap();
-        let transitions =
-            establish(&observed, Requirements::structural(), &Default::default(), false).unwrap();
-        assert!(transitions.is_empty());
-        assert!(!root.join(".db").exists(), "structural work bootstraps nothing");
-        assert!(!root.join("schema").exists());
-    }
-
-    /// An empty folder establishes nothing even for a functional command:
-    /// there is nothing to govern, and creating metadata to say "empty" is
-    /// ceremony.
-    #[test]
-    fn test1097_an_empty_folder_establishes_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let observed = observe(directory.path()).unwrap();
-        let transitions =
-            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
-        assert!(transitions.is_empty());
         assert!(!directory.path().join(".db").exists());
     }
 
-    /// Data with no metadata is adopted in one step, and the result is a real
-    /// database: metadata, schemas, and a first revision.
     #[test]
-    fn test1098_ungoverned_data_is_adopted_without_ceremony() {
+    fn test1097_an_empty_folder_is_empty_and_establishes_nothing() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write(
-            &root.join("users/u1.json"),
-            "{\"id\":\"u1\",\"name\":\"A\"}\n",
-        );
-        write(
-            &root.join("users/u2.json"),
-            "{\"id\":\"u2\",\"name\":\"B\"}\n",
-        );
-
-        let observed = observe(root).unwrap();
-        let transitions =
-            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
-
-        assert!(transitions.contains(&Transition::Bootstrapped));
-        assert!(transitions.iter().any(
-            |t| matches!(t, Transition::InferredSchemas(tables) if tables == &["users".to_string()])
-        ));
-        assert!(root.join(".db/format").exists());
-        assert!(root.join(".db/config").exists());
-        assert!(root.join(".db/schema/users.json").exists());
-        assert!(
-            !root.join("schema").exists(),
-            "adoption derives a schema; it does not declare one on the user's behalf"
-        );
-        assert_eq!(
-            std::fs::read_dir(root.join(".db/provenance"))
-                .unwrap()
-                .count(),
-            1,
-            "adoption records exactly one initial revision"
-        );
+        assert!(matches!(open(directory.path(), opening(Access::Write), &Default::default()).unwrap(), Opened::Empty));
+        assert!(!directory.path().join(".db").exists());
     }
 
-    /// An existing schema is authoritative intent. Establishment fills the gaps
-    /// around it and never rewrites it.
     #[test]
-    fn test1099_existing_schemas_are_preserved_byte_for_byte() {
+    fn test1098_ungoverned_data_is_adopted_in_one_step() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        // Deliberately non-canonical formatting, so any rewrite is detectable.
-        let handwritten = "{\n    \"$schema\": \"https://reldir.dev/schema/reldir-1\",\n    \"type\": \"object\",\n    \"properties\": {\"id\": {\"type\": \"string\"}},\n    \"required\": [\"id\"],\n    \"x-reldir\": {\"table\": \"users\", \"primaryKey\": [\"id\"], \"columnOrder\": [\"id\"]}\n}\n";
-        write(&root.join("schema/users.json"), handwritten);
+        write(&root.join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"A\"}\n");
+        write(&root.join("users/u2.json"), "{\"id\":\"u2\",\"name\":\"B\"}\n");
+        let Opened::Database { database, transitions, planned } = open(root, opening(Access::Write), &Default::default()).unwrap() else {
+            panic!("a folder with data is a database")
+        };
+        assert!(!planned);
+        assert_eq!(transitions, vec![Transition::Bootstrapped { inferred: vec!["users".into()] }]);
+        assert!(database.is_valid(), "{:?}", database.verdict.errors);
+        assert!(root.join(".db/schema/users.json").exists());
+        assert!(!root.join("schema").exists(), "adoption infers; it does not declare");
+        assert_eq!(crate::metadata::revisions(root).unwrap(), vec![1]);
+        assert_eq!(crate::metadata::head(root).unwrap().unwrap().origin, "import");
+    }
+
+    #[test]
+    fn test1099_a_pin_is_read_where_it_lies_and_never_rewritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let handwritten = format!(
+            "{{\n    \"$schema\": \"{}\",\n    \"type\": \"object\",\n    \"properties\": {{\"id\": {{\"type\": \"string\"}}}},\n    \"required\": [\"id\"],\n    \"x-reldir\": {{\"table\": \"users\", \"primaryKey\": [\"id\"]}}\n}}\n",
+            crate::schema::meta::DIALECT_URI
+        );
+        write(&root.join("schema/users.json"), &handwritten);
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
         write(&root.join("posts/p1.json"), "{\"id\":\"p1\"}\n");
-
-        let observed = observe(root).unwrap();
-        establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(root.join("schema/users.json")).unwrap(),
-            handwritten,
-            "a pin is the user's declaration and must survive establishment untouched"
-        );
-        // The pin becomes the working schema rather than being re-inferred from
-        // the rows, so what the user declared is what the database operates on.
-        let working = crate::schema::load(&root.join(".db/schema/users.json")).unwrap();
-        let pinned = crate::schema::load(&root.join("schema/users.json")).unwrap();
-        assert!(
-            crate::schema_store::equivalent(&working, &pinned).unwrap(),
-            "the working schema is taken from the pin"
-        );
-        assert!(
-            root.join(".db/schema/posts.json").exists(),
-            "only the unpinned table is inferred"
-        );
-        assert!(
-            !root.join("schema/posts.json").exists(),
-            "inference never writes a pin"
-        );
+        let Opened::Database { database, .. } = open(root, opening(Access::Write), &Default::default()).unwrap() else { panic!() };
+        assert!(database.is_valid(), "{:?}", database.verdict.errors);
+        assert_eq!(std::fs::read_to_string(root.join("schema/users.json")).unwrap(), handwritten);
+        assert!(!root.join(".db/schema/users.json").exists(), "a pinned table has no second copy");
+        assert!(root.join(".db/schema/posts.json").exists());
     }
 
-    /// Inference failure leaves nothing behind. A folder that could not be
-    /// interpreted must look exactly as it did before the attempt.
     #[test]
     fn test1100_failed_inference_writes_nothing() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        // An array root cannot be a row, so inference cannot type this table.
-        write(&root.join("things/a.json"), "[1,2]\n");
-
-        let observed = observe(root).unwrap();
-        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
-            .expect_err("inference cannot succeed here");
-        assert!(error.diagnostic.code.starts_with("INFER_"));
-        assert!(!root.join(".db").exists(), "no partial bootstrap remains");
-        assert!(!root.join("schema").exists());
+        write(&directory.path().join("things/a.json"), "[1,2]\n");
+        let error = open(directory.path(), opening(Access::Write), &Default::default()).err().unwrap();
+        assert!(error.diagnostic.code.starts_with("INFER_"), "{}", error.diagnostic.code);
+        assert!(!directory.path().join(".db").exists());
     }
 
-    /// `.db/` that does not declare its format is never guessed at -- reading a
-    /// database under the wrong format could misinterpret every byte -- but
-    /// what to do about it depends on what would be lost. A directory holding
-    /// only rebuildable state is rebuilt; one holding history is not, because
-    /// discarding it destroys the only copy.
     #[test]
     fn test1101_unlabelled_metadata_is_rebuilt_only_when_nothing_is_lost() {
-        let rebuildable = tempfile::tempdir().unwrap();
-        let root = rebuildable.path();
-        std::fs::create_dir_all(root.join(".db/indexes")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join(".db/transactions")).unwrap();
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
+        let Opened::Database { transitions, .. } = open(root, opening(Access::Write), &Default::default()).unwrap() else { panic!() };
+        assert_eq!(transitions[0], Transition::RebuiltMetadata(vec![]));
 
-        let observed = observe(root).unwrap();
-        assert_eq!(observed.format, FormatState::MarkerMissingRecoverable);
-        let transitions =
-            establish(&observed, Requirements::functional(), &Default::default(), false).unwrap();
-        assert!(transitions.contains(&Transition::RebuiltMetadata(vec![])));
-        assert!(root.join(".db/format").exists(), "the database is re-established");
-
-        // Recorded history is not rebuildable, so the same missing marker is a
-        // refusal rather than a rebuild.
         let historic = tempfile::tempdir().unwrap();
         let root = historic.path();
-        std::fs::create_dir_all(root.join(".db/provenance")).unwrap();
-        write(
-            &root.join(".db/provenance/00000000000000000001.json"),
-            "{}\n",
-        );
+        write(&root.join(".db/provenance/00000000000000000001.json"), "{}\n");
         write(&root.join("users/u1.json"), "{\"id\":\"u1\"}\n");
-
-        let observed = observe(root).unwrap();
-        assert_eq!(
-            observed.format,
-            FormatState::MarkerMissingUnrecoverable(vec!["provenance".to_string()])
-        );
-        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
-            .expect_err("history must not be discarded without authorization");
+        let error = open(root, opening(Access::Write), &Default::default()).err().unwrap();
         assert_eq!(error.diagnostic.code, "FORMAT_MISSING");
-        assert!(
-            error.diagnostic.message.contains("provenance"),
-            "the refusal names what would be lost: {}",
-            error.diagnostic.message
-        );
-
-        // The flag is that authorization, and it says what it destroyed.
-        let transitions =
-            establish(&observed, Requirements::functional(), &Default::default(), true).unwrap();
-        assert!(transitions.contains(&Transition::RebuiltMetadata(vec![
-            "provenance".to_string()
-        ])));
-        assert!(root.join(".db/format").exists());
+        assert!(error.diagnostic.message.contains("provenance"));
+        let authorized = Opening { rebuild_metadata: true, ..opening(Access::Write) };
+        let Opened::Database { transitions, .. } = open(root, authorized, &Default::default()).unwrap() else { panic!() };
+        assert_eq!(transitions[0], Transition::RebuiltMetadata(vec!["provenance".into()]));
     }
 
-    /// A format this binary cannot read stops the operation rather than being
-    /// bootstrapped over.
     #[test]
-    fn test1102_unsupported_format_is_refused() {
+    fn test1103_read_access_answers_without_touching_the_folder() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        write(
-            &root.join(".db/format"),
-            &format!("format_version = {}\n", crate::FORMAT_VERSION + 1),
-        );
-        let observed = observe(root).unwrap();
-        assert!(matches!(observed.format, FormatState::Unsupported(_)));
-        let error = establish(&observed, Requirements::functional(), &Default::default(), false)
-            .expect_err("a newer format cannot be read");
-        assert_eq!(error.diagnostic.code, "FORMAT_UNSUPPORTED");
-    }
-
-    /// Schemas needed only to answer a read can be produced without touching
-    /// the folder, which is what makes read-only operation possible on
-    /// ungoverned data.
-    #[test]
-    fn test1103_ephemeral_schemas_leave_the_folder_untouched() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        write(
-            &root.join("users/u1.json"),
-            "{\"id\":\"u1\",\"name\":\"A\"}\n",
-        );
-
-        let observed = observe(root).unwrap();
-        let schemas = ephemeral_schemas(&observed, &Default::default()).unwrap();
-        assert!(schemas.contains_key("users"));
+        write(&root.join("users/u1.json"), "{\"id\":\"u1\",\"name\":\"A\"}\n");
+        let Opened::Database { database, planned, .. } = open(root, opening(Access::Read), &Default::default()).unwrap() else { panic!() };
+        assert!(planned);
+        assert!(database.catalog.schemas.contains_key("users"));
         assert!(!root.join(".db").exists());
-        assert!(!root.join("schema").exists());
-    }
-
-    /// An explicitly named root is used exactly. Walking upward from a path the
-    /// user supplied could operate on a different database than the one they
-    /// named.
-    #[test]
-    fn test1104_an_explicit_root_is_never_walked_upward_from() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        std::fs::create_dir_all(root.join(".db")).unwrap();
-        let child = root.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-
-        let resolved = resolve_root(Some(&child)).unwrap();
-        assert_eq!(resolved.path, child);
-        assert_eq!(resolved.origin, RootOrigin::Explicit);
     }
 }

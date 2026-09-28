@@ -1,27 +1,56 @@
+//! Recorded history: how the database came to be what it is.
+//!
+//! Each accepted state has a *root hash* over everything that decides the
+//! logical database: the format, the configuration, each table's schema
+//! identity, and each row's canonical hash. The root is built per table -- a
+//! table digest over its rows, then a root over the tables -- and table digests
+//! are cached in the mirror, so recognising that nothing changed costs one read
+//! per table.
+//!
+//! Each accepted transition is a *provenance record* in `.db/provenance/`,
+//! numbered from 1, naming its predecessor's root and its own, and carrying
+//! only the entries that changed. The content of every entry a record adds is
+//! kept, content-addressed, in `.db/objects/`, so any recorded state can be
+//! reconstructed and any deleted row restored exactly.
+//!
+//! Provenance is not validity: a state can be valid without having been
+//! recorded, and history never claims to know who made an external change.
+
 use crate::{
     FORMAT_VERSION, VERSION, canonical,
     catalog::Catalog,
     diagnostic::{DbError, Result},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, io::Write, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Manifest {
-    pub format_version: u32,
-    pub revision: u64,
-    pub root_hash: String,
-    pub entries: BTreeMap<String, ManifestEntry>,
-}
+/// What one path contributes to a state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ManifestEntry {
+pub struct Entry {
+    /// `format`, `config`, `schema`, or `row`.
     pub kind: String,
     pub hash: String,
-    pub size: u64,
 }
+
+/// Where a lineage began, when it began over a quarantined history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Lineage {
+    /// The directory the previous history was moved to.
+    pub quarantined: String,
+    /// Why a new lineage began.
+    pub reason: String,
+}
+
+/// One accepted transition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
@@ -30,287 +59,331 @@ pub struct Provenance {
     pub previous_revision: Option<u64>,
     pub previous_root_hash: Option<String>,
     pub new_root_hash: String,
+    /// `internal`, `external`, `recovery`, `repair`, `migration`, `import`,
+    /// or `snapshot_restore`.
     pub origin: String,
-    pub affected_objects: Vec<String>,
-    pub schema_changes: Vec<String>,
+    /// Entries added or changed (`Some`) and removed (`None`).
+    pub changes: BTreeMap<String, Option<Entry>>,
     pub binary_version: String,
     pub format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_id: Option<String>,
-    pub entries: BTreeMap<String, ManifestEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
 }
 
-/// The hash the manifest records for a schema.
-///
-/// One definition, used both when recording a revision and when asking whether
-/// a schema still matches what was recorded. Two spellings of this would let a
-/// database disagree with its own history.
-fn schema_hash(schema: &crate::schema::Schema) -> Result<String> {
-    let value = crate::schema::semantic::encode_v1(schema);
-    let bytes = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
-    Ok(canonical::hash_bytes(&bytes))
-}
-
-pub fn state(c: &Catalog) -> Result<(String, BTreeMap<String, ManifestEntry>)> {
-    let mut entries = BTreeMap::new();
-    let mut root = Sha256::new();
-    root.update(format!("reldir-state-v{}\0", FORMAT_VERSION));
-    let format_path = c.root.join(".db/format");
-    if format_path.exists() {
-        let bytes = fs::read(&format_path).map_err(|e| DbError::io(&format_path, e))?;
-        let normalized = String::from_utf8(bytes).map_err(|e| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!(".db/format is not UTF-8: {e}"),
-                6,
-            )
-        })?;
-        let canonical = format!("{}\n", normalized.trim());
-        let hash = canonical::hash_bytes(canonical.as_bytes());
-        root.update(b".db/format\0");
-        root.update(hash.as_bytes());
-        entries.insert(
-            ".db/format".into(),
-            ManifestEntry {
-                kind: "format".into(),
-                hash,
-                size: canonical.len() as u64,
-            },
-        );
+impl Provenance {
+    /// The changes, spelled `A path`, `M path`, `D path` against the state
+    /// before, for reports.
+    pub fn summary(&self, before: &BTreeMap<String, Entry>) -> Vec<String> {
+        self.changes
+            .iter()
+            .map(|(path, entry)| match (before.contains_key(path), entry) {
+                (_, None) => format!("D {path}"),
+                (false, Some(_)) => format!("A {path}"),
+                (true, Some(_)) => format!("M {path}"),
+            })
+            .collect()
     }
-    let config_path = c.root.join(".db/config");
-    if config_path.exists() {
-        let bytes = fs::read(&config_path).map_err(|e| DbError::io(&config_path, e))?;
-        let value = crate::json::parse(&bytes).map_err(internal)?;
-        let canonical = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
-        let hash = canonical::hash_bytes(&canonical);
-        root.update(b".db/config\0");
-        root.update(hash.as_bytes());
-        entries.insert(
-            ".db/config".into(),
-            ManifestEntry {
+}
+
+pub const ORIGINS: &[&str] = &[
+    "internal",
+    "external",
+    "recovery",
+    "repair",
+    "migration",
+    "import",
+    "snapshot_restore",
+];
+
+fn corrupt(message: impl Into<String>) -> DbError {
+    DbError::new("INTERNAL_METADATA_CORRUPT", message, 6)
+}
+
+fn internal(e: serde_json::Error) -> DbError {
+    corrupt(e.to_string())
+}
+
+/// The hash `.db/format` contributes: of its normalized text.
+pub fn format_entry(root: &Path) -> Result<Option<Entry>> {
+    let path = root.join(".db/format");
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(Entry {
+            kind: "format".into(),
+            hash: canonical::hash_bytes(format!("{}\n", text.trim()).as_bytes()),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DbError::io(&path, error)),
+    }
+}
+
+/// The hash `.db/config` contributes: of its normalized JSON.
+pub fn config_entry(root: &Path) -> Result<Option<Entry>> {
+    let path = root.join(".db/config");
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let value = crate::json::parse(&bytes).map_err(|e| corrupt(format!(".db/config: {e}")))?;
+            let normalized = serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?;
+            Ok(Some(Entry {
                 kind: "config".into(),
-                hash,
-                size: bytes.len() as u64,
-            },
-        );
-    }
-    for (table, s) in &c.schemas {
-        let rel = format!("schema/{table}.json");
-        let val = crate::schema::semantic::encode_v1(s);
-        let bytes = serde_json::to_vec(&canonical::normalize(&val)).map_err(internal)?;
-        let hash = schema_hash(s)?;
-        root.update(rel.as_bytes());
-        root.update([0]);
-        root.update(hash.as_bytes());
-        entries.insert(
-            rel,
-            ManifestEntry {
-                kind: "schema".into(),
-                hash,
-                size: bytes.len() as u64,
-            },
-        );
-        let mut rows = c.rows.get(table).cloned().unwrap_or_default();
-        rows.sort_by_key(|r| crate::integrity::key(&r.value, &s.primary_key, s));
-        for row in rows {
-            let rel = row.relative.to_string_lossy().replace('\\', "/");
-            let val = canonical::canonical_row(&row.value, s);
-            let bytes = serde_json::to_vec(&val).map_err(internal)?;
-            let hash = canonical::hash_bytes(&bytes);
-            root.update(rel.as_bytes());
-            root.update([0]);
-            root.update(hash.as_bytes());
-            entries.insert(
-                rel,
-                ManifestEntry {
-                    kind: "row".into(),
-                    hash,
-                    size: row.raw.len() as u64,
-                },
-            );
+                hash: canonical::hash_bytes(&normalized),
+            }))
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DbError::io(&path, error)),
     }
-    Ok((hex::encode(root.finalize()), entries))
 }
 
-pub fn load_manifest(root: &Path) -> Result<Option<Manifest>> {
-    let p = root.join(".db/manifest.json");
-    if !p.exists() {
-        return Ok(None);
+/// A table's digest over its rows.
+pub fn table_digest<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut hasher = Sha256::new();
+    for (path, hash) in rows {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update([b'\n']);
     }
-    let metadata = fs::symlink_metadata(&p).map_err(|e| DbError::io(&p, e))?;
-    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("manifest {} is not a private regular file", p.display()),
-            6,
-        ));
-    }
-    let b = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
-    crate::json::parse_as(&b).map(Some).map_err(|e| {
-        DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("{}: {e}", p.display()),
-            6,
-        )
-    })
+    hex::encode(hasher.finalize())
 }
-pub fn validate_provenance(root: &Path, manifest: Option<&Manifest>) -> Result<()> {
-    let dir = root.join(".db/provenance");
-    ensure_real_directory(&root.join(".db/objects"), false, "object store")?;
-    if !ensure_real_directory(&dir, false, "provenance")? {
-        return Ok(());
+
+/// The root over a state's parts.
+pub fn root_hash(
+    format: Option<&Entry>,
+    config: Option<&Entry>,
+    tables: &BTreeMap<String, (Option<String>, String)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("reldir-state-v{FORMAT_VERSION}\0").as_bytes());
+    for (label, entry) in [("format", format), ("config", config)] {
+        hasher.update(label.as_bytes());
+        hasher.update([0]);
+        hasher.update(entry.map_or("", |e| e.hash.as_str()).as_bytes());
+        hasher.update([b'\n']);
     }
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
-        let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
-        // A writer publishes each record as a temp sibling that is then renamed
-        // into place, so a reader scanning this directory can legitimately meet
-        // one mid-write. It is not an unexpected entry and it is not this
-        // reader's to judge: the writer holding the lock will rename or remove
-        // it. Reporting it as corruption told people their database was broken
-        // whenever they read it while something wrote.
-        if is_in_progress_write(&path) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
-        if !metadata.file_type().is_file()
-            || has_multiple_links(&metadata)
-            || path.extension().and_then(|x| x.to_str()) != Some("json")
-        {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("unexpected provenance entry {}", path.display()),
-                6,
-            ));
-        }
-        paths.push(path);
+    for (table, (identity, digest)) in tables {
+        hasher.update(table.as_bytes());
+        hasher.update([0]);
+        hasher.update(identity.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update([b'\n']);
     }
-    paths.sort();
-    let mut prior: Option<Provenance> = None;
-    for path in paths {
-        let value: Provenance = crate::json::parse_as(
-            &fs::read(&path).map_err(|e| DbError::io(&path, e))?,
-        )
-        .map_err(|e| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("invalid provenance {}: {e}", path.display()),
-                6,
-            )
-        })?;
-        if value.format_version != FORMAT_VERSION {
-            return Err(DbError::new(
-                "FORMAT_UNSUPPORTED",
-                format!(
-                    "provenance {} uses format {}",
-                    path.display(),
-                    value.format_version
-                ),
-                6,
-            ));
-        }
-        let expected_name = format!("{:020}.json", value.revision);
-        if path.file_name().and_then(|name| name.to_str()) != Some(&expected_name) {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!(
-                    "provenance filename does not match revision {}",
-                    value.revision
-                ),
-                6,
-            ));
-        }
-        if !matches!(
-            value.origin.as_str(),
-            "internal"
-                | "external"
-                | "recovery"
-                | "repair"
-                | "migration"
-                | "import"
-                | "snapshot_restore"
-        ) {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("unknown provenance origin {:?}", value.origin),
-                6,
-            ));
-        }
-        match &prior {
-            None if value.revision != 1
-                || value.previous_revision.is_some()
-                || value.previous_root_hash.is_some() =>
-            {
-                return Err(DbError::new(
-                    "INTERNAL_METADATA_CORRUPT",
-                    "provenance history must begin at revision 1 without a predecessor",
-                    6,
-                ));
+    hex::encode(hasher.finalize())
+}
+
+/// The root of a set of entries, however they were obtained. The same function
+/// the live state's root is built from, applied to a reconstructed history.
+pub fn root_of(entries: &BTreeMap<String, Entry>) -> String {
+    let mut tables: BTreeMap<String, (Option<String>, Vec<(&str, &str)>)> = BTreeMap::new();
+    for (path, entry) in entries {
+        match entry.kind.as_str() {
+            "schema" => {
+                if let Some(table) = path.strip_prefix("schema/").and_then(|p| p.strip_suffix(".json")) {
+                    tables.entry(table.to_string()).or_default().0 = Some(entry.hash.clone());
+                }
             }
-            Some(p)
-                if value.revision != p.revision + 1
-                    || value.previous_revision != Some(p.revision)
-                    || value.previous_root_hash.as_deref() != Some(&p.new_root_hash) =>
-            {
-                return Err(DbError::new(
-                    "INTERNAL_METADATA_CORRUPT",
-                    format!("broken provenance chain at revision {}", value.revision),
-                    6,
-                ));
+            "row" => {
+                if let Some((table, _)) = path.split_once('/') {
+                    tables
+                        .entry(table.to_string())
+                        .or_default()
+                        .1
+                        .push((path.as_str(), entry.hash.as_str()));
+                }
             }
             _ => {}
         }
-        for (object_path, entry) in &value.entries {
-            validate_object(root, object_path, entry)?;
-        }
-        prior = Some(value);
     }
-    if let (Some(last), Some(m)) = (prior, manifest)
-        && (last.revision != m.revision
-            || last.new_root_hash != m.root_hash
-            || last.entries != m.entries)
-    {
-        // `record` publishes the provenance entry and then the manifest, as two
-        // separate atomic renames. A reader that arrives between them sees a
-        // history one revision ahead of the manifest -- not damage, just the
-        // instant before the second rename lands, and the only disagreement a
-        // correct writer can produce.
-        //
-        // Tolerating exactly that shape keeps the check strict: the newer
-        // record must be the manifest's immediate successor and must name the
-        // manifest as its predecessor, so a gap, a fork, or a mismatched
-        // predecessor is still corruption. Without this, reading a database
-        // while anything wrote to it reported the database as corrupt.
-        let publishing = last.revision == m.revision + 1
-            && last.previous_revision == Some(m.revision)
-            && last.previous_root_hash.as_deref() == Some(m.root_hash.as_str());
-        if !publishing {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                "manifest does not match the latest provenance record",
-                6,
-            ));
-        }
-    }
-    Ok(())
+    let digests = tables
+        .into_iter()
+        .map(|(table, (identity, rows))| (table, (identity, table_digest(rows))))
+        .collect();
+    root_hash(entries.get(".db/format"), entries.get(".db/config"), &digests)
 }
 
-fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()> {
-    if entry.hash.len() != 64
-        || !entry
-            .hash
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+/// The live state: its root, and -- on request -- its entries.
+pub fn live_root(catalog: &Catalog) -> Result<String> {
+    let format = format_entry(&catalog.root)?;
+    let config = config_entry(&catalog.root)?;
+    let mut tables = BTreeMap::new();
+    for (table, schema) in &catalog.schemas {
+        tables.insert(
+            table.clone(),
+            (Some(schema.identity().to_string()), catalog.mirror.table_digest(table)?),
+        );
+    }
+    Ok(root_hash(format.as_ref(), config.as_ref(), &tables))
+}
+
+/// Every entry of the live state.
+pub fn live_entries(catalog: &Catalog) -> Result<BTreeMap<String, Entry>> {
+    let mut entries = BTreeMap::new();
+    if let Some(format) = format_entry(&catalog.root)? {
+        entries.insert(".db/format".into(), format);
+    }
+    if let Some(config) = config_entry(&catalog.root)? {
+        entries.insert(".db/config".into(), config);
+    }
+    for (table, schema) in &catalog.schemas {
+        entries.insert(
+            crate::schema_store::pin_relative(table),
+            Entry {
+                kind: "schema".into(),
+                hash: schema.identity().to_string(),
+            },
+        );
+        for (path, hash) in catalog.mirror.row_hashes(table)? {
+            if let Some(hash) = hash {
+                entries.insert(path, Entry { kind: "row".into(), hash });
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn provenance_dir(root: &Path) -> PathBuf {
+    root.join(".db/provenance")
+}
+
+fn record_path(root: &Path, revision: u64) -> PathBuf {
+    provenance_dir(root).join(format!("{revision:020}.json"))
+}
+
+/// The revisions recorded, in order.
+pub fn revisions(root: &Path) -> Result<Vec<u64>> {
+    let dir = provenance_dir(root);
+    if !ensure_real_directory(&dir, false, "provenance")? {
+        return Ok(vec![]);
+    }
+    let mut out = vec![];
+    for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
+        let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
+        if is_in_progress_write(&path) {
+            continue;
+        }
+        let revision = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|stem| stem.len() == 20)
+            .and_then(|stem| stem.parse::<u64>().ok())
+            .ok_or_else(|| corrupt(format!("unexpected provenance entry {}", path.display())))?;
+        out.push(revision);
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+pub fn load_record(root: &Path, revision: u64) -> Result<Provenance> {
+    let path = record_path(root, revision);
+    let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
+    if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
+        return Err(corrupt(format!("provenance {} is not a private regular file", path.display())));
+    }
+    let record: Provenance = crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
+        .map_err(|e| corrupt(format!("invalid provenance {}: {e}", path.display())))?;
+    if record.revision != revision {
+        return Err(corrupt(format!("provenance {} records revision {}", path.display(), record.revision)));
+    }
+    if record.format_version != FORMAT_VERSION {
         return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("invalid object hash {:?} for {path}", entry.hash),
+            "FORMAT_UNSUPPORTED",
+            format!(
+                "provenance revision {revision} is format {}; this binary reads only format {FORMAT_VERSION}",
+                record.format_version
+            ),
             6,
         ));
     }
-    let expected_kind = if path == ".db/format" {
+    if !ORIGINS.contains(&record.origin.as_str()) {
+        return Err(corrupt(format!("provenance revision {revision} has unknown origin {:?}", record.origin)));
+    }
+    Ok(record)
+}
+
+/// The latest record, if any.
+pub fn head(root: &Path) -> Result<Option<Provenance>> {
+    match revisions(root)?.last() {
+        Some(revision) => load_record(root, *revision).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Replay the whole history, verifying that each record continues its
+/// predecessor, that each recorded root is the root of the entries it
+/// describes, and that every object it references is present and intact.
+/// Returns the entries of the head state.
+pub fn verify_history(root: &Path) -> Result<BTreeMap<String, Entry>> {
+    let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut prior: Option<Provenance> = None;
+    for revision in revisions(root)? {
+        let record = load_record(root, revision)?;
+        match &prior {
+            None if record.previous_revision.is_some() || record.previous_root_hash.is_some() => {
+                return Err(corrupt(format!(
+                    "provenance begins at revision {revision}, which claims a predecessor"
+                )));
+            }
+            Some(previous)
+                if record.revision != previous.revision + 1
+                    || record.previous_revision != Some(previous.revision)
+                    || record.previous_root_hash.as_deref() != Some(previous.new_root_hash.as_str()) =>
+            {
+                return Err(corrupt(format!("provenance is broken at revision {revision}")));
+            }
+            _ => {}
+        }
+        for (path, entry) in &record.changes {
+            match entry {
+                Some(entry) => {
+                    verify_object(root, path, entry)?;
+                    entries.insert(path.clone(), entry.clone());
+                }
+                None => {
+                    entries.remove(path);
+                }
+            }
+        }
+        if root_of(&entries) != record.new_root_hash {
+            return Err(corrupt(format!(
+                "provenance revision {revision} records a root its changes do not produce"
+            )));
+        }
+        prior = Some(record);
+    }
+    Ok(entries)
+}
+
+/// The entries of the state a revision recorded, replayed from the first.
+pub fn entries_at(root: &Path, revision: u64) -> Result<BTreeMap<String, Entry>> {
+    let revisions = revisions(root)?;
+    if !revisions.contains(&revision) {
+        return Err(DbError::new("UNKNOWN_REVISION", format!("there is no revision {revision}"), 4).with_help(
+            match revisions.last() {
+                Some(last) => format!("revisions run from {} to {last}; `reldir log` lists them", revisions[0]),
+                None => "nothing has been recorded yet".into(),
+            },
+        ));
+    }
+    let mut entries = BTreeMap::new();
+    for number in revisions.into_iter().take_while(|number| *number <= revision) {
+        for (path, entry) in load_record(root, number)?.changes {
+            match entry {
+                Some(entry) => {
+                    entries.insert(path, entry);
+                }
+                None => {
+                    entries.remove(&path);
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn expected_kind(path: &str) -> &'static str {
+    if path == ".db/format" {
         "format"
     } else if path == ".db/config" {
         "config"
@@ -318,331 +391,236 @@ fn validate_object(root: &Path, path: &str, entry: &ManifestEntry) -> Result<()>
         "schema"
     } else {
         "row"
-    };
-    if entry.kind != expected_kind {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!(
-                "object {path} has kind {:?}, expected {expected_kind:?}",
-                entry.kind
-            ),
-            6,
-        ));
     }
-    let object = root.join(format!(".db/objects/{}.json", entry.hash));
-    let metadata = fs::symlink_metadata(&object).map_err(|error| {
-        DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("missing revision object {}: {error}", object.display()),
-            6,
-        )
-    })?;
-    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!(
-                "revision object {} is not a private regular file",
-                object.display()
-            ),
-            6,
-        ));
+}
+
+fn object_path(root: &Path, hash: &str) -> PathBuf {
+    root.join(format!(".db/objects/{hash}.json"))
+}
+
+/// Check one recorded object against its entry.
+pub fn verify_object(root: &Path, path: &str, entry: &Entry) -> Result<()> {
+    if entry.hash.len() != 64 || !entry.hash.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return Err(corrupt(format!("invalid object hash {:?} for {path}", entry.hash)));
     }
-    let bytes = fs::read(&object).map_err(|error| DbError::io(&object, error))?;
-    let value = crate::json::parse(&bytes).map_err(|error| {
-        DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("invalid revision object {}: {error}", object.display()),
-            6,
-        )
-    })?;
-    let canonical = if entry.kind == "format" {
-        let text = value.as_str().ok_or_else(|| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!(
-                    "format revision object {} is not a string",
-                    object.display()
-                ),
-                6,
-            )
-        })?;
-        format!("{}\n", text.trim()).into_bytes()
-    } else if entry.kind == "row" {
-        // Row object order is semantic canonical order: schema columns first,
-        // then permitted extras. The object store preserves that order.
-        serde_json::to_vec(&value).map_err(internal)?
-    } else {
-        serde_json::to_vec(&canonical::normalize(&value)).map_err(internal)?
-    };
-    if canonical::hash_bytes(&canonical) != entry.hash {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!(
-                "revision object {} does not match its hash",
-                object.display()
-            ),
-            6,
-        ));
+    let expected = expected_kind(path);
+    if entry.kind != expected {
+        return Err(corrupt(format!("object {path} has kind {:?}, expected {expected:?}", entry.kind)));
+    }
+    let value = load_object(root, &entry.hash)?;
+    if object_hash(&entry.kind, &value)? != entry.hash {
+        return Err(corrupt(format!("revision object {} does not match its hash", entry.hash)));
     }
     Ok(())
 }
-pub fn provenance_head(root: &Path) -> Result<Option<Manifest>> {
-    let dir = root.join(".db/provenance");
-    if !ensure_real_directory(&dir, false, "provenance")? {
-        return Ok(None);
-    }
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
-        let path = entry.map_err(|e| DbError::io(&dir, e))?.path();
-        // The same transient a writer leaves while renaming a record into
-        // place. Reading the head of the history must look past it for the
-        // reason `validate_provenance` does: it belongs to a writer that holds
-        // the lock, and it is about to become a numbered record or vanish.
-        if is_in_progress_write(&path) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
-        if !metadata.file_type().is_file()
-            || has_multiple_links(&metadata)
-            || path.extension().and_then(|x| x.to_str()) != Some("json")
-        {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("unexpected provenance entry {}", path.display()),
-                6,
-            ));
-        }
-        paths.push(path);
-    }
-    paths.sort();
-    let Some(path) = paths.last() else {
-        return Ok(None);
-    };
-    let p: Provenance = crate::json::parse_as(&fs::read(path).map_err(|e| DbError::io(path, e))?)
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
-    Ok(Some(Manifest {
-        format_version: p.format_version,
-        revision: p.revision,
-        root_hash: p.new_root_hash,
-        entries: p.entries,
-    }))
+
+/// The hash an object of a kind has.
+pub fn object_hash(kind: &str, value: &Value) -> Result<String> {
+    Ok(match kind {
+        "format" => canonical::hash_bytes(
+            format!("{}\n", value.as_str().ok_or_else(|| corrupt("a format object is a string"))?.trim()).as_bytes(),
+        ),
+        "schema" => crate::schema::identity::identity(value),
+        "row" => canonical::hash_bytes(&serde_json::to_vec(value).map_err(internal)?),
+        _ => canonical::hash_bytes(&serde_json::to_vec(&canonical::normalize(value)).map_err(internal)?),
+    })
 }
-pub fn write_manifest(root: &Path, m: &Manifest) -> Result<()> {
-    write_json_atomic(&root.join(".db/manifest.json"), m)
-}
-fn write_provenance(root: &Path, p: &Provenance) -> Result<()> {
-    ensure_real_directory(&root.join(".db/provenance"), true, "provenance")?;
-    let path = root.join(format!(".db/provenance/{:020}.json", p.revision));
-    if path.exists() {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("provenance revision {} already exists", p.revision),
-            6,
-        ));
+
+pub fn load_object(root: &Path, hash: &str) -> Result<Value> {
+    let path = object_path(root, hash);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| corrupt(format!("missing revision object {}: {error}", path.display())))?;
+    if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
+        return Err(corrupt(format!("revision object {} is not a private regular file", path.display())));
     }
-    write_json_atomic(&path, p)
+    crate::json::parse(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
+        .map_err(|error| corrupt(format!("invalid revision object {}: {error}", path.display())))
 }
-pub fn reconcile_after_recovery(root: &Path) -> Result<()> {
-    let manifest = load_manifest(root)?;
-    let Some(head) = provenance_head(root)? else {
-        return Ok(());
-    };
-    match manifest {
-        Some(m) if m.revision == head.revision && m.root_hash == head.root_hash => Ok(()),
-        Some(m) if head.revision == m.revision + 1 => {
-            let p = load_provenance(root, head.revision)?;
-            if p.previous_revision != Some(m.revision)
-                || p.previous_root_hash.as_deref() != Some(&m.root_hash)
-            {
-                return Err(DbError::new(
-                    "INTERNAL_METADATA_CORRUPT",
-                    "recovered provenance does not continue the manifest",
-                    6,
-                ));
-            }
-            write_manifest(root, &head)
+
+/// The content a path last had in recorded history, and the revision that
+/// recorded it: what doctor restores when a row was removed by mistake.
+pub fn last_known(root: &Path, path: &str) -> Result<Option<(u64, Value)>> {
+    for revision in revisions(root)?.into_iter().rev() {
+        let record = load_record(root, revision)?;
+        match record.changes.get(path) {
+            Some(Some(entry)) => return Ok(Some((revision, load_object(root, &entry.hash)?))),
+            Some(None) => continue,
+            None => continue,
         }
-        None => write_manifest(root, &head),
-        _ => Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            "manifest/provenance divergence cannot be recovered unambiguously",
-            6,
+    }
+    Ok(None)
+}
+
+/// The content of each changed entry, as its object.
+fn object_value(catalog: &Catalog, path: &str, entry: &Entry) -> Result<Value> {
+    match entry.kind.as_str() {
+        "format" => Ok(Value::String(
+            fs::read_to_string(catalog.root.join(".db/format"))
+                .map_err(|e| DbError::io(&catalog.root.join(".db/format"), e))?
+                .trim()
+                .to_string(),
         )),
+        "config" => {
+            let path = catalog.root.join(".db/config");
+            let value = crate::json::parse(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
+                .map_err(|e| corrupt(e.to_string()))?;
+            Ok(canonical::normalize(&value))
+        }
+        "schema" => {
+            let table = path
+                .strip_prefix("schema/")
+                .and_then(|p| p.strip_suffix(".json"))
+                .ok_or_else(|| corrupt(format!("schema entry {path}")))?;
+            Ok(catalog
+                .schemas
+                .get(table)
+                .ok_or_else(|| corrupt(format!("no schema for {table}")))?
+                .document()
+                .clone())
+        }
+        _ => {
+            let row = catalog
+                .row_at(Path::new(path))?
+                .ok_or_else(|| corrupt(format!("no row at {path}")))?;
+            let schema = &catalog.schemas[&row.table];
+            Ok(canonical::canonical_row(&row.value, schema))
+        }
     }
 }
-fn load_provenance(root: &Path, revision: u64) -> Result<Provenance> {
-    let path = root.join(format!(".db/provenance/{revision:020}.json"));
-    let metadata = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
-    if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
-        return Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!(
-                "provenance {} is not a private regular file",
-                path.display()
-            ),
-            6,
-        ));
+
+/// What differs between the live state and the recorded head, entry by entry.
+/// Rows are compared inside the mirror, so the cost follows what changed.
+pub fn pending_changes(catalog: &Catalog) -> Result<BTreeMap<String, Option<Entry>>> {
+    let mut changes = catalog.mirror.row_delta()?;
+    let recorded = catalog.mirror.recorded_non_rows()?;
+    let mut current = BTreeMap::new();
+    if let Some(format) = format_entry(&catalog.root)? {
+        current.insert(".db/format".to_string(), format);
     }
-    crate::json::parse_as(&fs::read(&path).map_err(|e| DbError::io(&path, e))?)
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
+    if let Some(config) = config_entry(&catalog.root)? {
+        current.insert(".db/config".to_string(), config);
+    }
+    for (table, schema) in &catalog.schemas {
+        current.insert(
+            crate::schema_store::pin_relative(table),
+            Entry {
+                kind: "schema".into(),
+                hash: schema.identity().to_string(),
+            },
+        );
+    }
+    for (path, entry) in &current {
+        if recorded.get(path) != Some(entry) {
+            changes.insert(path.clone(), Some(entry.clone()));
+        }
+    }
+    for path in recorded.keys() {
+        if !current.contains_key(path) {
+            changes.insert(path.clone(), None);
+        }
+    }
+    Ok(changes)
 }
+
+/// Bring the mirror's copy of the recorded head in line with history, by
+/// replaying it when the mirror was rebuilt or lost.
+pub fn sync_recorded(catalog: &Catalog, head: Option<&Provenance>) -> Result<()> {
+    let known = catalog.mirror.meta("recorded_revision")?;
+    let expected = head.map(|h| h.revision.to_string());
+    if known == expected {
+        return Ok(());
+    }
+    let entries = match head {
+        Some(_) => verify_history(&catalog.root)?,
+        None => BTreeMap::new(),
+    };
+    catalog.mirror.replace_recorded(
+        &entries,
+        head.map(|h| h.revision),
+        head.map(|h| h.new_root_hash.as_str()),
+    )
+}
+
+/// Record the live state as the next revision, carrying only what changed
+/// since the head.
 pub fn record(
     catalog: &Catalog,
-    old: Option<&Manifest>,
-    new_root: String,
-    entries: BTreeMap<String, ManifestEntry>,
+    head: Option<&Provenance>,
     origin: &str,
     transaction_id: Option<&str>,
-) -> Result<Manifest> {
+    lineage: Option<Lineage>,
+) -> Result<Provenance> {
     let root = &catalog.root;
-    let revision = old.map_or(1, |m| m.revision + 1);
-    let affected = diff_entries(old.map(|m| &m.entries), &entries);
-    let schema_changes = affected
-        .iter()
-        .filter(|change| {
-            change
-                .split_once(' ')
-                .is_some_and(|(_, path)| path.starts_with("schema/"))
-        })
-        .cloned()
-        .collect();
-    let p = Provenance {
-        revision,
+    let changes = pending_changes(catalog)?;
+    ensure_real_directory(&root.join(".db/objects"), true, "object store")?;
+    for (path, entry) in changes.iter().filter_map(|(p, e)| e.as_ref().map(|e| (p, e))) {
+        let target = object_path(root, &entry.hash);
+        if target.exists() {
+            verify_object(root, path, entry)?;
+            continue;
+        }
+        let value = object_value(catalog, path, entry)?;
+        if object_hash(&entry.kind, &value)? != entry.hash {
+            return Err(corrupt(format!("the object for {path} does not hash to its entry")));
+        }
+        write_json_atomic(&target, &value)?;
+    }
+    let record = Provenance {
+        revision: head.map_or(1, |h| h.revision + 1),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        previous_revision: old.map(|m| m.revision),
-        previous_root_hash: old.map(|m| m.root_hash.clone()),
-        new_root_hash: new_root.clone(),
+        previous_revision: head.map(|h| h.revision),
+        previous_root_hash: head.map(|h| h.new_root_hash.clone()),
+        new_root_hash: live_root(catalog)?,
         origin: origin.into(),
-        affected_objects: affected,
-        schema_changes,
+        changes,
         binary_version: VERSION.into(),
         format_version: FORMAT_VERSION,
         transaction_id: transaction_id.map(String::from),
-        entries: entries.clone(),
+        lineage,
     };
-    store_objects(catalog, &entries)?;
-    write_provenance(root, &p)?;
-    let m = Manifest {
-        format_version: FORMAT_VERSION,
-        revision,
-        root_hash: new_root,
-        entries,
-    };
-    write_manifest(root, &m)?;
-    Ok(m)
+    ensure_real_directory(&provenance_dir(root), true, "provenance")?;
+    let path = record_path(root, record.revision);
+    if path.exists() {
+        return Err(corrupt(format!("provenance revision {} already exists", record.revision)));
+    }
+    write_json_atomic(&path, &record)?;
+    catalog
+        .mirror
+        .apply_recorded(&record.changes, record.revision, &record.new_root_hash)?;
+    Ok(record)
 }
-fn store_objects(c: &Catalog, entries: &BTreeMap<String, ManifestEntry>) -> Result<()> {
-    let dir = c.root.join(".db/objects");
-    ensure_real_directory(&dir, true, "object store")?;
-    let mut values = BTreeMap::<String, serde_json::Value>::new();
-    for (t, s) in &c.schemas {
-        values.insert(
-            format!("schema/{t}.json"),
-            canonical::normalize(&crate::schema::semantic::encode_v1(s)),
-        );
-        for r in &c.rows[t] {
-            values.insert(
-                r.relative.to_string_lossy().replace('\\', "/"),
-                canonical::canonical_row(&r.value, s),
-            );
-        }
+
+/// Move the whole history aside and begin a new lineage from nothing. The
+/// quarantined bytes are kept, never deleted.
+pub fn quarantine_history(root: &Path) -> Result<String> {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+    let destination = root.join(".db/provenance-quarantine").join(&stamp);
+    fs::create_dir_all(&destination).map_err(|e| DbError::io(&destination, e))?;
+    let source = provenance_dir(root);
+    if source.exists() {
+        fs::rename(&source, destination.join("provenance")).map_err(|e| DbError::io(&source, e))?;
+        sync_parent(&source)?;
     }
-    let config = c.root.join(".db/config");
-    if config.exists() {
-        values.insert(
-            ".db/config".into(),
-            canonical::normalize(
-                &crate::json::parse(&fs::read(&config).map_err(|e| DbError::io(&config, e))?)
-                    .map_err(internal)?,
-            ),
-        );
-    }
-    let format = c.root.join(".db/format");
-    if format.exists() {
-        values.insert(
-            ".db/format".into(),
-            serde_json::Value::String(
-                fs::read_to_string(&format)
-                    .map_err(|e| DbError::io(&format, e))?
-                    .trim()
-                    .into(),
-            ),
-        );
-    }
-    for (path, entry) in entries {
-        let target = dir.join(format!("{}.json", entry.hash));
-        match fs::symlink_metadata(&target) {
-            Ok(_) => validate_object(&c.root, path, entry)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let value = values.get(path).ok_or_else(|| {
-                    DbError::new(
-                        "INTERNAL_METADATA_CORRUPT",
-                        format!("cannot capture revision object {path}"),
-                        6,
-                    )
-                })?;
-                write_json_atomic(&target, value)?;
-                validate_object(&c.root, path, entry)?;
-            }
-            Err(error) => return Err(DbError::io(&target, error)),
-        }
-    }
-    Ok(())
+    Ok(format!(".db/provenance-quarantine/{stamp}"))
 }
-pub fn diff_entries(
-    old: Option<&BTreeMap<String, ManifestEntry>>,
-    new: &BTreeMap<String, ManifestEntry>,
-) -> Vec<String> {
-    let mut out = vec![];
-    let empty = BTreeMap::new();
-    let old = old.unwrap_or(&empty);
-    for (p, e) in new {
-        match old.get(p) {
-            None => out.push(format!("A {p}")),
-            Some(o) if o.hash != e.hash => out.push(format!("M {p}")),
-            _ => {}
-        }
-    }
-    for p in old.keys() {
-        if !new.contains_key(p) {
-            out.push(format!("D {p}"))
-        }
-    }
-    out
-}
+
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(internal)?;
     bytes.push(b'\n');
     write_bytes_atomic(path, &bytes)
 }
 
-/// Whether this path is a temp sibling some writer is still filling in.
-///
-/// Two writers create these, in different directories and with different
-/// spellings: `write_bytes_atomic` publishes metadata as `<name>.tmp-<uuid>`,
-/// and `apply_journal` replaces a row as `<name>.reldir-tmp-<uuid>`. Both are
-/// renamed into place, so any directory either publishes into can contain one
-/// for the length of a write.
-///
-/// Both spellings are recognised here because this is the contract between the
-/// writers that create them and the readers that must look past them. Stating
-/// it once is the point: the row-directory case was missed for exactly as long
-/// as the rule lived only in the scans that happened to remember it, and a
-/// reader that met a row sibling was told its database was invalid.
+/// Whether this path is a temp sibling some writer is still filling in:
+/// `<name>.tmp-<uuid>` for metadata, `<name>.reldir-tmp-<uuid>` for rows.
+/// Readers look past both; the writer holding the lock renames or removes it.
 pub fn is_in_progress_write(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.starts_with("tmp-") || extension.starts_with("reldir-tmp-")
-        })
+        .is_some_and(|extension| extension.starts_with("tmp-") || extension.starts_with("reldir-tmp-"))
 }
 
-/// Durably replace a file with exactly these bytes.
-///
-/// The one atomic-write mechanism: temp sibling, fsync, rename, fsync parent.
-/// Callers that have already rendered their content -- schemas, which must be
-/// byte-identical to the pin they came from -- use this rather than a second
-/// serializer that would produce a different encoding of the same value.
+/// Durably replace a file with exactly these bytes: temp sibling, fsync,
+/// rename, fsync the directory.
 pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).map_err(|e| DbError::io(p, e))?
@@ -655,23 +633,20 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_parent(path)?;
     Ok(())
 }
+
 pub fn sync_parent(path: &Path) -> Result<()> {
     if let Some(p) = path.parent() {
-        let f = fs::File::open(p).map_err(|e| DbError::io(p, e))?;
-        f.sync_all().map_err(|e| DbError::io(p, e))?
+        crate::fs::Fs::sync_dir(&crate::fs::Disk, p).map_err(|e| DbError::io(p, e))?;
     }
     Ok(())
 }
+
 pub fn ensure_real_directory(path: &Path, create: bool, description: &str) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("{description} {} is not a real directory", path.display()),
-            6,
-        )),
+        Ok(_) => Err(corrupt(format!("{description} {} is not a real directory", path.display()))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
+            fs::create_dir_all(path).map_err(|error| DbError::io(path, error))?;
             sync_parent(path)?;
             Ok(true)
         }
@@ -679,742 +654,69 @@ pub fn ensure_real_directory(path: &Path, create: bool, description: &str) -> Re
         Err(error) => Err(DbError::io(path, error)),
     }
 }
-fn internal(e: serde_json::Error) -> DbError {
-    DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6)
-}
-
-#[cfg(unix)]
-fn has_multiple_links(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() > 1
-}
-
-#[cfg(not(unix))]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
-    false
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn entry(kind: &str) -> ManifestEntry {
-        ManifestEntry {
-            kind: kind.into(),
-            hash: "a".repeat(64),
-            size: 1,
-        }
+    fn entry(kind: &str, hash: &str) -> Entry {
+        Entry { kind: kind.into(), hash: hash.into() }
     }
 
-    /// The object store is content addressed by lowercase hexadecimal SHA-256.
-    /// Anything else is corrupt internal metadata, not a hash to look up
-    /// (Section 58).
     #[test]
-    fn test1068_object_hashes_must_be_lowercase_sha256_hex() {
-        let root = Path::new("/nonexistent-root");
-        for invalid in [
-            String::new(),
-            "abc".into(),
-            "A".repeat(64),
-            "g".repeat(64),
-            "a".repeat(63),
-            "a".repeat(65),
-        ] {
-            let mut e = entry("row");
-            e.hash = invalid.clone();
-            let error = validate_object(root, "users/u1.json", &e)
-                .expect_err(&format!("{invalid:?} must be refused"));
-            assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
-        }
+    fn test2120_the_root_is_a_function_of_the_entries_alone() {
+        let mut entries = BTreeMap::from([
+            (".db/format".to_string(), entry("format", &"a".repeat(64))),
+            ("schema/users.json".to_string(), entry("schema", &"b".repeat(64))),
+            ("users/u1.json".to_string(), entry("row", &"c".repeat(64))),
+            ("users/u2.json".to_string(), entry("row", &"d".repeat(64))),
+        ]);
+        let first = root_of(&entries);
+        assert_eq!(first, root_of(&entries.clone()), "deterministic");
+        entries.insert("users/u2.json".into(), entry("row", &"e".repeat(64)));
+        assert_ne!(first, root_of(&entries), "a changed row is a changed state");
+        entries.insert("users/u2.json".into(), entry("row", &"d".repeat(64)));
+        assert_eq!(first, root_of(&entries), "and changing it back restores the state");
+        // The table grouping is by the first path component.
+        let moved = BTreeMap::from([
+            (".db/format".to_string(), entry("format", &"a".repeat(64))),
+            ("schema/users.json".to_string(), entry("schema", &"b".repeat(64))),
+            ("people/u1.json".to_string(), entry("row", &"c".repeat(64))),
+            ("users/u2.json".to_string(), entry("row", &"d".repeat(64))),
+        ]);
+        assert_ne!(first, root_of(&moved));
     }
 
-    /// An object's declared kind is derived from its path, so a mislabelled
-    /// entry means the metadata disagrees with the layout it describes.
     #[test]
-    fn test1069_object_kind_is_derived_from_its_path() {
-        let root = Path::new("/nonexistent-root");
-        for (path, expected) in [
-            (".db/format", "format"),
-            (".db/config", "config"),
-            ("schema/users.json", "schema"),
-            ("users/u1.json", "row"),
-        ] {
-            // The correct kind gets past the kind check and fails later, when
-            // the absent object file is opened.
-            let error = validate_object(root, path, &entry(expected)).unwrap_err();
-            assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
-            assert!(
-                !error.diagnostic.message.contains("expected"),
-                "{path} with kind {expected} should pass the kind check"
-            );
-
-            // A wrong kind is rejected by the kind check itself.
-            let wrong = if expected == "row" { "schema" } else { "row" };
-            let error = validate_object(root, path, &entry(wrong)).unwrap_err();
-            assert!(
-                error.diagnostic.message.contains("expected"),
-                "{path} with kind {wrong} must be refused as mislabelled"
-            );
-        }
-    }
-
-    /// Section 22: the state root covers the format, the configuration, every
-    /// schema, and every row, so the digest is stable across processes and
-    /// changes whenever any authoritative input changes.
-    #[test]
-    fn test1070_manifest_entries_round_trip_through_json() {
-        let manifest = Manifest {
-            format_version: FORMAT_VERSION,
-            revision: 7,
-            root_hash: "b".repeat(64),
-            entries: BTreeMap::from([
-                ("schema/users.json".to_string(), entry("schema")),
-                ("users/u1.json".to_string(), entry("row")),
-            ]),
-        };
-        let text = serde_json::to_string(&manifest).unwrap();
-        let parsed: Manifest = crate::json::parse_as(text.as_bytes()).unwrap();
-        assert_eq!(parsed.revision, 7);
-        assert_eq!(parsed.entries, manifest.entries);
-
-        // Unknown keys are refused: the manifest is a closed representation.
-        // The key is injected once, immediately inside the top-level object, so
-        // the refusal is about that object and not about some nested value.
-        let extended = format!(
-            "{{\"surprise\":1,{}",
-            text.strip_prefix('{').expect("an object was serialized")
-        );
-        assert!(crate::json::parse_as::<Manifest>(extended.as_bytes()).is_err());
-    }
-
-    /// Section 23: a provenance record names the transition it describes, and
-    /// the representation is closed so an unknown field cannot be ignored.
-    #[test]
-    fn test1071_provenance_records_round_trip_and_reject_unknown_fields() {
-        let provenance = Provenance {
+    fn test2121_provenance_records_round_trip_and_reject_unknown_fields() {
+        let record = Provenance {
             revision: 1,
             timestamp: "2026-09-14T00:00:00Z".into(),
             previous_revision: None,
             previous_root_hash: None,
             new_root_hash: "c".repeat(64),
             origin: "import".into(),
-            affected_objects: vec!["A users/u1.json".into()],
-            schema_changes: vec!["A schema/users.json".into()],
+            changes: BTreeMap::from([("users/u1.json".to_string(), Some(entry("row", &"a".repeat(64))))]),
             binary_version: VERSION.into(),
             format_version: FORMAT_VERSION,
             transaction_id: None,
-            entries: BTreeMap::from([("users/u1.json".to_string(), entry("row"))]),
+            lineage: None,
         };
-        let text = serde_json::to_string(&provenance).unwrap();
+        let text = serde_json::to_string(&record).unwrap();
         let parsed: Provenance = crate::json::parse_as(text.as_bytes()).unwrap();
         assert_eq!(parsed.revision, 1);
-        assert_eq!(parsed.origin, "import");
-        assert!(parsed.previous_revision.is_none());
-
-        let extended = format!(
-            "{{\"surprise\":1,{}",
-            text.strip_prefix('{').expect("an object was serialized")
-        );
+        let extended = format!("{{\"surprise\":1,{}", text.strip_prefix('{').unwrap());
         assert!(crate::json::parse_as::<Provenance>(extended.as_bytes()).is_err());
     }
 
-    /// Section 32: a provenance file is named for the revision it records, so a
-    /// zero-padded twenty-digit name sorts chronologically.
     #[test]
-    fn test1072_provenance_filenames_sort_chronologically() {
-        let names: Vec<String> = [1u64, 2, 10, 100, 1000]
-            .iter()
-            .map(|revision| format!("{revision:020}.json"))
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted, "zero padding must preserve revision order");
-        assert_eq!(names[0], "00000000000000000001.json");
-    }
-
-    // ---------------------------------------------------------------------
-    // Golden schema hashes.
-    //
-    // The schema file format is being replaced by a JSON Schema dialect. That
-    // is a change to how a schema is *written*, not to what it *is*, so every
-    // hash below must survive it unchanged: a revision's identity is its
-    // logical content, never its serialization.
-    //
-    // These are frozen literals rather than values recomputed on both sides of
-    // an assertion. A test that hashes the same input twice and compares the
-    // results passes no matter what the encoding does, which would make it
-    // worthless for exactly the change it exists to guard.
-    // ---------------------------------------------------------------------
-
-    use crate::schema::{
-        AdditionalFields, Action, Check, Column, ColumnType, Composition, CompositionKind,
-        ForeignKey, Generated, GeneratedKind,
-        Reference, Schema, Storage,
-    };
-    use indexmap::IndexMap;
-    use serde_json::json;
-
-    fn col(kind: ColumnType) -> Column {
-        Column {
-            kind,
-            nullable: false,
-            default: None,
-            generated: None,
-            values: None,
-            items: None,
-            properties: None,
-            pattern: None,
-            additional_properties: true,
-            required: Default::default(),
-            min_size: None,
-            max_size: None,
-            minimum: None,
-            maximum: None,
-            exclusive_minimum: None,
-            exclusive_maximum: None,
-            multiple_of: None,
-            unique_items: false,
-            composition: None,
-            description: None,
-            annotations: Default::default(),
+    fn test2122_object_hashes_and_kinds_are_checked() {
+        let root = Path::new("/nonexistent-root");
+        for invalid in [String::new(), "abc".into(), "A".repeat(64), "g".repeat(64)] {
+            let error = verify_object(root, "users/u1.json", &entry("row", &invalid)).unwrap_err();
+            assert_eq!(error.diagnostic.code, "INTERNAL_METADATA_CORRUPT");
         }
-    }
-
-    fn table(name: &str, columns: Vec<(&str, Column)>, primary_key: &[&str]) -> Schema {
-        let mut map = IndexMap::new();
-        for (column_name, column) in columns {
-            map.insert(column_name.to_string(), column);
-        }
-        Schema {
-            table: name.into(),
-            schema_version: 1,
-            schema_format: None,
-            description: None,
-            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
-            columns: map,
-            unique: vec![],
-            foreign_keys: vec![],
-            check: vec![],
-            indexes: vec![],
-            storage: None,
-            additional_fields: AdditionalFields::Reject,
-            annotations: Default::default(),
-        }
-    }
-
-    /// Every fixture the golden hashes cover, built once so the hash test and
-    /// any future encoder test describe the same schemas.
-    fn golden_fixtures() -> Vec<(&'static str, Schema)> {
-        let mut out = vec![];
-
-        // One fixture per column type, so a change to any type's encoding shows
-        // up as exactly one failing row.
-        for (label, kind) in [
-            ("bool", ColumnType::Bool),
-            ("int", ColumnType::Int),
-            ("float", ColumnType::Float),
-            ("decimal", ColumnType::Decimal),
-            ("string", ColumnType::String),
-            ("bytes", ColumnType::Bytes),
-            ("date", ColumnType::Date),
-            ("timestamp", ColumnType::Timestamp),
-            ("uuid", ColumnType::Uuid),
-            ("ulid", ColumnType::Ulid),
-            ("json", ColumnType::Json),
-        ] {
-            out.push((
-                label,
-                table("t", vec![("id", col(ColumnType::String)), ("v", col(kind))], &["id"]),
-            ));
-        }
-
-        // enum carries its values; array and object carry nested shape.
-        let mut enumerated = col(ColumnType::Enum);
-        enumerated.values = Some(vec!["a".into(), "b".into()]);
-        out.push((
-            "enum",
-            table("t", vec![("id", col(ColumnType::String)), ("v", enumerated)], &["id"]),
-        ));
-
-        let mut nested_array = col(ColumnType::Array);
-        nested_array.items = Some(Box::new(col(ColumnType::Decimal)));
-        out.push((
-            "array_of_decimal",
-            table("t", vec![("id", col(ColumnType::String)), ("v", nested_array)], &["id"]),
-        ));
-
-        let mut properties = IndexMap::new();
-        properties.insert("inner".to_string(), col(ColumnType::Ulid));
-        let mut nested_object = col(ColumnType::Object);
-        nested_object.properties = Some(properties);
-        out.push((
-            "object_with_ulid_property",
-            table("t", vec![("id", col(ColumnType::String)), ("v", nested_object)], &["id"]),
-        ));
-
-        // nullable x default x generated, the axes that decide `required`.
-        let mut nullable = col(ColumnType::String);
-        nullable.nullable = true;
-        out.push((
-            "nullable",
-            table("t", vec![("id", col(ColumnType::String)), ("v", nullable)], &["id"]),
-        ));
-
-        let mut defaulted = col(ColumnType::String);
-        defaulted.default = Some(json!("fixed"));
-        out.push((
-            "default_not_null",
-            table("t", vec![("id", col(ColumnType::String)), ("v", defaulted)], &["id"]),
-        ));
-
-        let mut nullable_defaulted = col(ColumnType::String);
-        nullable_defaulted.nullable = true;
-        nullable_defaulted.default = Some(json!("fixed"));
-        out.push((
-            "nullable_and_default",
-            table("t", vec![("id", col(ColumnType::String)), ("v", nullable_defaulted)], &["id"]),
-        ));
-
-        for (label, kind, generated) in [
-            ("generated_uuid", ColumnType::Uuid, GeneratedKind::Uuid),
-            ("generated_ulid", ColumnType::Ulid, GeneratedKind::Ulid),
-            ("generated_now", ColumnType::Timestamp, GeneratedKind::Now),
-            ("generated_sequence", ColumnType::Int, GeneratedKind::Sequence),
-        ] {
-            let mut column = col(kind);
-            column.generated = Some(Generated { kind: generated });
-            out.push((
-                label,
-                table("t", vec![("id", col(ColumnType::String)), ("v", column)], &["id"]),
-            ));
-        }
-
-        let mut described = col(ColumnType::String);
-        described.description = Some("what it holds".into());
-        let mut with_description =
-            table("t", vec![("id", col(ColumnType::String)), ("v", described)], &["id"]);
-        with_description.description = Some("the table".into());
-        out.push(("descriptions", with_description));
-
-        // Relational facts: each one alone, so a failure names the culprit.
-        let mut unique = table(
-            "t",
-            vec![("id", col(ColumnType::String)), ("v", col(ColumnType::String))],
-            &["id"],
-        );
-        unique.unique = vec![vec!["v".into()]];
-        out.push(("unique", unique));
-
-        let mut indexes = table(
-            "t",
-            vec![("id", col(ColumnType::String)), ("v", col(ColumnType::String))],
-            &["id"],
-        );
-        indexes.indexes = vec![vec!["v".into()]];
-        out.push(("indexes", indexes));
-
-        let mut checked = table(
-            "t",
-            vec![("id", col(ColumnType::String)), ("n", col(ColumnType::Int))],
-            &["id"],
-        );
-        checked.check = vec![Check {
-            name: "positive".into(),
-            expr: "n > 0".into(),
-        }];
-        out.push(("check", checked));
-
-        let mut stored = table(
-            "t",
-            vec![("id", col(ColumnType::String)), ("slug", col(ColumnType::String))],
-            &["id"],
-        );
-        stored.unique = vec![vec!["slug".into()]];
-        stored.storage = Some(Storage {
-            filename: vec!["slug".into()],
-        });
-        out.push(("storage_filename", stored));
-
-        let mut permissive = table("t", vec![("id", col(ColumnType::String))], &["id"]);
-        permissive.additional_fields = AdditionalFields::Allow;
-        out.push(("additional_fields_allow", permissive));
-
-        // Every bound decides which rows a schema admits, so each earns an
-        // identity of its own. Without these the identity change would be
-        // untested: no other fixture carries a bound, so adding the keywords
-        // moved nothing that already existed.
-        let mut bounded_string = col(ColumnType::String);
-        bounded_string.min_size = Some(1);
-        bounded_string.max_size = Some(64);
-        out.push((
-            "bounded_string",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", bounded_string)],
-                &["id"],
-            ),
-        ));
-
-        let mut bounded_number = col(ColumnType::Int);
-        bounded_number.minimum = Some(0.0);
-        bounded_number.maximum = Some(100.0);
-        bounded_number.multiple_of = Some(5.0);
-        out.push((
-            "bounded_number",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", bounded_number)],
-                &["id"],
-            ),
-        ));
-
-        let mut distinct = col(ColumnType::Array);
-        distinct.items = Some(Box::new(col(ColumnType::String)));
-        distinct.unique_items = true;
-        distinct.min_size = Some(1);
-        out.push((
-            "unique_items",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", distinct)],
-                &["id"],
-            ),
-        ));
-
-        // Composition narrows which values of the declared type are legal, so
-        // two schemas differing only by an alternative are different schemas.
-        let mut first = col(ColumnType::String);
-        first.pattern = Some("^[A-Z]{3}$".into());
-        let mut second = col(ColumnType::String);
-        second.pattern = Some("^[0-9]{6}$".into());
-        let mut composed = col(ColumnType::String);
-        composed.composition = Some(Composition {
-            kind: CompositionKind::One,
-            alternatives: vec![first, second],
-        });
-        out.push((
-            "composed_one_of",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", composed)],
-                &["id"],
-            ),
-        ));
-
-        // An alternative that names only `required` says one thing: the value
-        // must carry this member. Without it in identity, two schemas admitting
-        // different objects would share a hash -- and this is exactly the shape
-        // a composition alternative takes.
-        let mut requiring = col(ColumnType::Object);
-        requiring.required = ["owner".to_string()].into_iter().collect();
-        let mut alternative = col(ColumnType::Object);
-        alternative.required = ["reviewer".to_string()].into_iter().collect();
-        let mut composed_required = col(ColumnType::Object);
-        composed_required.properties = Some({
-            let mut p = IndexMap::new();
-            p.insert("owner".to_string(), col(ColumnType::String));
-            p
-        });
-        composed_required.composition = Some(Composition {
-            kind: CompositionKind::One,
-            alternatives: vec![requiring, alternative],
-        });
-        out.push((
-            "composed_required_members",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", composed_required)],
-                &["id"],
-            ),
-        ));
-
-        // An element foreign key relates each element of an array, which is a
-        // different relationship from the scalar key above it.
-        let mut refs = col(ColumnType::Array);
-        refs.items = Some(Box::new(col(ColumnType::String)));
-        let mut referencing = table(
-            "child",
-            vec![("id", col(ColumnType::String)), ("parent_refs", refs)],
-            &["id"],
-        );
-        referencing.foreign_keys = vec![ForeignKey {
-            columns: vec!["parent_refs[]".into()],
-            references: Reference {
-                table: "parent".into(),
-                columns: vec!["id".into()],
-            },
-            on_delete: Some(Action::Restrict),
-            on_update: Some(Action::Restrict),
-        }];
-        out.push(("fk_per_element", referencing));
-
-        // A pattern decides which rows a column admits, so it must be part of
-        // what the schema *is*. Without these fixtures the identity change
-        // would be untested: no other fixture carries a user pattern, and reldir's
-        // own decimal and ulid patterns are deliberately excluded from identity.
-        let mut patterned_column = col(ColumnType::String);
-        patterned_column.pattern = Some("^[a-z][a-z0-9._-]{2,127}$".into());
-        out.push((
-            "patterned",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", patterned_column)],
-                &["id"],
-            ),
-        ));
-
-        let mut closed_properties = IndexMap::new();
-        closed_properties.insert("source".to_string(), col(ColumnType::String));
-        let mut closed_column = col(ColumnType::Object);
-        closed_column.properties = Some(closed_properties);
-        closed_column.additional_properties = false;
-        out.push((
-            "closed_nested_object",
-            table(
-                "t",
-                vec![("id", col(ColumnType::String)), ("v", closed_column)],
-                &["id"],
-            ),
-        ));
-
-        let mut composite = table(
-            "t",
-            vec![("a", col(ColumnType::String)), ("b", col(ColumnType::String))],
-            &["a", "b"],
-        );
-        composite.unique = vec![vec!["a".into(), "b".into()]];
-        out.push(("composite_primary_key", composite));
-
-        let mut versioned = table("t", vec![("id", col(ColumnType::String))], &["id"]);
-        versioned.schema_version = 7;
-        versioned.schema_format = Some(crate::FORMAT_VERSION);
-        out.push(("schema_version_and_format", versioned));
-
-        // Every referential action, including the unset pair that defaults to
-        // restrict without being written.
-        for (label, on_delete, on_update) in [
-            ("fk_unset_actions", None, None),
-            ("fk_restrict", Some(Action::Restrict), Some(Action::Restrict)),
-            ("fk_cascade", Some(Action::Cascade), Some(Action::Cascade)),
-            ("fk_set_null", Some(Action::SetNull), Some(Action::Restrict)),
-            ("fk_set_default", Some(Action::SetDefault), Some(Action::Restrict)),
-            ("fk_no_action", Some(Action::NoAction), Some(Action::NoAction)),
-        ] {
-            let mut referencing = col(ColumnType::String);
-            referencing.nullable = true;
-            referencing.default = Some(json!("x"));
-            let mut child = table(
-                "child",
-                vec![("id", col(ColumnType::String)), ("parent_id", referencing)],
-                &["id"],
-            );
-            child.foreign_keys = vec![ForeignKey {
-                columns: vec!["parent_id".into()],
-                references: Reference {
-                    table: "parent".into(),
-                    columns: vec!["id".into()],
-                },
-                on_delete,
-                on_update,
-            }];
-            out.push((label, child));
-        }
-
-        // Column order is part of the logical schema: canonical rows are
-        // written in it, so two schemas differing only by order are different.
-        out.push((
-            "column_order_ab",
-            table(
-                "t",
-                vec![
-                    ("id", col(ColumnType::String)),
-                    ("a", col(ColumnType::String)),
-                    ("b", col(ColumnType::String)),
-                ],
-                &["id"],
-            ),
-        ));
-        out.push((
-            "column_order_ba",
-            table(
-                "t",
-                vec![
-                    ("id", col(ColumnType::String)),
-                    ("b", col(ColumnType::String)),
-                    ("a", col(ColumnType::String)),
-                ],
-                &["id"],
-            ),
-        ));
-
-        out
-    }
-
-    /// The logical identity of a schema, frozen.
-    ///
-    /// A schema's hash is what a revision is recorded against, so it must not
-    /// move when the file format changes. These are taken over
-    /// `semantic::encode_v1`, which is the whole point: identity follows the
-    /// relational content, so replacing the on-disk grammar with JSON Schema
-    /// must leave every one of these untouched. A failure here after the
-    /// migration means the serialization has leaked into semantic identity.
-    #[test]
-    fn test1125_schema_hashes_are_independent_of_the_file_format() {
-        const GOLDEN: &[(&str, &str)] = &[
-            ("bool", "0bf55eb68c2708f1a4ad0b6686c189a73fb0f71e8ea21be4e907def78ea5fc44"),
-            ("int", "a939dcce7c26dacdb5cfc1d32420e0a078f8f63c3bc886cd3786a92b73646810"),
-            ("float", "ddadf6eb139973d09dd25eacedcf6c3bbec6ee87df3d8346fe85631fd6296f37"),
-            ("decimal", "f26399f7a7c29ccf35da54e72f2d3b6eb93441428b64739d1373f77e71363d26"),
-            ("string", "bacaecf137c9d46af4532595b9d6d136d67d14fb83991796da4ecb5e65a531ce"),
-            ("bytes", "8280ca26faf8dab8843f167d43d595b44b7eafed2edfc55bebe10eec39d20d34"),
-            ("date", "605663fb2cee57cb3844b92a915d25f3aba9cfe0ea0c32f4133268474babb855"),
-            ("timestamp", "20983e49021d1239d9d8ca8bedbb73e0d2ee6812576c2877082f326ed13b9f54"),
-            ("uuid", "714b623636f681429e72a91fc2e24ca239b9f65553f18e730d76fe2e41c3fc70"),
-            ("ulid", "d78e2bc72249d0b71b8ff7ae7e1a46ff0f70379fab49b2a6f30e9f13e674ca7a"),
-            ("json", "7b18bcd514f76d114189ee328ce59a83a76e0741aa666d2c86a9b3b7dc459364"),
-            ("enum", "4fc4fe783a3d44f354ff6554a86e9df9f4c71574ac59eb52586d0d5c89375314"),
-            ("array_of_decimal", "f84a8ff25795181f16bbfd6740199fdaa1b85cddcd2902dfbba2fd80fbe1344f"),
-            ("object_with_ulid_property", "444980ee96c1f131a9684f3708f08ef8fab54165763f00930d56fd75a798dfeb"),
-            ("nullable", "be3fc5ed17bc06a9a3e0d6d2d98c16451b46d5439febd274192afb2126eb3800"),
-            ("default_not_null", "706ec91ff11e15d5d590052842a077cdfc8aca11c824c2c67483073828ae47ab"),
-            ("nullable_and_default", "10cee2f93793a85a5ab89d51afb45588bc7c376873403c7cda9f3bd82e183288"),
-            ("generated_uuid", "43ea5b01e8a2bb7dbd6c14c0ba7dcdc81bd50f127e6bc45ea5fab975e95bf002"),
-            ("generated_ulid", "b2d142c6febf8227bf61cf7bba1266785a3f79aa9a7234d319d6fab5cea4f1cb"),
-            ("generated_now", "2a4c033cad2310f2ae59815c808d50145b1d5d059ed994a0de20fd74b0d574f5"),
-            ("generated_sequence", "26e3e6b8cef0db3a27abd3eb65f4760ad8a2bc7667278463e00055e6bdb75627"),
-            ("descriptions", "10b4bd0a2fe9620e5e51a8e8e0b4673d8f0a547d4917f80f7dd5d71af5ba4494"),
-            ("unique", "6ce26284c29c46747a81345937b4bc537e3163a45fa229a24047511b4cb11289"),
-            ("indexes", "92bf7233758f91d742f5ae852720e7fcfc3f59b1fbd68f9b9df61f9f10f03a31"),
-            ("check", "4e61b420e65cf6b0a35b6ceb449770f039d6a67dce2f384ede06f51837cd1608"),
-            ("storage_filename", "2c53387a296180351c470dc11f79471b2ebec6c7917a89346ddea40c2540b0aa"),
-            ("additional_fields_allow", "df38fd9bf16cd9108c27f23adf84df9d62d5ca8876c1d780e7496d4307ff391c"),
-            // Bounds and composition decide which rows a schema admits, so each
-            // earns an identity of its own. Every hash above and below is
-            // unchanged: a schema that states no bound encodes none, so adding
-            // the keywords moved nothing that already existed.
-            ("bounded_string", "ceb718e0652738fa008fbf41e5db55f872ba0dab58d032b45437bf1ef7f8a714"),
-            ("bounded_number", "22393847fd08fb4f08ae95524c9c30e5ae9449f54e235d5009db31d35e8332af"),
-            ("unique_items", "cef58310f787e16311c28ed105eb7e1ba88f95c9860d243f49b48196b314cfcd"),
-            ("composed_one_of", "3ed4c37a07d3255cdfb63e9af6c781cd362ed26b730b9520192b108a95749305"),
-            // An alternative that names only `required` says one thing: the
-            // value must carry this member. Two schemas whose alternatives
-            // require different members admit different objects, so the
-            // requirement is part of what each schema is.
-            ("composed_required_members", "46207d53d7a5cf48aba1a987539c84603db4d281d01466c5412ec8e009f4f217"),
-            // An element foreign key is a different relationship from a scalar
-            // one, and the spelling that says so is part of the schema.
-            ("fk_per_element", "142628866e7833b8623b764902278cdc6372277f4621b01c2aaeedb18799ce6e"),
-            // A pattern and a closed object each decide which rows a schema
-            // admits, so each earns an identity of its own. Every hash above
-            // and below is unchanged: reldir's own decimal and ulid patterns are
-            // excluded from identity, so adding the keyword moved nothing that
-            // already existed.
-            ("patterned", "7f486b0cab18379e768dff0063a3b0d16d4945e5514fac53cdc07c6fc75f9a9c"),
-            ("closed_nested_object", "5352c322653b2cc854c596064fdab7bbbb1b5d5f4fcef4ff56d3e78948d70fe3"),
-            ("composite_primary_key", "121470cfcceecef0f75cbc824d0f2778c4877628860cad456ac22b425c9793f2"),
-            ("schema_version_and_format", "1b63cf55a764d6f0ec9783340577add6d7179ed5a9c48d5322d9568f6458aa49"),
-            ("fk_unset_actions", "8888df83fa328bcfb51d474610539db53e00d5f4fc343dc992b3151267f5f426"),
-            ("fk_restrict", "8888df83fa328bcfb51d474610539db53e00d5f4fc343dc992b3151267f5f426"),
-            ("fk_cascade", "388bc55a325d634c863da9dfef062388a6e7a7fe35a5b263546f007a56a9c829"),
-            ("fk_set_null", "b0cbb20d6ecf9914aa3a3c792a954c655bbb0c33b935efb752f7b8dc9ca250cd"),
-            ("fk_set_default", "7ceebe5a46548fdaae78d3074dea9f9dda6c08c5875251330ec2fc1a3dcb15a2"),
-            ("fk_no_action", "128e213e5c156b9c09f26c262555aa10b37243e938761c8a9bba967dacc77fe2"),
-            ("column_order_ab", "06bfe85c793f5868313e8d2b6326b7873335c11506f962e1e1cf71d08d9c874f"),
-            ("column_order_ba", "21d92c54ff542ff3e6c89132d35f77350c23859a63c2d0145ddd069a85ea6ab5"),
-        ];
-
-        let fixtures = golden_fixtures();
-        let computed: Vec<(String, String)> = fixtures
-            .iter()
-            .map(|(label, schema)| {
-                (
-                    (*label).to_string(),
-                    {
-                        let value = crate::schema::semantic::encode_v1(schema);
-                        let bytes =
-                            serde_json::to_vec(&canonical::normalize(&value)).expect("encodes");
-                        canonical::hash_bytes(&bytes)
-                    },
-                )
-            })
-            .collect();
-
-        if GOLDEN.is_empty() {
-            let rendered = computed
-                .iter()
-                .map(|(label, hash)| format!("        (\"{label}\", \"{hash}\"),"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            panic!("golden hashes are unrecorded; freeze these:\n{rendered}");
-        }
-
-        assert_eq!(
-            GOLDEN.len(),
-            computed.len(),
-            "every fixture must be pinned: the golden table has drifted from the fixtures"
-        );
-        for ((label, expected), (computed_label, actual)) in GOLDEN.iter().zip(&computed) {
-            assert_eq!(label, computed_label, "fixture order must be stable");
-            assert_eq!(
-                expected, actual,
-                "{label}: schema hash moved, so serialization has changed logical identity"
-            );
-        }
-    }
-
-    /// Column order is part of a schema's identity.
-    ///
-    /// `canonical_row` writes a row's keys in schema column order, so two
-    /// schemas differing only in that order write different bytes for the same
-    /// logical row -- `test1003` pins exactly that. Identity has to agree with
-    /// what the database actually writes, or the state root cannot distinguish
-    /// two databases whose files genuinely differ.
-    ///
-    /// The derived encoding lost this: it rendered `columns` as an object, and
-    /// `normalize` sorts object keys, so the ordering was erased before the
-    /// digest. `semantic::encode_v1` carries the order explicitly, which is the
-    /// one respect in which it departs from what the derive produced.
-    #[test]
-    fn test1126_column_order_changes_a_schemas_identity() {
-        let fixtures = golden_fixtures();
-        let find = |name: &str| {
-            fixtures
-                .iter()
-                .find(|(label, _)| *label == name)
-                .map(|(_, schema)| schema.clone())
-                .expect("fixture exists")
-        };
-        let ab = find("column_order_ab");
-        let ba = find("column_order_ba");
-
-        // The two schemas genuinely differ: they serialize the same row to
-        // different bytes, which is what makes sharing one hash a defect.
-        let mut row = serde_json::Map::new();
-        row.insert("id".into(), json!("r"));
-        row.insert("a".into(), json!("A"));
-        row.insert("b".into(), json!("B"));
-        assert_ne!(
-            serde_json::to_vec(&canonical::canonical_row(&row, &ab)).unwrap(),
-            serde_json::to_vec(&canonical::canonical_row(&row, &ba)).unwrap(),
-            "the fixtures must write different rows, or they are not a witness"
-        );
-
-        let identity = |schema: &crate::schema::Schema| {
-            let value = crate::schema::semantic::encode_v1(schema);
-            canonical::hash_bytes(&serde_json::to_vec(&canonical::normalize(&value)).unwrap())
-        };
-        assert_ne!(
-            identity(&ab),
-            identity(&ba),
-            "column order must change a schema's identity"
-        );
-
-        // An unstated referential action and its written equivalent impose the
-        // same behaviour, so they are one schema with one identity.
-        assert_eq!(
-            identity(&find("fk_unset_actions")),
-            identity(&find("fk_restrict")),
-            "an omitted on_delete is restrict"
-        );
+        let error = verify_object(root, "schema/users.json", &entry("row", &"a".repeat(64))).unwrap_err();
+        assert!(error.diagnostic.message.contains("expected \"schema\""), "{}", error.diagnostic.message);
     }
 }

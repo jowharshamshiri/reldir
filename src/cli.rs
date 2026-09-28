@@ -1,5844 +1,834 @@
+//! The command line: arguments in, a command run, its result rendered.
+//!
+//! Parsing lives here and nowhere else. Each subcommand becomes one call into
+//! [`crate::command`], whose output goes through a [`Terminal`] sink in the
+//! chosen format.
+
 use crate::{
-    canonical,
-    db::{Database, ObserveMode},
+    command::{self, Context, health::DoctorOptions, history, rows::ListOptions, schema::OnConflict},
+    config::ResourceOverrides,
     diagnostic::{DbError, Result},
-    infer::{self, Strictness},
-    metadata,
-    output::{self, Format},
-    schema::{Check, Column, ColumnType, ForeignKey, Generated, GeneratedKind, Schema},
-    transaction::{self, Change},
+    migrate::{Constraint, Migration, Operation},
+    output::{self, Finish, Format, Sink, Terminal},
 };
-use clap::{CommandFactory, Parser, Subcommand};
-use rustyline::{
-    Context as ReadlineContext, Editor, Helper,
-    completion::{Completer, Pair},
-    error::ReadlineError,
-    highlight::Highlighter,
-    hint::Hinter,
-    history::DefaultHistory,
-    validate::Validator,
-};
-use serde_json::{Map, Value};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::{
-    fs,
-    io::{self, BufRead, IsTerminal, Read, Write},
-    path::{Path, PathBuf},
+    io::IsTerminal,
+    path::PathBuf,
 };
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "reldir",
     version,
-    about = "Filesystem-native relational JSON database",
-    // `reldir 'SELECT ...'` runs the query and bare `reldir` opens the shell, so
-    // subcommand is optional and a leading positional that is not a subcommand
-    // name is captured as SQL. Global flags must remain usable alongside a
-    // subcommand, so the positional only negates the requirement -- it never
-    // conflicts with subcommand use.
+    about = "A relational database whose tables are directories of JSON files",
+    long_about = "reldir governs a folder of JSON files as a relational database: every file is a row, \
+                  every schema is a JSON Schema document, and no command -- SQL, row edits, imports, \
+                  migrations, repairs -- can leave the files invalid.\n\n\
+                  With no subcommand, `reldir 'SELECT ...'` runs one statement and bare `reldir` opens a shell.",
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
-    #[arg(long, global = true, env = "DB_DIR")]
-    db: Option<PathBuf>,
-    #[arg(long, global = true)]
-    readonly: bool,
-    #[arg(long,global=true,value_parser=["table","json","jsonl","csv","sqlite"])]
-    format: Option<String>,
-    #[arg(long, global = true)]
-    json: bool,
-    #[arg(long, global = true)]
-    quiet: bool,
-    #[arg(long, global = true)]
-    verbose: bool,
-    #[arg(long, global = true)]
-    no_color: bool,
-    #[arg(long, global = true)]
-    yes: bool,
-    #[arg(long, global = true)]
-    dry_run: bool,
-    /// Discard `.db/` and re-establish it from the rows and pins.
-    ///
-    /// The authorization for destroying metadata that cannot be rebuilt --
-    /// recorded history, configuration, snapshots. Functionally identical to
-    /// removing `.db/` by hand and running the command again, which is exactly
-    /// what it does, so there is one recovery path rather than two.
-    #[arg(long, global = true)]
-    rebuild_metadata: bool,
-    #[arg(long, global = true)]
-    timeout: Option<u64>,
-    /// Seconds to wait for the writer lock before reporting contention.
-    ///
-    /// Separate from `--timeout`, which bounds a query. `0` tries once and
-    /// fails immediately, which is what a CI job wanting a deterministic
-    /// failure asks for. Every wait is bounded; there is no "wait forever".
-    #[arg(long, global = true, value_name = "SECONDS")]
-    wait: Option<f64>,
-    #[arg(long, global = true)]
-    max_json_file_size: Option<u64>,
-    #[arg(long, global = true)]
-    max_nesting_depth: Option<usize>,
-    #[arg(long, global = true)]
-    max_query_memory: Option<u64>,
-    #[arg(long, global = true)]
-    max_sort_memory: Option<u64>,
-    #[arg(long, global = true)]
-    max_temporary_disk: Option<u64>,
-    #[arg(long, global = true)]
-    max_result_rows: Option<usize>,
-    #[arg(long, global = true)]
-    max_transaction_size: Option<u64>,
-    /// Never establish prerequisites implicitly. Reports what would be needed
-    /// instead of creating it, which is the posture CI and debugging want.
-    #[arg(long, global = true)]
-    no_auto: bool,
-    /// SQL to execute when no subcommand is given.
+    #[command(flatten)]
+    pub global: Global,
+    /// A SQL statement to run when no subcommand is given; `-` reads it from stdin.
     #[arg(value_name = "SQL")]
-    sql: Option<String>,
+    pub sql: Option<String>,
     #[command(subcommand)]
-    command: Option<Command>,
+    pub command: Option<Command>,
 }
-impl Cli {
-    pub fn machine_error_format(&self) -> Option<&str> {
-        if self.json {
-            Some("json")
-        } else {
-            self.format
-                .as_deref()
-                .filter(|x| matches!(*x, "json" | "jsonl"))
-        }
-    }
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct Global {
+    /// The database root, exactly as named. It must exist. Without it, reldir
+    /// uses the nearest ancestor of the working directory that holds `.db/`.
+    #[arg(long, global = true, env = "RELDIR_DB", value_name = "DIR")]
+    pub db: Option<PathBuf>,
+    /// Write nothing at all -- not rows, not history, not derived state.
+    #[arg(long, global = true)]
+    pub readonly: bool,
+    /// Output format: table (for people), json (one envelope), jsonl (a stream
+    /// of records), csv (records only), sarif (diagnostics, for code scanning).
+    /// Defaults to table on a terminal and jsonl otherwise.
+    #[arg(long, global = true, value_name = "FORMAT", value_parser = ["table", "json", "jsonl", "csv", "sarif"])]
+    pub format: Option<String>,
+    /// Shorthand for `--format json`.
+    #[arg(long, global = true, conflicts_with = "format")]
+    pub json: bool,
+    /// Print no informational prose; results, diagnostics and exit codes are unaffected.
+    #[arg(long, short, global = true)]
+    pub quiet: bool,
+    /// Report progress from the first file, not after a second.
+    #[arg(long, short, global = true)]
+    pub verbose: bool,
+    /// Never colour output. `NO_COLOR` in the environment does the same.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+    /// Answer yes to confirmations. Needed to confirm anything when there is no terminal to ask on.
+    #[arg(long, short, global = true)]
+    pub yes: bool,
+    /// Plan and validate every change, show it, and write nothing.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+    /// Never create a database implicitly; report what is missing instead.
+    #[arg(long, global = true)]
+    pub no_auto: bool,
+    /// Allow discarding an unlabelled `.db/` that holds history, to establish it again from the files.
+    #[arg(long, global = true)]
+    pub rebuild_metadata: bool,
+    /// Answer read-only queries from an INVALID database, reporting its faults first.
+    #[arg(long, global = true)]
+    pub allow_invalid: bool,
+    /// Allow operations that discard data or history: replacing a pin by
+    /// re-inference, beginning a new history lineage.
+    #[arg(long, global = true)]
+    pub allow_destructive: bool,
+    /// Seconds a query may run.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub timeout: Option<u64>,
+    /// Seconds to wait for the writer lock; 0 tries once.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    pub wait: Option<f64>,
+    /// Largest JSON file read, in bytes.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_json_file_size: Option<u64>,
+    /// Deepest JSON nesting read.
+    #[arg(long, global = true, value_name = "DEPTH")]
+    pub max_nesting_depth: Option<usize>,
+    /// Bytes of memory a query may use, sorting included.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_query_memory: Option<u64>,
+    /// Most rows a query may return; more is an error, never a silent truncation.
+    #[arg(long, global = true, value_name = "ROWS")]
+    pub max_result_rows: Option<usize>,
+    /// Most bytes one transaction may write.
+    #[arg(long, global = true, value_name = "BYTES")]
+    pub max_transaction_size: Option<u64>,
 }
-#[derive(Subcommand, Clone)]
-enum Command {
-    #[command(
-        about = "Initialize a database",
-        after_help = "Example: reldir init ./data --adopt"
-    )]
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Make a folder a database.
+    #[command(after_help = "Examples:\n  reldir init ./data\n  reldir init ./content --adopt")]
     Init {
+        /// The folder; created when missing. Defaults to --db, then the working directory.
         path: Option<PathBuf>,
+        /// Govern the data already in the folder, inferring its schemas.
         #[arg(long)]
         adopt: bool,
+        /// Keep recorded history in version control alongside the rows.
         #[arg(long)]
         track_provenance: bool,
     },
-    #[command(about = "Show validity and changes", after_help = "Example: reldir status")]
+    /// Show what a folder holds and what reldir would make of it, writing nothing.
+    #[command(after_help = "Example: reldir inspect ./data")]
+    Inspect {
+        /// The folder. Defaults to --db, then the working directory.
+        path: Option<PathBuf>,
+    },
+    /// Validity, unrecorded changes, and the current revision.
+    #[command(after_help = "Example: reldir status")]
     Status,
-    #[command(
-        about = "Inspect a directory without adoption",
-        after_help = "Example: reldir inspect ./data"
-    )]
-    Inspect { path: Option<PathBuf> },
-    #[command(
-        about = "Fully validate the database",
-        after_help = "Example: reldir --readonly check"
-    )]
+    /// Validate everything; exit 2 when invalid.
+    #[command(after_help = "Examples:\n  reldir check\n  reldir --readonly check --format sarif > reldir.sarif")]
     Check {
+        /// Also fail, with exit 7, on warnings and lint findings.
         #[arg(long)]
         strict: bool,
     },
-    #[command(
-        about = "Infer explicit schemas",
-        after_help = "Example: reldir infer users --write"
-    )]
-    Infer {
-        table: Option<String>,
-        #[arg(long)]
-        write: bool,
-        #[arg(long)]
-        all: bool,
-        #[arg(long, default_value = "balanced")]
-        strictness: String,
-        #[arg(long, value_delimiter = ',')]
-        pk: Vec<String>,
-    },
-    #[command(
-        about = "Report schema strengthening opportunities",
-        after_help = "Example: reldir lint --strict"
-    )]
+    /// Report how the schemas could say more than they do.
+    #[command(after_help = "Example: reldir lint --strict")]
     Lint {
+        /// Only this table.
         table: Option<String>,
+        /// Exit 7 when there are findings.
         #[arg(long)]
         strict: bool,
+        /// Also report missing descriptions.
         #[arg(long)]
         descriptions: bool,
     },
-    #[command(
-        about = "Diagnose and repair",
-        after_help = "Example: reldir doctor --fix --yes"
-    )]
+    /// Diagnose, and repair least destructively.
+    #[command(after_help = "Examples:\n  reldir doctor\n  reldir doctor --fix\n  reldir doctor --fix --allow-data --only FIX_REMOVE_REFERENCE")]
     Doctor {
+        /// Apply the default fix for each problem.
         #[arg(long)]
         fix: bool,
+        /// Also apply fixes that rewrite rows.
         #[arg(long)]
         allow_data: bool,
-        #[arg(long)]
+        /// Only this fix id or problem code; naming an alternative chooses it over the default.
+        #[arg(long, value_name = "FIX_ID|CODE")]
         only: Option<String>,
-        #[arg(long)]
+        /// Explain what a fix does and exit.
+        #[arg(long, value_name = "FIX_ID")]
         explain: Option<String>,
+        /// Do not snapshot before rewriting rows.
         #[arg(long)]
         no_snapshot: bool,
     },
-    #[command(about = "List tables", after_help = "Example: reldir tables")]
+    /// List the tables.
     Tables,
-    #[command(about = "Describe a table", after_help = "Example: reldir describe users")]
-    Describe { table: String },
-    #[command(
-        about = "Get a row by primary key",
-        after_help = "Example: reldir get users abc"
-    )]
-    Get { table: String, key: String },
-    #[command(
-        about = "List table rows",
-        after_help = "Example: reldir list users --limit 10"
-    )]
-    List {
+    /// A table's columns, key, references in and out, and size.
+    #[command(after_help = "Example: reldir describe users")]
+    Describe {
+        /// The table.
         table: String,
-        #[arg(long = "where", value_name = "EXPR")]
-        where_expr: Option<String>,
-        #[arg(long)]
+    },
+    /// One row, by primary key.
+    #[command(after_help = "Examples:\n  reldir get users u1\n  reldir get memberships '[\"team1\",\"u1\"]'")]
+    Get {
+        /// The table.
+        table: String,
+        /// The key: its value, or a JSON array for a composite key.
+        key: String,
+    },
+    /// Rows of a table.
+    #[command(after_help = "Example: reldir list users --where \"role = 'admin'\" --order -created_at --limit 10")]
+    List {
+        /// The table.
+        table: String,
+        /// A SQL condition over the table's columns.
+        #[arg(long = "where", value_name = "CONDITION")]
+        filter: Option<String>,
+        /// A column to order by; prefix `-` for descending. Defaults to the key.
+        #[arg(long, value_name = "COLUMN")]
         order: Option<String>,
-        #[arg(long)]
+        /// Most rows to show.
+        #[arg(long, value_name = "N")]
         limit: Option<usize>,
     },
-    #[command(
-        about = "Insert rows",
-        after_help = "Example: reldir insert users '{\"id\":\"abc\"}'"
-    )]
+    /// Insert a row, or an array of rows, as one transaction.
+    #[command(after_help = "Examples:\n  reldir insert users '{\"id\":\"u3\",\"name\":\"Ada\"}'\n  reldir insert users --from rows.json")]
     Insert {
+        /// The table.
         table: String,
-        json_value: Option<String>,
-        #[arg(long)]
+        /// The row as JSON, or an array of rows.
+        #[arg(required_unless_present = "from")]
+        json: Option<String>,
+        /// Read the JSON from a file, or `-` for stdin.
+        #[arg(long, value_name = "FILE", conflicts_with = "json")]
         from: Option<String>,
     },
-    #[command(
-        about = "Patch one row",
-        after_help = "Example: reldir update users abc '{\"name\":\"Alice\"}'"
-    )]
+    /// Set columns of one row.
+    #[command(after_help = "Example: reldir update users u1 '{\"name\":\"Ada Lovelace\"}'")]
     Update {
+        /// The table.
         table: String,
+        /// The row's key.
         key: String,
+        /// A JSON object of the columns to set.
         patch: String,
     },
-    #[command(about = "Delete one row", after_help = "Example: reldir delete users abc")]
-    Delete { table: String, key: String },
-    #[command(
-        about = "Execute SQL",
-        after_help = "Example: reldir sql 'SELECT * FROM users'"
-    )]
-    Sql {
-        sql: String,
-        #[arg(long = "param")]
-        params: Vec<String>,
-        #[arg(long)]
-        explain: bool,
-        #[arg(long)]
-        explain_analyze: bool,
-    },
-    #[command(
-        about = "Explain SQL",
-        after_help = "Example: reldir explain 'SELECT * FROM users'"
-    )]
-    Explain { sql: String },
-    #[command(
-        subcommand,
-        about = "Manage schemas",
-        after_help = "Example: reldir schema show users"
-    )]
-    Schema(SchemaCommand),
-    #[command(
-        about = "Export a table",
-        after_help = "Example: reldir export users --format csv --out users.csv"
-    )]
-    Export {
+    /// Delete one row; referencing rows follow their `onDelete` actions.
+    #[command(after_help = "Example: reldir delete subjects subject.calculus --dry-run")]
+    Delete {
+        /// The table.
         table: String,
+        /// The row's key.
+        key: String,
+    },
+    /// Run one SQL statement: a query, or an INSERT, UPDATE or DELETE.
+    #[command(after_help = "Examples:\n  reldir sql 'SELECT * FROM users WHERE id = ?' --param u1\n  echo 'SELECT count(*) FROM users' | reldir sql -")]
+    Sql {
+        /// The statement; `-` reads it from stdin.
+        statement: String,
+        /// A parameter: `value` for the next `?`, or `name=value` for `:name`. Values are JSON, or text.
+        #[arg(long = "param", value_name = "VALUE")]
+        params: Vec<String>,
+    },
+    /// Show how SQLite would run a statement, without running it.
+    Explain {
+        /// The statement; `-` reads it from stdin.
+        statement: String,
+        /// A parameter, as for `sql`.
+        #[arg(long = "param", value_name = "VALUE")]
+        params: Vec<String>,
+    },
+    /// Show, declare, pin, validate schemas; print the dialect.
+    #[command(subcommand)]
+    Schema(SchemaCommand),
+    /// Infer schemas from rows.
+    #[command(after_help = "Examples:\n  reldir infer users\n  reldir infer --all --write\n  reldir infer users --write --on-schema-conflict compare")]
+    Infer {
+        /// Tables to infer; all when none are named.
+        tables: Vec<String>,
+        /// Every table directory.
         #[arg(long)]
+        all: bool,
+        /// Keep the inferred schemas.
+        #[arg(long)]
+        write: bool,
+        /// strict refuses anything uncertain; balanced is the default; loose accepts mixed kinds as json.
+        #[arg(long, default_value = "balanced", value_parser = ["strict", "balanced", "loose"])]
+        strictness: String,
+        /// The primary key to use, for one table.
+        #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+        pk: Vec<String>,
+        /// When a table already has a schema: ask, fail, compare (show the difference), or reinfer (replace it).
+        #[arg(long, default_value = "ask", value_parser = ["ask", "fail", "compare", "reinfer"])]
+        on_schema_conflict: String,
+    },
+    /// Change table structure.
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
+    /// Insert rows from a JSON, JSON Lines or CSV file.
+    #[command(after_help = "Example: reldir import users --from users.jsonl")]
+    Import {
+        /// The table.
+        table: String,
+        /// The file; `-` for stdin (read as JSON).
+        #[arg(long, value_name = "FILE")]
+        from: String,
+    },
+    /// Every row of a table in canonical form.
+    #[command(after_help = "Example: reldir export users --out users.jsonl")]
+    Export {
+        /// The table.
+        table: String,
+        /// Write to this new file (JSON Lines, or CSV for a .csv name) instead of stdout.
+        #[arg(long, value_name = "FILE")]
         out: Option<PathBuf>,
     },
-    #[command(
-        about = "Import rows transactionally",
-        after_help = "Example: reldir import users --from users.jsonl"
-    )]
-    Import {
-        table: String,
-        #[arg(long)]
-        from: PathBuf,
-    },
-    #[command(about = "Show semantic changes", after_help = "Example: reldir diff")]
+    /// What changed: since the last revision, or between two.
+    #[command(after_help = "Examples:\n  reldir diff\n  reldir diff users\n  reldir diff --from 3 --to 5 --schema")]
     Diff {
-        args: Vec<String>,
+        /// Only this table.
+        table: Option<String>,
+        /// The older revision.
+        #[arg(long, requires = "to")]
+        from: Option<u64>,
+        /// The newer revision.
+        #[arg(long, requires = "from")]
+        to: Option<u64>,
+        /// Only schema changes.
         #[arg(long)]
         schema: bool,
     },
-    #[command(about = "Show revision history", after_help = "Example: reldir log")]
-    Log,
-    #[command(about = "Show a revision", after_help = "Example: reldir show 1")]
-    Show { revision: u64 },
-    #[command(
-        subcommand,
-        about = "Manage snapshots",
-        after_help = "Example: reldir snapshot list"
-    )]
-    Snapshot(SnapshotCommand),
-    #[command(
-        about = "Recover interrupted transactions",
-        after_help = "Example: reldir recover"
-    )]
-    Recover,
-    #[command(about = "Rebuild indexes", after_help = "Example: reldir reindex")]
-    Reindex,
-    #[command(about = "Rebuild query statistics", after_help = "Example: reldir analyze")]
-    Analyze,
-    #[command(
-        about = "Collect unneeded internal state",
-        after_help = "Example: reldir gc --dry-run"
-    )]
-    Gc,
-    #[command(
-        about = "Upgrade the on-disk format",
-        after_help = "Example: reldir upgrade-format"
-    )]
-    UpgradeFormat,
-    #[command(
-        about = "Run an interactive SQL shell",
-        after_help = "Example: reldir shell"
-    )]
-    Shell,
-    #[command(
-        about = "Generate shell completions",
-        after_help = "Example: reldir completions zsh"
-    )]
-    Completions { shell: String },
-    #[command(
-        subcommand,
-        about = "Apply schema migrations",
-        after_help = "Example: reldir migrate apply migration.json"
-    )]
-    Migrate(MigrateCommand),
-}
-#[derive(Subcommand, Clone)]
-enum SchemaCommand {
-    #[command(about = "Show a schema", after_help = "Example: reldir schema show users")]
-    Show { table: String },
-    #[command(
-        about = "Create a minimal schema",
-        after_help = "Example: reldir schema new users"
-    )]
-    New { table: String },
-    #[command(
-        about = "Pin the working schema so it survives .db being rebuilt",
-        after_help = "Example: reldir schema pin users"
-    )]
-    Pin {
-        table: String,
-        /// Replace a pin that differs from the working schema.
-        #[arg(long)]
-        overwrite: bool,
+    /// Recorded revisions, newest first.
+    Log {
+        /// Most revisions to show.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
-    #[command(
-        about = "Rebuild the working schema from its pin",
-        after_help = "Example: reldir schema restore users"
-    )]
-    Restore { table: String },
-    #[command(
-        about = "Validate all schemas",
-        after_help = "Example: reldir schema validate"
-    )]
+    /// One revision.
+    Show {
+        /// The revision number.
+        revision: u64,
+    },
+    /// Named copies of the whole database.
+    #[command(subcommand)]
+    Snapshot(SnapshotCommand),
+    /// Finish interrupted transactions; or begin a new history lineage.
+    #[command(after_help = "Example: reldir recover --history new-lineage --allow-destructive")]
+    Recover {
+        /// `new-lineage`: move unverifiable history aside and begin again from the current files.
+        #[arg(long, value_name = "MODE", value_parser = ["new-lineage"])]
+        history: Option<String>,
+    },
+    /// Remove history objects no revision references.
+    Gc,
+    /// Refresh the query planner's statistics.
+    Analyze,
+    /// An interactive SQL shell.
+    Shell,
+    /// Serve the database to AI agents over the Model Context Protocol, on stdio.
+    Mcp,
+    /// Shell completion script.
+    Completions {
+        /// bash, zsh, fish, elvish or powershell.
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SchemaCommand {
+    /// A table's schema document.
+    Show {
+        /// The table.
+        table: String,
+    },
+    /// Declare a new table with a string key `id`, as a pin to edit.
+    New {
+        /// The table.
+        table: String,
+    },
+    /// Make an inferred schema the table's declaration in `schema/`.
+    Pin {
+        /// The table.
+        table: String,
+    },
+    /// Report faults in the schemas alone.
     Validate,
-    #[command(
-        about = "Print the JSON Schema dialect reldir accepts",
-        after_help = "Example: reldir schema dialect > reldir-1.json"
-    )]
+    /// Print the schema dialect, for editors.
+    #[command(after_help = "Example: reldir schema dialect > reldir.schema.json")]
     Dialect,
 }
-#[derive(Subcommand, Clone)]
-enum SnapshotCommand {
-    #[command(after_help = "Example: reldir snapshot create before-import")]
-    Create { name: String },
-    #[command(after_help = "Example: reldir snapshot list")]
-    List,
-    #[command(after_help = "Example: reldir snapshot restore before-import --yes")]
-    Restore { name: String },
-    #[command(after_help = "Example: reldir snapshot delete before-import --yes")]
-    Delete { name: String },
-}
-#[derive(Subcommand, Clone)]
-enum MigrateCommand {
-    #[command(after_help = "Example: reldir migrate add-table users --from users-schema.json")]
-    AddTable {
-        table: String,
-        #[arg(long)]
-        from: PathBuf,
-    },
-    #[command(after_help = "Example: reldir migrate drop-table users --dry-run")]
-    DropTable { table: String },
-    #[command(after_help = "Example: reldir migrate rename-table users people")]
-    RenameTable { table: String, new: String },
-    #[command(
-        after_help = "Example: reldir migrate add-column users active --type bool --default true"
-    )]
-    AddColumn {
-        table: String,
-        column: String,
-        #[arg(long = "type", value_name = "TYPE")]
-        kind: String,
-        #[arg(long)]
-        nullable: bool,
-        #[arg(long)]
-        default: Option<String>,
-    },
-    #[command(after_help = "Example: reldir migrate drop-column users legacy_name")]
-    DropColumn { table: String, column: String },
-    #[command(after_help = "Example: reldir migrate rename-column users name display_name")]
-    RenameColumn {
-        table: String,
-        column: String,
-        new: String,
-    },
-    #[command(after_help = "Example: reldir migrate change-type users score float")]
-    ChangeType {
-        table: String,
-        column: String,
-        kind: String,
-        #[arg(long)]
-        using: Option<String>,
-    },
-    #[command(
-        after_help = "Example: reldir migrate add-constraint users '{\"kind\":\"unique\",\"columns\":[\"email\"]}'"
-    )]
-    AddConstraint { table: String, definition: String },
-    #[command(after_help = "Example: reldir migrate drop-constraint users unique_email")]
-    DropConstraint { table: String, name: String },
-    #[command(after_help = "Example: reldir migrate add-index users email")]
-    AddIndex {
-        table: String,
-        #[arg(value_delimiter = ',')]
-        columns: Vec<String>,
-    },
-    #[command(after_help = "Example: reldir migrate drop-index users email")]
-    DropIndex {
-        table: String,
-        #[arg(value_delimiter = ',')]
-        columns: Vec<String>,
-    },
-    #[command(after_help = "Example: reldir migrate apply migration.json")]
-    Apply { file: PathBuf },
-}
 
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ConstraintDefinition {
-    Unique {
-        columns: Vec<String>,
-    },
-    ForeignKey {
-        #[serde(flatten)]
-        foreign_key: ForeignKey,
-    },
-    Check {
-        #[serde(flatten)]
-        check: Check,
-    },
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MigrationDocument {
-    operations: Vec<MigrationOperation>,
-}
-#[derive(serde::Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum MigrationOperation {
-    AddTable {
-        table: String,
-        /// The table's schema, as a JSON Schema document.
-        ///
-        /// Held as a `Value` and decoded through the codec rather than
-        /// deserialized directly, so a migration file cannot become a second
-        /// way to spell a schema.
-        schema: Box<Value>,
-    },
-    DropTable {
-        table: String,
-    },
-    RenameTable {
-        table: String,
-        new: String,
-    },
-    AddColumn {
-        table: String,
-        column: String,
-        #[serde(rename = "type")]
-        kind: ColumnType,
-        #[serde(default)]
-        nullable: bool,
-        #[serde(default)]
-        default: Option<Value>,
-    },
-    DropColumn {
-        table: String,
-        column: String,
-    },
-    RenameColumn {
-        table: String,
-        column: String,
-        new: String,
-    },
-    ChangeType {
-        table: String,
-        column: String,
-        #[serde(rename = "type")]
-        kind: ColumnType,
-        #[serde(default)]
-        using: Option<String>,
-    },
-    AddConstraint {
-        table: String,
-        definition: ConstraintDefinition,
-    },
-    DropConstraint {
-        table: String,
+#[derive(Subcommand, Debug, Clone)]
+pub enum SnapshotCommand {
+    /// Copy the whole database under a name.
+    Create {
+        /// The name.
         name: String,
     },
+    /// The snapshots.
+    List,
+    /// Make the database what a snapshot holds, as one validated transaction.
+    Restore {
+        /// The name.
+        name: String,
+    },
+    /// Delete a snapshot.
+    Delete {
+        /// The name.
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum MigrateCommand {
+    /// Declare a table from a schema document.
+    AddTable {
+        /// The table.
+        table: String,
+        /// The schema document.
+        #[arg(long, value_name = "FILE")]
+        from: String,
+    },
+    /// Remove a table and every row.
+    DropTable {
+        /// The table.
+        table: String,
+    },
+    /// Rename a table, its directory, and every reference to it.
+    RenameTable {
+        /// The table.
+        table: String,
+        /// Its new name.
+        new: String,
+    },
+    /// Add a column.
+    AddColumn {
+        /// The table.
+        table: String,
+        /// The column.
+        column: String,
+        /// Its type.
+        #[arg(long = "type", value_name = "TYPE")]
+        kind: String,
+        /// Admit null, and leave existing rows without it.
+        #[arg(long)]
+        nullable: bool,
+        /// A JSON default, written into every existing row.
+        #[arg(long, value_name = "JSON")]
+        default: Option<String>,
+    },
+    /// Remove a column from the schema and every row.
+    DropColumn {
+        /// The table.
+        table: String,
+        /// The column.
+        column: String,
+    },
+    /// Rename a column everywhere.
+    RenameColumn {
+        /// The table.
+        table: String,
+        /// The column.
+        column: String,
+        /// Its new name.
+        new: String,
+    },
+    /// Change a column's type, converting every value.
+    ChangeType {
+        /// The table.
+        table: String,
+        /// The column.
+        column: String,
+        /// The new type.
+        kind: String,
+        /// A SQL expression over the row computing each new value.
+        #[arg(long, value_name = "EXPRESSION")]
+        using: Option<String>,
+    },
+    /// Add a constraint, as JSON with a `kind` of unique, foreign_key, check, acyclic or assertion.
+    #[command(after_help = "Example: reldir migrate add-constraint posts '{\"kind\":\"foreign_key\",\"from\":[\"user_id\"],\"to\":{\"table\":\"users\"}}'")]
+    AddConstraint {
+        /// The table.
+        table: String,
+        /// The constraint.
+        definition: String,
+    },
+    /// Remove a named constraint.
+    DropConstraint {
+        /// The table.
+        table: String,
+        /// The constraint's name.
+        name: String,
+    },
+    /// Index columns for faster queries.
     AddIndex {
+        /// The table.
         table: String,
+        /// Comma-separated columns.
+        #[arg(value_delimiter = ',')]
         columns: Vec<String>,
     },
+    /// Remove an index.
     DropIndex {
+        /// The table.
         table: String,
+        /// Comma-separated columns.
+        #[arg(value_delimiter = ',')]
         columns: Vec<String>,
+    },
+    /// Join a table to an identity domain, whose tables share one key namespace.
+    SetDomain {
+        /// The table.
+        table: String,
+        /// The domain; omit to leave the current one.
+        domain: Option<String>,
+    },
+    /// Run a migration file: {"operations": [...]}.
+    Apply {
+        /// The file; `-` for stdin.
+        file: String,
     },
 }
 
-struct InferOptions<'a> {
-    table: Option<&'a str>,
-    write: bool,
-    all: bool,
-    strictness: &'a str,
-    pk: &'a [String],
-    format: Format,
+impl Cli {
+    fn format(&self) -> Result<Format> {
+        if self.global.json {
+            return Ok(Format::Json);
+        }
+        match &self.global.format {
+            Some(text) => Format::parse(text),
+            None if std::io::stdout().is_terminal() => Ok(Format::Table),
+            None => Ok(Format::Jsonl),
+        }
+    }
+
+    fn context(&self) -> Context {
+        let global = &self.global;
+        Context {
+            db: global.db.clone(),
+            readonly: global.readonly,
+            no_auto: global.no_auto,
+            rebuild_metadata: global.rebuild_metadata,
+            dry_run: global.dry_run,
+            yes: global.yes,
+            allow_invalid: global.allow_invalid,
+            allow_destructive: global.allow_destructive,
+            overrides: ResourceOverrides {
+                max_json_file_size: global.max_json_file_size,
+                max_nesting_depth: global.max_nesting_depth,
+                max_result_rows: global.max_result_rows,
+                max_query_memory: global.max_query_memory,
+                max_transaction_size: global.max_transaction_size,
+                timeout_seconds: global.timeout,
+                wait_seconds: global.wait,
+            },
+        }
+    }
 }
 
-struct DoctorOptions<'a> {
-    fix: bool,
-    allow_data: bool,
-    only: Option<&'a str>,
-    explain: Option<&'a str>,
-    no_snapshot: bool,
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Init { .. } => "init",
+        Command::Inspect { .. } => "inspect",
+        Command::Status => "status",
+        Command::Check { .. } => "check",
+        Command::Lint { .. } => "lint",
+        Command::Doctor { .. } => "doctor",
+        Command::Tables => "tables",
+        Command::Describe { .. } => "describe",
+        Command::Get { .. } => "get",
+        Command::List { .. } => "list",
+        Command::Insert { .. } => "insert",
+        Command::Update { .. } => "update",
+        Command::Delete { .. } => "delete",
+        Command::Sql { .. } => "sql",
+        Command::Explain { .. } => "explain",
+        Command::Schema(_) => "schema",
+        Command::Infer { .. } => "infer",
+        Command::Migrate(_) => "migrate",
+        Command::Import { .. } => "import",
+        Command::Export { .. } => "export",
+        Command::Diff { .. } => "diff",
+        Command::Log { .. } => "log",
+        Command::Show { .. } => "show",
+        Command::Snapshot(_) => "snapshot",
+        Command::Recover { .. } => "recover",
+        Command::Gc => "gc",
+        Command::Analyze => "analyze",
+        Command::Shell => "shell",
+        Command::Mcp => "mcp",
+        Command::Completions { .. } => "completions",
+    }
 }
 
-pub fn run(cli: Cli) -> Result<i32> {
-    let mut settings = cli.clone();
-    let resource_overrides = crate::config::ResourceOverrides {
-        max_json_file_size: cli.max_json_file_size,
-        max_nesting_depth: cli.max_nesting_depth,
-        max_query_memory: cli.max_query_memory,
-        max_sort_memory: cli.max_sort_memory,
-        max_temporary_disk: cli.max_temporary_disk,
-        max_result_rows: cli.max_result_rows,
-        max_transaction_size: cli.max_transaction_size,
-        timeout_seconds: cli.timeout,
-        wait_seconds: cli.wait,
-    };
-    let requested_root = cli
-        .db
-        .clone()
-        .unwrap_or(std::env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?);
-    let format = if cli.json {
-        Format::Json
-    } else if let Some(f) = &cli.format {
-        Format::parse(f)?
-    } else if io::stdout().is_terminal() {
-        Format::Table
-    } else {
-        Format::Jsonl
-    };
-    // Section 49: colour on a TTY, disabled by --no-color and by NO_COLOR.
-    // Settled once, before any command can emit, so every writer agrees.
+/// Run a parsed command line, rendering its result; returns the exit status.
+pub fn run(cli: Cli) -> i32 {
     output::set_presentation(output::Presentation {
-        color: !cli.no_color
+        color: !cli.global.no_color
             && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
-            && io::stderr().is_terminal(),
-        quiet: cli.quiet,
-        verbose: cli.verbose,
+            && std::io::stderr().is_terminal(),
+        quiet: cli.global.quiet,
+        verbose: cli.global.verbose,
     });
-    // No subcommand: run the SQL given as a bare positional, or open the shell.
-    // A bare invocation carries no intent to make this folder a database, so it
-    // establishes nothing up front; the first statement that needs a persistent
-    // database performs its own establishment.
-    let command = match cli.command.clone() {
-        Some(command) => command,
-        None => match cli.sql.clone() {
-            Some(sql) => Command::Sql {
-                sql,
-                params: vec![],
-                explain: false,
-                explain_analyze: false,
-            },
-            None => Command::Shell,
-        },
+    let format = match cli.format() {
+        Ok(format) => format,
+        Err(error) => {
+            error.render_human();
+            return error.exit;
+        }
+    };
+    let context = cli.context();
+    let command = match (&cli.command, &cli.sql) {
+        (Some(command), _) => command.clone(),
+        (None, Some(statement)) => Command::Sql { statement: statement.clone(), params: vec![] },
+        (None, None) if std::io::stdin().is_terminal() => Command::Shell,
+        (None, None) => Command::Sql { statement: "-".into(), params: vec![] },
     };
     match command {
-        Command::Init {
-            path,
-            adopt,
-            track_provenance,
-        } => cmd_init(
-            path.or(cli.db),
-            adopt,
-            track_provenance,
-            cli.dry_run,
-            format,
-            &resource_overrides,
-        ),
-        Command::Inspect { path } => cmd_inspect(path.or(cli.db), format),
-        Command::Completions { shell } => completions(&shell),
-        // The dialect describes what this binary accepts, not what any
-        // directory contains, so it answers before a database is resolved --
-        // otherwise `reldir schema dialect > dialect.json`, which the
-        // documentation tells people to run, captures a status record instead.
-        Command::Schema(SchemaCommand::Dialect) => dialect(format),
-        Command::Infer {
-            table,
-            write,
-            all,
-            strictness,
-            pk,
-        } if !requested_root.join(".db").exists() => infer_standalone(
-            &requested_root,
-            InferOptions {
-                table: table.as_deref(),
-                write,
-                all,
-                strictness: &strictness,
-                pk: &pk,
-                format,
-            },
-            &resource_overrides,
-        ),
-        command => {
-            let resolved = crate::state::resolve_root(cli.db.as_deref())?;
-            let root = resolved.path.clone();
-            let observation = crate::state::observe(&root)?;
-
-            // A read that promises not to write must not acquire hidden write
-            // side effects, and a diagnosis must not alter what it reports on:
-            // `check` in either form leaves derived state exactly as it found it.
-            // `status` is not in this set. Adopting a valid external change is
-            // the system's central promise, and recording that transition is
-            // authoritative work, not derived repair: a status that observed a
-            // change without accepting it would leave the database permanently
-            // behind its own files.
-            if !observation.writable {
-                settings.readonly = true;
-            }
-
-            let requirements = command_requirements(&command, &settings);
-            // A dry run plans what a real run would do, under the same
-            // requirements. It must not plan work the invocation would refuse:
-            // `--no-auto` establishes nothing, so it has nothing to promise, and
-            // printing a plan before refusing would describe work that was never
-            // going to happen.
-            let transitions = if cli.dry_run {
-                crate::state::plan(
-                    &observation,
-                    requirements,
-                    &resource_overrides,
-                    cli.rebuild_metadata,
-                )?
-            } else {
-                crate::state::establish(
-                    &observation,
-                    requirements,
-                    &resource_overrides,
-                    cli.rebuild_metadata,
-                )?
-            };
-            report_transitions(&transitions, format, cli.dry_run)?;
-
-            // A dry run that planned a metadata rebuild has said everything it
-            // has to say. Continuing would open a database whose format marker
-            // is exactly what the plan proposes to restore, so it would fail on
-            // the condition being reported rather than reporting it.
-            if cli.dry_run
-                && transitions
-                    .iter()
-                    .any(|transition| matches!(transition, crate::state::Transition::RebuiltMetadata(_)))
-            {
-                return Ok(0);
-            }
-
-            // A folder holding nothing at all has nothing to govern, and saying
-            // so is the answer rather than a prerequisite to satisfy first.
-            // Emptiness is a fact about the folder's contents, not about
-            // whether metadata happens to exist: a folder full of ungoverned
-            // JSON is emphatically not empty, and reporting it as such would
-            // be a lie that hides the user's own data from them.
-            if observation.format == crate::state::FormatState::Absent
-                && observation.topology.is_empty()
-            {
-                return empty_database_result(&command, format);
-            }
-
-            // A diagnosis still adopts a valid external change -- that is
-            // authoritative, not derived -- but leaves indexes and the manifest
-            // exactly as it found them.
-            let mode = if settings.readonly {
-                ObserveMode::READ_ONLY
-            } else {
-                ObserveMode::RECORD
-            };
-            // The folder holds data but carries no metadata. An invocation that
-            // *cannot* write still owes an answer, so the relational model is
-            // built in memory and the files are read exactly as they are.
-            //
-            // Being unable to write is not the same as having been told not to
-            // establish. `--no-auto` asks to be shown what is missing rather
-            // than have it worked around, and a diagnostic's whole job is to
-            // report the folder's state -- answering from an invented model
-            // would conceal the very thing they were run to reveal. Both fall
-            // through and surface UNINITIALIZED.
-            let cannot_write = settings.readonly || cli.dry_run;
-            let establishes_on_demand = matches!(command, Command::Shell);
-            let answers_ephemerally = !cli.no_auto && (cannot_write || establishes_on_demand);
-            // Absent metadata is not the only way to arrive needing a model
-            // that is not on disk. A database whose `.db/schema/` is gone while
-            // its pins remain has declarations but nothing to read them from,
-            // and a writer reconstructs them; an invocation that cannot write
-            // owes the same answer without leaving the file behind. Testing
-            // only for absent metadata sent that case to the ordinary open,
-            // where the catalog found no schemas and the query failed with
-            // UNKNOWN_TABLE for a table the user had declared.
-            let model_is_not_on_disk = observation.format == crate::state::FormatState::Absent
-                || !observation.pins_needing_working_copy()?.is_empty();
-            let mut db = if model_is_not_on_disk && answers_ephemerally {
-                let schemas = crate::state::ephemeral_schemas(&observation, &resource_overrides)?;
-                Database::ephemeral(root, schemas, &resource_overrides)?
-            } else {
-                Database::open_with_overrides(root, mode, &resource_overrides)?
-            };
-            if settings.readonly {
-                for warning in db.catalog.warnings.iter().filter(|warning| {
-                    matches!(
-                        warning.code.as_str(),
-                        "METADATA_STALE_READONLY" | "INDEX_STALE"
-                    )
-                }) {
-                    output::diagnostic_notice(warning, format);
+        Command::Shell => return shell(&context),
+        Command::Mcp => {
+            return match crate::mcp::serve(context) {
+                Ok(()) => 0,
+                Err(error) => {
+                    error.render_human();
+                    error.exit
                 }
-            }
-            dispatch(command, &mut db, format, &settings)
+            };
         }
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "reldir", &mut std::io::stdout());
+            return 0;
+        }
+        _ => {}
     }
+    let name = command_name(&command);
+    if format == Format::Sarif && !matches!(command, Command::Check { .. } | Command::Lint { .. } | Command::Doctor { .. }) {
+        let error = DbError::usage("--format sarif reports diagnostics, so it applies to check, lint and doctor");
+        error.render_human();
+        return error.exit;
+    }
+    let mut terminal = Terminal::new(format, name);
+    let outcome = dispatch(&context, &mut terminal, command);
+    terminal.finish(outcome)
 }
 
-/// What a command needs established before it can run.
-///
-/// Declared per command rather than inferred, so a new command has to answer
-/// the question instead of inheriting the most permissive behavior.
-fn command_requirements(command: &Command, cli: &Cli) -> crate::state::Requirements {
-    // `--no-auto` is the "do not change my prerequisites" posture, and
-    // `--readonly` cannot write at all: both establish nothing, so they require
-    // nothing.
-    //
-    // `--dry-run` is not in that set. It reports what a real run would do, which
-    // it can only compute by asking what that run would require. Planning is not
-    // establishing -- `plan` writes nothing -- so a dry run keeps the command's
-    // ordinary requirements and simply stops short of performing them.
-    if cli.no_auto || cli.readonly {
-        return crate::state::Requirements::structural();
-    }
+/// Run one command against a sink.
+pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Result<Finish> {
+    use command::{health, query, rows, schema, setup};
     match command {
-        // These operate on the folder rather than on relations. `Shell` joins
-        // them because a bare invocation carries no intent to make this folder
-        // a database; the first statement that needs one establishes it.
-        Command::Recover | Command::UpgradeFormat | Command::Shell => {
-            crate::state::Requirements::structural()
-        }
-        _ => crate::state::Requirements::functional(),
-    }
-}
-
-/// Report automatic establishment once, after it succeeded and before the
-/// command's own output.
-fn report_transitions(
-    transitions: &[crate::state::Transition],
-    format: Format,
-    planned: bool,
-) -> Result<()> {
-    if transitions.is_empty() {
-        return Ok(());
-    }
-    if matches!(format, Format::Json | Format::Jsonl) {
-        // Establishment is part of the machine-readable contract, so it is
-        // emitted as data rather than as prose a consumer would have to parse.
-        // `planned` distinguishes what happened from what would happen, which a
-        // consumer cannot infer from the wording.
-        let records = transitions
-            .iter()
-            .map(|transition| {
-                obj([
-                    ("kind", Value::String("state_transition".into())),
-                    ("transition", Value::String(transition.kind().into())),
-                    ("planned", Value::Bool(planned)),
-                    (
-                        "detail",
-                        Value::String(if planned {
-                            transition.describe_planned()
-                        } else {
-                            transition.describe()
-                        }),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        output::records(&records, format)?;
-        return Ok(());
-    }
-    let summary = transitions
-        .iter()
-        .map(|transition| {
-            if planned {
-                transition.describe_planned()
-            } else {
-                transition.describe()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    output::notice_stderr(&summary);
-    Ok(())
-}
-
-/// The answer for a folder that holds no database and no data.
-///
-/// Emptiness is a legitimate state with a truthful answer, not a fault the user
-/// has to clear before asking their first question.
-fn empty_database_result(command: &Command, format: Format) -> Result<i32> {
-    match command {
-        // Commands whose answer is "there is nothing here" can say so directly.
-        Command::Status | Command::Tables | Command::Check { .. } | Command::Lint { .. } => {
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("status".into())),
-                    ("valid", Value::Bool(true)),
-                    ("state", Value::String("EMPTY".into())),
-                    ("tables", Value::from(0)),
-                    ("rows", Value::from(0)),
-                ]),
-                "no tables, no data",
-            )?;
-            Ok(0)
-        }
-        // Everything else names a relation that cannot exist yet. Saying so is
-        // the truthful answer, and it is not a failure of the invocation.
-        _ => {
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("status".into())),
-                    ("valid", Value::Bool(true)),
-                    ("state", Value::String("EMPTY".into())),
-                    ("tables", Value::from(0)),
-                    ("rows", Value::from(0)),
-                ]),
-                "no tables, no data",
-            )?;
-            Ok(0)
-        }
-    }
-}
-
-fn dispatch(command: Command, db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
-    match command {
-        Command::Status => status(db, format),
-        Command::Check { strict, .. } => check(db, format, strict),
-        Command::Lint {
-            table,
-            strict,
-            descriptions,
-        } => lint(db, format, table.as_deref(), strict, descriptions),
-        Command::Doctor {
-            fix,
-            allow_data,
-            only,
-            explain,
-            no_snapshot,
-        } => doctor(
-            db,
-            format,
-            DoctorOptions {
-                fix,
-                allow_data,
-                only: only.as_deref(),
-                explain: explain.as_deref(),
-                no_snapshot,
-            },
-            cli,
+        Command::Init { path, adopt, track_provenance } => setup::init(context, sink, path.as_deref(), adopt, track_provenance),
+        Command::Inspect { path } => setup::inspect(context, sink, path.as_deref()),
+        Command::Status => health::status(context, sink),
+        Command::Check { strict } => health::check(context, sink, strict),
+        Command::Lint { table, strict, descriptions } => health::lint(context, sink, table.as_deref(), strict, descriptions),
+        Command::Doctor { fix, allow_data, only, explain, no_snapshot } => health::doctor(
+            context,
+            sink,
+            DoctorOptions { fix, allow_data, only: only.as_deref(), explain: explain.as_deref(), no_snapshot },
         ),
-        Command::Infer {
-            table,
-            write,
-            all,
-            strictness,
-            pk,
-        } => infer_cmd(
-            db,
-            InferOptions {
-                table: table.as_deref(),
-                write,
-                all,
-                strictness: &strictness,
-                pk: &pk,
-                format,
-            },
-            cli,
-        ),
-        Command::Tables => {
-            db.require_valid()?;
-            let rows = db
-                .catalog
-                .schemas
-                .keys()
-                .map(|t| {
-                    obj([
-                        ("kind", Value::String("table".into())),
-                        ("table", Value::String(t.clone())),
-                        ("rows", Value::from(db.catalog.rows[t].len())),
-                    ])
-                })
-                .collect::<Vec<_>>();
-            output::records(&rows, format)?;
-            Ok(0)
-        }
-        Command::Describe { table } => {
-            db.require_valid()?;
-            let s = db
-                .catalog
-                .schemas
-                .get(&table)
-                .ok_or_else(|| db.catalog.unknown_table(&table))?;
-            if format == Format::Table {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&crate::schema::json_schema::encode(s)).unwrap()
-                );
-            } else {
-                output::records(
-                    &[serialized_record(
-                        "schema",
-                        &crate::schema::json_schema::encode(s),
-                    )?],
-                    format,
-                )?;
-            }
-            Ok(0)
-        }
-        Command::Get { table, key } => get(db, &table, &key, format),
-        Command::List {
-            table,
-            where_expr,
-            order,
-            limit,
-        } => list(
-            db,
+        Command::Tables => rows::tables(context, sink),
+        Command::Describe { table } => rows::describe(context, sink, &table),
+        Command::Get { table, key } => rows::get(context, sink, &table, &key),
+        Command::List { table, filter, order, limit } => rows::list(
+            context,
+            sink,
             &table,
-            where_expr.as_deref(),
-            order.as_deref(),
-            limit,
-            format,
-            cli.timeout.or(db.config.timeout_seconds),
+            ListOptions { filter: filter.as_deref(), order: order.as_deref(), limit },
         ),
-        Command::Insert {
-            table,
-            json_value,
-            from,
-        } => insert(db, &table, json_value, from, format, cli),
-        Command::Update { table, key, patch } => update(db, &table, &key, &patch, format, cli),
-        Command::Delete { table, key } => delete(db, &table, &key, format, cli),
-        Command::Sql {
-            sql: query,
-            params,
-            explain,
-            explain_analyze,
-        } => {
-            if explain || explain_analyze {
-                explain_sql(db, &query, &params, explain_analyze, format, cli)
-            } else {
-                sql(db, &query, &params, format, cli)
-            }
+        Command::Insert { table, json, from } => {
+            let text = match (json, from) {
+                (Some(json), None) => json,
+                (None, Some(from)) => command::read_input(&from, 1 << 30)?,
+                _ => return Err(DbError::usage("give the row as JSON, or --from a file")),
+            };
+            rows::insert(context, sink, &table, &text)
         }
-        Command::Explain { sql: s } => explain_sql(db, &s, &[], false, format, cli),
-        Command::Schema(s) => schema_cmd(db, s, format, cli),
-        Command::Export { table, out } => export(db, &table, out.as_deref(), format),
-        Command::Import { table, from } => import(db, &table, &from, format, cli),
-        Command::Diff { args, schema } => diff(db, &args, schema, format),
-        Command::Log => log(db, format),
-        Command::Show { revision } => show(db, revision, format),
-        Command::Snapshot(s) => snapshot(db, s, format, cli),
-        Command::Recover => {
-            require_writable(cli)?;
-            let changed = crate::db::recover(&db.root)?;
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("recovery".into())),
-                    ("changed", Value::Bool(changed)),
-                ]),
-                if changed {
-                    "recovery complete"
-                } else {
-                    "no pending transactions"
-                },
-            )?;
-            Ok(0)
-        }
-        Command::Reindex => {
-            require_writable(cli)?;
-            reindex(db, format)
-        }
-        Command::Analyze => {
-            require_writable(cli)?;
-            analyze(db, format)
-        }
-        Command::Gc => {
-            require_writable(cli)?;
-            gc(db, cli.dry_run, format, cli.yes)
-        }
-        Command::UpgradeFormat => {
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("format_status".into())),
-                    ("format_version", Value::from(crate::FORMAT_VERSION)),
-                    ("current", Value::Bool(true)),
-                ]),
-                &format!("format {} is current", crate::FORMAT_VERSION),
-            )?;
-            Ok(0)
-        }
-        Command::Shell => shell(db, format, cli),
-        Command::Migrate(m) => migrate(db, m, format, cli),
-        Command::Init { .. } | Command::Inspect { .. } | Command::Completions { .. } => {
-            unreachable!()
-        }
-    }
-}
-
-fn cmd_init(
-    path: Option<PathBuf>,
-    adopt: bool,
-    track: bool,
-    dry: bool,
-    format: Format,
-    resource_overrides: &crate::config::ResourceOverrides,
-) -> Result<i32> {
-    let root = path.unwrap_or(std::env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?);
-    if root.join(".db").exists() {
-        return Err(DbError::new(
-            "ALREADY_INITIALIZED",
-            format!("{} is already initialized", root.display()),
-            1,
-        ));
-    }
-    if !adopt {
-        if dry {
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("initialization_plan".into())),
-                    ("path", Value::String(root.display().to_string())),
-                    ("adopt", Value::Bool(false)),
-                ]),
-                &format!("would initialize {}", root.display()),
-            )?;
-            return Ok(0);
-        }
-        crate::db::init_empty(&root, track)?;
-        event(
-            format,
-            obj([
-                ("kind", Value::String("initialization".into())),
-                ("path", Value::String(root.display().to_string())),
-                ("revision", Value::from(1)),
-            ]),
-            &format!("initialized {} (revision 1)", root.display()),
-        )?;
-        return Ok(0);
-    }
-    let tables = infer::discover_tables(&root)?;
-    let skipped = skipped_adoption_directories(&root)?;
-    let existing = existing_schema_names(&root)?;
-    let missing: Vec<_> = tables
-        .iter()
-        .filter(|t| !existing.contains(*t))
-        .cloned()
-        .collect();
-    let mut inference_config = crate::config::Config::default();
-    inference_config.apply_overrides(resource_overrides);
-    inference_config
-        .validate()
-        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-    let ignore_set = inference_config
-        .ignore_set()
-        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
-    let tables = tables
-        .into_iter()
-        .filter(|table| !ignore_set.is_match(table))
-        .collect::<Vec<_>>();
-    let missing = missing
-        .into_iter()
-        .filter(|table| !ignore_set.is_match(table))
-        .collect::<Vec<_>>();
-    let reference_catalog = crate::catalog::Catalog::observe(&root, &inference_config)?;
-    let schemas = infer::infer_all_with_references(
-        &root,
-        &missing,
-        Strictness::Balanced,
-        &inference_config,
-        None,
-        Some(&reference_catalog),
-    )?;
-    let preflight = adoption_preflight(&root, &schemas, &inference_config)?;
-    let errors = crate::integrity::validate(&preflight);
-    if !errors.is_empty() {
-        output::diagnostics(&errors, format);
-        return Ok(2);
-    }
-    if dry {
-        if format == Format::Table {
-            output::notice(&format!(
-                "would adopt {} tables and infer {} schemas",
-                tables.len(),
-                schemas.len()
-            ));
-            for (name, reason) in &skipped {
-                output::notice(&format!("skipped {name}: {reason}"));
-            }
-        } else {
-            let mut records = vec![obj([
-                ("kind", Value::String("adoption_plan".into())),
-                ("tables", Value::from(tables.len())),
-                ("inferred_schemas", Value::from(schemas.len())),
-            ])];
-            records.extend(skipped.iter().map(|(name, reason)| {
-                obj([
-                    ("kind", Value::String("skipped_directory".into())),
-                    ("path", Value::String(name.clone())),
-                    ("reason", Value::String(reason.clone())),
-                ])
-            }));
-            output::records(&records, format)?;
-        }
-        return Ok(0);
-    }
-    crate::db::init_layout(&root, track)?;
-    for s in schemas.values() {
-        crate::schema_store::write_working(&root, s, inference_config.indentation_width)?
-    }
-    // A pinned table was not inferred, but it still needs the working copy every
-    // subsystem reads. Adoption takes it from the declaration rather than from
-    // the rows, so what the user wrote is what governs.
-    for table in crate::schema_store::pinned_tables(&root)? {
-        if let Some(pinned) = crate::schema_store::load_pin(&root, &table)? {
-            crate::schema_store::write_working(&root, &pinned, inference_config.indentation_width)?
-        }
-    }
-    let c = crate::catalog::Catalog::observe(&root, &inference_config)?;
-    let (hash, entries) = metadata::state(&c)?;
-    metadata::record(&c, None, hash.clone(), entries, "import", None)?;
-    // Adoption builds the indexes for everything it adopted, so the database is
-    // complete when this returns rather than repairing itself on first read.
-    crate::index::rebuild(&root, &c)?;
-    if matches!(format, Format::Table | Format::Sqlite) {
-        output::notice(&format!(
-            "Scanned {} directories, {} JSON files.\nVALID   revision 1   root {}",
-            tables.len(),
-            c.row_count(),
-            &hash[..8]
-        ));
-        for (name, reason) in &skipped {
-            output::notice(&format!("Skipped {name}: {reason}"));
-        }
-    } else {
-        let mut records = vec![obj([
-            ("kind", Value::String("initialization".into())),
-            ("tables", Value::from(tables.len())),
-            ("rows", Value::from(c.row_count())),
-            ("revision", Value::from(1)),
-            ("root", Value::String(hash)),
-        ])];
-        records.extend(skipped.iter().map(|(name, reason)| {
-            obj([
-                ("kind", Value::String("skipped_directory".into())),
-                ("path", Value::String(name.clone())),
-                ("reason", Value::String(reason.clone())),
-            ])
-        }));
-        output::records(&records, format)?;
-    }
-    Ok(0)
-}
-fn skipped_adoption_directories(root: &Path) -> Result<Vec<(String, String)>> {
-    let mut skipped = vec![];
-    for entry in fs::read_dir(root).map_err(|error| DbError::io(root, error))? {
-        let path = entry.map_err(|error| DbError::io(root, error))?.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if matches!(name, "schema" | ".db" | ".git") || name.starts_with('.') {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
-        if !metadata.file_type().is_dir() {
-            continue;
-        }
-        let mut contains_json = false;
-        for entry in fs::read_dir(&path).map_err(|error| DbError::io(&path, error))? {
-            let entry = entry.map_err(|error| DbError::io(&path, error))?;
-            contains_json |=
-                entry.path().extension().and_then(|value| value.to_str()) == Some("json");
-        }
-        if !contains_json {
-            skipped.push((name.into(), "contains no top-level .json files".into()));
-        }
-    }
-    skipped.sort();
-    Ok(skipped)
-}
-fn cmd_inspect(path: Option<PathBuf>, format: Format) -> Result<i32> {
-    let root = path.unwrap_or(std::env::current_dir().map_err(|e| DbError::io(Path::new("."), e))?);
-    let tables = infer::discover_tables(&root)?;
-    let rows = tables
-        .into_iter()
-        .map(|t| {
-            obj([
-                ("kind", Value::String("directory".into())),
-                ("table", Value::String(t)),
-            ])
-        })
-        .collect::<Vec<_>>();
-    output::records(&rows, format)?;
-    Ok(0)
-}
-/// Tables that already have a schema, from either location.
-///
-/// A pinned table is never inferred: the pin is the user's declaration, and
-/// inferring over it would produce a working copy that contradicts the very
-/// file meant to fix it. Adoption therefore counts a pin as an existing schema
-/// exactly as it counts reldir's own working copy.
-fn existing_schema_names(root: &Path) -> Result<std::collections::BTreeSet<String>> {
-    let mut out = crate::schema_store::pinned_tables(root)?;
-    let dir = crate::schema_store::working_dir(root);
-    if !dir.exists() {
-        return Ok(out);
-    }
-    let metadata = fs::symlink_metadata(&dir).map_err(|error| DbError::io(&dir, error))?;
-    if !metadata.file_type().is_dir() {
-        return Err(DbError::from_diag(
-            crate::diagnostic::Diagnostic::error(
-                "NON_REGULAR_FILE",
-                "schema/ must be a real directory",
-            )
-            .at("schema"),
-            2,
-        ));
-    }
-    for e in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
-        let p = e.map_err(|e| DbError::io(&dir, e))?.path();
-        let metadata = fs::symlink_metadata(&p).map_err(|error| DbError::io(&p, error))?;
-        if !metadata.file_type().is_file() || has_multiple_links(&metadata) {
-            return Err(DbError::from_diag(
-                crate::diagnostic::Diagnostic::error(
-                    "NON_REGULAR_FILE",
-                    "schema entries must be private regular files",
-                )
-                .at(p.strip_prefix(root).unwrap_or(&p)),
-                2,
-            ));
-        }
-        if p.extension().and_then(|x| x.to_str()) == Some("json")
-            && let Some(s) = p.file_stem().and_then(|x| x.to_str())
-        {
-            out.insert(s.into());
-        }
-    }
-    Ok(out)
-}
-fn adoption_preflight(
-    root: &Path,
-    inferred: &std::collections::BTreeMap<String, Schema>,
-    config: &crate::config::Config,
-) -> Result<crate::catalog::Catalog> {
-    let temp = tempfile::tempdir().map_err(|e| DbError::io(Path::new("/tmp"), e))?;
-    let shadow = temp.path();
-    // The shadow must look like a database, or observing it finds no working
-    // schemas and reports an unestablished folder instead of the prospective
-    // state under test.
-    fs::create_dir_all(crate::schema_store::working_dir(shadow))
-        .map_err(|e| DbError::io(shadow, e))?;
-    fs::write(
-        shadow.join(".db/format"),
-        format!("format_version = {}\n", crate::FORMAT_VERSION),
-    )
-    .map_err(|e| DbError::io(shadow, e))?;
-    // Pins come along so that the pin/working agreement the observation checks
-    // is the same question here as in the real database.
-    for table in crate::schema_store::pinned_tables(root)? {
-        if let Some(pinned) = crate::schema_store::load_pin(root, &table)? {
-            let destination = crate::schema_store::pin_path(shadow, &table);
-            fs::create_dir_all(crate::schema_store::pin_dir(shadow))
-                .map_err(|e| DbError::io(shadow, e))?;
-            metadata::write_bytes_atomic(
-                &destination,
-                &crate::schema_store::canonical_bytes(&pinned, config.indentation_width)?,
-            )?;
-        }
-    }
-    for (t, s) in inferred {
-        metadata::write_bytes_atomic(
-            &crate::schema_store::working_path(shadow, t),
-            &crate::schema_store::canonical_bytes(s, config.indentation_width)?,
-        )?
-    }
-    let mut table_names = infer::discover_tables(root)?;
-    table_names.extend(existing_schema_names(root)?);
-    table_names.sort();
-    table_names.dedup();
-    for t in table_names {
-        let src = root.join(&t);
-        if !src.exists() {
-            continue;
-        }
-        let table_metadata =
-            fs::symlink_metadata(&src).map_err(|error| DbError::io(&src, error))?;
-        if !table_metadata.file_type().is_dir() {
-            fs::write(shadow.join(&t), b"unsupported table path\n")
-                .map_err(|error| DbError::io(&shadow.join(&t), error))?;
-            continue;
-        }
-        fs::create_dir(shadow.join(&t)).map_err(|e| DbError::io(&shadow.join(&t), e))?;
-        for e in fs::read_dir(&src).map_err(|e| DbError::io(&src, e))? {
-            let p = e.map_err(|e| DbError::io(&src, e))?.path();
-            let metadata = fs::symlink_metadata(&p).map_err(|e| DbError::io(&p, e))?;
-            if metadata.file_type().is_file() && !has_multiple_links(&metadata) {
-                fs::copy(
-                    &p,
-                    shadow.join(&t).join(p.file_name().ok_or_else(|| {
-                        DbError::new("PATH_VIOLATION", "table entry has no filename", 2)
-                    })?),
-                )
-                .map_err(|e| DbError::io(&p, e))?;
-            } else {
-                fs::create_dir(shadow.join(&t).join(p.file_name().ok_or_else(|| {
-                    DbError::new("PATH_VIOLATION", "table entry has no filename", 2)
-                })?))
-                .map_err(|e| DbError::io(&p, e))?;
-            }
-        }
-    }
-    crate::catalog::Catalog::observe(shadow, config)
-}
-
-#[cfg(unix)]
-fn has_multiple_links(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() > 1
-}
-
-#[cfg(not(unix))]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
-    false
-}
-fn infer_standalone(
-    root: &Path,
-    options: InferOptions<'_>,
-    resource_overrides: &crate::config::ResourceOverrides,
-) -> Result<i32> {
-    let InferOptions {
-        table,
-        write,
-        all: _,
-        strictness,
-        pk,
-        format,
-    } = options;
-    let strict = match strictness {
-        "strict" => Strictness::Strict,
-        "balanced" => Strictness::Balanced,
-        "loose" => Strictness::Loose,
-        _ => {
-            return Err(DbError::usage(
-                "strictness must be strict, balanced, or loose",
-            ));
-        }
-    };
-    let tables = if let Some(t) = table {
-        vec![t.into()]
-    } else {
-        infer::discover_tables(root)?
-    };
-    let mut inference_config = crate::config::Config::default();
-    inference_config.apply_overrides(resource_overrides);
-    inference_config
-        .validate()
-        .map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
-    let ignore_set = inference_config
-        .ignore_set()
-        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
-    let tables = tables
-        .into_iter()
-        .filter(|table| !ignore_set.is_match(table))
-        .collect::<Vec<_>>();
-    let reference_catalog = crate::catalog::Catalog::observe(root, &inference_config)?;
-    let schemas = infer::infer_all_with_references(
-        root,
-        &tables,
-        strict,
-        &inference_config,
-        if pk.is_empty() { None } else { Some(pk) },
-        Some(&reference_catalog),
-    )?;
-    if write {
-        for s in schemas.values() {
-            let p = crate::schema_store::working_path(root, &s.table);
-            if p.exists() {
-                return Err(DbError::usage(format!(
-                    "refusing to overwrite {}",
-                    p.display()
-                )));
-            }
-            crate::schema_store::write_working(root, s, inference_config.indentation_width)?
-        }
-    } else {
-        output_schemas(schemas.values(), format)?;
-    }
-    Ok(0)
-}
-fn status(db: &Database, format: Format) -> Result<i32> {
-    if matches!(format, Format::Json | Format::Jsonl) {
-        let manifest = db.manifest.as_ref();
-        let summary = obj([
-            ("kind", Value::String("status".into())),
-            ("valid", Value::Bool(db.diagnostics.is_empty())),
-            (
-                "state",
-                Value::String(
-                    if db.diagnostics.is_empty() {
-                        if db.external_changes.is_empty() {
-                            "VALID_UNCHANGED"
-                        } else {
-                            "VALID_CHANGED_EXTERNALLY"
-                        }
-                    } else {
-                        "INVALID"
-                    }
-                    .into(),
-                ),
-            ),
-            (
-                "revision",
-                Value::from(manifest.map_or(0, |manifest| manifest.revision)),
-            ),
-            (
-                "root",
-                Value::String(
-                    manifest
-                        .map_or("", |manifest| manifest.root_hash.as_str())
-                        .into(),
-                ),
-            ),
-            (
-                "external_changes",
-                Value::Array(
-                    db.external_changes
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            ),
-        ]);
-        let diagnostics = if db.diagnostics.is_empty() {
-            &db.catalog.warnings
-        } else {
-            &db.diagnostics
-        };
-        output::check_result(diagnostics, summary, format)?;
-        return Ok(crate::diagnostic::exit_code_for_diagnostics(
-            &db.diagnostics,
-        ));
-    }
-    if !db.diagnostics.is_empty() {
-        output::diagnostics(&db.diagnostics, format);
-        eprintln!(
-            "INVALID   revision {}   ({} external changes, {} violations)\nrun `reldir doctor` for fix options",
-            db.manifest.as_ref().map_or(0, |m| m.revision),
-            db.external_changes.len(),
-            db.diagnostics.len()
-        );
-        return Ok(crate::diagnostic::exit_code_for_diagnostics(
-            &db.diagnostics,
-        ));
-    }
-    if !db.catalog.warnings.is_empty() {
-        output::diagnostics(&db.catalog.warnings, format);
-    }
-    let m = db.manifest.as_ref();
-    if format == Format::Table {
-        output::notice(&format!(
-            "VALID   revision {}   root {}   external changes: {}",
-            m.map_or(0, |m| m.revision),
-            m.map_or("unknown", |m| &m.root_hash[..8]),
-            if db.external_changes.is_empty() {
-                "none"
-            } else {
-                "accepted"
-            }
-        ));
-        if !db.external_changes.is_empty() {
-            output::notice("changed:");
-            for p in &db.external_changes {
-                output::notice(&format!("  {p}"));
-            }
-        }
-        let findings = crate::lint::lint(&db.catalog, &db.config, false);
-        if !findings.is_empty() {
-            output::notice(&format!(
-                "lint: {} findings (run `reldir lint`)",
-                findings.len()
-            ));
-        }
-    }
-    Ok(0)
-}
-fn check(db: &Database, format: Format, strict: bool) -> Result<i32> {
-    let lint = crate::lint::lint(&db.catalog, &db.config, false);
-    let mut violations = std::collections::BTreeMap::<String, usize>::new();
-    for diagnostic in &db.diagnostics {
-        *violations.entry(diagnostic.code.clone()).or_default() += 1;
-    }
-    let mut lint_counts = std::collections::BTreeMap::<String, usize>::new();
-    for diagnostic in &lint {
-        *lint_counts
-            .entry(format!("{:?}", diagnostic.severity).to_ascii_lowercase())
-            .or_default() += 1;
-    }
-    let summary = obj([
-        ("kind", Value::String("check_summary".into())),
-        ("valid", Value::Bool(db.diagnostics.is_empty())),
-        ("tables", Value::from(db.catalog.schemas.len())),
-        ("rows", Value::from(db.catalog.row_count())),
-        (
-            "violations",
-            serde_json::to_value(&violations)
-                .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?,
-        ),
-        (
-            "lint",
-            serde_json::to_value(&lint_counts)
-                .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?,
-        ),
-        (
-            "elapsed_ms",
-            Value::from(db.validation_elapsed.as_millis() as u64),
-        ),
-    ]);
-    if matches!(format, Format::Json | Format::Jsonl) {
-        let mut reported = db.diagnostics.clone();
-        if strict {
-            reported.extend(db.catalog.warnings.clone());
-            reported.extend(lint.clone());
-        }
-        output::check_result(&reported, summary, format)?;
-        if !db.diagnostics.is_empty() {
-            return Ok(crate::diagnostic::exit_code_for_diagnostics(
-                &db.diagnostics,
-            ));
-        }
-        if strict && (!lint.is_empty() || !db.catalog.warnings.is_empty()) {
-            return Ok(7);
-        }
-        return Ok(0);
-    }
-    if !db.diagnostics.is_empty() {
-        output::diagnostics(&db.diagnostics, format);
-        eprintln!(
-            "{} tables, {} rows, {} violations ({:?}), {} lint findings ({:?}), {} ms",
-            db.catalog.schemas.len(),
-            db.catalog.row_count(),
-            db.diagnostics.len(),
-            violations,
-            lint.len(),
-            lint_counts,
-            db.validation_elapsed.as_millis(),
-        );
-        return Ok(crate::diagnostic::exit_code_for_diagnostics(
-            &db.diagnostics,
-        ));
-    }
-    if strict && (!lint.is_empty() || !db.catalog.warnings.is_empty()) {
-        let mut findings = db.catalog.warnings.clone();
-        findings.extend(lint);
-        output::diagnostics(&findings, format);
-        return Ok(7);
-    }
-    output::notice(&format!(
-        "VALID: {} tables, {} rows, 0 violations, {} lint findings ({:?}), {} ms",
-        db.catalog.schemas.len(),
-        db.catalog.row_count(),
-        lint.len(),
-        lint_counts,
-        db.validation_elapsed.as_millis(),
-    ));
-    Ok(0)
-}
-fn lint(
-    db: &Database,
-    format: Format,
-    table: Option<&str>,
-    strict: bool,
-    descriptions: bool,
-) -> Result<i32> {
-    let mut x = crate::lint::lint(&db.catalog, &db.config, descriptions);
-    if let Some(t) = table {
-        x.retain(|d| d.table.as_deref() == Some(t))
-    }
-    output::diagnostics(&x, format);
-    Ok(if strict && !x.is_empty() { 7 } else { 0 })
-}
-
-fn doctor(db: &mut Database, format: Format, options: DoctorOptions<'_>, cli: &Cli) -> Result<i32> {
-    let DoctorOptions {
-        fix,
-        allow_data,
-        only,
-        explain,
-        no_snapshot,
-    } = options;
-    let plan = crate::doctor::plan(db);
-    if let Some(id) = explain {
-        if let Some(f) = plan.iter().find(|f| f.id == id) {
-            if format == Format::Table {
-                println!(
-                    "{} [{}]: {}\npaths: {}",
-                    f.id,
-                    f.class,
-                    f.description,
-                    f.paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            } else {
-                output::records(&[serialized_record("doctor_fix", f)?], format)?;
-            }
-            return Ok(0);
-        }
-        return Err(DbError::usage(format!(
-            "unknown or inapplicable fix {id:?}"
-        )));
-    }
-    let mut machine_records = Vec::new();
-    if format == Format::Table {
-        output::notice("Doctor plan:");
-        for class in ["derived", "schema", "layout", "data", "manual"] {
-            let items: Vec<_> = plan
-                .iter()
-                .filter(|f| f.class == class && doctor_fix_matches(only, &f.id))
-                .collect();
-            if !items.is_empty() {
-                output::notice(&format!("  {class} ({}):", items.len()));
-                for f in items {
-                    output::notice(&format!("    {}  {}", f.id, f.description));
-                    for path in &f.paths {
-                        output::notice(&format!("      -> {}", path.display()));
-                    }
-                }
-            }
-        }
-    } else {
-        machine_records = plan
-            .iter()
-            .filter(|fix| doctor_fix_matches(only, &fix.id))
-            .map(|fix| serialized_record("doctor_fix", fix))
-            .collect::<Result<Vec<_>>>()?;
-    }
-    if !fix {
-        if format != Format::Table {
-            output::records(&machine_records, format)?;
-        }
-        return Ok(crate::diagnostic::exit_code_for_diagnostics(
-            &db.diagnostics,
-        ));
-    }
-    require_writable(cli)?;
-    let changes = crate::doctor::repair_changes(db, only, allow_data)?;
-    if changes.is_empty() {
-        let no_change = obj([
-            ("kind", Value::String("no_change".into())),
-            (
-                "message",
-                Value::String("no applicable automatic fixes".into()),
-            ),
-        ]);
-        if format == Format::Table {
-            event(format, no_change, "no applicable automatic fixes")?;
-        } else {
-            machine_records.push(no_change);
-            output::records(&machine_records, format)?;
-        }
-        return Ok(crate::diagnostic::exit_code_for_diagnostics(
-            &db.diagnostics,
-        ));
-    }
-    let touches_rows = changes.iter().any(|c| match c {
-        Change::Write { path, .. } | Change::Delete { path } => {
-            !crate::schema_store::is_schema_relative(&path.to_string_lossy())
-        }
-    });
-    if cli.dry_run || touches_rows {
-        let diffs = doctor_diff_records(&db.root, &changes)?;
-        if format == Format::Table {
-            print_doctor_diffs(&diffs);
-        } else {
-            machine_records.extend(diffs);
-        }
-    }
-    if !cli.dry_run && !cli.yes {
-        if format != Format::Table {
-            output::records(&machine_records, format)?;
-        }
-        return Err(DbError::new(
-            "CONFIRMATION_REQUIRED",
-            if format == Format::Table {
-                "doctor fixes require --yes"
-            } else {
-                "--yes is required to apply doctor fixes with machine-readable output"
+        Command::Update { table, key, patch } => rows::update(context, sink, &table, &key, &patch),
+        Command::Delete { table, key } => rows::delete(context, sink, &table, &key),
+        Command::Sql { statement, params } => query::sql(context, sink, &statement, &params),
+        Command::Explain { statement, params } => query::explain(context, sink, &statement, &params),
+        Command::Schema(SchemaCommand::Show { table }) => schema::show(context, sink, &table),
+        Command::Schema(SchemaCommand::New { table }) => schema::new(context, sink, &table),
+        Command::Schema(SchemaCommand::Pin { table }) => schema::pin(context, sink, &table),
+        Command::Schema(SchemaCommand::Validate) => schema::validate(context, sink),
+        Command::Schema(SchemaCommand::Dialect) => schema::dialect(sink),
+        Command::Infer { tables, all, write, strictness, pk, on_schema_conflict } => schema::infer(
+            context,
+            sink,
+            schema::InferOptions {
+                tables,
+                all,
+                write,
+                strictness: schema::parse_strictness(&strictness)?,
+                primary_key: (!pk.is_empty()).then_some(pk.as_slice()),
+                on_conflict: OnConflict::parse(&on_schema_conflict)?,
             },
-            9,
-        ));
-    }
-    if touches_rows && !no_snapshot && !cli.dry_run {
-        let name = format!(
-            "pre-doctor-{}",
-            db.manifest.as_ref().map_or(0, |m| m.revision)
-        );
-        let dest = db.root.join(".db/snapshots").join(&name);
-        if dest.exists() {
-            return Err(DbError::new(
-                "SNAPSHOT_EXISTS",
-                format!(
-                    "required safety snapshot {name:?} already exists; delete it or use --no-snapshot"
-                ),
-                1,
-            ));
-        }
-        create_snapshot(db, &name)?;
-        let snapshot = obj([
-            ("kind", Value::String("snapshot".into())),
-            ("name", Value::String(name.clone())),
-            ("action", Value::String("created".into())),
-        ]);
-        if format == Format::Table {
-            event(
-                format,
-                snapshot,
-                &format!(
-                    "created snapshot {name}; restore with `reldir snapshot restore {name} --yes`"
-                ),
-            )?;
-        } else {
-            machine_records.push(snapshot);
-        }
-    }
-    let start = observed_entries(db)?;
-    let paths = transaction::commit(
-        &db.root,
-        &db.config,
-        &start,
-        &changes,
-        "repair",
-        cli.dry_run,
-        db.resource_overrides(),
-    )?;
-    let revision = resulting_revision(db, cli.dry_run)?;
-    if format == Format::Table {
-        print_mutation(&paths, revision, cli.dry_run, format)?;
-    } else {
-        machine_records.extend(mutation_records(&paths, revision, cli.dry_run));
-        output::records(&machine_records, format)?;
-    }
-    Ok(0)
-}
-
-fn infer_cmd(db: &mut Database, options: InferOptions<'_>, cli: &Cli) -> Result<i32> {
-    let InferOptions {
-        table,
-        write,
-        all,
-        strictness,
-        pk,
-        format,
-    } = options;
-    let strict = match strictness {
-        "strict" => Strictness::Strict,
-        "balanced" => Strictness::Balanced,
-        "loose" => Strictness::Loose,
-        _ => {
-            return Err(DbError::usage(
-                "strictness must be strict, balanced, or loose",
-            ));
-        }
-    };
-    let tables = if let Some(t) = table {
-        vec![t.into()]
-    } else {
-        infer::discover_tables(&db.root)?
-    };
-    let ignore_set = db
-        .config
-        .ignore_set()
-        .map_err(|message| DbError::new("INTERNAL_METADATA_CORRUPT", message, 6))?;
-    let wanted: Vec<_> = tables
-        .into_iter()
-        .filter(|table| !ignore_set.is_match(table))
-        .filter(|t| all || !db.catalog.schemas.contains_key(t))
-        .collect();
-    let schemas = infer::infer_all_with_references(
-        &db.root,
-        &wanted,
-        strict,
-        &db.config,
-        if pk.is_empty() { None } else { Some(pk) },
-        Some(&db.catalog),
-    )?;
-    if !write {
-        output_schemas(schemas.values(), format)?;
-        return Ok(0);
-    }
-    let mut changes = vec![];
-    for (t, s) in schemas {
-        // Re-inference replaces the working schema, which reldir owns. A pinned
-        // table is refused: the pin is the user's declaration, and silently
-        // diverging from it would break the equality the pin exists to assert.
-        if db.catalog.pinned.contains(&t) {
-            return Err(DbError::from_diag(
-                crate::diagnostic::Diagnostic::error(
-                    "SCHEMA_PINNED",
-                    format!("{t} is pinned; inference must not diverge from the pin"),
-                )
-                .at(crate::schema_store::pin_relative(&t))
-                .table(&t)
-                .help(format!(
-                    "edit schema/{t}.json and run `reldir schema restore {t}`, \
-                     or unpin by deleting it"
-                )),
-                1,
-            ));
-        }
-        let name = crate::schema_store::working_relative(&t);
-        let bytes = canonical::pretty_with_indent(
-            &crate::schema::json_schema::encode(&s),
-            db.config.indentation_width,
-        );
-        if fs::read(db.root.join(&name)).ok().as_deref() != Some(bytes.as_slice()) {
-            changes.push(Change::Write {
-                path: name.into(),
-                bytes,
-            });
-        }
-    }
-    if changes.is_empty() {
-        return commit_changes(db, changes, "internal", format, cli);
-    }
-    let paths = transaction::commit(
-        &db.root,
-        &db.config,
-        &observed_entries(db)?,
-        &changes,
-        "internal",
-        cli.dry_run,
-        db.resource_overrides(),
-    )?;
-    print_mutation(
-        &paths,
-        resulting_revision(db, cli.dry_run)?,
-        cli.dry_run,
-        format,
-    )?;
-    Ok(0)
-}
-
-fn get(db: &Database, table: &str, key: &str, format: Format) -> Result<i32> {
-    db.require_valid()?;
-    let s = schema_for(db, table)?;
-    let values = key_values(key, s)?;
-    let k = canonical::compact(&Value::Array(values));
-    let row = crate::integrity::rows_by_key(&db.catalog, table)
-        .get(&k)
-        .copied()
-        .ok_or_else(|| DbError::new("UNKNOWN_ROW", format!("no {table} row with key {key}"), 4))?;
-    output::records(std::slice::from_ref(&row.value), format)?;
-    Ok(0)
-}
-fn list(
-    db: &Database,
-    table: &str,
-    where_expr: Option<&str>,
-    order: Option<&str>,
-    limit: Option<usize>,
-    format: Format,
-    timeout_seconds: Option<u64>,
-) -> Result<i32> {
-    db.require_valid()?;
-    schema_for(db, table)?;
-    let mut sql = format!("SELECT * FROM {}", quote(table));
-    if let Some(w) = where_expr {
-        sql.push_str(" WHERE ");
-        sql.push_str(w)
-    }
-    if let Some(o) = order {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(&quote(o))
-    }
-    if let Some(n) = limit {
-        sql.push_str(&format!(" LIMIT {n}"))
-    }
-    let timeout = timeout_seconds.map(std::time::Duration::from_secs);
-    if stream_query_if_supported(db, &sql, &[], timeout, format)? {
-        return Ok(0);
-    }
-    let r = crate::sql::execute_params_with_limits(
-        &db.catalog,
-        &sql,
-        &[],
-        query_limits_with_timeout(db, timeout),
-    )?;
-    if r.rows.len() > db.config.max_result_rows {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!(
-                "query returned more than {} rows",
-                db.config.max_result_rows
-            ),
-            4,
-        ));
-    }
-    output::records(&r.rows, format)?;
-    Ok(0)
-}
-fn insert(
-    db: &Database,
-    table: &str,
-    json_value: Option<String>,
-    from: Option<String>,
-    format: Format,
-    cli: &Cli,
-) -> Result<i32> {
-    db.require_valid()?;
-    let text = if let Some(f) = from {
-        if f == "-" {
-            read_limited(
-                io::stdin().lock(),
-                db.config.max_transaction_size,
-                Path::new("stdin"),
-            )?
-        } else {
-            let path = Path::new(&f);
-            let file = fs::File::open(path).map_err(|error| DbError::io(path, error))?;
-            read_limited(file, db.config.max_transaction_size, path)?
-        }
-    } else {
-        json_value.ok_or_else(|| DbError::usage("insert requires JSON or --from"))?
-    };
-    let v =
-        crate::json::parse_str(&text).map_err(|e| DbError::usage(format!("invalid JSON: {e}")))?;
-    let rows = match v {
-        Value::Array(a) => a,
-        x => vec![x],
-    };
-    let s = schema_for(db, table)?;
-    let first_sequence = next_sequence(db, table, s)?;
-    let mut changes = vec![];
-    for (v_i, v) in rows.into_iter().enumerate() {
-        let mut row = v
-            .as_object()
-            .cloned()
-            .ok_or_else(|| DbError::usage("insert input must be an object or array of objects"))?;
-        let sequence = first_sequence
-            .checked_add(v_i as i64)
-            .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "generated sequence exhausted i64", 2))?;
-        materialize(&mut row, s, sequence);
-        let path = PathBuf::from(table).join(canonical::filename(s, &row).ok_or_else(|| {
-            DbError::new("IDENTITY_MISMATCH", "cannot derive filename from row", 2)
-        })?);
-        if db.root.join(&path).exists() {
-            return Err(DbError::new(
-                "PRIMARY_KEY_VIOLATION",
-                format!("row path {} already exists", path.display()),
-                2,
-            ));
-        }
-        changes.push(Change::Write {
-            path,
-            bytes: canonical::pretty_with_indent(
-                &canonical::canonical_row(&row, s),
-                db.config.indentation_width,
-            ),
-        })
-    }
-    commit_changes(db, changes, "internal", format, cli)
-}
-fn update(
-    db: &Database,
-    table: &str,
-    key: &str,
-    patch: &str,
-    format: Format,
-    cli: &Cli,
-) -> Result<i32> {
-    db.require_valid()?;
-    let s = schema_for(db, table)?;
-    // Resolve the row first so a missing key is reported distinctly instead of
-    // turning into a successful zero-row SQL update.
-    find_row(db, table, key)?;
-    let p = crate::json::parse_str(patch)
-        .map_err(|e| DbError::usage(format!("invalid patch JSON: {e}")))?;
-    let p = p
-        .as_object()
-        .ok_or_else(|| DbError::usage("patch must be a JSON object"))?;
-    if p.is_empty() {
-        event(
-            format,
-            obj([
-                ("kind", Value::String("no_change".into())),
-                ("message", Value::String("patch is empty".into())),
-            ]),
-            "no change: patch is empty",
-        )?;
-        return Ok(0);
-    }
-    for name in p.keys() {
-        if !s.columns.contains_key(name) {
-            return Err(DbError::new(
-                "UNKNOWN_COLUMN",
-                format!("unknown column {table}.{name}"),
-                4,
-            ));
-        }
-    }
-    let key_params = key_values(key, s)?;
-    let mut params = p.values().cloned().collect::<Vec<_>>();
-    params.extend(key_params);
-    let assignments = p
-        .keys()
-        .map(|name| format!("{} = ?", quote(name)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let predicate = s
-        .primary_key
-        .iter()
-        .map(|name| format!("{} = ?", quote(name)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let statement = format!(
-        "UPDATE {} SET {assignments} WHERE {predicate}",
-        quote(table)
-    );
-    let result =
-        crate::sql::execute_with_limits(&db.catalog, &statement, &params, query_limits(db, cli))?;
-    commit_changes(db, result.changes, "internal", format, cli)
-}
-fn delete(db: &Database, table: &str, key: &str, format: Format, cli: &Cli) -> Result<i32> {
-    db.require_valid()?;
-    let s = schema_for(db, table)?;
-    let values = key_values(key, s)?;
-    let where_sql = s
-        .primary_key
-        .iter()
-        .map(|c| format!("{} = ?", quote(c)))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let sql = format!("DELETE FROM {} WHERE {where_sql}", quote(table));
-    let r = crate::sql::execute_with_limits(&db.catalog, &sql, &values, query_limits(db, cli))?;
-    commit_changes(db, r.changes, "internal", format, cli)
-}
-fn sql(db: &Database, text: &str, param_text: &[String], format: Format, cli: &Cli) -> Result<i32> {
-    db.require_valid()?;
-    let params = param_text
-        .iter()
-        .map(|p| {
-            let (name, text) = p
-                .split_once('=')
-                .map_or((None, p.as_str()), |(n, v)| (Some(n.to_string()), v));
-            crate::json::parse_str(text)
-                .map(|value| crate::sql::SqlParam { name, value })
-                .map_err(|e| DbError::usage(format!("invalid parameter {p:?}: {e}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let actual = text.to_string();
-    if stream_query_if_supported(
-        db,
-        &actual,
-        &params,
-        cli.timeout
-            .or(db.config.timeout_seconds)
-            .map(std::time::Duration::from_secs),
-        format,
-    )? {
-        return Ok(0);
-    }
-    let r = crate::sql::execute_params_with_limits(
-        &db.catalog,
-        &actual,
-        &params,
-        query_limits(db, cli),
-    )?;
-    if r.rows.len() > db.config.max_result_rows {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!(
-                "query returned more than {} rows",
-                db.config.max_result_rows
-            ),
-            4,
-        ));
-    }
-    if r.mutation {
-        commit_changes(db, r.changes, "internal", format, cli)
-    } else {
-        output::records(&r.rows, format)?;
-        Ok(0)
-    }
-}
-
-fn explain_sql(
-    db: &Database,
-    text: &str,
-    param_text: &[String],
-    analyze: bool,
-    format: Format,
-    cli: &Cli,
-) -> Result<i32> {
-    db.require_valid()?;
-    let params = parse_sql_params(param_text)?;
-    if analyze && !crate::sql::is_read_statement(text)? {
-        return Err(DbError::new(
-            "QUERY_UNSUPPORTED",
-            "--explain-analyze is restricted to read-only statements",
-            4,
-        ));
-    }
-    let physical = crate::sql::execute_params_with_limits(
-        &db.catalog,
-        &format!("EXPLAIN QUERY PLAN {text}"),
-        &params,
-        query_limits(db, cli),
-    )?
-    .rows;
-    let details = physical
-        .iter()
-        .filter_map(|row| row.get("detail").and_then(Value::as_str))
-        .map(String::from)
-        .collect::<Vec<_>>();
-    let declared_indexes = db
-        .catalog
-        .schemas
-        .iter()
-        .flat_map(|(table, schema)| {
-            schema
-                .indexes
-                .iter()
-                .map(move |columns| crate::sql::index_name(table, columns))
-        })
-        .collect::<Vec<_>>();
-    let selected = declared_indexes
-        .iter()
-        .filter(|name| details.iter().any(|detail| detail.contains(*name)))
-        .cloned()
-        .collect::<Vec<_>>();
-    let rejected = declared_indexes
-        .iter()
-        .filter(|name| !selected.contains(name))
-        .map(|name| {
-            obj([
-                ("index", Value::String(name.clone())),
-                (
-                    "reason",
-                    Value::String("SQLite costed another access path lower".into()),
-                ),
-            ])
-        })
-        .map(Value::Object)
-        .collect::<Vec<_>>();
-    let mut record = obj([
-        ("kind", Value::String("query_plan".into())),
-        (
-            "logical_plan",
-            Value::String(crate::sql::normalized_statement(text)?),
         ),
-        (
-            "physical_plan",
-            Value::Array(physical.into_iter().map(Value::Object).collect()),
-        ),
-        (
-            "selected_indexes",
-            Value::Array(selected.into_iter().map(Value::String).collect()),
-        ),
-        ("rejected_indexes", Value::Array(rejected)),
-        (
-            "estimated_rows_upper_bound",
-            Value::from(db.catalog.row_count()),
-        ),
-    ]);
-    if analyze {
-        let started = std::time::Instant::now();
-        let result = crate::sql::execute_params_with_limits(
-            &db.catalog,
-            text,
-            &params,
-            query_limits(db, cli),
-        )?;
-        record.insert("actual_rows".into(), Value::from(result.rows.len()));
-        record.insert(
-            "actual_elapsed_us".into(),
-            Value::from(started.elapsed().as_micros() as u64),
-        );
-    }
-    output::records(&[record], format)?;
-    Ok(0)
-}
-
-fn parse_sql_params(param_text: &[String]) -> Result<Vec<crate::sql::SqlParam>> {
-    param_text
-        .iter()
-        .map(|parameter| {
-            let (name, text) = parameter
-                .split_once('=')
-                .map_or((None, parameter.as_str()), |(name, value)| {
-                    (Some(name.to_string()), value)
-                });
-            crate::json::parse_str(text)
-                .map(|value| crate::sql::SqlParam { name, value })
-                .map_err(|error| {
-                    DbError::usage(format!("invalid parameter {parameter:?}: {error}"))
-                })
-        })
-        .collect()
-}
-
-fn stream_query_if_supported(
-    db: &Database,
-    statement: &str,
-    params: &[crate::sql::SqlParam],
-    timeout: Option<std::time::Duration>,
-    format: Format,
-) -> Result<bool> {
-    if !matches!(format, Format::Jsonl | Format::Csv) || !crate::sql::is_read_statement(statement)?
-    {
-        return Ok(false);
-    }
-    match format {
-        Format::Jsonl => {
-            crate::sql::query_each_timeout(
-                &db.catalog,
-                statement,
-                params,
-                query_limits_with_timeout(db, timeout),
-                output::jsonl_record,
-            )?;
-        }
-        Format::Csv => {
-            let mut writer = csv::Writer::from_writer(io::stdout().lock());
-            let mut headers: Option<Vec<String>> = None;
-            crate::sql::query_each_timeout(
-                &db.catalog,
-                statement,
-                params,
-                query_limits_with_timeout(db, timeout),
-                |row| {
-                    if headers.is_none() {
-                        let row_headers = row.keys().cloned().collect::<Vec<_>>();
-                        writer
-                            .write_record(&row_headers)
-                            .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))?;
-                        headers = Some(row_headers);
-                    }
-                    let row_headers = headers.as_ref().ok_or_else(|| {
-                        DbError::new(
-                            "INTERNAL_METADATA_CORRUPT",
-                            "CSV header state was not initialized",
-                            6,
-                        )
-                    })?;
-                    writer
-                        .write_record(
-                            row_headers
-                                .iter()
-                                .map(|name| output_cell(row.get(name).unwrap_or(&Value::Null))),
-                        )
-                        .map_err(|error| DbError::new("QUERY_TYPE_ERROR", error.to_string(), 4))
-                },
-            )?;
-            writer
-                .flush()
-                .map_err(|error| DbError::io(Path::new("stdout"), error))?;
-        }
-        _ => unreachable!(),
-    }
-    Ok(true)
-}
-
-fn output_cell(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(value) => value.clone(),
-        _ => canonical::compact(value),
-    }
-}
-
-fn schema_cmd(db: &Database, cmd: SchemaCommand, format: Format, cli: &Cli) -> Result<i32> {
-    match cmd {
-        SchemaCommand::Show { table } => {
-            let s = schema_for(db, &table)?;
-            if format == Format::Table {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&crate::schema::json_schema::encode(s)).unwrap()
-                );
-            } else {
-                output::records(
-                    &[serialized_record(
-                        "schema",
-                        &crate::schema::json_schema::encode(s),
-                    )?],
-                    format,
-                )?;
-            }
-            Ok(0)
-        }
-        SchemaCommand::Validate => check(db, format, false),
-        // Answered before a database is resolved; see the early dispatch.
-        SchemaCommand::Dialect => unreachable!(),
-        SchemaCommand::New { table } => {
-            if !crate::schema::valid_name(&table) {
-                return Err(DbError::new(
-                    "SCHEMA_INVALID_TABLE_NAME",
-                    format!("invalid table name {table:?}"),
-                    2,
-                ));
-            }
-            if db.catalog.schemas.contains_key(&table) {
-                return Err(DbError::new(
-                    "SCHEMA_MISSING_REQUIRED",
-                    "schema already exists",
-                    1,
-                ));
-            }
-            let mut cols = indexmap::IndexMap::new();
-            cols.insert(
-                "id".into(),
-                Column {
-                    kind: ColumnType::Uuid,
-                    nullable: false,
-                    default: None,
-                    generated: Some(Generated {
-                        kind: GeneratedKind::Uuid,
-                    }),
-                    values: None,
-                    items: None,
-                    properties: None,
-                    pattern: None,
-                    additional_properties: true,
-                    required: Default::default(),
-                    min_size: None,
-                    max_size: None,
-                    minimum: None,
-                    maximum: None,
-                    exclusive_minimum: None,
-                    exclusive_maximum: None,
-                    multiple_of: None,
-                    unique_items: false,
-                    composition: None,
-                    description: None,
-                    annotations: Default::default(),
-                },
-            );
-            let s = Schema {
-                table: table.clone(),
-                schema_version: 1,
-                schema_format: None,
-                description: None,
-                primary_key: vec!["id".into()],
-                columns: cols,
-                unique: vec![],
-                foreign_keys: vec![],
-                check: vec![],
-                indexes: vec![],
-                storage: None,
-                additional_fields: crate::schema::AdditionalFields::Reject,
-                annotations: Default::default(),
+        Command::Migrate(migrate) => {
+            let migration = match migrate {
+                MigrateCommand::Apply { file } => schema::read_migration(&file)?,
+                other => Migration { operations: vec![operation(other)?] },
             };
-            commit_changes(
-                db,
-                vec![Change::Write {
-                    path: crate::schema_store::working_relative(&table).into(),
-                    bytes: canonical::pretty_with_indent(
-                        &crate::schema::json_schema::encode(&s),
-                        db.config.indentation_width,
-                    ),
-                }],
-                "internal",
-                format,
-                cli,
-            )
+            schema::migrate(context, sink, migration)
         }
-        SchemaCommand::Pin { table, overwrite } => {
-            // Pinning declares the schema reldir derived: it copies the working
-            // copy into `schema/`, where it survives `.db` being deleted and is
-            // carried by version control.
-            let working = schema_for(db, &table)?.clone();
-            let bytes =
-                crate::schema_store::canonical_bytes(&working, db.config.indentation_width)?;
-            if let Some(pinned) = crate::schema_store::load_pin(&db.root, &table)? {
-                if crate::schema_store::equivalent(&pinned, &working)? {
-                    event(
-                        format,
-                        obj([
-                            ("kind", Value::String("no_change".into())),
-                            ("table", Value::String(table.clone())),
-                            ("message", Value::String("schema is already pinned".into())),
-                        ]),
-                        &format!("no change: schema {table} is already pinned"),
-                    )?;
-                    return Ok(0);
-                }
-                // A pin already exists and says something else. Replacing it
-                // discards a declaration the user wrote, which is theirs to
-                // authorize -- unlike the working copy, which reldir rebuilds from
-                // the pin without asking because it owns it.
-                if !overwrite {
-                    return Err(DbError::from_diag(
-                        crate::diagnostic::Diagnostic::error(
-                            "SCHEMA_ALREADY_PINNED",
-                            format!("schema/{table}.json already declares a different schema"),
-                        )
-                        .at(crate::schema_store::pin_relative(&table))
-                        .table(&table)
-                        .help(
-                            "pass --overwrite to replace the declaration with the working schema",
-                        ),
-                        2,
-                    ));
-                }
-            }
-            commit_changes(
-                db,
-                vec![Change::Write {
-                    path: crate::schema_store::pin_relative(&table).into(),
-                    bytes,
-                }],
-                "internal",
-                format,
-                cli,
-            )
+        Command::Import { table, from } => rows::import(context, sink, &table, &from),
+        Command::Export { table, out } => {
+            let as_csv = out.as_deref().and_then(|path| path.extension()).is_some_and(|ext| ext == "csv");
+            rows::export(context, sink, &table, out.as_deref(), as_csv)
         }
-        SchemaCommand::Restore { table } => {
-            // The pin is the declaration, so restoring takes it as the working
-            // schema. This is how a divergence is resolved in the pin's favour.
-            let Some(pinned) = crate::schema_store::load_pin(&db.root, &table)? else {
-                return Err(DbError::from_diag(
-                    crate::diagnostic::Diagnostic::error(
-                        "SCHEMA_NOT_PINNED",
-                        format!("{table} has no pinned schema to restore from"),
-                    )
-                    .table(&table)
-                    .help(format!("run `reldir schema pin {table}` to create one")),
-                    1,
-                ));
-            };
-            crate::schema_store::write_working(&db.root, &pinned, db.config.indentation_width)?;
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("schema_restored".into())),
-                    ("table", Value::String(table.clone())),
-                ]),
-                &format!("restored .db/schema/{table}.json from its pin"),
-            )?;
-            Ok(0)
-        }
-    }
-}
-
-fn export(db: &Database, table: &str, out: Option<&Path>, format: Format) -> Result<i32> {
-    db.require_valid()?;
-    schema_for(db, table)?;
-    if format == Format::Sqlite {
-        let path = out.ok_or_else(|| DbError::usage("sqlite export requires --out"))?;
-        crate::sql::export_sqlite(&db.catalog, table, path)?;
-        event(
-            format,
-            obj([
-                ("kind", Value::String("export".into())),
-                ("table", Value::String(table.into())),
-                ("path", Value::String(path.display().to_string())),
-                ("format", Value::String("sqlite".into())),
-            ]),
-            &format!("exported database to {}", path.display()),
-        )?;
-        return Ok(0);
-    }
-    let schema = &db.catalog.schemas[table];
-    let rows = db.catalog.rows[table]
-        .iter()
-        .map(|row| {
-            canonical::canonical_row(&row.value, schema)
-                .as_object()
-                .cloned()
-                .ok_or_else(|| {
-                    DbError::new(
-                        "INTERNAL_METADATA_CORRUPT",
-                        "canonical row serialization did not produce an object",
-                        6,
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(path) = out {
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(DbError::usage(format!(
-                "refusing to overwrite {}",
-                path.display()
-            )));
-        }
-        let bytes = match format {
-            Format::Json => {
-                let mut b = serde_json::to_vec_pretty(&rows).unwrap();
-                b.push(b'\n');
-                b
-            }
-            Format::Jsonl => rows
-                .iter()
-                .flat_map(|r| {
-                    let mut b = serde_json::to_vec(r).unwrap();
-                    b.push(b'\n');
-                    b
-                })
-                .collect(),
-            Format::Csv => {
-                let mut w = csv::Writer::from_writer(vec![]);
-                let heads: Vec<_> = db.catalog.schemas[table].columns.keys().cloned().collect();
-                w.write_record(&heads)
-                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?;
-                for r in &rows {
-                    w.write_record(
-                        heads
-                            .iter()
-                            .map(|header| output_cell(r.get(header).unwrap_or(&Value::Null))),
-                    )
-                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?
-                }
-                w.into_inner()
-                    .map_err(|e| DbError::new("QUERY_TYPE_ERROR", e.to_string(), 4))?
-            }
-            Format::Table | Format::Sqlite => {
-                return Err(DbError::usage(
-                    "file export format must be json, jsonl, or csv",
-                ));
-            }
-        };
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| DbError::io(path, error))?;
-        file.write_all(&bytes)
-            .map_err(|error| DbError::io(path, error))?;
-        file.sync_all().map_err(|error| DbError::io(path, error))?;
-        event(
-            format,
-            obj([
-                ("kind", Value::String("export".into())),
-                ("table", Value::String(table.into())),
-                ("path", Value::String(path.display().to_string())),
-                ("rows", Value::from(rows.len())),
-            ]),
-            &format!("exported {} rows to {}", rows.len(), path.display()),
-        )?
-    } else {
-        output::records(&rows, format)?
-    }
-    Ok(0)
-}
-fn import(db: &Database, table: &str, path: &Path, format: Format, cli: &Cli) -> Result<i32> {
-    let input_size = fs::metadata(path)
-        .map_err(|error| DbError::io(path, error))?
-        .len();
-    if input_size > db.config.max_transaction_size {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!(
-                "import input is {input_size} bytes, exceeding the {} byte transaction limit",
-                db.config.max_transaction_size
-            ),
-            2,
-        ));
-    }
-    let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
-    let values = if ext == "csv" {
-        let mut rdr = csv::Reader::from_path(path)
-            .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))?;
-        let headers = rdr
-            .headers()
-            .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))?
-            .clone();
-        let s = schema_for(db, table)?;
-        let mut out = vec![];
-        for row in rdr.records() {
-            let row = row.map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))?;
-            let mut m = Map::new();
-            for (h, v) in headers.iter().zip(row.iter()) {
-                let column = s.columns.get(h).ok_or_else(|| {
-                    DbError::new(
-                        "UNKNOWN_COLUMN",
-                        format!("CSV header names unknown column {table}.{h}"),
-                        4,
-                    )
-                })?;
-                m.insert(h.into(), parse_csv(v, column)?);
-            }
-            out.push(Value::Object(m))
-        }
-        out
-    } else {
-        let text = fs::read_to_string(path).map_err(|e| DbError::io(path, e))?;
-        if ext == "jsonl" {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    crate::json::parse_str(l)
-                        .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            match crate::json::parse_str(&text)
-                .map_err(|e| DbError::new("INVALID_JSON", e.to_string(), 2))?
-            {
-                Value::Array(a) => a,
-                v => vec![v],
-            }
-        }
-    };
-    let s = schema_for(db, table)?;
-    let first_sequence = next_sequence(db, table, s)?;
-    let mut changes = vec![];
-    for (i, v) in values.into_iter().enumerate() {
-        let mut r = v
-            .as_object()
-            .cloned()
-            .ok_or_else(|| DbError::new("ROW_ROOT_NOT_OBJECT", "import rows must be objects", 2))?;
-        let sequence = first_sequence
-            .checked_add(i as i64)
-            .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "generated sequence exhausted i64", 2))?;
-        materialize(&mut r, s, sequence);
-        let path = PathBuf::from(table).join(canonical::filename(s, &r).ok_or_else(|| {
-            DbError::new(
-                "IDENTITY_MISMATCH",
-                "cannot derive imported row filename",
-                2,
-            )
-        })?);
-        if db.root.join(&path).exists() {
-            return Err(DbError::new(
-                "PRIMARY_KEY_VIOLATION",
-                format!("{} already exists", path.display()),
-                2,
-            ));
-        }
-        changes.push(Change::Write {
-            path,
-            bytes: canonical::pretty_with_indent(
-                &canonical::canonical_row(&r, s),
-                db.config.indentation_width,
-            ),
-        })
-    }
-    commit_changes(db, changes, "import", format, cli)
-}
-fn diff(db: &Database, args: &[String], schema_only: bool, format: Format) -> Result<i32> {
-    let table_filter = if args.len() == 1 && args[0].parse::<u64>().is_err() {
-        Some(args[0].as_str())
-    } else {
-        None
-    };
-    let working = args.len() <= 1;
-    let (old, new) = if args.len() == 2 {
-        let a = load_revision(
-            db,
-            args[0]
-                .parse()
-                .map_err(|_| DbError::usage("revision must be an integer"))?,
-        )?;
-        let b = load_revision(
-            db,
-            args[1]
-                .parse()
-                .map_err(|_| DbError::usage("revision must be an integer"))?,
-        )?;
-        (a.entries, b.entries)
-    } else if working {
-        let (_, current) = metadata::state(&db.catalog)?;
-        (
-            db.manifest
-                .as_ref()
-                .map(|m| m.entries.clone())
-                .unwrap_or_default(),
-            current,
-        )
-    } else {
-        return Err(DbError::usage(
-            "diff accepts a table or exactly two revisions",
-        ));
-    };
-    let mut rows = vec![];
-    let changes = metadata::diff_entries(Some(&old), &new);
-    let mut removed = std::collections::BTreeMap::new();
-    let mut added = std::collections::BTreeMap::new();
-    for x in &changes {
-        let path = x[2..].to_string();
-        if x.starts_with("D ") {
-            removed.insert(old[&path].hash.clone(), path);
-        } else if x.starts_with("A ") {
-            added.insert(new[&path].hash.clone(), path);
-        }
-    }
-    let mut key_changes = std::collections::BTreeMap::<String, (String, Value, Value)>::new();
-    let mut key_change_targets = std::collections::BTreeSet::new();
-    let removed_paths = changes
-        .iter()
-        .filter_map(|change| change.strip_prefix("D "))
-        .collect::<Vec<_>>();
-    let added_paths = changes
-        .iter()
-        .filter_map(|change| change.strip_prefix("A "))
-        .collect::<Vec<_>>();
-    for old_path in removed_paths {
-        if added.contains_key(&old[old_path].hash) {
-            continue;
-        }
-        let Some(table) = authoritative_table(old_path) else {
-            continue;
-        };
-        let Some(primary_key) = diff_primary_key(db, &new, table, working)? else {
-            continue;
-        };
-        let old_value = load_object(db, &old[old_path].hash)?;
-        let old_payload = without_fields(&old_value, &primary_key);
-        let candidates = added_paths
-            .iter()
-            .filter(|new_path| {
-                authoritative_table(new_path) == Some(table)
-                    && !removed.contains_key(&new[**new_path].hash)
-                    && !key_change_targets.contains(**new_path)
-            })
-            .filter_map(|new_path| {
-                let value = if working {
-                    current_object(db, new_path)
-                } else {
-                    load_object(db, &new[*new_path].hash)
-                };
-                match value {
-                    Ok(value) if without_fields(&value, &primary_key) == old_payload => {
-                        Some(Ok(((*new_path).to_string(), value)))
-                    }
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if let [candidate] = candidates.as_slice() {
-            let old_key = row_key_value(&old_value, &primary_key);
-            let new_key = row_key_value(&candidate.1, &primary_key);
-            key_change_targets.insert(candidate.0.clone());
-            key_changes.insert(old_path.into(), (candidate.0.clone(), old_key, new_key));
-        }
-    }
-    for x in changes {
-        let path = x[2..].to_string();
-        if schema_only && !crate::schema_store::is_pin_relative(&path) {
-            continue;
-        }
-        if let Some(t) = table_filter
-            && !path.starts_with(&format!("{t}/"))
-            && !path.starts_with(&format!("schema/{t}."))
-        {
-            continue;
-        }
-        if x.starts_with("D ") {
-            if let Some((to, old_key, new_key)) = key_changes.get(&path) {
-                rows.push(obj([
-                    ("kind", Value::String("key_change".into())),
-                    ("from", Value::String(path)),
-                    ("to", Value::String(to.clone())),
-                    ("old", old_key.clone()),
-                    ("new", new_key.clone()),
-                ]));
-                continue;
-            }
-            let hash = &old[&path].hash;
-            if let Some(to) = added.get(hash) {
-                rows.push(obj([
-                    ("kind", Value::String("rename".into())),
-                    ("from", Value::String(path)),
-                    ("to", Value::String(to.clone())),
-                ]));
-                continue;
-            }
-            rows.push(obj([
-                ("kind", Value::String("row_removed".into())),
-                ("path", Value::String(path)),
-            ]));
-        } else if x.starts_with("A ") {
-            if removed.contains_key(&new[&path].hash) || key_change_targets.contains(&path) {
-                continue;
-            }
-            rows.push(obj([
-                ("kind", Value::String("row_added".into())),
-                ("path", Value::String(path)),
-            ]));
-        } else {
-            let old_value = load_object(db, &old[&path].hash)?;
-            let new_value = if working {
-                current_object(db, &path)?
-            } else {
-                load_object(db, &new[&path].hash)?
-            };
-            if crate::schema_store::is_pin_relative(&path) {
-                rows.extend(schema_diff(&path, &old_value, &new_value));
-            } else {
-                rows.extend(field_diff(&path, &old_value, &new_value));
-            }
-        }
-    }
-    output::records(&rows, format)?;
-    Ok(0)
-}
-fn authoritative_table(path: &str) -> Option<&str> {
-    let (table, _) = path.split_once('/')?;
-    (!matches!(table, ".db" | "schema")).then_some(table)
-}
-
-/// The primary key a table had at a revision.
-///
-/// Renaming a file is told apart from rewriting one by comparing rows with
-/// their key fields removed, so the key is all a diff needs from the schema of
-/// the moment. It is also all that can honestly be recovered: stored objects
-/// hold the semantic encoding, which exists to be hashed rather than read back,
-/// and reconstructing a whole `Schema` from it would confuse identity with the
-/// file form.
-fn diff_primary_key(
-    db: &Database,
-    entries: &std::collections::BTreeMap<String, metadata::ManifestEntry>,
-    table: &str,
-    working: bool,
-) -> Result<Option<Vec<String>>> {
-    if working {
-        return Ok(db
-            .catalog
-            .schemas
-            .get(table)
-            .map(|schema| schema.primary_key.clone()));
-    }
-    let Some(entry) = entries.get(&format!("schema/{table}.json")) else {
-        return Ok(None);
-    };
-    let value = load_object(db, &entry.hash)?;
-    let key = value
-        .get("primary_key")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("the stored schema for {table:?} records no primary key"),
-                6,
-            )
-        })?
-        .iter()
-        .map(|name| {
-            name.as_str().map(String::from).ok_or_else(|| {
-                DbError::new(
-                    "INTERNAL_METADATA_CORRUPT",
-                    format!("the stored primary key for {table:?} is not a list of names"),
-                    6,
-                )
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(key))
-}
-
-fn without_fields(value: &Value, fields: &[String]) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        for field in fields {
-            object.remove(field);
-        }
-    }
-    value
-}
-
-/// The key values a row carries, as a diff reports them.
-///
-/// Read from the row itself rather than from the schema's defaults: a diff
-/// describes files as they are, and the schema of the moment may not be the one
-/// that wrote a historical row. A key column with no value in the row has no
-/// key value, which is what `null` says here.
-fn row_key_value(value: &Value, primary_key: &[String]) -> Value {
-    Value::Array(
-        primary_key
-            .iter()
-            .map(|name| value.get(name).cloned().unwrap_or(Value::Null))
-            .collect(),
-    )
-}
-fn load_revision(db: &Database, revision: u64) -> Result<metadata::Provenance> {
-    let p = db.root.join(format!(".db/provenance/{revision:020}.json"));
-    if !p.exists() {
-        return Err(DbError::usage(format!("unknown revision {revision}")));
-    }
-    crate::json::parse_as(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
-}
-fn load_object(db: &Database, hash: &str) -> Result<Value> {
-    let p = db.root.join(format!(".db/objects/{hash}.json"));
-    crate::json::parse(&fs::read(&p).map_err(|e| DbError::io(&p, e))?)
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))
-}
-fn current_object(db: &Database, path: &str) -> Result<Value> {
-    if path == ".db/config" {
-        return crate::json::parse(
-            &fs::read(db.root.join(path)).map_err(|e| DbError::io(&db.root.join(path), e))?,
-        )
-        .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6));
-    }
-    if path == ".db/format" {
-        return Ok(Value::String(
-            fs::read_to_string(db.root.join(path))
-                .map_err(|e| DbError::io(&db.root.join(path), e))?
-                .trim()
-                .into(),
-        ));
-    }
-    if let Some(table) = path
-        .strip_prefix("schema/")
-        .and_then(|x| x.strip_suffix(".json"))
-    {
-        return Ok(crate::schema::semantic::encode_v1(&db.catalog.schemas[table]));
-    }
-    let table = path
-        .split('/')
-        .next()
-        .ok_or_else(|| DbError::new("PATH_VIOLATION", "invalid manifest path", 6))?;
-    let row = db
-        .catalog
-        .rows
-        .get(table)
-        .into_iter()
-        .flatten()
-        .find(|r| r.relative.to_string_lossy() == path)
-        .ok_or_else(|| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("manifest row {path} is missing"),
-                6,
-            )
-        })?;
-    Ok(canonical::canonical_row(
-        &row.value,
-        &db.catalog.schemas[table],
-    ))
-}
-/// One column's definition, spelled the way the schema file spells it.
-///
-/// The stored form is the semantic encoding, which names reldir's types directly
-/// and carries `nullable` as a flag. A schema file says neither: it says
-/// `"type": "integer"` with an `x-reldir-type` tag, and expresses nullability as a
-/// union with `"null"`. Reporting a change in the reader's own vocabulary is the
-/// difference between a diff they can act on and one they have to translate.
-fn as_dialect(definition: &Value) -> Value {
-    let Some(object) = definition.as_object() else {
-        return definition.clone();
-    };
-    let nullable = object
-        .get("nullable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let kind = object.get("type").and_then(Value::as_str).unwrap_or("json");
-
-    // The same mapping the codec writes to disk, read off the semantic form.
-    let (name, tag, extra): (&str, Option<&str>, Option<(&str, Value)>) = match kind {
-        "bool" => ("boolean", None, None),
-        "int" => ("integer", Some("int"), None),
-        "float" => ("number", None, None),
-        "decimal" => ("string", Some("decimal"), None),
-        "string" => ("string", None, None),
-        "bytes" => (
-            "string",
-            None,
-            Some(("contentEncoding", Value::String("base64".into()))),
+        Command::Diff { table, from, to, schema } => history::diff(
+            context,
+            sink,
+            history::DiffOptions { revisions: from.zip(to), table, schema_only: schema },
         ),
-        "date" => ("string", None, Some(("format", Value::String("date".into())))),
-        "timestamp" => (
-            "string",
-            None,
-            Some(("format", Value::String("date-time".into()))),
+        Command::Log { limit } => history::log(context, sink, limit),
+        Command::Show { revision } => history::show(context, sink, revision),
+        Command::Snapshot(snapshot) => history::snapshot(
+            context,
+            sink,
+            match snapshot {
+                SnapshotCommand::Create { name } => history::SnapshotAction::Create(name),
+                SnapshotCommand::List => history::SnapshotAction::List,
+                SnapshotCommand::Restore { name } => history::SnapshotAction::Restore(name),
+                SnapshotCommand::Delete { name } => history::SnapshotAction::Delete(name),
+            },
         ),
-        "uuid" => ("string", None, Some(("format", Value::String("uuid".into())))),
-        "ulid" => ("string", Some("ulid"), None),
-        "enum" => ("string", None, None),
-        "array" => ("array", None, None),
-        "object" => ("object", None, None),
-        // `json` admits any value, which the dialect spells as the empty schema.
-        _ => {
-            return Value::Object(Map::new());
+        Command::Recover { history: mode } => history::recover(context, sink, mode.is_some()),
+        Command::Gc => history::gc(context, sink),
+        Command::Analyze => history::analyze(context, sink),
+        Command::Shell | Command::Mcp | Command::Completions { .. } => {
+            Err(DbError::usage("this command runs interactively and has no result to report"))
         }
+    }
+}
+
+fn operation(command: MigrateCommand) -> Result<Operation> {
+    let json = |text: &str, what: &str| {
+        crate::json::parse_str(text).map_err(|error| DbError::usage(format!("{what} is not JSON: {error}")))
     };
-
-    let mut out = Map::new();
-    out.insert(
-        "type".into(),
-        if nullable {
-            Value::Array(vec![
-                Value::String(name.into()),
-                Value::String("null".into()),
-            ])
-        } else {
-            Value::String(name.into())
-        },
-    );
-    if let Some((key, value)) = extra {
-        out.insert(key.into(), value);
-    }
-    if let Some(tag) = tag {
-        out.insert("x-reldir-type".into(), Value::String(tag.into()));
-    }
-    if let Some(values) = object.get("values") {
-        out.insert("enum".into(), values.clone());
-    }
-    if let Some(items) = object.get("items") {
-        out.insert("items".into(), as_dialect(items));
-    }
-    if let Some(properties) = object.get("properties").and_then(Value::as_array) {
-        let mut nested = Map::new();
-        for entry in properties {
-            if let Some(pair) = entry.as_array()
-                && let (Some(key), Some(value)) = (pair.first().and_then(Value::as_str), pair.get(1))
-            {
-                nested.insert(key.to_string(), as_dialect(value));
-            }
-        }
-        out.insert("properties".into(), Value::Object(nested));
-    }
-    if let Some(default) = object.get("default") {
-        out.insert("default".into(), default.clone());
-    }
-    if let Some(description) = object.get("description") {
-        out.insert("description".into(), description.clone());
-    }
-    Value::Object(out)
-}
-
-/// What changed about a table, rather than what changed about its file.
-///
-/// Both sides are the semantic encoding: that is what the object store holds,
-/// because identity is taken over it. Printing it verbatim would show a reader
-/// a shape that appears in no file they can edit -- snake_case keys and columns
-/// as pairs -- so the change is reported in the terms the schema is written in
-/// instead. `reldir diff` promises semantic changes, and for a schema the semantics
-/// are its columns and constraints, not its serialization.
-fn schema_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> {
-    let mut out = vec![];
-    let change = |kind: &str, name: String, before: Value, after: Value| {
-        obj([
-            ("kind", Value::String(kind.into())),
-            ("path", Value::String(path.into())),
-            ("name", Value::String(name)),
-            ("old", before),
-            ("new", after),
-        ])
-    };
-
-    // Columns are encoded as ordered [name, definition] pairs, so both which
-    // columns exist and the order they are written in are visible here.
-    let columns = |value: &Value| -> Vec<(String, Value)> {
-        value
-            .get("columns")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let pair = entry.as_array()?;
-                        Some((pair.first()?.as_str()?.to_string(), pair.get(1)?.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let before = columns(old);
-    let after = columns(new);
-
-    // Generators live under `x-reldir.generated` in a schema file, keyed by column,
-    // so a change to one is reported as the table fact it is rather than as a
-    // property of the column subschema.
-    let generators = |entries: &[(String, Value)]| -> Value {
-        let mut map = Map::new();
-        for (name, definition) in entries {
-            if let Some(kind) = definition.get("generated").and_then(|g| g.get("kind")) {
-                map.insert(name.clone(), kind.clone());
-            }
-        }
-        Value::Object(map)
-    };
-    let generated_before = generators(&before);
-    let generated_after = generators(&after);
-    if generated_before != generated_after {
-        out.push(change(
-            "schema_change",
-            "generated".into(),
-            generated_before,
-            generated_after,
-        ));
-    }
-    let before_names: Vec<&str> = before.iter().map(|(name, _)| name.as_str()).collect();
-    let after_names: Vec<&str> = after.iter().map(|(name, _)| name.as_str()).collect();
-
-    for (name, definition) in &after {
-        match before.iter().find(|(existing, _)| existing == name) {
-            None => out.push(change(
-                "column_added",
-                name.clone(),
-                Value::Null,
-                as_dialect(definition),
-            )),
-            Some((_, previous)) if previous != definition => {
-                // Some differences in the semantic form are not differences in
-                // the column's own declaration: a generator is a table fact,
-                // reported under `generated` rather than inside the subschema.
-                // Emitting a row whose two sides render identically would show
-                // a reader a change they cannot see and cannot act on.
-                let (before, after) = (as_dialect(previous), as_dialect(definition));
-                if before != after {
-                    out.push(change("column_changed", name.clone(), before, after));
-                }
-            }
-            Some(_) => {}
-        }
-    }
-    for (name, definition) in &before {
-        if !after_names.contains(&name.as_str()) {
-            out.push(change(
-                "column_removed",
-                name.clone(),
-                as_dialect(definition),
-                Value::Null,
-            ));
-        }
-    }
-    // Order is logical state -- rows are written in it -- so a reordering is a
-    // change even when every column survives unaltered.
-    if before_names != after_names
-        && before_names.len() == after_names.len()
-        && before_names.iter().all(|name| after_names.contains(name))
-    {
-        out.push(change(
-            "column_order_changed",
-            String::new(),
-            Value::Array(before_names.iter().map(|n| Value::String((*n).into())).collect()),
-            Value::Array(after_names.iter().map(|n| Value::String((*n).into())).collect()),
-        ));
-    }
-
-    // `storage` wraps its column list in an object; the dialect writes
-    // `x-reldir.filename` as the list itself, so the wrapper is unwrapped rather
-    // than shown as a shape that appears in no file.
-    let filename = |value: &Value| -> Value {
-        value
-            .get("filename")
-            .cloned()
-            .unwrap_or(Value::Null)
-    };
-    let filename_before = filename(old.get("storage").unwrap_or(&Value::Null));
-    let filename_after = filename(new.get("storage").unwrap_or(&Value::Null));
-    if filename_before != filename_after {
-        out.push(change(
-            "schema_change",
-            "filename".into(),
-            filename_before,
-            filename_after,
-        ));
-    }
-
-    // Everything else a schema says, reported under the name it is written by.
-    for (key, label) in [
-        ("primary_key", "primaryKey"),
-        ("unique", "unique"),
-        ("indexes", "indexes"),
-        ("foreign_keys", "foreignKeys"),
-        ("check", "checks"),
-        ("additional_fields", "additionalProperties"),
-        ("schema_version", "schemaVersion"),
-        ("schema_format", "schemaFormat"),
-        ("description", "description"),
-    ] {
-        let before = old.get(key).cloned().unwrap_or(Value::Null);
-        let after = new.get(key).cloned().unwrap_or(Value::Null);
-        if before != after {
-            out.push(change("schema_change", label.into(), before, after));
-        }
-    }
-    out
-}
-
-fn field_diff(path: &str, old: &Value, new: &Value) -> Vec<Map<String, Value>> {
-    let mut out = vec![];
-    if let (Some(a), Some(b)) = (old.as_object(), new.as_object()) {
-        let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
-        for key in keys {
-            let before = a.get(key).cloned().unwrap_or(Value::Null);
-            let after = b.get(key).cloned().unwrap_or(Value::Null);
-            if before != after {
-                out.push(obj([
-                    ("kind", Value::String("field_change".into())),
-                    ("path", Value::String(path.into())),
-                    ("field", Value::String(key.clone())),
-                    ("old", before),
-                    ("new", after),
-                ]));
-            }
-        }
-    } else if old != new {
-        out.push(obj([
-            ("kind", Value::String("change".into())),
-            ("path", Value::String(path.into())),
-            ("old", old.clone()),
-            ("new", new.clone()),
-        ]));
-    }
-    out
-}
-fn log(db: &Database, format: Format) -> Result<i32> {
-    let dir = db.root.join(".db/provenance");
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| DbError::io(&dir, e))? {
-        paths.push(entry.map_err(|e| DbError::io(&dir, e))?.path());
-    }
-    paths.sort_by(|a, b| b.cmp(a));
-    let mut rows = vec![];
-    for p in paths {
-        if p.extension().and_then(|x| x.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
-        let revision: metadata::Provenance = crate::json::parse_as(&bytes)
-            .map_err(|e| DbError::new("INTERNAL_METADATA_CORRUPT", e.to_string(), 6))?;
-        rows.push(serialized_record("provenance", &revision)?)
-    }
-    output::records(&rows, format)?;
-    Ok(0)
-}
-fn show(db: &Database, revision: u64, format: Format) -> Result<i32> {
-    let p = db.root.join(format!(".db/provenance/{revision:020}.json"));
-    if !p.exists() {
-        return Err(DbError::usage(format!("unknown revision {revision}")));
-    }
-    let bytes = fs::read(&p).map_err(|e| DbError::io(&p, e))?;
-    if format == Format::Table {
-        print!(
-            "{}",
-            String::from_utf8(bytes).map_err(|error| {
-                DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
-            })?
-        );
-    } else {
-        let provenance: metadata::Provenance = crate::json::parse_as(&bytes)
-            .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
-        output::records(&[serialized_record("provenance", &provenance)?], format)?;
-    }
-    Ok(0)
-}
-
-fn snapshot(db: &Database, cmd: SnapshotCommand, format: Format, cli: &Cli) -> Result<i32> {
-    let base = db.root.join(".db/snapshots");
-    match cmd {
-        SnapshotCommand::Create { name } => {
-            require_writable(cli)?;
-            db.require_valid()?;
-            valid_snapshot(&name)?;
-            ensure_snapshot_base(&base, true)?;
-            let dest = base.join(&name);
-            if dest.exists() {
-                return Err(DbError::usage("snapshot already exists"));
-            }
-            if cli.dry_run {
-                event(
-                    format,
-                    obj([
-                        ("kind", Value::String("snapshot".into())),
-                        ("name", Value::String(name.clone())),
-                        ("action", Value::String("create_planned".into())),
-                    ]),
-                    &format!("would create snapshot {name}"),
-                )?;
-                return Ok(0);
-            }
-            create_snapshot(db, &name)?;
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("snapshot".into())),
-                    ("name", Value::String(name.clone())),
-                    ("action", Value::String("created".into())),
-                ]),
-                &format!("created snapshot {name}"),
-            )?;
-            Ok(0)
-        }
-        SnapshotCommand::List => {
-            let mut rows = vec![];
-            if !ensure_snapshot_base(&base, false)? {
-                output::records(&rows, format)?;
-                return Ok(0);
-            }
-            for e in fs::read_dir(&base).map_err(|e| DbError::io(&base, e))? {
-                let e = e.map_err(|e| DbError::io(&base, e))?;
-                let path = e.path();
-                let metadata =
-                    fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
-                if !metadata.file_type().is_dir() {
-                    return Err(DbError::new(
-                        "INTERNAL_METADATA_CORRUPT",
-                        format!("snapshot entry {} is not a real directory", path.display()),
-                        6,
-                    ));
-                }
-                rows.push(obj([
-                    ("kind", Value::String("snapshot".into())),
-                    (
-                        "name",
-                        Value::String(e.file_name().to_string_lossy().into()),
-                    ),
-                ]))
-            }
-            output::records(&rows, format)?;
-            Ok(0)
-        }
-        SnapshotCommand::Restore { name } => {
-            require_writable(cli)?;
-            valid_snapshot(&name)?;
-            if !cli.dry_run && !cli.yes {
-                return Err(DbError::new(
-                    "CONFIRMATION_REQUIRED",
-                    "snapshot restore requires --yes",
-                    9,
-                ));
-            }
-            let src = base.join(&name);
-            if !ensure_snapshot_base(&base, false)? || !snapshot_exists(&src)? {
-                return Err(DbError::usage("snapshot does not exist"));
-            }
-            let changes = changes_from_snapshot(db, &src)?;
-            commit_changes(db, changes, "snapshot_restore", format, cli)
-        }
-        SnapshotCommand::Delete { name } => {
-            require_writable(cli)?;
-            valid_snapshot(&name)?;
-            if !cli.dry_run && !cli.yes {
-                return Err(DbError::new(
-                    "CONFIRMATION_REQUIRED",
-                    "snapshot delete requires --yes",
-                    9,
-                ));
-            }
-            let p = base.join(name);
-            let exists = ensure_snapshot_base(&base, false)? && snapshot_exists(&p)?;
-            if !cli.dry_run && exists {
-                fs::remove_dir_all(&p).map_err(|e| DbError::io(&p, e))?
-            }
-            let display_name = p
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| DbError::new("PATH_VIOLATION", "invalid snapshot path", 1))?;
-            event(
-                format,
-                obj([
-                    ("kind", Value::String("snapshot".into())),
-                    ("name", Value::String(display_name.into())),
-                    (
-                        "action",
-                        Value::String(
-                            if cli.dry_run {
-                                "delete_planned"
-                            } else {
-                                "deleted"
-                            }
-                            .into(),
-                        ),
-                    ),
-                ]),
-                &format!(
-                    "{} snapshot {}",
-                    if cli.dry_run {
-                        "would delete"
-                    } else {
-                        "deleted"
-                    },
-                    display_name
-                ),
-            )?;
-            Ok(0)
-        }
-    }
-}
-fn reindex(db: &Database, format: Format) -> Result<i32> {
-    db.require_valid()?;
-    crate::index::rebuild(&db.root, &db.catalog)?;
-    event(
-        format,
-        obj([
-            ("kind", Value::String("maintenance".into())),
-            ("operation", Value::String("reindex".into())),
-        ]),
-        "rebuilt indexes",
-    )?;
-    Ok(0)
-}
-fn analyze(db: &Database, format: Format) -> Result<i32> {
-    db.require_valid()?;
-    let stats: std::collections::BTreeMap<_, _> = db
-        .catalog
-        .rows
-        .iter()
-        .map(|(t, r)| (t.clone(), obj([("rows", Value::from(r.len()))])))
-        .collect();
-    let statistics = db.root.join(".db/statistics");
-    ensure_rebuildable_directory(&statistics)?;
-    metadata::write_json_atomic(&statistics.join("catalog.json"), &stats)?;
-    event(
-        format,
-        obj([
-            ("kind", Value::String("maintenance".into())),
-            ("operation", Value::String("analyze".into())),
-        ]),
-        "rebuilt statistics",
-    )?;
-    Ok(0)
-}
-fn ensure_rebuildable_directory(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(file_metadata) if file_metadata.file_type().is_dir() => Ok(()),
-        Ok(_) => {
-            fs::remove_file(path).map_err(|error| DbError::io(path, error))?;
-            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
-            metadata::sync_parent(path)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path).map_err(|error| DbError::io(path, error))?;
-            metadata::sync_parent(path)
-        }
-        Err(error) => Err(DbError::io(path, error)),
-    }
-}
-fn gc(db: &Database, dry: bool, format: Format, yes: bool) -> Result<i32> {
-    db.require_valid()?;
-    let mut retained = std::collections::BTreeSet::new();
-    if let Some(manifest) = &db.manifest {
-        retained.extend(manifest.entries.values().map(|entry| entry.hash.clone()));
-    }
-    let provenance = db.root.join(".db/provenance");
-    for entry in fs::read_dir(&provenance).map_err(|error| DbError::io(&provenance, error))? {
-        let path = entry
-            .map_err(|error| DbError::io(&provenance, error))?
-            .path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes = fs::read(&path).map_err(|error| DbError::io(&path, error))?;
-        let revision: metadata::Provenance = crate::json::parse_as(&bytes).map_err(|error| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("invalid provenance {}: {error}", path.display()),
-                6,
-            )
-        })?;
-        retained.extend(revision.entries.values().map(|entry| entry.hash.clone()));
-    }
-
-    let mut targets = Vec::<(PathBuf, u64, &'static str)>::new();
-    let objects = db.root.join(".db/objects");
-    if objects.exists() {
-        for entry in fs::read_dir(&objects).map_err(|error| DbError::io(&objects, error))? {
-            let path = entry.map_err(|error| DbError::io(&objects, error))?.path();
-            let metadata =
-                fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
-            let hash = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.strip_suffix(".json"));
-            if hash.is_none_or(|hash| !retained.contains(hash)) {
-                targets.push((path, metadata.len(), "object"));
-            }
-        }
-    }
-    let transactions = db.root.join(".db/transactions");
-    for entry in fs::read_dir(&transactions).map_err(|error| DbError::io(&transactions, error))? {
-        let path = entry
-            .map_err(|error| DbError::io(&transactions, error))?
-            .path();
-        let metadata = fs::symlink_metadata(&path).map_err(|error| DbError::io(&path, error))?;
-        if metadata.file_type().is_dir()
-            && (!path.join("COMMITTING").exists() || path.join("COMPLETE").exists())
-        {
-            targets.push((path, 0, "transaction"));
-        }
-    }
-    targets.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut records = targets
-        .iter()
-        .map(|(path, bytes, target_kind)| {
-            obj([
-                ("kind", Value::String("gc_candidate".into())),
-                ("target_kind", Value::String((*target_kind).into())),
-                (
-                    "path",
-                    Value::String(
-                        path.strip_prefix(&db.root)
-                            .unwrap_or(path)
-                            .display()
-                            .to_string(),
-                    ),
-                ),
-                ("bytes", Value::from(*bytes)),
-            ])
-        })
-        .collect::<Vec<_>>();
-    let reclaimable_bytes = targets.iter().map(|target| target.1).sum::<u64>();
-    if format == Format::Table {
-        for record in &records {
-            output::notice(&format!(
-                "{} {} ({} bytes)",
-                if dry { "would reclaim" } else { "reclaim" },
-                record["path"].as_str().unwrap_or(""),
-                record["bytes"]
-            ));
-        }
-        output::notice(&format!(
-            "{} item(s), {} byte(s) reclaimable",
-            targets.len(),
-            reclaimable_bytes
-        ));
-    } else {
-        records.push(obj([
-            ("kind", Value::String("gc_summary".into())),
-            ("items", Value::from(targets.len())),
-            ("bytes", Value::from(reclaimable_bytes)),
-            ("dry_run", Value::Bool(dry)),
-        ]));
-        output::records(&records, format)?;
-    }
-    if !dry && !targets.is_empty() && !yes {
-        return Err(DbError::new(
-            "CONFIRMATION_REQUIRED",
-            "garbage collection requires --yes after reviewing the reclaim plan",
-            9,
-        ));
-    }
-    if !dry {
-        for (path, _, _) in &targets {
-            let metadata = fs::symlink_metadata(path).map_err(|error| DbError::io(path, error))?;
-            if metadata.file_type().is_dir() {
-                fs::remove_dir_all(path).map_err(|error| DbError::io(path, error))?;
-            } else {
-                fs::remove_file(path).map_err(|error| DbError::io(path, error))?;
-            }
-        }
-    }
-    Ok(0)
-}
-
-struct ShellHelper {
-    candidates: Vec<String>,
-}
-impl Completer for ShellHelper {
-    type Candidate = Pair;
-
-    fn complete(
-        &self,
-        line: &str,
-        position: usize,
-        _context: &ReadlineContext<'_>,
-    ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let start = line[..position]
-            .rfind(|character: char| character.is_whitespace() || matches!(character, ',' | '('))
-            .map_or(0, |index| index + 1);
-        let prefix = line[start..position].to_ascii_lowercase();
-        let matches = self
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.to_ascii_lowercase().starts_with(&prefix))
-            .map(|candidate| Pair {
-                display: candidate.clone(),
-                replacement: candidate.clone(),
-            })
-            .collect();
-        Ok((start, matches))
-    }
-}
-impl Hinter for ShellHelper {
-    type Hint = String;
-}
-impl Highlighter for ShellHelper {}
-impl Validator for ShellHelper {}
-impl Helper for ShellHelper {}
-
-fn shell(db: &mut Database, format: Format, cli: &Cli) -> Result<i32> {
-    // The shell opens against whatever model the folder provides, including an
-    // empty one. Refusing entry because the database is not yet valid would put
-    // the ceremony back: each statement enforces its own requirements when it
-    // runs, and a diagnostic statement is exactly what the user needs here.
-    if !db.diagnostics.is_empty() {
-        output::diagnostics(&db.diagnostics, format);
-    }
-    if !io::stdin().is_terminal() {
-        for line in io::stdin().lock().lines() {
-            let line = line.map_err(|e| DbError::io(Path::new("stdin"), e))?;
-            if !shell_line(db, line.trim(), format, cli)? {
-                break;
-            }
-        }
-        return Ok(0);
-    }
-    let mut candidates = vec![
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "FROM",
-        "WHERE",
-        "INNER JOIN",
-        "LEFT JOIN",
-        "GROUP BY",
-        "HAVING",
-        "ORDER BY",
-        "LIMIT",
-        "OFFSET",
-        "DISTINCT",
-        "COUNT",
-        "SUM",
-        "AVG",
-        "MIN",
-        "MAX",
-        ".tables",
-        ".describe",
-        ".status",
-        ".quit",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect::<Vec<_>>();
-    for (table, schema) in &db.catalog.schemas {
-        candidates.push(table.clone());
-        candidates.extend(schema.columns.keys().cloned());
-    }
-    candidates.sort();
-    candidates.dedup();
-    let mut editor = Editor::<ShellHelper, DefaultHistory>::new()
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?;
-    editor.set_helper(Some(ShellHelper { candidates }));
-    // Input history persists per database, so recall survives the session:
-    // `.db/.gitignore` already excludes everything but `format` and `config`,
-    // which keeps query text -- literals included -- out of the repository.
-    let history = db.root.join(".db/shell-history");
-    if history.exists() {
-        editor
-            .load_history(&history)
-            .map_err(|error| DbError::io(&history, std::io::Error::other(error)))?;
-    }
-    loop {
-        match editor.readline("reldir> ") {
-            Ok(line) => {
-                let query = line.trim();
-                if query.is_empty() {
-                    continue;
-                }
-                // Leaving the shell is not a query worth recalling: recording
-                // it would put `.quit` at the top of every later session's
-                // history, one keystroke from ending that session too.
-                if !matches!(query, ".quit" | ".exit") {
-                    editor
-                        .add_history_entry(query)
-                        .map_err(|error| {
-                            DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
-                        })?;
-                }
-                if !shell_line(db, query, format, cli)? {
-                    break;
-                }
-            }
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(error) => return Err(DbError::new("IO_ERROR", error.to_string(), 6)),
-        }
-    }
-    // History is per-database state, so it needs a database. A shell over a
-    // folder that has none answers from an in-memory model and leaves no trace,
-    // which is the whole point of that mode -- writing a history file would be
-    // the one thing it did create.
-    if !cli.readonly && crate::schema_store::working_dir(&db.root).exists() {
-        // rustyline rewrites the history file in place and does not create it,
-        // so the first session on a database must put it there. Without this
-        // the initial save fails with ENOENT and nothing is ever persisted.
-        if !history.exists() {
-            fs::write(&history, "").map_err(|error| DbError::io(&history, error))?;
-        }
-        // A session that answered every question has succeeded. Failing it here
-        // would discard that work over a convenience file, so the inability to
-        // record history is reported and the exit stays clean.
-        if let Err(error) = editor.save_history(&history) {
-            crate::output::notice_stderr(&format!(
-                "warning: could not save shell history to {}: {error}",
-                history.display()
-            ));
-        }
-    }
-    Ok(0)
-}
-
-fn shell_line(db: &mut Database, query: &str, format: Format, cli: &Cli) -> Result<bool> {
-    if query.is_empty() {
-        return Ok(true);
-    }
-    if matches!(query, ".quit" | ".exit") {
-        return Ok(false);
-    }
-    if query == ".tables" {
-        println!(
-            "{}",
-            db.catalog
-                .schemas
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        return Ok(true);
-    }
-    if query == ".status" {
-        status(db, format)?;
-        return Ok(true);
-    }
-    if let Some(table) = query.strip_prefix(".describe ") {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&crate::schema::json_schema::encode(schema_for(
-                db, table,
-            )?))
-            .map_err(|error| {
-                DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6)
-            })?
-        );
-        return Ok(true);
-    }
-    let read = crate::sql::is_read_statement(query)?;
-    match sql(db, query, &[], format, cli) {
-        Ok(_) => {
-            if !read {
-                db.refresh(if cli.readonly {
-                    ObserveMode::READ_ONLY
-                } else {
-                    ObserveMode::RECORD
-                })?;
-            }
-        }
-        Err(error) => error.render_human(),
-    }
-    io::stdout()
-        .flush()
-        .map_err(|error| DbError::io(Path::new("stdout"), error))?;
-    Ok(true)
-}
-
-fn migrate(db: &Database, cmd: MigrateCommand, format: Format, cli: &Cli) -> Result<i32> {
-    db.require_valid()?;
-    match cmd {
+    Ok(match command {
         MigrateCommand::AddTable { table, from } => {
-            let s = crate::schema::load(&from)?;
-            if s.table != table {
-                return Err(DbError::new(
-                    "SCHEMA_TABLE_NAME_MISMATCH",
-                    "--from schema table does not match requested table",
-                    2,
-                ));
-            }
-            commit_changes(
-                db,
-                vec![Change::Write {
-                    path: crate::schema_store::working_relative(&table).into(),
-                    bytes: canonical::pretty_with_indent(
-                        &crate::schema::json_schema::encode(&s),
-                        db.config.indentation_width,
-                    ),
-                }],
-                "migration",
-                format,
-                cli,
-            )
+            let text = command::read_input(&from, 64 * 1024 * 1024)?;
+            Operation::AddTable { table, schema: Box::new(json(&text, "the schema")?) }
         }
-        MigrateCommand::DropTable { table } => {
-            let _ = schema_for(db, &table)?;
-            let mut changes = vec![Change::Delete {
-                path: crate::schema_store::working_relative(&table).into(),
-            }];
-            changes.extend(db.catalog.rows[&table].iter().map(|r| Change::Delete {
-                path: r.relative.clone(),
-            }));
-            commit_changes(db, changes, "migration", format, cli)
-        }
-        MigrateCommand::RenameTable { table, new } => {
-            if db.catalog.schemas.contains_key(&new) {
-                return Err(DbError::new(
-                    "SCHEMA_INVALID_TABLE_NAME",
-                    "target table already exists",
-                    2,
-                ));
-            }
-            let mut schemas = db.catalog.schemas.clone();
-            let mut renamed = schemas
-                .remove(&table)
-                .ok_or_else(|| db.catalog.unknown_table(&table))?;
-            renamed.table = new.clone();
-            schemas.insert(new.clone(), renamed);
-            for schema in schemas.values_mut() {
-                for fk in &mut schema.foreign_keys {
-                    if fk.references.table == table {
-                        fk.references.table = new.clone();
-                    }
-                }
-            }
-            let mut changes = vec![Change::Delete {
-                path: crate::schema_store::working_relative(&table).into(),
-            }];
-            for (name, schema) in schemas {
-                let old = db
-                    .catalog
-                    .schemas
-                    .get(&name)
-                    .map(crate::schema::json_schema::encode);
-                let value = crate::schema::json_schema::encode(&schema);
-                if old.as_ref() != Some(&value) {
-                    changes.push(Change::Write {
-                        path: crate::schema_store::working_relative(&name).into(),
-                        bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
-                    });
-                }
-            }
-            for r in &db.catalog.rows[&table] {
-                changes.push(Change::Delete {
-                    path: r.relative.clone(),
-                });
-                changes.push(Change::Write {
-                    path: PathBuf::from(&new).join(r.relative.file_name().unwrap()),
-                    bytes: r.raw.clone(),
-                })
-            }
-            commit_changes(db, changes, "migration", format, cli)
-        }
-        MigrateCommand::AddColumn {
+        MigrateCommand::DropTable { table } => Operation::DropTable { table },
+        MigrateCommand::RenameTable { table, new } => Operation::RenameTable { table, new },
+        MigrateCommand::AddColumn { table, column, kind, nullable, default } => Operation::AddColumn {
             table,
             column,
             kind,
             nullable,
-            default,
-        } => {
-            let mut s = schema_for(db, &table)?.clone();
-            if s.columns.contains_key(&column) {
-                return Err(DbError::new(
-                    "SCHEMA_COLUMN_UNKNOWN",
-                    "column already exists",
-                    2,
-                ));
-            }
-            let kind = parse_type(&kind)?;
-            let default = default
-                .map(|x| {
-                    crate::json::parse_str(&x)
-                        .map_err(|e| DbError::usage(format!("invalid default: {e}")))
-                })
-                .transpose()?;
-            if !nullable && default.is_none() && !db.catalog.rows[&table].is_empty() {
-                return Err(DbError::new(
-                    "ROW_MISSING_FIELD",
-                    "non-null column on a nonempty table requires --default",
-                    2,
-                ));
-            }
-            s.columns.insert(
-                column.clone(),
-                Column {
-                    kind,
-                    nullable,
-                    default: default.clone(),
-                    generated: None,
-                    values: None,
-                    items: None,
-                    properties: None,
-                    pattern: None,
-                    additional_properties: true,
-                    required: Default::default(),
-                    min_size: None,
-                    max_size: None,
-                    minimum: None,
-                    maximum: None,
-                    exclusive_minimum: None,
-                    exclusive_maximum: None,
-                    multiple_of: None,
-                    unique_items: false,
-                    composition: None,
-                    description: None,
-                    annotations: Default::default(),
-                },
-            );
-            rewrite_schema_rows(
-                db,
-                s,
-                move |r| {
-                    r.insert(column.clone(), default.clone().unwrap_or(Value::Null));
-                    Ok(())
-                },
-                format,
-                cli,
-            )
+            default: default.map(|text| json(&text, "the default")).transpose()?,
+        },
+        MigrateCommand::DropColumn { table, column } => Operation::DropColumn { table, column },
+        MigrateCommand::RenameColumn { table, column, new } => Operation::RenameColumn { table, column, new },
+        MigrateCommand::ChangeType { table, column, kind, using } => Operation::ChangeType { table, column, kind, using },
+        MigrateCommand::AddConstraint { table, definition } => {
+            let definition: Constraint = serde_json::from_value(json(&definition, "the constraint")?)
+                .map_err(|error| DbError::usage(format!("the constraint is not one reldir knows: {error}")))?;
+            Operation::AddConstraint { table, definition }
         }
-        MigrateCommand::DropColumn { table, column } => {
-            let mut s = schema_for(db, &table)?.clone();
-            if s.primary_key.contains(&column)
-                || s.unique.iter().any(|x| x.contains(&column))
-                || s.foreign_keys.iter().any(|x| x.columns.contains(&column))
-            {
-                return Err(DbError::new(
-                    "SCHEMA_COLUMN_UNKNOWN",
-                    "drop dependent constraints in the same declarative migration",
-                    2,
-                ));
-            }
-            s.columns.shift_remove(&column).ok_or_else(|| {
-                DbError::new("UNKNOWN_COLUMN", format!("unknown column {column}"), 4)
-            })?;
-            rewrite_schema_rows(
-                db,
-                s,
-                move |r| {
-                    r.remove(&column);
-                    Ok(())
-                },
-                format,
-                cli,
-            )
-        }
-        MigrateCommand::RenameColumn { table, column, new } => {
-            let mut s = schema_for(db, &table)?.clone();
-            if !s.columns.contains_key(&column) || s.columns.contains_key(&new) {
-                return Err(DbError::new(
-                    "UNKNOWN_COLUMN",
-                    "source missing or target already exists",
-                    4,
-                ));
-            }
-            let index = s.columns.get_index_of(&column).unwrap();
-            let col = s.columns.shift_remove(&column).unwrap();
-            s.columns.shift_insert(index, new.clone(), col);
-            for x in &mut s.primary_key {
-                if x == &column {
-                    *x = new.clone()
-                }
-            }
-            for set in s.unique.iter_mut().chain(s.indexes.iter_mut()) {
-                for x in set {
-                    if x == &column {
-                        *x = new.clone()
-                    }
-                }
-            }
-            for fk in &mut s.foreign_keys {
-                for x in &mut fk.columns {
-                    if x == &column {
-                        *x = new.clone()
-                    }
-                }
-                if fk.references.table == table {
-                    for x in &mut fk.references.columns {
-                        if x == &column {
-                            *x = new.clone()
+        MigrateCommand::DropConstraint { table, name } => Operation::DropConstraint { table, name },
+        MigrateCommand::AddIndex { table, columns } => Operation::AddIndex { table, columns },
+        MigrateCommand::DropIndex { table, columns } => Operation::DropIndex { table, columns },
+        MigrateCommand::SetDomain { table, domain } => Operation::SetIdentityDomain { table, domain },
+        MigrateCommand::Apply { .. } => unreachable!("handled by the caller"),
+    })
+}
+
+/// The interactive shell: SQL statements ending in `;`, and dot commands.
+fn shell(context: &Context) -> i32 {
+    use rustyline::{DefaultEditor, error::ReadlineError};
+    let Ok(mut editor) = DefaultEditor::new() else {
+        eprintln!("the shell needs a terminal");
+        return 1;
+    };
+    eprintln!("reldir {} -- SQL ending in `;`, or .help", crate::VERSION);
+    let mut buffer = String::new();
+    loop {
+        let prompt = if buffer.is_empty() { "reldir> " } else { "   ...> " };
+        match editor.readline(prompt) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if buffer.is_empty() && trimmed.starts_with('.') {
+                    let _ = editor.add_history_entry(trimmed);
+                    let mut words = trimmed.split_whitespace();
+                    let command = match (words.next(), words.next()) {
+                        (Some(".quit" | ".exit"), _) => return 0,
+                        (Some(".help"), _) => {
+                            eprintln!(".tables  .describe TABLE  .schema TABLE  .check  .status  .quit");
+                            continue;
                         }
-                    }
-                }
-            }
-            if let Some(storage) = &mut s.storage {
-                for x in &mut storage.filename {
-                    if x == &column {
-                        *x = new.clone()
-                    }
-                }
-            }
-            for check in &mut s.check {
-                check.expr = rename_expression_identifier(&check.expr, &column, &new)?;
-            }
-            let mut changes = schema_row_changes(db, &s, |r| {
-                if let Some(v) = r.remove(&column) {
-                    r.insert(new.clone(), v);
-                }
-                Ok(())
-            })?;
-            for (name, other) in &db.catalog.schemas {
-                if name == &table {
+                        (Some(".tables"), _) => Command::Tables,
+                        (Some(".describe"), Some(table)) => Command::Describe { table: table.into() },
+                        (Some(".schema"), Some(table)) => Command::Schema(SchemaCommand::Show { table: table.into() }),
+                        (Some(".check"), _) => Command::Check { strict: false },
+                        (Some(".status"), _) => Command::Status,
+                        _ => {
+                            eprintln!("unknown command {trimmed:?}; .help lists them");
+                            continue;
+                        }
+                    };
+                    let mut terminal = Terminal::new(Format::Table, command_name(&command));
+                    let outcome = dispatch(context, &mut terminal, command);
+                    terminal.finish(outcome);
                     continue;
                 }
-                let mut updated = other.clone();
-                for fk in &mut updated.foreign_keys {
-                    if fk.references.table == table {
-                        for target in &mut fk.references.columns {
-                            if target == &column {
-                                *target = new.clone()
-                            }
-                        }
-                    }
+                buffer.push_str(&line);
+                buffer.push('\n');
+                if !trimmed.ends_with(';') {
+                    continue;
                 }
-                let value = crate::schema::json_schema::encode(&updated);
-                if crate::schema::json_schema::encode(other) != value {
-                    changes.push(Change::Write {
-                        path: crate::schema_store::working_relative(name).into(),
-                        bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
-                    });
-                }
+                let statement = std::mem::take(&mut buffer);
+                let _ = editor.add_history_entry(statement.trim());
+                let mut terminal = Terminal::new(Format::Table, "sql");
+                let outcome = command::query::sql(context, &mut terminal, statement.trim().trim_end_matches(';'), &[]);
+                terminal.finish(outcome);
             }
-            commit_changes(db, changes, "migration", format, cli)
-        }
-        MigrateCommand::ChangeType {
-            table,
-            column,
-            kind,
-            using,
-        } => {
-            let target = parse_type(&kind)?;
-            let changes = declarative_migration_changes(
-                db,
-                MigrationDocument {
-                    operations: vec![MigrationOperation::ChangeType {
-                        table,
-                        column,
-                        kind: target,
-                        using,
-                    }],
-                },
-            )?;
-            commit_changes(db, changes, "migration", format, cli)
-        }
-        MigrateCommand::AddConstraint { table, definition } => {
-            let mut s = schema_for(db, &table)?.clone();
-            let def: ConstraintDefinition = serde_json::from_value(
-                crate::json::parse_str(&definition)
-                    .map_err(|e| DbError::usage(format!("invalid constraint definition: {e}")))?,
-            )
-            .map_err(|e| DbError::usage(format!("invalid constraint definition: {e}")))?;
-            match def {
-                ConstraintDefinition::Unique { columns } => {
-                    if s.unique.contains(&columns) {
-                        return Err(DbError::usage("unique constraint already exists"));
-                    }
-                    s.unique.push(columns)
-                }
-                ConstraintDefinition::ForeignKey { foreign_key } => {
-                    s.foreign_keys.push(foreign_key)
-                }
-                ConstraintDefinition::Check { check } => {
-                    if s.check.iter().any(|c| c.name == check.name) {
-                        return Err(DbError::usage("check name already exists"));
-                    }
-                    s.check.push(check)
-                }
-            }
-            commit_schema(db, s, format, cli)
-        }
-        MigrateCommand::DropConstraint { table, name } => {
-            let mut s = schema_for(db, &table)?.clone();
-            let before = (s.unique.len(), s.foreign_keys.len(), s.check.len());
-            s.check.retain(|c| c.name != name);
-            s.unique
-                .retain(|c| format!("unique_{}", c.join("_")) != name);
-            s.foreign_keys
-                .retain(|c| format!("fk_{}", c.columns.join("_")) != name);
-            if before == (s.unique.len(), s.foreign_keys.len(), s.check.len()) {
-                return Err(DbError::usage(format!("unknown constraint {name:?}")));
-            }
-            commit_schema(db, s, format, cli)
-        }
-        MigrateCommand::AddIndex { table, columns } => {
-            let mut s = schema_for(db, &table)?.clone();
-            if columns.is_empty() {
-                return Err(DbError::usage("index requires columns"));
-            }
-            if s.indexes.contains(&columns) {
-                event(
-                    format,
-                    obj([
-                        ("kind", Value::String("no_change".into())),
-                        ("message", Value::String("index already exists".into())),
-                    ]),
-                    "no change: index already exists",
-                )?;
-                return Ok(0);
-            }
-            s.indexes.push(columns);
-            commit_schema(db, s, format, cli)
-        }
-        MigrateCommand::DropIndex { table, columns } => {
-            let mut s = schema_for(db, &table)?.clone();
-            let before = s.indexes.len();
-            s.indexes.retain(|x| x != &columns);
-            if before == s.indexes.len() {
-                return Err(DbError::usage("index does not exist"));
-            }
-            commit_schema(db, s, format, cli)
-        }
-        MigrateCommand::Apply { file } => {
-            let bytes = fs::read(&file).map_err(|e| DbError::io(&file, e))?;
-            let document: MigrationDocument = serde_json::from_value(
-                crate::json::parse(&bytes)
-                    .map_err(|e| DbError::usage(format!("invalid migration JSON: {e}")))?,
-            )
-            .map_err(|e| DbError::usage(format!("invalid migration JSON: {e}")))?;
-            let changes = declarative_migration_changes(db, document)?;
-            commit_changes(db, changes, "migration", format, cli)
-        }
-    }
-}
-fn commit_schema(db: &Database, s: Schema, format: Format, cli: &Cli) -> Result<i32> {
-    let table = s.table.clone();
-    let value = crate::schema::json_schema::encode(&s);
-    commit_changes(
-        db,
-        vec![Change::Write {
-            path: crate::schema_store::working_relative(&table).into(),
-            bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
-        }],
-        "migration",
-        format,
-        cli,
-    )
-}
-fn declarative_migration_changes(db: &Database, doc: MigrationDocument) -> Result<Vec<Change>> {
-    let mut schemas = db.catalog.schemas.clone();
-    let mut rows: std::collections::BTreeMap<String, Vec<Map<String, Value>>> = db
-        .catalog
-        .rows
-        .iter()
-        .map(|(t, rs)| (t.clone(), rs.iter().map(|r| r.value.clone()).collect()))
-        .collect();
-    for op in doc.operations {
-        match op {
-            MigrationOperation::AddTable { table, schema } => {
-                let schema = crate::schema::json_schema::decode(&schema)?;
-                if schemas.contains_key(&table) || schema.table != table {
-                    return Err(DbError::new(
-                        "SCHEMA_TABLE_NAME_MISMATCH",
-                        format!("cannot add table {table:?}: schema identity conflicts"),
-                        2,
-                    ));
-                }
-                schemas.insert(table.clone(), schema);
-                rows.insert(table, vec![]);
-            }
-            MigrationOperation::DropTable { table } => {
-                if schemas.remove(&table).is_none() {
-                    return Err(db.catalog.unknown_table(&table));
-                }
-                rows.remove(&table);
-            }
-            MigrationOperation::RenameTable { table, new } => {
-                if schemas.contains_key(&new) {
-                    return Err(DbError::new(
-                        "SCHEMA_INVALID_TABLE_NAME",
-                        format!("table {new} already exists"),
-                        2,
-                    ));
-                }
-                let mut s = schemas
-                    .remove(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                s.table = new.clone();
-                schemas.insert(new.clone(), s);
-                let moved = rows.remove(&table).unwrap_or_default();
-                rows.insert(new.clone(), moved);
-                for s in schemas.values_mut() {
-                    for fk in &mut s.foreign_keys {
-                        if fk.references.table == table {
-                            fk.references.table = new.clone()
-                        }
-                    }
-                }
-            }
-            MigrationOperation::AddColumn {
-                table,
-                column,
-                kind,
-                nullable,
-                default,
-            } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                if s.columns.contains_key(&column) {
-                    return Err(DbError::new(
-                        "SCHEMA_COLUMN_UNKNOWN",
-                        format!("column {column} already exists"),
-                        2,
-                    ));
-                }
-                if !nullable && default.is_none() && !rows[&table].is_empty() {
-                    return Err(DbError::new(
-                        "ROW_MISSING_FIELD",
-                        "non-null column on a nonempty table requires a default",
-                        2,
-                    ));
-                }
-                s.columns.insert(
-                    column.clone(),
-                    Column {
-                        kind,
-                        nullable,
-                        default: default.clone(),
-                        generated: None,
-                        values: None,
-                        items: None,
-                        properties: None,
-                        pattern: None,
-                        additional_properties: true,
-                        required: Default::default(),
-                        min_size: None,
-                        max_size: None,
-                        minimum: None,
-                        maximum: None,
-                        exclusive_minimum: None,
-                        exclusive_maximum: None,
-                        multiple_of: None,
-                        unique_items: false,
-                        composition: None,
-                        description: None,
-                        annotations: Default::default(),
-                    },
-                );
-                for row in rows.get_mut(&table).unwrap() {
-                    row.insert(column.clone(), default.clone().unwrap_or(Value::Null));
-                }
-            }
-            MigrationOperation::DropColumn { table, column } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                if s.columns.shift_remove(&column).is_none() {
-                    return Err(DbError::new(
-                        "UNKNOWN_COLUMN",
-                        format!("unknown column {column}"),
-                        4,
-                    ));
-                }
-                for row in rows.get_mut(&table).unwrap() {
-                    row.remove(&column);
-                }
-            }
-            MigrationOperation::RenameColumn { table, column, new } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                let index = s.columns.get_index_of(&column).ok_or_else(|| {
-                    DbError::new("UNKNOWN_COLUMN", format!("unknown column {column}"), 4)
-                })?;
-                if s.columns.contains_key(&new) {
-                    return Err(DbError::new(
-                        "SCHEMA_COLUMN_UNKNOWN",
-                        format!("column {new} already exists"),
-                        2,
-                    ));
-                }
-                let col = s.columns.shift_remove(&column).unwrap();
-                s.columns.shift_insert(index, new.clone(), col);
-                rename_schema_column(s, &column, &new)?;
-                for row in rows.get_mut(&table).unwrap() {
-                    if let Some(v) = row.remove(&column) {
-                        row.insert(new.clone(), v);
-                    }
-                }
-                for (other_name, other) in schemas.iter_mut() {
-                    if other_name == &table {
-                        continue;
-                    }
-                    for fk in &mut other.foreign_keys {
-                        if fk.references.table == table {
-                            for x in &mut fk.references.columns {
-                                if x == &column {
-                                    *x = new.clone()
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            MigrationOperation::ChangeType {
-                table,
-                column,
-                kind,
-                using,
-            } => {
-                let old_schema = schemas
-                    .get(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?
-                    .clone();
-                let mut target_column =
-                    old_schema.columns.get(&column).cloned().ok_or_else(|| {
-                        DbError::new("UNKNOWN_COLUMN", format!("unknown {table}.{column}"), 4)
-                    })?;
-                retarget_column(&mut target_column, kind.clone())?;
-                if let Some(expr) = using {
-                    let cat = virtual_catalog(&schemas, &rows)?;
-                    let s = old_schema.clone();
-                    let where_sql = s
-                        .primary_key
-                        .iter()
-                        .map(|c| format!("{} = ?", quote(c)))
-                        .collect::<Vec<_>>()
-                        .join(" AND ");
-                    for row in rows
-                        .get_mut(&table)
-                        .ok_or_else(|| db.catalog.unknown_table(&table))?
-                    {
-                        let params: Vec<_> = s
-                            .primary_key
-                            .iter()
-                            .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let q = format!(
-                            "SELECT ({expr}) AS value FROM {} WHERE {where_sql}",
-                            quote(&table)
-                        );
-                        let result = crate::sql::execute(&cat, &q, &params)?;
-                        let value = result
-                            .rows
-                            .first()
-                            .and_then(|r| r.get("value"))
-                            .cloned()
-                            .ok_or_else(|| {
-                                DbError::new(
-                                    "QUERY_TYPE_ERROR",
-                                    "conversion expression produced no value",
-                                    4,
-                                )
-                            })?;
-                        let converted = convert_query_value(value, &kind)?;
-                        if !crate::value::matches_column(&converted, &target_column) {
-                            return Err(DbError::new(
-                                "TYPE_MISMATCH",
-                                format!(
-                                    "conversion expression produced a value incompatible with {table}.{column}"
-                                ),
-                                2,
-                            ));
-                        }
-                        row.insert(column.clone(), converted);
-                    }
-                } else {
-                    let mut offenders = Vec::new();
-                    let table_rows = rows
-                        .get_mut(&table)
-                        .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                    for (index, row) in table_rows.iter_mut().enumerate() {
-                        if let Some(value) = row.get(&column) {
-                            if let Some(converted) =
-                                crate::value::lossless_convert(value, &target_column)
-                            {
-                                row.insert(column.clone(), converted);
-                            } else {
-                                let path = canonical::filename(&old_schema, row)
-                                    .map(|name| {
-                                        PathBuf::from(&table).join(name).display().to_string()
-                                    })
-                                    .unwrap_or_else(|| format!("{table}/<row {}>", index + 1));
-                                offenders.push(path);
-                            }
-                        }
-                    }
-                    if !offenders.is_empty() {
-                        return Err(DbError::new(
-                            "TYPE_MISMATCH",
-                            format!(
-                                "change-type cannot losslessly convert {table}.{column} in: {}; supply using with an explicit conversion expression",
-                                offenders.join(", ")
-                            ),
-                            2,
-                        ));
-                    }
-                }
-                *schemas
-                    .get_mut(&table)
-                    .and_then(|s| s.columns.get_mut(&column))
-                    .ok_or_else(|| {
-                        DbError::new("UNKNOWN_COLUMN", format!("unknown {table}.{column}"), 4)
-                    })? = target_column;
-            }
-            MigrationOperation::AddConstraint { table, definition } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                add_constraint(s, definition)?;
-            }
-            MigrationOperation::DropConstraint { table, name } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                drop_constraint(s, &name)?;
-            }
-            MigrationOperation::AddIndex { table, columns } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                if !s.indexes.contains(&columns) {
-                    s.indexes.push(columns)
-                }
-            }
-            MigrationOperation::DropIndex { table, columns } => {
-                let s = schemas
-                    .get_mut(&table)
-                    .ok_or_else(|| db.catalog.unknown_table(&table))?;
-                let n = s.indexes.len();
-                s.indexes.retain(|x| x != &columns);
-                if n == s.indexes.len() {
-                    return Err(DbError::usage("index does not exist"));
-                }
+            Err(ReadlineError::Interrupted) => buffer.clear(),
+            Err(ReadlineError::Eof) => return 0,
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
             }
         }
     }
-    authoritative_diff(db, &schemas, &rows)
-}
-fn add_constraint(s: &mut Schema, definition: ConstraintDefinition) -> Result<()> {
-    match definition {
-        ConstraintDefinition::Unique { columns } => {
-            if s.unique.contains(&columns) {
-                return Err(DbError::usage("unique constraint already exists"));
-            }
-            s.unique.push(columns)
-        }
-        ConstraintDefinition::ForeignKey { foreign_key } => s.foreign_keys.push(foreign_key),
-        ConstraintDefinition::Check { check } => {
-            if s.check.iter().any(|x| x.name == check.name) {
-                return Err(DbError::usage("check name already exists"));
-            }
-            s.check.push(check)
-        }
-    }
-    Ok(())
-}
-fn drop_constraint(s: &mut Schema, name: &str) -> Result<()> {
-    let before = (s.unique.len(), s.foreign_keys.len(), s.check.len());
-    s.check.retain(|c| c.name != name);
-    s.unique
-        .retain(|c| format!("unique_{}", c.join("_")) != name);
-    s.foreign_keys
-        .retain(|c| format!("fk_{}", c.columns.join("_")) != name);
-    if before == (s.unique.len(), s.foreign_keys.len(), s.check.len()) {
-        return Err(DbError::usage(format!("unknown constraint {name:?}")));
-    }
-    Ok(())
-}
-fn rename_schema_column(s: &mut Schema, old: &str, new: &str) -> Result<()> {
-    for x in &mut s.primary_key {
-        if x == old {
-            *x = new.into()
-        }
-    }
-    for set in s.unique.iter_mut().chain(s.indexes.iter_mut()) {
-        for x in set {
-            if x == old {
-                *x = new.into()
-            }
-        }
-    }
-    for fk in &mut s.foreign_keys {
-        for x in &mut fk.columns {
-            if x == old {
-                *x = new.into()
-            }
-        }
-        if fk.references.table == s.table {
-            for x in &mut fk.references.columns {
-                if x == old {
-                    *x = new.into()
-                }
-            }
-        }
-    }
-    if let Some(storage) = &mut s.storage {
-        for x in &mut storage.filename {
-            if x == old {
-                *x = new.into()
-            }
-        }
-    }
-    for check in &mut s.check {
-        check.expr = rename_expression_identifier(&check.expr, old, new)?
-    }
-    Ok(())
-}
-fn virtual_catalog(
-    schemas: &std::collections::BTreeMap<String, Schema>,
-    rows: &std::collections::BTreeMap<String, Vec<Map<String, Value>>>,
-) -> Result<crate::catalog::Catalog> {
-    let temp = tempfile::tempdir().map_err(|e| DbError::io(Path::new("/tmp"), e))?;
-    fs::create_dir_all(crate::schema_store::working_dir(temp.path()))
-        .map_err(|e| DbError::io(temp.path(), e))?;
-    fs::write(
-        temp.path().join(".db/format"),
-        format!("format_version = {}\n", crate::FORMAT_VERSION),
-    )
-    .map_err(|e| DbError::io(temp.path(), e))?;
-    for (t, s) in schemas {
-        metadata::write_bytes_atomic(
-            &crate::schema_store::working_path(temp.path(), t),
-            &crate::schema_store::canonical_bytes(
-                s,
-                crate::config::Config::default().indentation_width,
-            )?,
-        )?;
-        fs::create_dir(temp.path().join(t)).map_err(|e| DbError::io(&temp.path().join(t), e))?;
-        for row in &rows[t] {
-            let name = canonical::filename(s, row).ok_or_else(|| {
-                DbError::new(
-                    "IDENTITY_MISMATCH",
-                    format!("cannot derive filename for {t}"),
-                    2,
-                )
-            })?;
-            fs::write(
-                temp.path().join(t).join(name),
-                canonical::pretty(&canonical::canonical_row(row, s)),
-            )
-            .map_err(|e| DbError::io(temp.path(), e))?;
-        }
-    }
-    crate::catalog::Catalog::observe(temp.path(), &crate::config::Config::default())
-}
-fn authoritative_diff(
-    db: &Database,
-    schemas: &std::collections::BTreeMap<String, Schema>,
-    rows: &std::collections::BTreeMap<String, Vec<Map<String, Value>>>,
-) -> Result<Vec<Change>> {
-    let mut changes = vec![];
-    for t in db.catalog.schemas.keys() {
-        if !schemas.contains_key(t) {
-            changes.push(Change::Delete {
-                path: crate::schema_store::working_relative(t).into(),
-            })
-        }
-    }
-    for (t, s) in schemas {
-        let value = crate::schema::json_schema::encode(s);
-        if db
-            .catalog
-            .schemas
-            .get(t)
-            .map(crate::schema::json_schema::encode)
-            .as_ref()
-            != Some(&value)
-        {
-            changes.push(Change::Write {
-                path: crate::schema_store::working_relative(t).into(),
-                bytes: canonical::pretty_with_indent(&value, db.config.indentation_width),
-            })
-        }
-    }
-    let old: std::collections::BTreeMap<_, _> = db
-        .catalog
-        .rows
-        .values()
-        .flatten()
-        .map(|r| (r.relative.clone(), r.value.clone()))
-        .collect();
-    let mut new = std::collections::BTreeMap::new();
-    for (t, rs) in rows {
-        let s = &schemas[t];
-        for row in rs {
-            let path = PathBuf::from(t).join(canonical::filename(s, row).ok_or_else(|| {
-                DbError::new(
-                    "IDENTITY_MISMATCH",
-                    format!("cannot derive filename for {t}"),
-                    2,
-                )
-            })?);
-            new.insert(path, row.clone());
-        }
-    }
-    for p in old.keys() {
-        if !new.contains_key(p) {
-            changes.push(Change::Delete { path: p.clone() })
-        }
-    }
-    for (p, row) in new {
-        if old.get(&p) != Some(&row) {
-            let t = p
-                .components()
-                .next()
-                .unwrap()
-                .as_os_str()
-                .to_string_lossy()
-                .to_string();
-            changes.push(Change::Write {
-                path: p,
-                bytes: canonical::pretty_with_indent(
-                    &canonical::canonical_row(&row, &schemas[&t]),
-                    db.config.indentation_width,
-                ),
-            })
-        }
-    }
-    Ok(changes)
-}
-fn rewrite_schema_rows<F: Fn(&mut Map<String, Value>) -> Result<()>>(
-    db: &Database,
-    s: Schema,
-    edit: F,
-    format: Format,
-    cli: &Cli,
-) -> Result<i32> {
-    let changes = schema_row_changes(db, &s, edit)?;
-    commit_changes(db, changes, "migration", format, cli)
-}
-fn schema_row_changes<F: Fn(&mut Map<String, Value>) -> Result<()>>(
-    db: &Database,
-    s: &Schema,
-    edit: F,
-) -> Result<Vec<Change>> {
-    let table = s.table.clone();
-    let mut changes = vec![Change::Write {
-        path: crate::schema_store::working_relative(&table).into(),
-        bytes: canonical::pretty_with_indent(
-            &crate::schema::json_schema::encode(s),
-            db.config.indentation_width,
-        ),
-    }];
-    for row in &db.catalog.rows[&table] {
-        let mut r = row.value.clone();
-        edit(&mut r)?;
-        let new = PathBuf::from(&table).join(canonical::filename(s, &r).ok_or_else(|| {
-            DbError::new(
-                "IDENTITY_MISMATCH",
-                "cannot derive migrated row filename",
-                2,
-            )
-        })?);
-        if new != row.relative {
-            changes.push(Change::Delete {
-                path: row.relative.clone(),
-            })
-        }
-        changes.push(Change::Write {
-            path: new,
-            bytes: canonical::pretty_with_indent(
-                &canonical::canonical_row(&r, s),
-                db.config.indentation_width,
-            ),
-        })
-    }
-    Ok(changes)
-}
-
-fn commit_changes(
-    db: &Database,
-    changes: Vec<Change>,
-    origin: &str,
-    format: Format,
-    cli: &Cli,
-) -> Result<i32> {
-    require_writable(cli)?;
-    if changes.is_empty() {
-        event(
-            format,
-            obj([
-                ("kind", Value::String("no_change".into())),
-                ("message", Value::String("no change".into())),
-            ]),
-            "no change",
-        )?;
-        return Ok(0);
-    }
-    // An operation that rewrites a pinned table's working schema rewrites its
-    // pin in the same transaction. The pin exists to fix the working schema, so
-    // letting reldir's own work move one without the other would manufacture the
-    // divergence the pin is meant to rule out -- and would do it atomically
-    // enough that the user could never see which side moved.
-    let changes = pair_pinned_schema_writes(db, changes)?;
-    let paths = transaction::commit(
-        &db.root,
-        &db.config,
-        &observed_entries(db)?,
-        &changes,
-        origin,
-        cli.dry_run,
-        db.resource_overrides(),
-    )?;
-    if cli.dry_run && origin == "migration" && format == Format::Table {
-        let row_files = paths
-            .iter()
-            .filter(|path| {
-                path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                    && !crate::schema_store::is_schema_relative(&path.to_string_lossy())
-                    && !path.starts_with(".db")
-            })
-            .count();
-        let schema_files = paths
-            .iter()
-            .filter(|path| crate::schema_store::is_schema_relative(&path.to_string_lossy()))
-            .count();
-        output::notice(&format!(
-            "migration plan: {row_files} row file(s), {schema_files} schema file(s)"
-        ));
-    }
-    print_mutation(
-        &paths,
-        resulting_revision(db, cli.dry_run)?,
-        cli.dry_run,
-        format,
-    )?;
-    Ok(0)
-}
-fn resulting_revision(db: &Database, dry_run: bool) -> Result<u64> {
-    if dry_run {
-        return Ok(db
-            .manifest
-            .as_ref()
-            .map_or(1, |manifest| manifest.revision + 1));
-    }
-    Ok(metadata::load_manifest(&db.root)?.map_or(0, |manifest| manifest.revision))
-}
-fn require_writable(cli: &Cli) -> Result<()> {
-    if cli.readonly && !cli.dry_run {
-        return Err(DbError::new(
-            "READ_ONLY",
-            "this operation would write, but the database is in read-only mode",
-            1,
-        ));
-    }
-    Ok(())
-}
-fn print_mutation(paths: &[PathBuf], revision: u64, dry: bool, format: Format) -> Result<()> {
-    let rows = mutation_records(paths, revision, dry);
-    if format == Format::Table {
-        let suffix = if dry {
-            String::new()
-        } else {
-            format!("; revision {revision}")
-        };
-        output::notice(&format!(
-            "{} {} path(s){}",
-            if dry { "would change" } else { "changed" },
-            paths.len(),
-            suffix
-        ));
-        for p in paths {
-            output::notice(&format!("  {}", p.display()))
-        }
-    } else {
-        output::records(&rows, format)?
-    }
-    Ok(())
-}
-fn mutation_records(paths: &[PathBuf], revision: u64, dry: bool) -> Vec<Map<String, Value>> {
-    paths
-        .iter()
-        .map(|path| {
-            obj([
-                (
-                    "kind",
-                    Value::String(if dry { "planned_change" } else { "change" }.into()),
-                ),
-                ("path", Value::String(path.display().to_string())),
-                ("revision", Value::from(revision)),
-            ])
-        })
-        .collect()
-}
-
-fn doctor_diff_records(root: &Path, changes: &[Change]) -> Result<Vec<Map<String, Value>>> {
-    changes
-        .iter()
-        .map(|change| {
-            let (path, after) = match change {
-                Change::Write { path, bytes } => (path, Some(bytes.as_slice())),
-                Change::Delete { path } => (path, None),
-            };
-            let before = match fs::read(root.join(path)) {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(DbError::io(&root.join(path), error)),
-            };
-            Ok(obj([
-                ("kind", Value::String("doctor_diff".into())),
-                ("path", Value::String(path.display().to_string())),
-                (
-                    "before",
-                    before.as_deref().map(bytes_value).unwrap_or(Value::Null),
-                ),
-                ("after", after.map(bytes_value).unwrap_or(Value::Null)),
-            ]))
-        })
-        .collect()
-}
-
-fn bytes_value(bytes: &[u8]) -> Value {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Value::String(text.into()),
-        Err(_) => Value::Array(bytes.iter().copied().map(Value::from).collect()),
-    }
-}
-
-fn print_doctor_diffs(records: &[Map<String, Value>]) {
-    for record in records {
-        let path = record["path"].as_str().unwrap_or("<unknown>");
-        println!("--- {path}");
-        println!("+++ {path}");
-        print_prefixed_content('-', &record["before"]);
-        print_prefixed_content('+', &record["after"]);
-    }
-}
-
-fn print_prefixed_content(prefix: char, value: &Value) {
-    match value {
-        Value::Null => println!("{prefix}<absent>"),
-        Value::String(text) => {
-            for line in text.lines() {
-                println!("{prefix}{line}");
-            }
-        }
-        Value::Array(bytes) => println!("{prefix}<binary bytes: {}>", bytes.len()),
-        _ => unreachable!("doctor diff content has a fixed shape"),
-    }
-}
-/// Keep pins in step with the working schemas they fix.
-///
-/// A change plan names working schemas; for every pinned table it touches, the
-/// same bytes are written to the pin. Deletions propagate too: dropping a table
-/// removes its declaration along with reldir's copy of it.
-fn pair_pinned_schema_writes(db: &Database, changes: Vec<Change>) -> Result<Vec<Change>> {
-    let mut paired = Vec::with_capacity(changes.len());
-    for change in changes {
-        let relative = match &change {
-            Change::Write { path, .. } | Change::Delete { path } => {
-                path.to_string_lossy().into_owned()
-            }
-        };
-        let table = crate::schema_store::working_table(&relative).map(str::to_string);
-        paired.push(change);
-        let Some(table) = table else { continue };
-        if !db.catalog.pinned.contains(&table) {
-            continue;
-        }
-        let pin = PathBuf::from(crate::schema_store::pin_relative(&table));
-        match paired.last().expect("just pushed") {
-            Change::Write { bytes, .. } => {
-                let bytes = bytes.clone();
-                paired.push(Change::Write { path: pin, bytes });
-            }
-            Change::Delete { .. } => paired.push(Change::Delete { path: pin }),
-        }
-    }
-    Ok(paired)
-}
-
-/// What this observation says about every governed path.
-///
-/// A mutation carries this into `commit` so the conflict check can ask whether
-/// the paths it touches have moved, rather than whether the database as a whole
-/// has. The whole-database question refused writers for commits they had no
-/// stake in, which is what made concurrent writes fail even when each one
-/// waited its turn for the lock.
-fn observed_entries(
-    db: &Database,
-) -> Result<std::collections::BTreeMap<String, metadata::ManifestEntry>> {
-    Ok(metadata::state(&db.catalog)?.1)
-}
-fn schema_for<'a>(db: &'a Database, table: &str) -> Result<&'a Schema> {
-    db.catalog
-        .schemas
-        .get(table)
-        .ok_or_else(|| db.catalog.unknown_table(table))
-}
-fn find_row<'a>(db: &'a Database, table: &str, key: &str) -> Result<&'a crate::catalog::Row> {
-    let s = schema_for(db, table)?;
-    let vals = key_values(key, s)?;
-    let k = canonical::compact(&Value::Array(vals));
-    crate::integrity::rows_by_key(&db.catalog, table)
-        .get(&k)
-        .copied()
-        .ok_or_else(|| DbError::new("UNKNOWN_ROW", format!("no row with key {key}"), 4))
-}
-fn key_values(text: &str, schema: &Schema) -> Result<Vec<Value>> {
-    if schema.primary_key.len() == 1 {
-        let column = &schema.columns[&schema.primary_key[0]];
-        let parsed = crate::json::parse_str(text).unwrap_or_else(|_| Value::String(text.into()));
-        if crate::value::matches_column(&parsed, column) {
-            return Ok(vec![parsed]);
-        }
-        let textual = Value::String(text.into());
-        if crate::value::matches_column(&textual, column) {
-            return Ok(vec![textual]);
-        }
-        return Err(DbError::new(
-            "TYPE_MISMATCH",
-            format!("primary key does not match type {:?}", column.kind),
-            4,
-        ));
-    }
-    let v = crate::json::parse_str(text)
-        .map_err(|_| DbError::usage("composite primary keys must be a JSON array"))?;
-    let a = v
-        .as_array()
-        .cloned()
-        .ok_or_else(|| DbError::usage("composite primary keys must be a JSON array"))?;
-    if a.len() != schema.primary_key.len() {
-        return Err(DbError::usage(format!(
-            "primary key requires {} values",
-            schema.primary_key.len()
-        )));
-    }
-    for (value, name) in a.iter().zip(&schema.primary_key) {
-        if !crate::value::matches_column(value, &schema.columns[name]) {
-            return Err(DbError::new(
-                "TYPE_MISMATCH",
-                format!("primary-key component {name:?} does not match its declared type"),
-                4,
-            ));
-        }
-    }
-    Ok(a)
-}
-fn materialize(row: &mut Map<String, Value>, s: &Schema, seq: i64) {
-    for (n, c) in &s.columns {
-        if !row.contains_key(n) {
-            row.insert(
-                n.clone(),
-                c.default
-                    .clone()
-                    .or_else(|| crate::value::generate(c, seq))
-                    .unwrap_or(Value::Null),
-            );
-        }
-    }
-}
-fn read_limited(reader: impl Read, limit: u64, source: &Path) -> Result<String> {
-    let mut bytes = Vec::new();
-    reader
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| DbError::io(source, error))?;
-    if bytes.len() as u64 > limit {
-        return Err(DbError::new(
-            "RESOURCE_LIMIT",
-            format!("input exceeds the configured {limit} byte transaction limit"),
-            2,
-        ));
-    }
-    String::from_utf8(bytes)
-        .map_err(|error| DbError::usage(format!("input is not valid UTF-8: {error}")))
-}
-fn next_sequence(db: &Database, table: &str, schema: &Schema) -> Result<i64> {
-    let maximum = schema
-        .columns
-        .iter()
-        .filter(|(_, column)| {
-            column
-                .generated
-                .as_ref()
-                .is_some_and(|generated| matches!(generated.kind, GeneratedKind::Sequence))
-        })
-        .flat_map(|(name, _)| {
-            db.catalog.rows[table]
-                .iter()
-                .filter_map(move |row| row.value.get(name).and_then(Value::as_i64))
-        })
-        .max()
-        .unwrap_or(0);
-    maximum
-        .checked_add(1)
-        .ok_or_else(|| DbError::new("RESOURCE_LIMIT", "generated sequence exhausted i64", 2))
-}
-fn parse_csv(v: &str, c: &Column) -> Result<Value> {
-    if v.is_empty() && c.nullable {
-        return Ok(Value::Null);
-    }
-    let parsed = match c.kind {
-        ColumnType::Bool => Value::Bool(
-            v.parse()
-                .map_err(|_| DbError::new("TYPE_MISMATCH", format!("{v:?} is not bool"), 2))?,
-        ),
-        ColumnType::Int => Value::from(
-            v.parse::<i64>()
-                .map_err(|_| DbError::new("TYPE_MISMATCH", format!("{v:?} is not int"), 2))?,
-        ),
-        ColumnType::Float => Value::from(
-            v.parse::<f64>()
-                .map_err(|_| DbError::new("TYPE_MISMATCH", format!("{v:?} is not float"), 2))?,
-        ),
-        ColumnType::Array | ColumnType::Object | ColumnType::Json => crate::json::parse_str(v)
-            .map_err(|e| DbError::new("TYPE_MISMATCH", e.to_string(), 2))?,
-        _ => Value::String(v.into()),
-    };
-    Ok(parsed)
-}
-fn parse_type(s: &str) -> Result<ColumnType> {
-    serde_json::from_str(&format!("\"{s}\""))
-        .map_err(|_| DbError::new("SCHEMA_TYPE_UNKNOWN", format!("unknown type {s:?}"), 2))
-}
-
-fn retarget_column(column: &mut Column, target: ColumnType) -> Result<()> {
-    let previous = column.kind.clone();
-    if previous != target {
-        if target == ColumnType::Enum && previous != ColumnType::Enum {
-            return Err(DbError::new(
-                "SCHEMA_MISSING_REQUIRED",
-                "change-type to enum requires enum values, which this operation cannot infer",
-                2,
-            ));
-        }
-        if target == ColumnType::Array && previous != ColumnType::Array {
-            return Err(DbError::new(
-                "SCHEMA_MISSING_REQUIRED",
-                "change-type to array requires an items schema, which this operation cannot infer",
-                2,
-            ));
-        }
-    }
-
-    column.kind = target;
-    if column.kind != ColumnType::Enum {
-        column.values = None;
-    }
-    if column.kind != ColumnType::Array {
-        column.items = None;
-    }
-    if column.kind != ColumnType::Object {
-        column.properties = None;
-    }
-
-    if let Some(generated) = &column.generated {
-        let compatible = matches!(
-            (&generated.kind, &column.kind),
-            (GeneratedKind::Uuid, ColumnType::Uuid)
-                | (GeneratedKind::Ulid, ColumnType::Ulid)
-                | (GeneratedKind::Now, ColumnType::Timestamp)
-                | (GeneratedKind::Sequence, ColumnType::Int)
-        );
-        if !compatible {
-            return Err(DbError::new(
-                "SCHEMA_DEFAULT_TYPE_MISMATCH",
-                "change-type is incompatible with the column's generated value",
-                2,
-            ));
-        }
-    }
-    if let Some(default) = column.default.clone() {
-        column.default = Some(crate::value::lossless_convert(&default, column).ok_or_else(
-            || {
-                DbError::new(
-                    "SCHEMA_DEFAULT_TYPE_MISMATCH",
-                    "column default cannot be converted losslessly to the target type",
-                    2,
-                )
-            },
-        )?);
-    }
-    Ok(())
-}
-
-fn convert_query_value(v: Value, target: &ColumnType) -> Result<Value> {
-    match target {
-        ColumnType::Bool => match v {
-            Value::Bool(_) => Ok(v),
-            Value::Number(n) if n.as_i64() == Some(0) => Ok(Value::Bool(false)),
-            Value::Number(n) if n.as_i64() == Some(1) => Ok(Value::Bool(true)),
-            _ => Err(DbError::new(
-                "TYPE_MISMATCH",
-                "conversion result is not boolean",
-                2,
-            )),
-        },
-        ColumnType::Int => v
-            .as_i64()
-            .map(Value::from)
-            .ok_or_else(|| DbError::new("TYPE_MISMATCH", "conversion result is not int", 2)),
-        ColumnType::Float => v
-            .as_f64()
-            .map(Value::from)
-            .ok_or_else(|| DbError::new("TYPE_MISMATCH", "conversion result is not float", 2)),
-        _ => Ok(v),
-    }
-}
-fn rename_expression_identifier(expr: &str, old: &str, new: &str) -> Result<String> {
-    let chars: Vec<char> = expr.chars().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '\'' {
-            out.push(chars[i]);
-            i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '\'' {
-                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                        out.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1
-            }
-            continue;
-        }
-        if chars[i] == '"' {
-            out.push('"');
-            i += 1;
-            let mut ident = String::new();
-            while i < chars.len() {
-                if chars[i] == '"' {
-                    if i + 1 < chars.len() && chars[i + 1] == '"' {
-                        ident.push('"');
-                        i += 2;
-                        continue;
-                    }
-                    break;
-                }
-                ident.push(chars[i]);
-                i += 1
-            }
-            if i >= chars.len() {
-                return Err(DbError::new(
-                    "SCHEMA_CHECK_INVALID",
-                    format!("unterminated quoted identifier in {expr:?}"),
-                    2,
-                ));
-            }
-            let value = if ident == old { new } else { &ident };
-            out.push_str(&value.replace('"', "\"\""));
-            out.push('"');
-            i += 1;
-            continue;
-        }
-        if chars[i].is_alphabetic() || chars[i] == '_' {
-            let start = i;
-            i += 1;
-            while i < chars.len() && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '$')) {
-                i += 1
-            }
-            let word: String = chars[start..i].iter().collect();
-            out.push_str(if word == old { new } else { &word });
-            continue;
-        }
-        out.push(chars[i]);
-        i += 1
-    }
-    Ok(out)
-}
-fn quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-fn event(format: Format, record: Map<String, Value>, human: &str) -> Result<()> {
-    if matches!(format, Format::Table | Format::Sqlite) {
-        // Informational confirmation: suppressed by --quiet (Section 49).
-        // Machine-readable output is a contract and is never suppressed.
-        output::notice(human);
-        Ok(())
-    } else {
-        output::records(&[record], format)
-    }
-}
-
-fn query_limits(db: &Database, cli: &Cli) -> crate::sql::QueryLimits {
-    query_limits_with_timeout(
-        db,
-        cli.timeout
-            .or(db.config.timeout_seconds)
-            .map(std::time::Duration::from_secs),
-    )
-}
-
-fn query_limits_with_timeout(
-    db: &Database,
-    timeout: Option<std::time::Duration>,
-) -> crate::sql::QueryLimits {
-    crate::sql::QueryLimits {
-        timeout,
-        max_rows: db.config.max_result_rows,
-        max_memory: db.config.max_query_memory,
-        max_sort_memory: db.config.max_sort_memory,
-        max_temporary_disk: db.config.max_temporary_disk,
-    }
-}
-
-fn doctor_fix_matches(only: Option<&str>, fix: &str) -> bool {
-    let Some(only) = only else {
-        return true;
-    };
-    only == fix
-        || matches!(
-            (only, fix),
-            ("IDENTITY_MISMATCH", "FIX_RENAME_TO_IDENTITY")
-                | (
-                    "ROW_UNKNOWN_FIELD",
-                    "FIX_DROP_UNKNOWN_FIELD" | "FIX_RENAME_FIELD"
-                )
-                | ("TYPE_MISMATCH", "FIX_COERCE_VALUE")
-                | (
-                    "FOREIGN_KEY_VIOLATION",
-                    "FIX_ORPHAN_SET_NULL" | "FIX_ORPHAN_DELETE_ROW"
-                )
-                | ("LINT_SCHEMA_UNPINNED", "FIX_PIN_SCHEMA")
-                | ("LINT_NULLABLE_NEVER_NULL", "FIX_TIGHTEN_NULLABLE")
-                | ("LINT_WIDER_TYPE", "FIX_NARROW_TYPE")
-                | ("LINT_ENUM_CANDIDATE", "FIX_ADD_ENUM")
-                | ("LINT_UNIQUE_CANDIDATE", "FIX_ADD_UNIQUE")
-                | ("LINT_FK_CANDIDATE", "FIX_ADD_FK")
-                | ("LINT_CHECK_CANDIDATE", "FIX_ADD_CHECK")
-                | ("LINT_FK_NO_INDEX", "FIX_ADD_INDEX")
-                | ("LINT_PK_NOT_GENERATED", "FIX_ADD_GENERATOR")
-                | ("LINT_NON_CANONICAL_FORMATTING", "FIX_CANONICALIZE")
-        )
-}
-
-fn serialized_record<T: serde::Serialize>(kind: &str, value: &T) -> Result<Map<String, Value>> {
-    let mut object = serde_json::to_value(value)
-        .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error.to_string(), 6))?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| {
-            DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                "serialized command record is not an object",
-                6,
-            )
-        })?;
-    object.insert("kind".into(), Value::String(kind.into()));
-    Ok(object)
-}
-
-fn output_schemas<'a>(schemas: impl Iterator<Item = &'a Schema>, format: Format) -> Result<()> {
-    if format == Format::Table {
-        for schema in schemas {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&crate::schema::json_schema::encode(schema)).unwrap()
-            );
-        }
-        return Ok(());
-    }
-    let records = schemas
-        .map(|schema| serialized_record("schema", &crate::schema::json_schema::encode(schema)))
-        .collect::<Result<Vec<_>>>()?;
-    output::records(&records, format)
-}
-
-fn obj<const N: usize>(items: [(&str, Value); N]) -> Map<String, Value> {
-    items.into_iter().map(|(k, v)| (k.into(), v)).collect()
-}
-fn valid_snapshot(s: &str) -> Result<()> {
-    let lower = s.to_ascii_lowercase();
-    let base = lower.split('.').next().unwrap_or(&lower);
-    let windows_reserved = matches!(base, "con" | "prn" | "aux" | "nul")
-        || base
-            .strip_prefix("com")
-            .or_else(|| base.strip_prefix("lpt"))
-            .is_some_and(|number| number.len() == 1 && matches!(number.as_bytes()[0], b'1'..=b'9'));
-    if s.is_empty()
-        || s.contains(['/', '\\', '\0'])
-        || s == "."
-        || s == ".."
-        || s.ends_with(['.', ' '])
-        || windows_reserved
-    {
-        return Err(DbError::new("PATH_VIOLATION", "invalid snapshot name", 2));
-    }
-    Ok(())
-}
-
-fn ensure_snapshot_base(base: &Path, create: bool) -> Result<bool> {
-    match fs::symlink_metadata(base) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("snapshot path {} is not a real directory", base.display()),
-            6,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            fs::create_dir(base).map_err(|error| DbError::io(base, error))?;
-            metadata::sync_parent(base)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(DbError::io(base, error)),
-    }
-}
-
-fn snapshot_exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(DbError::new(
-            "INTERNAL_METADATA_CORRUPT",
-            format!("snapshot {} is not a real directory", path.display()),
-            6,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(DbError::io(path, error)),
-    }
-}
-
-fn reject_snapshot_collision(base: &Path, candidate: &str) -> Result<()> {
-    use unicode_normalization::UnicodeNormalization;
-    let normalized: String = candidate.nfc().flat_map(char::to_lowercase).collect();
-    for entry in fs::read_dir(base).map_err(|error| DbError::io(base, error))? {
-        let entry = entry.map_err(|error| DbError::io(base, error))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let existing: String = name.nfc().flat_map(char::to_lowercase).collect();
-        if existing == normalized {
-            return Err(DbError::new(
-                "PATH_COLLISION",
-                format!("snapshot name {candidate:?} collides with existing {name:?}"),
-                2,
-            ));
-        }
-    }
-    Ok(())
-}
-fn copy_authoritative(db: &Database, dest: &Path) -> Result<()> {
-    fs::create_dir_all(crate::schema_store::working_dir(dest)).map_err(|e| DbError::io(dest, e))?;
-    fs::create_dir_all(dest.join(".db")).map_err(|e| DbError::io(dest, e))?;
-    for name in ["format", "config"] {
-        let source = db.root.join(".db").join(name);
-        copy_file_synced(&source, &dest.join(".db").join(name))?;
-    }
-    for (t, rows) in &db.catalog.rows {
-        fs::create_dir_all(dest.join(t)).map_err(|e| DbError::io(dest, e))?;
-        for r in rows {
-            copy_file_synced(&r.path, &dest.join(&r.relative))?;
-        }
-    }
-    for t in db.catalog.schemas.keys() {
-        copy_file_synced(
-            &crate::schema_store::working_path(&db.root, t),
-            &crate::schema_store::working_path(dest, t),
-        )?;
-    }
-    // Pins are the user's declaration, so a snapshot that dropped them would
-    // restore a database that had forgotten what was declared.
-    for t in crate::schema_store::pinned_tables(&db.root)? {
-        fs::create_dir_all(crate::schema_store::pin_dir(dest)).map_err(|e| DbError::io(dest, e))?;
-        copy_file_synced(
-            &crate::schema_store::pin_path(&db.root, &t),
-            &crate::schema_store::pin_path(dest, &t),
-        )?;
-    }
-    Ok(())
-}
-fn copy_file_synced(source: &Path, destination: &Path) -> Result<()> {
-    fs::copy(source, destination).map_err(|error| DbError::io(source, error))?;
-    fs::File::open(destination)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| DbError::io(destination, error))
-}
-fn create_snapshot(db: &Database, name: &str) -> Result<()> {
-    let base = db.root.join(".db/snapshots");
-    valid_snapshot(name)?;
-    ensure_snapshot_base(&base, true)?;
-    reject_snapshot_collision(&base, name)?;
-    let destination = base.join(name);
-    if destination.exists() {
-        return Err(DbError::new(
-            "SNAPSHOT_EXISTS",
-            format!("snapshot {name:?} already exists"),
-            1,
-        ));
-    }
-    let staging = tempfile::Builder::new()
-        .prefix(".creating-")
-        .tempdir_in(&base)
-        .map_err(|error| DbError::io(&base, error))?;
-    copy_authoritative(db, staging.path())?;
-    let staging = staging.keep();
-    if let Err(error) = fs::rename(&staging, &destination) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(DbError::io(&destination, error));
-    }
-    metadata::sync_parent(&destination)
-}
-fn changes_from_snapshot(db: &Database, src: &Path) -> Result<Vec<Change>> {
-    crate::db::validate_format(src)?;
-    let snapshot_config = crate::db::load_config(src)?;
-    let snap = crate::catalog::Catalog::observe(src, &snapshot_config)?;
-    let errors = crate::integrity::validate(&snap);
-    if let Some(d) = errors.into_iter().next() {
-        return Err(DbError::from_diag(d, 2));
-    }
-    let mut changes = vec![];
-    for name in ["format", "config"] {
-        let rel = PathBuf::from(".db").join(name);
-        let source = src.join(&rel);
-        if !source.is_file() {
-            return Err(DbError::new(
-                "INTERNAL_METADATA_CORRUPT",
-                format!("snapshot is missing {}", rel.display()),
-                6,
-            ));
-        }
-        let bytes = fs::read(&source).map_err(|e| DbError::io(&source, e))?;
-        if fs::read(db.root.join(&rel)).map_err(|e| DbError::io(&db.root.join(&rel), e))? != bytes {
-            changes.push(Change::Write { path: rel, bytes });
-        }
-    }
-    let mut snapshot_paths = std::collections::BTreeSet::new();
-    snapshot_paths.extend(
-        snap.schemas
-            .keys()
-            .map(|table| PathBuf::from(crate::schema_store::working_relative(table))),
-    );
-    snapshot_paths.extend(snap.rows.values().flatten().map(|row| row.relative.clone()));
-    let mut current_paths = std::collections::BTreeSet::new();
-    let schema_dir = crate::schema_store::working_dir(&db.root);
-    for entry in fs::read_dir(&schema_dir).map_err(|error| DbError::io(&schema_dir, error))? {
-        let path = entry
-            .map_err(|error| DbError::io(&schema_dir, error))?
-            .path();
-        let relative = path
-            .strip_prefix(&db.root)
-            .map_err(|_| DbError::new("PATH_VIOLATION", "schema path escaped database", 6))?
-            .to_path_buf();
-        current_paths.insert(relative);
-    }
-    let table_names = db
-        .catalog
-        .schemas
-        .keys()
-        .chain(snap.schemas.keys())
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
-    for table in table_names {
-        let directory = db.root.join(&table);
-        match fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.file_type().is_dir() => {
-                for entry in
-                    fs::read_dir(&directory).map_err(|error| DbError::io(&directory, error))?
-                {
-                    let path = entry
-                        .map_err(|error| DbError::io(&directory, error))?
-                        .path();
-                    current_paths.insert(
-                        path.strip_prefix(&db.root)
-                            .map_err(|_| {
-                                DbError::new("PATH_VIOLATION", "row path escaped database", 6)
-                            })?
-                            .to_path_buf(),
-                    );
-                }
-            }
-            Ok(_) => {
-                current_paths.insert(PathBuf::from(&table));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DbError::io(&directory, error)),
-        }
-    }
-    for path in current_paths {
-        if !snapshot_paths.contains(&path) {
-            changes.push(Change::Delete { path });
-        }
-    }
-    for t in snap.schemas.keys() {
-        let p = PathBuf::from(crate::schema_store::working_relative(t));
-        let bytes = fs::read(src.join(&p)).map_err(|e| DbError::io(&src.join(&p), e))?;
-        if fs::read(db.root.join(&p)).ok().as_deref() != Some(bytes.as_slice()) {
-            changes.push(Change::Write {
-                path: p.clone(),
-                bytes,
-            });
-        }
-        for r in &snap.rows[t] {
-            if fs::read(db.root.join(&r.relative)).ok().as_deref() != Some(r.raw.as_slice()) {
-                changes.push(Change::Write {
-                    path: r.relative.clone(),
-                    bytes: r.raw.clone(),
-                })
-            }
-        }
-    }
-    Ok(changes)
-}
-/// Print the JSON Schema dialect this binary accepts.
-///
-/// The `$schema` URI in every schema names the dialect; nothing fetches it, and
-/// nothing is served there. Emitting the bundled document is what lets an editor
-/// complete a schema written by hand, so it must work in any directory --
-/// including one that is not a database yet, which is exactly where someone
-/// sets their editor up.
-fn dialect(_format: Format) -> Result<i32> {
-    // Printed verbatim in every format. The record framing the other commands
-    // use would add a `kind` key, and this document's identity is its content:
-    // an editor pointed at a copy carrying an extra top-level property would
-    // treat that property as part of the dialect.
-    println!(
-        "{}",
-        serde_json::to_string_pretty(crate::schema::meta::meta_schema()).unwrap()
-    );
-    Ok(0)
-}
-
-fn completions(shell: &str) -> Result<i32> {
-    let shell: clap_complete::Shell = shell
-        .parse()
-        .map_err(|_| DbError::usage("shell must be bash, zsh, fish, elvish, or powershell"))?;
-    clap_complete::generate(shell, &mut Cli::command(), "reldir", &mut io::stdout());
-    Ok(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{AdditionalFields, Column, ColumnType};
-    use indexmap::IndexMap;
-    use serde_json::json;
 
-    fn column(kind: ColumnType) -> Column {
-        Column {
-            kind,
-            nullable: false,
-            default: None,
-            generated: None,
-            values: None,
-            items: None,
-            properties: None,
-            pattern: None,
-            additional_properties: true,
-            required: Default::default(),
-            min_size: None,
-            max_size: None,
-            minimum: None,
-            maximum: None,
-            exclusive_minimum: None,
-            exclusive_maximum: None,
-            multiple_of: None,
-            unique_items: false,
-            composition: None,
-            description: None,
-            annotations: Default::default(),
-        }
-    }
-
-    fn schema(columns: &[(&str, ColumnType)], primary_key: &[&str]) -> Schema {
-        let mut map = IndexMap::new();
-        for (name, kind) in columns {
-            map.insert((*name).to_string(), column(kind.clone()));
-        }
-        Schema {
-            table: "t".into(),
-            schema_version: 1,
-            schema_format: None,
-            description: None,
-            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
-            columns: map,
-            unique: vec![],
-            foreign_keys: vec![],
-            check: vec![],
-            indexes: vec![],
-            storage: None,
-            additional_fields: AdditionalFields::Reject,
-            annotations: Default::default(),
-        }
-    }
-
-    /// One deliberate change to a schema, as the coverage table below names it.
-    type SchemaEdit = Box<dyn Fn(&mut Schema)>;
-
-    /// Every relational key a schema can carry is visible in a diff.
-    ///
-    /// `x-reldir` has a closed key set, and a change to any of them changes what
-    /// the database enforces. A key the codec accepts but the diff never
-    /// mentions would let a constraint appear or vanish with the diff reporting
-    /// nothing at all -- the quietest possible failure, and the one a reader is
-    /// least able to catch.
+    /// Every argument and command says what it is for.
     #[test]
-    fn test1145_every_relational_key_is_reported_when_it_changes() {
-        // `table` is excluded deliberately: a schema whose table disagrees with
-        // its filename is refused outright, so it cannot differ across two
-        // revisions of the same file.
-        let semantic = |build: &dyn Fn(&mut Schema)| {
-            let mut s = schema(&[("id", ColumnType::String)], &["id"]);
-            build(&mut s);
-            crate::schema::semantic::encode_v1(&s)
-        };
-        let unchanged = semantic(&|_| {});
-
-        let cases: Vec<(&str, SchemaEdit)> = vec![
-            ("primaryKey", Box::new(|s: &mut Schema| {
-                s.columns.insert("alt".into(), column(ColumnType::String));
-                s.primary_key = vec!["alt".into()];
-            })),
-            ("columnOrder", Box::new(|s: &mut Schema| {
-                s.columns.insert("alt".into(), column(ColumnType::String));
-                s.columns.swap_indices(0, 1);
-            })),
-            ("unique", Box::new(|s: &mut Schema| s.unique = vec![vec!["id".into()]])),
-            ("indexes", Box::new(|s: &mut Schema| s.indexes = vec![vec!["id".into()]])),
-            ("foreignKeys", Box::new(|s: &mut Schema| {
-                s.foreign_keys = vec![crate::schema::ForeignKey {
-                    columns: vec!["id".into()],
-                    references: crate::schema::Reference {
-                        table: "other".into(),
-                        columns: vec!["id".into()],
-                    },
-                    on_delete: None,
-                    on_update: None,
-                }];
-            })),
-            ("checks", Box::new(|s: &mut Schema| {
-                s.check = vec![crate::schema::Check {
-                    name: "c".into(),
-                    expr: "id IS NOT NULL".into(),
-                }];
-            })),
-            ("generated", Box::new(|s: &mut Schema| {
-                s.columns["id"].kind = ColumnType::Ulid;
-                s.columns["id"].generated = Some(crate::schema::Generated {
-                    kind: crate::schema::GeneratedKind::Ulid,
-                });
-            })),
-            ("filename", Box::new(|s: &mut Schema| {
-                s.storage = Some(crate::schema::Storage { filename: vec!["id".into()] });
-            })),
-            ("schemaVersion", Box::new(|s: &mut Schema| s.schema_version = 7)),
-            ("schemaFormat", Box::new(|s: &mut Schema| {
-                s.schema_format = Some(crate::FORMAT_VERSION)
-            })),
-            ("additionalProperties", Box::new(|s: &mut Schema| {
-                s.additional_fields = AdditionalFields::Allow
-            })),
-        ];
-
-        for (key, build) in cases {
-            let changed = semantic(&*build);
-            let rows = schema_diff("schema/t.json", &unchanged, &changed);
-            assert!(
-                !rows.is_empty(),
-                "{key}: a change to it must be reported, not passed over in silence"
-            );
-            let rendered = serde_json::to_string(&rows).unwrap();
-            assert!(
-                !rendered.contains("\"nullable\""),
-                "{key}: the internal encoding must not reach the reader: {rendered}"
-            );
-        }
-    }
-
-    /// A schema change is described in the words the schema file uses.
-    ///
-    /// `schema_diff` reads the semantic encoding, because that is what revision
-    /// objects hold -- but that form names reldir's types directly, carries
-    /// nullability as a flag, and lists columns as pairs. None of that appears
-    /// in a file anyone edits. Every branch of the mapping is checked here
-    /// rather than through the CLI, because a wrong spelling in a branch that
-    /// never runs is invisible until someone diffs that kind of column.
-    #[test]
-    fn test1139_diffed_columns_are_described_in_the_dialects_spelling() {
-        let semantic = |kind: ColumnType, nullable: bool| {
-            let mut column = column(kind);
-            column.nullable = nullable;
-            crate::schema::semantic::encode_v1(&{
-                let mut s = schema(&[("id", ColumnType::String)], &["id"]);
-                s.columns.insert("v".into(), column);
-                s
-            })["columns"][1][1]
-                .clone()
-        };
-        let dialect = |kind: ColumnType, nullable: bool| as_dialect(&semantic(kind, nullable));
-
-        // Standard keywords carry the type wherever they can.
-        assert_eq!(dialect(ColumnType::Bool, false)["type"], json!("boolean"));
-        assert_eq!(dialect(ColumnType::Float, false)["type"], json!("number"));
-        assert_eq!(dialect(ColumnType::String, false)["type"], json!("string"));
-        assert_eq!(dialect(ColumnType::Array, false)["type"], json!("array"));
-        assert_eq!(dialect(ColumnType::Object, false)["type"], json!("object"));
-        assert_eq!(dialect(ColumnType::Date, false)["format"], json!("date"));
-        assert_eq!(
-            dialect(ColumnType::Timestamp, false)["format"],
-            json!("date-time")
-        );
-        assert_eq!(dialect(ColumnType::Uuid, false)["format"], json!("uuid"));
-        assert_eq!(
-            dialect(ColumnType::Bytes, false)["contentEncoding"],
-            json!("base64")
-        );
-
-        // The tag appears only where no standard keyword distinguishes two reldir
-        // types, and it agrees with what the codec writes to disk.
-        assert_eq!(dialect(ColumnType::Int, false)["x-reldir-type"], json!("int"));
-        assert_eq!(
-            dialect(ColumnType::Decimal, false)["x-reldir-type"],
-            json!("decimal")
-        );
-        assert_eq!(dialect(ColumnType::Ulid, false)["x-reldir-type"], json!("ulid"));
-        assert!(dialect(ColumnType::String, false).get("x-reldir-type").is_none());
-
-        // A column admitting any value is the empty schema, not a type name.
-        assert_eq!(dialect(ColumnType::Json, false), json!({}));
-
-        // Nullability is a union, never a flag.
-        assert_eq!(
-            dialect(ColumnType::String, true)["type"],
-            json!(["string", "null"])
-        );
-        for kind in [
-            ColumnType::Bool,
-            ColumnType::Int,
-            ColumnType::Float,
-            ColumnType::Decimal,
-            ColumnType::String,
-            ColumnType::Bytes,
-            ColumnType::Date,
-            ColumnType::Timestamp,
-            ColumnType::Uuid,
-            ColumnType::Ulid,
-            ColumnType::Enum,
-            ColumnType::Array,
-            ColumnType::Object,
-            ColumnType::Json,
-        ] {
-            for nullable in [false, true] {
-                let rendered = dialect(kind.clone(), nullable);
-                let text = serde_json::to_string(&rendered).unwrap();
-                assert!(
-                    !text.contains("nullable"),
-                    "{kind:?}: nullability is a union, not a flag: {text}"
-                );
-                for internal in ["\"bool\"", "\"int\"", "\"decimal\"", "\"ulid\"", "\"json\""] {
-                    assert!(
-                        !text.contains(&format!("\"type\":{internal}")),
-                        "{kind:?}: reldir's own type names must not reach a reader: {text}"
-                    );
+    fn test2230_every_argument_has_help() {
+        fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for argument in command.get_arguments() {
+                let id = argument.get_id().as_str();
+                if matches!(id, "help" | "version") {
+                    continue;
                 }
-                assert!(
-                    !text.contains("x-reldir-generated"),
-                    "{kind:?}: generators are a table fact, not a column keyword"
-                );
+                if argument.get_help().is_none() && argument.get_long_help().is_none() {
+                    missing.push(format!("{path} {id}"));
+                }
+            }
+            for sub in command.get_subcommands() {
+                if sub.get_about().is_none() && sub.get_long_about().is_none() {
+                    missing.push(format!("{path} {} (about)", sub.get_name()));
+                }
+                walk(sub, &format!("{path} {}", sub.get_name()), missing);
             }
         }
-
-        // Nested shape is part of a column's type, so it is translated too.
-        let mut inner = column(ColumnType::Decimal);
-        inner.nullable = true;
-        let mut array = column(ColumnType::Array);
-        array.items = Some(Box::new(inner));
-        let mut with_array = schema(&[("id", ColumnType::String)], &["id"]);
-        with_array.columns.insert("v".into(), array);
-        let rendered =
-            as_dialect(&crate::schema::semantic::encode_v1(&with_array)["columns"][1][1]);
-        assert_eq!(rendered["type"], json!("array"));
-        assert_eq!(rendered["items"]["x-reldir-type"], json!("decimal"));
-        assert_eq!(rendered["items"]["type"], json!(["string", "null"]));
-
-        // An enum is a string constrained by `enum`, as a schema file spells it.
-        let mut enumeration = column(ColumnType::Enum);
-        enumeration.values = Some(vec!["a".into(), "b".into()]);
-        let mut with_enum = schema(&[("id", ColumnType::String)], &["id"]);
-        with_enum.columns.insert("v".into(), enumeration);
-        let rendered = as_dialect(&crate::schema::semantic::encode_v1(&with_enum)["columns"][1][1]);
-        assert_eq!(rendered["type"], json!("string"));
-        assert_eq!(rendered["enum"], json!(["a", "b"]));
-    }
-
-    /// Section 29: a key given on the command line is decoded against the type
-    /// the schema declares for it, not against whatever JSON syntax it happens
-    /// to resemble. `reldir get things 123` must find the row whose key is the
-    /// string `"123"` when that is what the column says, and the row whose key
-    /// is the number `123` when it says that instead -- without the user
-    /// quoting anything to defeat their shell.
-    #[test]
-    fn test1114_a_primary_key_argument_is_decoded_against_its_declared_type() {
-        let numeric = schema(&[("id", ColumnType::Int)], &["id"]);
-        assert_eq!(
-            key_values("123", &numeric).unwrap(),
-            vec![Value::from(123)],
-            "an int column takes the number"
-        );
-
-        let textual = schema(&[("id", ColumnType::String)], &["id"]);
-        assert_eq!(
-            key_values("123", &textual).unwrap(),
-            vec![Value::String("123".into())],
-            "a string column takes the same argument as text"
-        );
-        assert_eq!(
-            key_values("abc", &textual).unwrap(),
-            vec![Value::String("abc".into())],
-            "bare text needs no quoting"
-        );
-        assert_eq!(
-            key_values("true", &textual).unwrap(),
-            vec![Value::String("true".into())],
-            "JSON-looking text is still text where the column says so"
-        );
-    }
-
-    /// A key that cannot be the declared type is refused rather than coerced:
-    /// silently widening it would look up a row that does not exist and report
-    /// it missing, which hides the real mistake.
-    #[test]
-    fn test1115_a_key_that_cannot_match_its_column_is_refused() {
-        let numeric = schema(&[("id", ColumnType::Int)], &["id"]);
-        let error = key_values("not-a-number", &numeric)
-            .expect_err("text cannot be an int key");
-        assert_eq!(error.diagnostic.code, "TYPE_MISMATCH");
-        assert_eq!(error.exit, 4);
-    }
-
-    /// A composite key is supplied as a JSON array, checked component by
-    /// component: arity first, then each declared type.
-    #[test]
-    fn test1116_composite_keys_are_arrays_checked_against_each_column() {
-        let composite = schema(
-            &[("a", ColumnType::String), ("b", ColumnType::Int)],
-            &["a", "b"],
-        );
-        assert_eq!(
-            key_values(r#"["x",7]"#, &composite).unwrap(),
-            vec![Value::String("x".into()), Value::from(7)]
-        );
-
-        let not_an_array = key_values("x", &composite).expect_err("must be an array");
-        assert_eq!(not_an_array.diagnostic.code, "USAGE");
-
-        let wrong_arity = key_values(r#"["x"]"#, &composite).expect_err("arity is checked");
-        assert_eq!(wrong_arity.diagnostic.code, "USAGE");
-        assert!(wrong_arity.diagnostic.message.contains('2'));
-
-        let wrong_type =
-            key_values(r#"["x","seven"]"#, &composite).expect_err("each component is typed");
-        assert_eq!(wrong_type.diagnostic.code, "TYPE_MISMATCH");
-        assert!(wrong_type.diagnostic.message.contains('b'));
+        let mut missing = vec![];
+        walk(&Cli::command(), "reldir", &mut missing);
+        assert!(missing.is_empty(), "undocumented: {missing:#?}");
+        Cli::command().debug_assert();
     }
 }

@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
@@ -10,15 +10,22 @@ pub enum Severity {
     Info,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub line: usize,
     pub column: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+fn diagnostic_kind() -> String {
+    "diagnostic".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Diagnostic {
-    pub kind: &'static str,
+    /// Always `"diagnostic"`: the record kind in the machine-readable stream.
+    #[serde(default = "diagnostic_kind")]
+    pub kind: String,
     pub severity: Severity,
     pub code: String,
     pub message: String,
@@ -28,6 +35,10 @@ pub struct Diagnostic {
     pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+    /// RFC 6901 pointer to the value the diagnostic is about, inside the file
+    /// named by `path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_line: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,15 +56,20 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// Read a diagnostic back from its machine-readable form.
+    pub fn from_json(value: &serde_json::Value) -> std::result::Result<Self, serde_json::Error> {
+        Self::deserialize(value)
+    }
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            kind: "diagnostic",
+            kind: diagnostic_kind(),
             severity: Severity::Error,
             code: code.into(),
             message: message.into(),
             table: None,
             path: None,
             location: None,
+            pointer: None,
             source_line: None,
             field: None,
             constraint: None,
@@ -90,6 +106,28 @@ impl Diagnostic {
         self.field = Some(field.into());
         self
     }
+    pub fn constraint(mut self, constraint: impl Into<String>) -> Self {
+        self.constraint = Some(constraint.into());
+        self
+    }
+    pub fn pointer(mut self, pointer: impl Into<String>) -> Self {
+        self.pointer = Some(pointer.into());
+        self
+    }
+    /// Resolve `pointer` against the bytes of the file the diagnostic is about,
+    /// filling in the location and the source line a reader needs.
+    pub fn locate_in(mut self, raw: &[u8], spans: &crate::locate::Spans) -> Self {
+        if let Some(pointer) = &self.pointer
+            && let Some(location) = spans.location(pointer)
+        {
+            self.source_line = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|text| text.lines().nth(location.line.saturating_sub(1)))
+                .map(String::from);
+            self.location = Some(location);
+        }
+        self
+    }
     pub fn expected(mut self, text: impl Into<String>) -> Self {
         self.expected = Some(text.into());
         self
@@ -108,20 +146,22 @@ impl Diagnostic {
     }
 }
 
+/// The exit status a set of diagnostics about the database's state implies.
+/// Only errors count: a warning never fails a command.
 pub fn exit_code_for_diagnostics(diagnostics: &[Diagnostic]) -> i32 {
-    if diagnostics.iter().any(|diagnostic| {
+    let errors = || diagnostics.iter().filter(|d| d.severity == Severity::Error);
+    if errors().any(|diagnostic| {
         matches!(
             diagnostic.code.as_str(),
             "FORMAT_UNSUPPORTED" | "INTERNAL_METADATA_CORRUPT"
         )
     }) {
         6
-    } else if diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "TRANSACTION_INCOMPLETE")
-    {
+    } else if errors().any(|diagnostic| {
+        matches!(diagnostic.code.as_str(), "TRANSACTION_INCOMPLETE" | "RECOVERY_REQUIRED")
+    }) {
         5
-    } else if diagnostics.is_empty() {
+    } else if errors().next().is_none() {
         0
     } else {
         2
@@ -132,21 +172,35 @@ pub fn exit_code_for_diagnostics(diagnostics: &[Diagnostic]) -> i32 {
 #[error("{diagnostic:?}")]
 pub struct DbError {
     pub diagnostic: Box<Diagnostic>,
+    /// Further faults behind the same failure: a refused change names every
+    /// fault it would have introduced, not only the first.
+    pub related: Vec<Diagnostic>,
     pub exit: i32,
 }
 
 impl DbError {
     pub fn new(code: &str, message: impl Into<String>, exit: i32) -> Self {
-        Self {
-            diagnostic: Box::new(Diagnostic::error(code, message)),
-            exit,
-        }
+        Self::from_diag(Diagnostic::error(code, message), exit)
     }
     pub fn from_diag(diagnostic: Diagnostic, exit: i32) -> Self {
         Self {
             diagnostic: Box::new(diagnostic),
+            related: vec![],
             exit,
         }
+    }
+    pub fn with_related(mut self, related: Vec<Diagnostic>) -> Self {
+        self.related = related;
+        self
+    }
+    /// Every diagnostic the error carries, the lead first.
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        std::iter::once((*self.diagnostic).clone()).chain(self.related.iter().cloned()).collect()
+    }
+    /// The same error, with advice on what to do about it.
+    pub fn with_help(mut self, text: impl Into<String>) -> Self {
+        self.diagnostic.help = Some(text.into());
+        self
     }
     pub fn usage(message: impl Into<String>) -> Self {
         Self::new("USAGE", message, 1)
@@ -158,7 +212,16 @@ impl DbError {
         self.exit
     }
     pub fn render_human(&self) {
-        let d = &self.diagnostic;
+        render_human(&self.diagnostic);
+        for related in &self.related {
+            render_human(related);
+        }
+    }
+}
+
+/// Render one diagnostic compiler-style on stderr.
+pub fn render_human(d: &Diagnostic) {
+    {
         let (colour, reset) = crate::output::severity_style(&d.severity);
         let (bold, bold_reset) = crate::output::emphasis();
         eprintln!(
@@ -181,6 +244,11 @@ impl DbError {
                 line,
                 " ".repeat(loc.column.saturating_sub(1))
             );
+        }
+        if let Some(pointer) = &d.pointer
+            && !pointer.is_empty()
+        {
+            eprintln!("   = at: {pointer}");
         }
         if let Some(c) = &d.constraint {
             eprintln!("   = constraint: {c}");
@@ -278,6 +346,11 @@ mod tests {
     #[test]
     fn test1028_diagnostic_exit_codes_follow_the_documented_precedence() {
         assert_eq!(exit_code_for_diagnostics(&[]), 0);
+        assert_eq!(
+            exit_code_for_diagnostics(&[Diagnostic::warning("ASSERTION_VIOLATION", "m")]),
+            0,
+            "a warning never fails a command"
+        );
         assert_eq!(
             exit_code_for_diagnostics(&[Diagnostic::error("FOREIGN_KEY_VIOLATION", "m")]),
             2

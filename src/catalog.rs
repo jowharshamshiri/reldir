@@ -1,472 +1,380 @@
+//! Observing the governed directory.
+//!
+//! A catalog is what the binary knows about the folder at one moment: which
+//! tables exist and what their schemas say, which files hold their rows, and
+//! everything wrong with any of it that can be judged file by file. Rows are
+//! not held in memory: they live in the [`Mirror`], which this module keeps in
+//! step with the files -- re-reading only files whose size, times or inode
+//! moved, and re-validating only what it re-read.
+//!
+//! Observation reads through a [`Source`], so the same code observes the disk
+//! and the disk-with-a-planned-change-laid-over-it that a mutation is judged
+//! against before anything is written.
+//!
+//! Every document read here is untrusted input and is parsed under the
+//! configured nesting and size bounds.
+
 use crate::{
+    canonical,
     config::Config,
     diagnostic::{DbError, Diagnostic, Result},
-    schema::{self, Schema},
+    fs::{Kind, Source},
+    mirror::{self, Ingest, Mirror},
+    schema::{Schema, SchemaFileKind},
 };
 use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 use unicode_normalization::UnicodeNormalization;
 
+/// A row, as the mirror holds it.
 #[derive(Debug, Clone)]
 pub struct Row {
     pub table: String,
-    pub path: PathBuf,
+    /// Path relative to the database root, with `/` separators.
     pub relative: PathBuf,
+    /// The row's members, in schema column order.
     pub value: Map<String, Value>,
-    pub raw: Vec<u8>,
+}
+
+impl Row {
+    /// The file's bytes, read now, for diagnostics that point into them and for
+    /// changes that must preserve them.
+    pub fn raw(&self, root: &Path) -> Result<Vec<u8>> {
+        let path = root.join(&self.relative);
+        std::fs::read(&path).map_err(|error| DbError::io(&path, error))
+    }
+}
+
+/// Where a table's schema came from.
+#[derive(Debug, Clone)]
+pub struct SchemaFile {
+    pub kind: SchemaFileKind,
+    /// Relative to the database root.
+    pub relative: PathBuf,
+    pub bytes: Vec<u8>,
 }
 
 /// What to tell someone holding a directory of rows the database does not
 /// govern. One text, so the `UNGOVERNED_DIRECTORY` warning and the
 /// `UNKNOWN_TABLE` error can never advise two different things.
 fn ungoverned_help(name: &str) -> String {
-    format!("run `reldir infer {name} --write` or add it to .db/config ignore")
+    format!("run `reldir infer {name} --write`, or add it to the ignore list in .db/config")
 }
 
-#[derive(Debug, Clone)]
 pub struct Catalog {
     pub root: PathBuf,
-    /// Top-level directories that hold data but no schema governs.
-    ///
-    /// Recorded by the observation that decides the question, so that anything
-    /// needing to know whether a name is an ungoverned directory reads the same
-    /// answer the `UNGOVERNED_DIRECTORY` warning was derived from. Deciding it a
-    /// second time elsewhere would let the two disagree.
+    /// Top-level directories holding data that no schema governs.
     pub ungoverned: Vec<String>,
-    /// Tables whose working schema is fixed by a pin in `schema/`.
-    ///
-    /// Recorded at observation because it is a property of the folder, not of
-    /// any one schema: a table is pinned or it is not, and every subsystem that
-    /// cares -- lint, doctor, the mutation rules -- must read the same answer.
+    /// Tables whose schema is a pin in `schema/`.
     pub pinned: BTreeSet<String>,
+    /// Every schema that could be read.
     pub schemas: BTreeMap<String, Schema>,
-    /// The bytes each schema was parsed from, keyed by table.
-    ///
-    /// Retained so that a finding about a schema can report where in the file
-    /// the offending declaration sits. Without the original text there is no
-    /// honest way to compute a line and column, and a diagnostic that points
-    /// nowhere is no better than one that points at the wrong place.
-    pub schema_sources: BTreeMap<String, Vec<u8>>,
-    pub rows: BTreeMap<String, Vec<Row>>,
+    /// Where each table's schema lives, including those that could not be
+    /// read -- a fault in a schema is still a fault at a path.
+    pub schema_files: BTreeMap<String, SchemaFile>,
+    /// Working schemas left behind by a table that now has a pin. The pin
+    /// governs; these are derived copies to discard.
+    pub superseded_working: Vec<String>,
+    /// Faults found while observing: structure, schemas, and cross-schema
+    /// rules. [`crate::integrity::validate`] adds row and set-level faults.
     pub diagnostics: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
     pub indentation_width: usize,
+    pub mirror: Rc<Mirror>,
+    /// Paths read afresh in this observation, in path order.
+    pub reread: Vec<String>,
+    /// Tables whose rows were all re-read because their schema changed.
+    pub rebuilt_tables: Vec<String>,
+    /// Whether the persistent mirror had to be discarded and rebuilt.
+    pub rebuilt_mirror: bool,
 }
 
 impl Catalog {
-    /// Observe the governed directory.
-    ///
-    /// Every document read here is untrusted input, so the whole observation
-    /// runs under the configured nesting bound (Sections 57 and 61). The bound
-    /// is applied by the parser during deserialization, which is the only place
-    /// it can protect the recursion itself.
-    pub fn observe(root: &Path, config: &Config) -> Result<Self> {
+    /// Observe the governed directory against the schemas it declares.
+    pub fn observe(
+        root: &Path,
+        config: &Config,
+        source: &dyn Source,
+        mirror: Rc<Mirror>,
+        rebuilt_mirror: bool,
+    ) -> Result<Self> {
         crate::json::with_depth_limit(config.max_nesting_depth, || {
-            Self::observe_bounded(root, config)
+            let mut catalog = Self::empty(root, config, mirror, rebuilt_mirror);
+            catalog.load_schemas(config, source)?;
+            catalog.refresh(config, source)?;
+            Ok(catalog)
         })
     }
 
-    /// Observe using schemas supplied by the caller rather than read from
-    /// `schema/`.
-    ///
-    /// A folder of JSON with no `schema/` is still describable: inference can
-    /// produce the schemas without writing them, and the rows are then read and
-    /// validated exactly as they would be for a governed database. This is what
-    /// lets a read-only invocation answer over an unadopted folder without
-    /// creating anything.
-    ///
-    /// Row loading and validation are shared with `observe`, so there is one
-    /// interpretation of validity regardless of where the schemas came from.
-    /// The schemas carry no source bytes, which the only consumer -- lint's
-    /// location reporting -- already handles by omitting a location rather than
-    /// inventing one.
+    /// Observe using schemas that were never written -- inferred in memory for a
+    /// folder that carries no database. Rows are read and judged exactly as for
+    /// a governed database, so there is one interpretation of validity
+    /// regardless of where the schemas came from.
     pub fn observe_with_schemas(
         root: &Path,
         config: &Config,
+        source: &dyn Source,
         schemas: BTreeMap<String, Schema>,
     ) -> Result<Self> {
         crate::json::with_depth_limit(config.max_nesting_depth, || {
-            let mut c = Self::empty(root, config);
-            c.schemas = schemas;
-            // Schemas supplied by the caller were never read from disk, so
-            // nothing here is pinned: this observation describes a folder that
-            // carries no database.
-            c.pinned = BTreeSet::new();
-            c.load_rows(root, config)?;
-            Ok(c)
+            let mut catalog = Self::empty(root, config, Rc::new(Mirror::open_memory()?), false);
+            catalog.schemas = schemas;
+            crate::integrity::validate_schemas(&mut catalog);
+            catalog.refresh(config, source)?;
+            Ok(catalog)
         })
     }
 
-    /// The `UNKNOWN_TABLE` error for a name this catalog does not govern.
-    ///
-    /// A directory of rows sitting unclaimed beside the database is the case
-    /// where the user is one command from what they wanted, so the error says
-    /// which command. Where no such directory exists the name is simply wrong --
-    /// a typo, a dropped table -- and advising inference of a directory that is
-    /// not there would send them after nothing.
-    pub fn unknown_table(&self, table: &str) -> DbError {
-        let diagnostic = Diagnostic::error("UNKNOWN_TABLE", format!("unknown table {table:?}"));
-        let diagnostic = if self.ungoverned.iter().any(|name| name == table) {
-            diagnostic.at(table).help(ungoverned_help(table))
-        } else {
-            diagnostic
-        };
-        DbError::from_diag(diagnostic, 4)
+    /// Observe the directory as a planned change would leave it, judge it, and
+    /// discard the observation. Nothing is written: the planned bytes are read
+    /// from memory, and the mirror is changed only inside a savepoint that is
+    /// rolled back.
+    pub fn prospect(&self, config: &Config, source: &dyn Source) -> Result<crate::integrity::Verdict> {
+        self.mirror.savepoint("reldir_prospect")?;
+        let outcome = crate::json::with_depth_limit(config.max_nesting_depth, || {
+            let mut future = Self::empty(&self.root, config, Rc::clone(&self.mirror), false);
+            future.load_schemas(config, source)?;
+            future.refresh(config, source)?;
+            crate::integrity::validate_through(&future, source)
+        });
+        self.mirror.rollback_to("reldir_prospect")?;
+        outcome
     }
 
-    fn empty(root: &Path, config: &Config) -> Self {
+    fn empty(root: &Path, config: &Config, mirror: Rc<Mirror>, rebuilt_mirror: bool) -> Self {
         Self {
             root: root.to_path_buf(),
             ungoverned: vec![],
             pinned: BTreeSet::new(),
             schemas: BTreeMap::new(),
-            schema_sources: BTreeMap::new(),
-            rows: BTreeMap::new(),
+            schema_files: BTreeMap::new(),
+            superseded_working: vec![],
             diagnostics: vec![],
             warnings: vec![],
             indentation_width: config.indentation_width,
+            mirror,
+            reread: vec![],
+            rebuilt_tables: vec![],
+            rebuilt_mirror,
         }
     }
 
-    fn observe_bounded(root: &Path, config: &Config) -> Result<Self> {
-        let mut c = Self::empty(root, config);
-        // Working schemas are what everything validates against. They live
-        // under `.db/`, so an absent directory means this folder has not been
-        // established yet -- a bootstrap condition the caller resolves, not a
-        // fault in a database that exists.
-        let schema_dir = crate::schema_store::working_dir(root);
-        let schema_dir_metadata = match fs::symlink_metadata(&schema_dir) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(c),
-            Err(error) => return Err(DbError::io(&schema_dir, error)),
+    /// The `UNKNOWN_TABLE` error for a name this catalog does not govern.
+    pub fn unknown_table(&self, table: &str) -> DbError {
+        let diagnostic = Diagnostic::error("UNKNOWN_TABLE", format!("unknown table {table:?}"));
+        let diagnostic = if self.ungoverned.iter().any(|name| name == table) {
+            diagnostic.at(table).help(ungoverned_help(table))
+        } else {
+            let nearest = self
+                .schemas
+                .keys()
+                .min_by_key(|name| strsim::levenshtein(name, table))
+                .filter(|name| strsim::levenshtein(name, table) <= 2);
+            match nearest {
+                Some(name) => diagnostic.help(format!("did you mean {name:?}?")),
+                None => diagnostic,
+            }
         };
-        if !schema_dir_metadata.file_type().is_dir() {
-            c.diagnostics.push(
-                Diagnostic::error("NON_REGULAR_FILE", ".db/schema must be a real directory")
-                    .at(".db/schema"),
-            );
-            return Ok(c);
-        }
-        let mut schema_names = BTreeSet::new();
-        for path in read_dir_sorted(&schema_dir)? {
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-            let meta = fs::symlink_metadata(&path).map_err(|e| DbError::io(&path, e))?;
-            if !meta.file_type().is_file() {
-                c.diagnostics.push(
-                    Diagnostic::error("NON_REGULAR_FILE", "schema entries must be regular files")
-                        .at(rel),
-                );
-                continue;
-            }
-            if has_multiple_links(&meta) {
-                c.diagnostics.push(
-                    Diagnostic::error("NON_REGULAR_FILE", "hard-linked schema files are rejected")
-                        .at(rel),
-                );
-                continue;
-            }
-            if meta.len() > config.max_json_file_size {
-                c.diagnostics.push(
-                    Diagnostic::error(
-                        "RESOURCE_LIMIT",
-                        format!("schema exceeds {} byte limit", config.max_json_file_size),
-                    )
-                    .at(rel),
-                );
-                continue;
-            }
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                c.diagnostics.push(
-                    Diagnostic::error(
-                        "UNEXPECTED_FILE",
-                        "schema directory may contain only .json files",
-                    )
-                    .at(rel),
-                );
-                continue;
-            }
-            let schema_bytes = fs::read(&path).map_err(|error| DbError::io(&path, error))?;
-            if let Err(error) = crate::json::parse(&schema_bytes)
-                && crate::json::is_depth_limit(&error)
-            {
-                c.diagnostics.push(
-                    Diagnostic::error(
-                        "RESOURCE_LIMIT",
-                        format!(
-                            "schema JSON nesting exceeds depth limit {}",
-                            config.max_nesting_depth
-                        ),
-                    )
-                    .at(rel),
-                );
-                continue;
-            }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let normalized: String = stem.nfc().flat_map(char::to_lowercase).collect();
-            if !schema_names.insert(normalized) {
-                c.diagnostics.push(
-                    Diagnostic::error(
-                        "PATH_COLLISION",
-                        "schema paths collide under case/Unicode normalization",
-                    )
-                    .at(rel),
-                );
-                continue;
-            }
-            match schema::load(&path) {
-                Ok(s) => {
-                    let local = s.validate_local(stem);
-                    c.diagnostics
-                        .extend(local.into_iter().map(|d| d.at(rel.clone()).table(stem)));
-                    c.schema_sources.insert(stem.into(), schema_bytes);
-                    if c.schemas.insert(stem.into(), s).is_some() {
-                        c.diagnostics.push(
-                            Diagnostic::error("PATH_COLLISION", "duplicate normalized schema path")
-                                .at(rel),
-                        );
-                    }
-                }
-                Err(e) => c.diagnostics.push(*e.diagnostic),
-            }
-        }
-        // A pin is the declaration; the working copy is reldir's. When they
-        // disagree the pin governs, and the working copy -- derived state, like
-        // an index -- is rebuilt from it. That is what makes `schema/` worth
-        // keeping in version control and `.db/` safe to delete.
-        //
-        // There is deliberately no arbitration over which side moved. reldir only
-        // ever writes a working copy equal to the pin or to what it inferred,
-        // so a disagreement always resolves the same way, and the manifest --
-        // the only witness that could tell them apart -- goes stale the moment
-        // a pin is adopted without a revision being recorded.
-        c.pinned = crate::schema_store::pinned_tables(root)?;
-        for table in &c.pinned {
-            let Some(pin) = crate::schema_store::load_pin(root, table)? else {
-                continue;
-            };
-            if c.schemas.get(table).is_some_and(|working| {
-                crate::schema_store::equivalent(&pin, working).unwrap_or(false)
-            }) {
-                continue;
-            }
-            // A pin is checked exactly as a working schema is: it comes from a
-            // file a human wrote, so adopting it unchecked would let a
-            // malformed declaration govern silently.
-            c.diagnostics
-                .extend(pin.validate_local(table).into_iter().map(|diagnostic| {
-                    diagnostic
-                        .at(crate::schema_store::pin_relative(table))
-                        .table(table)
-                }));
-            c.schema_sources.insert(
-                table.clone(),
-                crate::schema_store::canonical_bytes(&pin, config.indentation_width)?,
-            );
-            c.schemas.insert(table.clone(), pin);
-        }
-        c.load_rows(root, config)?;
-        Ok(c)
-    }
-    pub fn row_count(&self) -> usize {
-        self.rows.values().map(Vec::len).sum()
+        DbError::from_diag(diagnostic, 4)
     }
 
-    /// Validate the schema set, read every governed row, and report top-level
-    /// directories that no schema claims.
-    fn load_rows(&mut self, root: &Path, config: &Config) -> Result<()> {
-        validate_cross(&self.schemas, &mut self.diagnostics);
-        let ignores = config
-            .ignore_set()
-            .map_err(|error| DbError::new("INTERNAL_METADATA_CORRUPT", error, 6))?;
-        for (table, s) in &self.schemas {
-            let dir = root.join(table);
-            self.rows.insert(table.clone(), vec![]);
-            if !dir.exists() {
-                continue;
-            }
-            let md = fs::symlink_metadata(&dir).map_err(|e| DbError::io(&dir, e))?;
-            if !md.file_type().is_dir() {
-                self.diagnostics.push(
-                    Diagnostic::error("NON_REGULAR_FILE", "table path must be a directory")
-                        .at(table),
-                );
-                continue;
-            }
-            let mut names = BTreeSet::new();
-            let entries = read_dir_sorted(&dir)?;
-            // Section 49: a scan that outlasts a second reports its progress on
-            // a terminal. The reporter is inert off-TTY and under --quiet.
-            let mut progress = crate::output::Progress::new("scanning", entries.len());
-            for path in entries {
-                progress.advance();
-                let rel = path.strip_prefix(root).unwrap().to_path_buf();
-                let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
-                if ignores.is_match(&rel) || ignores.is_match(name) {
-                    continue;
-                }
-                let norm: String = name.nfc().flat_map(char::to_lowercase).collect();
-                if !names.insert(norm) {
+    /// Read every schema file. A table's schema is its pin when it has one,
+    /// else its working schema; a table with both is governed by the pin, and
+    /// the working copy is recorded as superseded derived state.
+    fn load_schemas(&mut self, config: &Config, source: &dyn Source) -> Result<()> {
+        let mut candidates: BTreeMap<String, (SchemaFileKind, PathBuf)> = BTreeMap::new();
+        for (kind, directory) in [
+            (SchemaFileKind::Working, crate::schema_store::working_dir(&self.root)),
+            (SchemaFileKind::Pin, crate::schema_store::pin_dir(&self.root)),
+        ] {
+            let relative_directory = relative(&self.root, &directory);
+            match source.metadata(&directory) {
+                Ok(meta) if meta.kind == Kind::Dir => {}
+                Ok(_) => {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "PATH_COLLISION",
-                            "row paths collide under case-insensitive normalization",
+                            "NON_REGULAR_FILE",
+                            format!("{} must be a real directory", relative_directory.display()),
                         )
-                        .at(rel.clone()),
+                        .at(relative_directory),
                     );
                     continue;
                 }
-                // A writer replaces a row by renaming a temp sibling over it, so
-                // this directory legitimately holds one for the length of every
-                // commit -- observed in 114 of 400 samples during one import.
-                // It is not a row and it is not this reader's to judge: the
-                // writer holding the lock will rename it into place or remove
-                // it. Reporting it as UNEXPECTED_FILE told people their database
-                // was invalid whenever they read it while something wrote.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::io(&directory, error)),
+            }
+            let mut seen = BTreeSet::new();
+            for path in source.read_dir(&directory).map_err(|e| DbError::io(&directory, e))? {
+                let relative_path = relative(&self.root, &path);
                 if crate::metadata::is_in_progress_write(&path) {
                     continue;
                 }
-                let md = match fs::symlink_metadata(&path) {
-                    Ok(md) => md,
-                    // The listing and the stat are separate syscalls, and a
-                    // rename between them removes the name the scan just saw.
-                    // A row that is no longer there is absent, which is an
-                    // ordinary state -- not an I/O fault that should abort the
-                    // whole observation and report the database unreadable.
+                let meta = match source.metadata(&path) {
+                    Ok(meta) => meta,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(DbError::io(&path, error)),
                 };
-                if !md.file_type().is_file() {
+                if meta.kind != Kind::File || meta.links > 1 {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            if md.file_type().is_dir() {
-                                "UNEXPECTED_FILE"
-                            } else {
-                                "NON_REGULAR_FILE"
-                            },
-                            "governed table entries must be regular .json files",
+                            "NON_REGULAR_FILE",
+                            "schema entries must be private regular files",
                         )
-                        .at(rel),
+                        .at(relative_path),
                     );
                     continue;
                 }
-                if has_multiple_links(&md) {
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
                     self.diagnostics.push(
-                        Diagnostic::error("NON_REGULAR_FILE", "hard-linked row files are rejected")
-                            .at(rel),
+                        Diagnostic::error("UNEXPECTED_FILE", "a schema directory holds only .json files")
+                            .at(relative_path),
                     );
                     continue;
                 }
-                if path.extension().and_then(|x| x.to_str()) != Some("json") {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            "UNEXPECTED_FILE",
-                            "governed table entries must be .json files",
-                        )
-                        .at(rel),
-                    );
-                    continue;
-                }
-                if md.len() > config.max_json_file_size {
+                if meta.len > config.max_json_file_size {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "RESOURCE_LIMIT",
-                            format!("file exceeds {} byte limit", config.max_json_file_size),
+                            format!("schema exceeds the {} byte file limit", config.max_json_file_size),
                         )
-                        .at(rel),
+                        .at(relative_path),
                     );
                     continue;
                 }
-                let raw = match fs::read(&path) {
-                    Ok(v) => v,
-                    // Same window as the stat above, one step later: the row
-                    // was listed, stat'd, and then renamed away before it could
-                    // be read. Absent, not malformed -- calling it INVALID_JSON
-                    // would accuse the writer's completed work of being corrupt.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        self.diagnostics
-                            .push(Diagnostic::error("INVALID_JSON", e.to_string()).at(rel));
-                        continue;
-                    }
-                };
-                let val: Value = match crate::json::parse(&raw) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // A document that is well formed but too deep is a
-                        // resource-limit refusal, not malformed JSON.
-                        if crate::json::is_depth_limit(&e) {
-                            self.diagnostics.push(
-                                Diagnostic::error(
-                                    "RESOURCE_LIMIT",
-                                    format!(
-                                        "JSON nesting exceeds depth limit {}",
-                                        config.max_nesting_depth
-                                    ),
-                                )
-                                .at(rel),
-                            );
-                            continue;
-                        }
-                        let mut d = Diagnostic::error("INVALID_JSON", e.to_string()).at(rel);
-                        d.location = Some(crate::diagnostic::Location {
-                            line: e.line(),
-                            column: e.column(),
-                        });
-                        d.source_line = String::from_utf8_lossy(&raw)
-                            .lines()
-                            .nth(e.line().saturating_sub(1))
-                            .map(String::from);
-                        self.diagnostics.push(d);
-                        continue;
-                    }
-                };
-                let Some(obj) = val.as_object() else {
-                    self.diagnostics.push(
-                        Diagnostic::error("ROW_ROOT_NOT_OBJECT", "row JSON root must be an object")
-                            .at(rel)
-                            .table(table),
-                    );
-                    continue;
-                };
-                let expected = crate::canonical::filename(s, obj);
-                if expected.as_deref() != Some(name) {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                let normalized: String = stem.nfc().flat_map(char::to_lowercase).collect();
+                if !seen.insert(normalized) {
                     self.diagnostics.push(
                         Diagnostic::error(
-                            "IDENTITY_MISMATCH",
-                            format!("filename {name:?} does not match row identity"),
+                            "PATH_COLLISION",
+                            "schema paths collide under case or Unicode normalization",
                         )
-                        .at(rel.clone())
-                        .table(table)
-                        .expected(expected.unwrap_or_else(|| {
-                            "a filename derived from non-null x-reldir.filename columns".into()
-                        }))
-                        .observed(name)
-                        .fix("FIX_RENAME_TO_IDENTITY"),
+                        .at(relative_path),
                     );
+                    continue;
                 }
-                self.rows.get_mut(table).unwrap().push(Row {
-                    table: table.clone(),
-                    path,
-                    relative: rel,
-                    value: obj.clone(),
-                    raw,
-                });
+                if kind == SchemaFileKind::Pin {
+                    self.pinned.insert(stem.clone());
+                    if candidates.contains_key(&stem) {
+                        self.superseded_working.push(stem.clone());
+                    }
+                }
+                candidates.insert(stem, (kind, path));
             }
         }
-        for entry in read_dir_sorted(root)? {
+        for (table, (kind, path)) in candidates {
+            let relative_path = relative(&self.root, &path);
+            let bytes = source.read(&path).map_err(|error| DbError::io(&path, error))?;
+            let spans = crate::locate::Spans::of(&bytes);
+            match Schema::from_bytes(&bytes) {
+                Ok(schema) if schema.table() != table => self.diagnostics.push(
+                    Diagnostic::error(
+                        "SCHEMA_TABLE_NAME_MISMATCH",
+                        format!(
+                            "x-reldir.table is {:?}, but the file is named for {table:?}; a schema governs \
+                             the table its file is named for",
+                            schema.table()
+                        ),
+                    )
+                    .at(relative_path.clone())
+                    .table(&table)
+                    .pointer("/x-reldir/table")
+                    .locate_in(&bytes, &spans),
+                ),
+                Ok(schema) => {
+                    self.schemas.insert(table.clone(), schema);
+                }
+                Err(problems) => {
+                    self.diagnostics.extend(problems.into_iter().map(|diagnostic| {
+                        let mut located = diagnostic.at(relative_path.clone()).table(&table);
+                        if located.location.is_none() {
+                            located = located.locate_in(&bytes, &spans);
+                        } else if located.source_line.is_none()
+                            && let Some(location) = &located.location
+                        {
+                            located.source_line = std::str::from_utf8(&bytes)
+                                .ok()
+                                .and_then(|text| text.lines().nth(location.line.saturating_sub(1)))
+                                .map(String::from);
+                        }
+                        located
+                    }));
+                }
+            }
+            self.schema_files.insert(
+                table,
+                SchemaFile {
+                    kind,
+                    relative: relative_path,
+                    bytes,
+                },
+            );
+        }
+        crate::integrity::validate_schemas(self);
+        Ok(())
+    }
+
+    /// Bring the mirror in line with the files.
+    fn refresh(&mut self, config: &Config, source: &dyn Source) -> Result<()> {
+        let seen_ns = now_ns();
+        let ignores = config
+            .ignore_set()
+            .map_err(|error| DbError::new("CONFIG_INVALID", error, 1))?;
+        // Tables whose schema cannot be read are not interpreted: their rows
+        // have no rules to be judged by, and judging them by stale ones would
+        // report faults that are not there.
+        let governed: BTreeMap<String, Schema> = self
+            .schemas
+            .iter()
+            .filter(|(table, _)| !self.blocked(table))
+            .map(|(table, schema)| (table.clone(), schema.clone()))
+            .collect();
+        let mirror = Rc::clone(&self.mirror);
+        mirror.savepoint("reldir_refresh")?;
+        let outcome = (|| -> Result<()> {
+            self.rebuilt_tables = mirror.sync_schemas(&governed)?;
+            let mut present = BTreeSet::new();
+            for (table, schema) in &governed {
+                self.scan_table(table, schema, config, &ignores, seen_ns, source, &mut present)?;
+            }
+            for table in governed.keys() {
+                for path in mirror.paths(table)? {
+                    if !present.contains(&path) {
+                        mirror.remove(&path)?;
+                    }
+                }
+            }
+            // A duplicate that relaxed a table's key indexes may be gone now.
+            mirror.tighten(&governed)?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => mirror.release("reldir_refresh")?,
+            Err(error) => {
+                mirror.rollback_to("reldir_refresh")?;
+                return Err(error);
+            }
+        }
+        let entries = match source.read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(error) => return Err(DbError::io(&self.root, error)),
+        };
+        for entry in entries {
             let name = entry.file_name().and_then(|x| x.to_str()).unwrap_or("");
             if matches!(name, "schema" | ".db" | ".git")
-                || self.schemas.contains_key(name)
+                || name.starts_with('.')
+                || self.schema_files.contains_key(name)
                 || ignores.is_match(name)
             {
                 continue;
             }
-            let md = fs::symlink_metadata(&entry).map_err(|e| DbError::io(&entry, e))?;
-            if md.is_dir() {
+            let is_dir = source.metadata(&entry).is_ok_and(|meta| meta.kind == Kind::Dir);
+            if is_dir {
                 self.ungoverned.push(name.to_string());
                 self.warnings.push(
                     Diagnostic::warning(
@@ -480,688 +388,376 @@ impl Catalog {
         }
         Ok(())
     }
+
+    /// Whether a table's schema has faults that stop its rows being judged.
+    pub fn blocked(&self, table: &str) -> bool {
+        !self.schemas.contains_key(table)
+            || self
+                .diagnostics
+                .iter()
+                .any(|d| d.table.as_deref() == Some(table) && d.code.starts_with("SCHEMA_"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_table(
+        &mut self,
+        table: &str,
+        schema: &Schema,
+        config: &Config,
+        ignores: &globset::GlobSet,
+        seen_ns: i64,
+        source: &dyn Source,
+        present: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let directory = self.root.join(table);
+        match source.metadata(&directory) {
+            Ok(meta) if meta.kind == Kind::Dir => {}
+            Ok(_) => {
+                self.diagnostics.push(
+                    Diagnostic::error("NON_REGULAR_FILE", "a table's path must be a real directory")
+                        .at(table)
+                        .table(table),
+                );
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(DbError::io(&directory, error)),
+        }
+        let entries = source.read_dir(&directory).map_err(|e| DbError::io(&directory, e))?;
+        let rebuilt = self.rebuilt_tables.iter().any(|t| t == table);
+        let mut names = BTreeSet::new();
+        let mut progress = crate::output::Progress::new("scanning", entries.len());
+        for path in entries {
+            progress.advance();
+            let relative_path = relative(&self.root, &path);
+            let key = slash(&relative_path);
+            let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            if ignores.is_match(&relative_path) || ignores.is_match(name) {
+                continue;
+            }
+            // A writer replaces a row by renaming a temp sibling over it, so a
+            // table directory legitimately holds one for the length of a
+            // commit. It is not a row and not this reader's to judge.
+            if crate::metadata::is_in_progress_write(&path) {
+                continue;
+            }
+            let normalized: String = name.nfc().flat_map(char::to_lowercase).collect();
+            if !names.insert(normalized) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "PATH_COLLISION",
+                        "row paths collide under case or Unicode normalization, so they name one \
+                         file on some filesystems and two on others",
+                    )
+                    .at(relative_path)
+                    .table(table),
+                );
+                continue;
+            }
+            let meta = match source.metadata(&path) {
+                Ok(meta) => meta,
+                // Listed, then renamed away before it could be examined:
+                // absent, which is an ordinary state.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(DbError::io(&path, error)),
+            };
+            if meta.kind != Kind::File {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        if meta.kind == Kind::Dir { "UNEXPECTED_FILE" } else { "NON_REGULAR_FILE" },
+                        "a table directory holds only regular .json files",
+                    )
+                    .at(relative_path)
+                    .table(table),
+                );
+                continue;
+            }
+            if meta.links > 1 {
+                self.diagnostics.push(
+                    Diagnostic::error("NON_REGULAR_FILE", "hard-linked row files are refused")
+                        .at(relative_path)
+                        .table(table),
+                );
+                continue;
+            }
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                self.diagnostics.push(
+                    Diagnostic::error("UNEXPECTED_FILE", "a table directory holds only .json files")
+                        .at(relative_path)
+                        .table(table)
+                        .help("move it out, or add it to the ignore list in .db/config"),
+                );
+                continue;
+            }
+            if meta.len > config.max_json_file_size {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "RESOURCE_LIMIT",
+                        format!("file exceeds the {} byte limit", config.max_json_file_size),
+                    )
+                    .at(relative_path)
+                    .table(table),
+                );
+                continue;
+            }
+            present.insert(key.clone());
+            let cached = if rebuilt { None } else { self.mirror.file(&key)? };
+            if let Some(entry) = &cached
+                && entry.trusted_for(&meta.stat)
+            {
+                continue;
+            }
+            let raw = match source.read(&path) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    present.remove(&key);
+                    continue;
+                }
+                Err(error) => return Err(DbError::io(&path, error)),
+            };
+            let raw_hash = canonical::hash_bytes(&raw);
+            if let Some(entry) = &cached
+                && entry.raw_hash == raw_hash
+            {
+                self.mirror.touch(&key, &meta.stat, seen_ns)?;
+                continue;
+            }
+            self.reread.push(key.clone());
+            let (row, diagnostics) = judge_row(table, schema, name, &raw, config);
+            self.mirror.put(Ingest {
+                path: &key,
+                table,
+                schema,
+                stat: meta.stat,
+                raw_hash,
+                seen_ns,
+                row: row.as_ref(),
+                diagnostics,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Every row of a table, in path order.
+    pub fn rows(&self, table: &str) -> Result<Vec<Row>> {
+        let mut out = vec![];
+        self.each_row(table, |row| {
+            out.push(row);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit every row of a table in path order without holding the table.
+    pub fn each_row(&self, table: &str, mut visit: impl FnMut(Row) -> Result<()>) -> Result<()> {
+        self.mirror.each_file(table, |entry| {
+            if let Some(value) = entry.doc {
+                visit(Row {
+                    table: entry.table,
+                    relative: PathBuf::from(entry.path),
+                    value,
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The row a file holds, if the mirror has read one there.
+    pub fn row_at(&self, relative_path: &Path) -> Result<Option<Row>> {
+        Ok(self.mirror.file(&slash(relative_path))?.and_then(|entry| {
+            entry.doc.map(|value| Row {
+                table: entry.table,
+                relative: relative_path.to_path_buf(),
+                value,
+            })
+        }))
+    }
+
+    /// The row a table holds under a primary key, rendered as keys are.
+    pub fn row_by_key(&self, table: &str, key: &str) -> Result<Option<Row>> {
+        let holders = self.mirror.holders(key, mirror::PRIMARY, &[table.to_string()])?;
+        match holders.first() {
+            Some((_, path)) => self.row_at(Path::new(path)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn row_count(&self) -> Result<u64> {
+        let mut total = 0;
+        for table in self.schemas.keys() {
+            total += self.mirror.count(table)?;
+        }
+        Ok(total)
+    }
 }
 
+/// Everything wrong with one file on its own: whether it parses, whether it is
+/// an object, whether it satisfies its schema, and whether its name is the one
+/// its identity derives.
+pub fn judge_row(
+    table: &str,
+    schema: &Schema,
+    name: &str,
+    raw: &[u8],
+    config: &Config,
+) -> (Option<Map<String, Value>>, Vec<Diagnostic>) {
+    let mut out = vec![];
+    let value = match crate::json::parse(raw) {
+        Ok(value) => value,
+        Err(error) => {
+            let diagnostic = if crate::json::is_depth_limit(&error) {
+                Diagnostic::error(
+                    "RESOURCE_LIMIT",
+                    format!("JSON nesting exceeds the depth limit {}", config.max_nesting_depth),
+                )
+            } else {
+                let mut diagnostic = Diagnostic::error("INVALID_JSON", error.to_string());
+                diagnostic.location = Some(crate::diagnostic::Location {
+                    line: error.line(),
+                    column: error.column(),
+                });
+                diagnostic.source_line = String::from_utf8_lossy(raw)
+                    .lines()
+                    .nth(error.line().saturating_sub(1))
+                    .map(String::from);
+                if raw.windows(7).any(|window| window == b"<<<<<<<") {
+                    diagnostic = diagnostic.help("the file holds merge-conflict markers; resolve the merge");
+                }
+                diagnostic
+            };
+            out.push(diagnostic.table(table));
+            return (None, out);
+        }
+    };
+    let Some(object) = value.as_object() else {
+        out.push(
+            Diagnostic::error("ROW_ROOT_NOT_OBJECT", "a row file holds one JSON object")
+                .table(table)
+                .pointer(""),
+        );
+        return (None, out);
+    };
+    let spans = crate::locate::Spans::of(raw);
+    let found = schema.validator().check(&value);
+    let missing: Vec<&str> = found
+        .iter()
+        .filter(|d| d.code == "ROW_MISSING_FIELD")
+        .filter_map(|d| d.field.as_deref())
+        .collect();
+    for mut diagnostic in found.iter().cloned() {
+        attach_fixes(&mut diagnostic, schema, &value, &missing);
+        out.push(diagnostic.table(table).locate_in(raw, &spans));
+    }
+    match canonical::filename(schema, object) {
+        Some(expected) if !canonical::filename_fits(&expected) => out.push(
+            Diagnostic::error(
+                "FILENAME_TOO_LONG",
+                format!(
+                    "the row's identity renders to a {}-byte filename, beyond the {}-byte limit \
+                     filesystems share",
+                    expected.len(),
+                    canonical::MAX_FILENAME_BYTES
+                ),
+            )
+            .table(table),
+        ),
+        Some(expected) if expected != name => out.push(
+            Diagnostic::error(
+                "IDENTITY_MISMATCH",
+                format!("the file is named {name:?}, but the row's identity names it {expected:?}"),
+            )
+            .table(table)
+            .expected(expected.clone())
+            .observed(name)
+            .fix("FIX_RENAME_TO_IDENTITY")
+            .help(format!("rename the file to {expected}; the row itself is unaffected")),
+        ),
+        Some(_) => {}
+        None => out.push(
+            Diagnostic::error(
+                "IDENTITY_MISMATCH",
+                "the row has no identity: a column its filename is built from is absent or null",
+            )
+            .table(table)
+            .observed(name),
+        ),
+    }
+    (Some(object.clone()), out)
+}
+
+/// Offer exactly the repairs that would work for this row: a coercion only when
+/// one exists, a default only when the column declares one, a rename only when
+/// an unknown member is unambiguously a misspelt missing column.
+fn attach_fixes(diagnostic: &mut Diagnostic, schema: &Schema, row: &Value, missing: &[&str]) {
+    let top_column = diagnostic
+        .pointer
+        .as_deref()
+        .map(crate::schema::path::pointer_tokens)
+        .filter(|tokens| tokens.len() == 1)
+        .map(|mut tokens| tokens.remove(0));
+    match diagnostic.code.as_str() {
+        "TYPE_MISMATCH" => {
+            let coercible = top_column
+                .as_deref()
+                .is_some_and(|column| schema.validator().coercion(row, column).is_some());
+            if !coercible {
+                diagnostic.fixes.retain(|fix| fix != "FIX_COERCE_VALUE");
+            }
+        }
+        "ROW_MISSING_FIELD" | "NOT_NULL_VIOLATION" => {
+            let column = diagnostic.field.as_deref().and_then(|name| schema.column(name));
+            if column.is_some_and(|column| column.default().is_some_and(|value| !value.is_null())) {
+                diagnostic.fixes.push("FIX_FILL_DEFAULT".into());
+            }
+        }
+        "ROW_UNKNOWN_FIELD" => {
+            if let Some(unknown) = diagnostic.field.clone() {
+                let mut ranked: Vec<(usize, &str)> = missing
+                    .iter()
+                    .map(|name| (strsim::levenshtein(&unknown, name), *name))
+                    .filter(|(distance, _)| *distance <= 2)
+                    .collect();
+                ranked.sort();
+                let unambiguous = match ranked.as_slice() {
+                    [only] => Some(only.1),
+                    [first, second, ..] if first.0 < second.0 => Some(first.1),
+                    _ => None,
+                };
+                if let Some(name) = unambiguous {
+                    diagnostic.expected = Some(name.to_string());
+                    diagnostic.fixes.insert(0, "FIX_RENAME_FIELD".into());
+                    diagnostic.help = Some(format!("did you mean {name:?}?"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos() as i64)
+}
+
+fn relative(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+}
+
+/// Whether a file has other names. A hard-linked metadata or row file could be
+/// changed through a path reldir does not govern, so it is refused.
 #[cfg(unix)]
-fn has_multiple_links(metadata: &fs::Metadata) -> bool {
+pub fn has_multiple_links(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink() > 1
 }
 
 #[cfg(not(unix))]
-fn has_multiple_links(_metadata: &fs::Metadata) -> bool {
+pub fn has_multiple_links(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn read_dir_sorted(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut v = vec![];
-    for e in fs::read_dir(path).map_err(|e| DbError::io(path, e))? {
-        v.push(e.map_err(|e| DbError::io(path, e))?.path())
-    }
-    v.sort();
-    Ok(v)
-}
-fn validate_cross(schemas: &BTreeMap<String, Schema>, out: &mut Vec<Diagnostic>) {
-    for (table, s) in schemas {
-        for fk in &s.foreign_keys {
-            if fk.columns.is_empty() || fk.columns.len() != fk.references.columns.len() {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "foreign key column arity must match target",
-                    )
-                    .table(table),
-                );
-                continue;
-            }
-            if fk.columns.iter().collect::<BTreeSet<_>>().len() != fk.columns.len()
-                || fk.references.columns.iter().collect::<BTreeSet<_>>().len()
-                    != fk.references.columns.len()
-            {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "foreign key column lists must not repeat columns",
-                    )
-                    .table(table),
-                );
-                continue;
-            }
-            // An element key names exactly one column: a tuple drawn from two
-            // arrays has no defined pairing, so there is nothing for a
-            // composite element key to mean.
-            if fk.is_per_element() && fk.columns.len() != 1 {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "an element foreign key names exactly one column",
-                    )
-                    .table(table),
-                );
-                continue;
-            }
-            for spelled in &fk.columns {
-                let c = &crate::schema::key_column(spelled).name.to_string();
-                if !s.columns.contains_key(c) {
-                    out.push(
-                        Diagnostic::error(
-                            "SCHEMA_COLUMN_UNKNOWN",
-                            format!("foreign key names unknown column {c:?}"),
-                        )
-                        .table(table),
-                    );
-                }
-            }
-            let Some(target) = schemas.get(&fk.references.table) else {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_TARGET_MISSING",
-                        format!(
-                            "foreign key target table {:?} has no schema",
-                            fk.references.table
-                        ),
-                    )
-                    .table(table),
-                );
-                continue;
-            };
-            for column in &fk.references.columns {
-                if !target.columns.contains_key(column) {
-                    out.push(
-                        Diagnostic::error(
-                            "SCHEMA_COLUMN_UNKNOWN",
-                            format!(
-                                "foreign key target names unknown column {:?}.{:?}",
-                                fk.references.table, column
-                            ),
-                        )
-                        .table(table),
-                    );
-                }
-            }
-            let unique = target.primary_key == fk.references.columns
-                || target.unique.iter().any(|u| u == &fk.references.columns);
-            if !unique {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_TARGET_NOT_UNIQUE",
-                        "foreign key target columns are not a primary key or unique constraint",
-                    )
-                    .table(table),
-                );
-            }
-            for (spelled, b) in fk.columns.iter().zip(&fk.references.columns) {
-                let addressed = crate::schema::key_column(spelled);
-                let a = addressed.name;
-                // An element key compares the ARRAY'S ELEMENT against the
-                // target, because that is the value being matched. Comparing
-                // the array itself would always differ and report a mismatch
-                // that says nothing about the data.
-                let referencing = s.columns.get(a).and_then(|column| {
-                    if addressed.per_element {
-                        column.items.as_deref()
-                    } else {
-                        Some(column)
-                    }
-                });
-                if addressed.per_element
-                    && s.columns
-                        .get(a)
-                        .is_some_and(|column| column.kind != crate::schema::ColumnType::Array)
-                {
-                    out.push(
-                        Diagnostic::error(
-                            "SCHEMA_FK_TYPE_MISMATCH",
-                            format!("{table}.{a} is addressed per element but is not an array"),
-                        )
-                        .table(table),
-                    );
-                    continue;
-                }
-                if let (Some(x), Some(y)) = (referencing, target.columns.get(b))
-                    && !same_column_type(x, y, false)
-                {
-                    out.push(
-                        Diagnostic::error(
-                            "SCHEMA_FK_TYPE_MISMATCH",
-                            format!(
-                                "{table}.{a} and {}.{b} have different types",
-                                fk.references.table
-                            ),
-                        )
-                        .table(table),
-                    );
-                }
-            }
-            if fk.is_per_element()
-                && [fk.delete_action(), fk.update_action()].iter().any(|action| {
-                    matches!(
-                        action,
-                        crate::schema::Action::SetNull | crate::schema::Action::SetDefault
-                    )
-                })
-            {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "set_null and set_default have no meaning for an element foreign key: \
-                         an element is removed or it is not, and neither action says which",
-                    )
-                    .table(table),
-                );
-            }
-            if [fk.delete_action(), fk.update_action()].contains(&crate::schema::Action::SetNull)
-                && fk.columns.iter().any(|spelled| {
-                    let c = crate::schema::key_column(spelled).name;
-                    s.columns.get(c).is_some_and(|v| !v.nullable)
-                })
-            {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "set_null requires nullable referencing columns",
-                    )
-                    .table(table),
-                );
-            }
-            if [fk.delete_action(), fk.update_action()].contains(&crate::schema::Action::SetDefault)
-                && fk.columns.iter().any(|spelled| {
-                    let c = crate::schema::key_column(spelled).name;
-                    s.columns.get(c).is_some_and(|v| v.default.is_none())
-                })
-            {
-                out.push(
-                    Diagnostic::error(
-                        "SCHEMA_FK_ACTION_INVALID",
-                        "set_default requires defaults on referencing columns",
-                    )
-                    .table(table),
-                );
-            }
-        }
-    }
-    fn visit<'a>(
-        n: &'a str,
-        s: &'a BTreeMap<String, Schema>,
-        vis: &mut BTreeSet<&'a str>,
-        stack: &mut BTreeSet<&'a str>,
-        update: bool,
-    ) -> bool {
-        if stack.contains(n) {
-            return true;
-        }
-        if !vis.insert(n) {
-            return false;
-        }
-        stack.insert(n);
-        let cycle = s.get(n).is_some_and(|x| {
-            x.foreign_keys
-                .iter()
-                .filter(|f| {
-                    (if update {
-                        f.update_action()
-                    } else {
-                        f.delete_action()
-                    }) == crate::schema::Action::Cascade
-                })
-                .any(|f| visit(&f.references.table, s, vis, stack, update))
-        });
-        stack.remove(n);
-        cycle
-    }
-    for (update, action) in [(false, "delete"), (true, "update")] {
-        let mut vis = BTreeSet::new();
-        for n in schemas.keys() {
-            if visit(n, schemas, &mut vis, &mut BTreeSet::new(), update) {
-                out.push(Diagnostic::error(
-                    "SCHEMA_FK_CYCLE",
-                    format!("foreign keys form an all-cascade {action} cycle"),
-                ));
-                break;
-            }
-        }
-    }
-}
-
-fn same_column_type(
-    left: &crate::schema::Column,
-    right: &crate::schema::Column,
-    compare_nullable: bool,
-) -> bool {
-    if left.kind != right.kind || (compare_nullable && left.nullable != right.nullable) {
-        return false;
-    }
-    match left.kind {
-        crate::schema::ColumnType::Enum => left.values == right.values,
-        crate::schema::ColumnType::Array => match (&left.items, &right.items) {
-            (Some(left), Some(right)) => same_column_type(left, right, true),
-            (None, None) => true,
-            _ => false,
-        },
-        crate::schema::ColumnType::Object => match (&left.properties, &right.properties) {
-            (Some(left), Some(right)) => {
-                left.len() == right.len()
-                    && left.iter().all(|(name, left)| {
-                        right
-                            .get(name)
-                            .is_some_and(|right| same_column_type(left, right, true))
-                    })
-            }
-            (None, None) => true,
-            _ => false,
-        },
-        _ => true,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::schema::{
-        Action, AdditionalFields, Column, ColumnType, ForeignKey, Reference, Storage,
-    };
-    use indexmap::IndexMap;
-    use serde_json::json;
-
-    fn column(kind: ColumnType, nullable: bool) -> Column {
-        Column {
-            kind,
-            nullable,
-            default: None,
-            generated: None,
-            values: None,
-            items: None,
-            properties: None,
-            pattern: None,
-            additional_properties: true,
-            required: Default::default(),
-            min_size: None,
-            max_size: None,
-            minimum: None,
-            maximum: None,
-            exclusive_minimum: None,
-            exclusive_maximum: None,
-            multiple_of: None,
-            unique_items: false,
-            composition: None,
-            description: None,
-            annotations: Default::default(),
-        }
-    }
-
-    fn schema(table: &str, columns: &[(&str, ColumnType, bool)], primary_key: &[&str]) -> Schema {
-        let mut map = IndexMap::new();
-        for (name, kind, nullable) in columns {
-            map.insert((*name).to_string(), column(kind.clone(), *nullable));
-        }
-        Schema {
-            table: table.into(),
-            schema_version: 1,
-            schema_format: None,
-            description: None,
-            primary_key: primary_key.iter().map(|k| (*k).to_string()).collect(),
-            columns: map,
-            unique: vec![],
-            foreign_keys: vec![],
-            check: vec![],
-            indexes: vec![],
-            storage: None,
-            additional_fields: AdditionalFields::Reject,
-            annotations: Default::default(),
-        }
-    }
-
-    fn foreign_key(columns: &[&str], table: &str, target: &[&str]) -> ForeignKey {
-        ForeignKey {
-            columns: columns.iter().map(|c| (*c).to_string()).collect(),
-            references: Reference {
-                table: table.into(),
-                columns: target.iter().map(|c| (*c).to_string()).collect(),
-            },
-            on_delete: Some(Action::Restrict),
-            on_update: Some(Action::Restrict),
-        }
-    }
-
-    fn cross(schemas: Vec<Schema>) -> Vec<String> {
-        let map: BTreeMap<String, Schema> =
-            schemas.into_iter().map(|s| (s.table.clone(), s)).collect();
-        let mut out = vec![];
-        validate_cross(&map, &mut out);
-        out.into_iter().map(|d| d.code).collect()
-    }
-
-    fn parent() -> Schema {
-        schema("a", &[("id", ColumnType::String, false)], &["id"])
-    }
-
-    /// Section 11: a foreign key must reference a table that exists, name real
-    /// columns on both sides, and target a key that actually identifies a row.
-    #[test]
-    fn test1008_foreign_keys_must_reference_a_real_unique_target() {
-        let mut child = schema(
-            "b",
-            &[
-                ("id", ColumnType::String, false),
-                ("a_id", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        child.foreign_keys = vec![foreign_key(&["a_id"], "ghost", &["id"])];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_TARGET_MISSING".into()));
-
-        // A target column that does not exist on the target table.
-        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["nope"])];
-        let codes = cross(vec![parent(), child.clone()]);
-        assert!(codes.contains(&"SCHEMA_COLUMN_UNKNOWN".into()));
-        assert!(codes.contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into()));
-
-        // A local column that does not exist on the referencing table.
-        child.foreign_keys = vec![foreign_key(&["ghost"], "a", &["id"])];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_COLUMN_UNKNOWN".into()));
-
-        // A target that exists but is neither a primary key nor unique.
-        let mut wide = schema(
-            "a",
-            &[
-                ("id", ColumnType::String, false),
-                ("label", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["label"])];
-        assert!(
-            cross(vec![wide.clone(), child.clone()])
-                .contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into())
-        );
-
-        // Declaring that target unique makes the same foreign key legitimate.
-        wide.unique = vec![vec!["label".into()]];
-        assert!(!cross(vec![wide, child]).contains(&"SCHEMA_FK_TARGET_NOT_UNIQUE".into()));
-    }
-
-    /// An element key relates each element of an array, so its ELEMENT type is
-    /// what must match the target. Comparing the array itself would always
-    /// differ and report a mismatch that says nothing about the data.
-    #[test]
-    fn test1161_element_foreign_keys_compare_the_element_type() {
-        let parent = schema("parent", &[("id", ColumnType::String, false)], &["id"]);
-
-        let mut refs = column(ColumnType::Array, false);
-        refs.items = Some(Box::new(column(ColumnType::String, false)));
-        let mut child = schema("child", &[("id", ColumnType::String, false)], &["id"]);
-        child.columns.insert("parent_refs".into(), refs);
-        child.foreign_keys = vec![ForeignKey {
-            columns: vec!["parent_refs[]".into()],
-            references: Reference { table: "parent".into(), columns: vec!["id".into()] },
-            on_delete: Some(Action::Restrict),
-            on_update: Some(Action::Restrict),
-        }];
-
-        let mut schemas = BTreeMap::new();
-        schemas.insert("parent".to_string(), parent.clone());
-        schemas.insert("child".to_string(), child.clone());
-        let mut out = vec![];
-        validate_cross(&schemas, &mut out);
-        let found: Vec<&str> = out.iter().map(|d| d.code.as_str()).collect();
-        assert!(
-            !found.contains(&"SCHEMA_FK_TYPE_MISMATCH"),
-            "array<string> elements match a string target: {found:?}"
-        );
-
-        // An element key on a column that is not an array has no elements to
-        // relate, and saying so is more useful than comparing the wrong thing.
-        let mut scalar = child.clone();
-        scalar
-            .columns
-            .insert("parent_refs".into(), column(ColumnType::String, false));
-        let mut schemas = BTreeMap::new();
-        schemas.insert("parent".to_string(), parent.clone());
-        schemas.insert("child".to_string(), scalar);
-        let mut out = vec![];
-        validate_cross(&schemas, &mut out);
-        assert!(
-            out.iter().any(|d| d.code == "SCHEMA_FK_TYPE_MISMATCH"),
-            "a non-array addressed per element must be refused"
-        );
-    }
-
-    /// `set_null` and `set_default` have no meaning for an element key: an
-    /// element is removed or it is not, and neither action says which. A schema
-    /// that declares one is stating an intention reldir cannot carry out.
-    #[test]
-    fn test1162_element_keys_refuse_null_and_default_actions() {
-        let parent = schema("parent", &[("id", ColumnType::String, false)], &["id"]);
-        let mut refs = column(ColumnType::Array, true);
-        refs.items = Some(Box::new(column(ColumnType::String, false)));
-        let mut child = schema("child", &[("id", ColumnType::String, false)], &["id"]);
-        child.columns.insert("parent_refs".into(), refs);
-        child.foreign_keys = vec![ForeignKey {
-            columns: vec!["parent_refs[]".into()],
-            references: Reference { table: "parent".into(), columns: vec!["id".into()] },
-            on_delete: Some(Action::SetNull),
-            on_update: Some(Action::Restrict),
-        }];
-
-        let mut schemas = BTreeMap::new();
-        schemas.insert("parent".to_string(), parent);
-        schemas.insert("child".to_string(), child);
-        let mut out = vec![];
-        validate_cross(&schemas, &mut out);
-        assert!(
-            out.iter().any(|d| d.code == "SCHEMA_FK_ACTION_INVALID"),
-            "set_null on an element key must be refused"
-        );
-    }
-
-    /// Section 11: referencing and referenced column types must be identical, so
-    /// a key can never be compared across incompatible representations.
-    #[test]
-    fn test1009_foreign_key_column_types_must_match_exactly() {
-        let mut child = schema(
-            "b",
-            &[
-                ("id", ColumnType::String, false),
-                ("a_id", ColumnType::Int, false),
-            ],
-            &["id"],
-        );
-        child.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
-        assert!(cross(vec![parent(), child]).contains(&"SCHEMA_FK_TYPE_MISMATCH".into()));
-
-        // The same types agree.
-        let mut ok = schema(
-            "b",
-            &[
-                ("id", ColumnType::String, false),
-                ("a_id", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        ok.foreign_keys = vec![foreign_key(&["a_id"], "a", &["id"])];
-        assert!(!cross(vec![parent(), ok]).contains(&"SCHEMA_FK_TYPE_MISMATCH".into()));
-    }
-
-    /// Section 11: arity must match and neither side may repeat a column,
-    /// because a malformed pairing has no defined meaning.
-    #[test]
-    fn test1010_foreign_key_column_lists_must_be_well_formed() {
-        let mut child = schema(
-            "b",
-            &[
-                ("id", ColumnType::String, false),
-                ("x", ColumnType::String, false),
-                ("y", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        // Two local columns against one target column.
-        child.foreign_keys = vec![foreign_key(&["x", "y"], "a", &["id"])];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-
-        // An empty column list.
-        child.foreign_keys = vec![foreign_key(&[], "a", &[])];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-
-        // A repeated column on the referencing side.
-        let mut composite = schema(
-            "a",
-            &[
-                ("p", ColumnType::String, false),
-                ("q", ColumnType::String, false),
-            ],
-            &["p", "q"],
-        );
-        composite.table = "a".into();
-        child.foreign_keys = vec![foreign_key(&["x", "x"], "a", &["p", "q"])];
-        assert!(cross(vec![composite, child]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-    }
-
-    /// Section 11: set_null needs somewhere to put the null and set_default
-    /// needs a default to restore, otherwise the action could not be executed.
-    #[test]
-    fn test1011_referential_actions_require_columns_that_can_hold_them() {
-        let mut child = schema(
-            "b",
-            &[
-                ("id", ColumnType::String, false),
-                ("a_id", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        let mut fk = foreign_key(&["a_id"], "a", &["id"]);
-        fk.on_delete = Some(Action::SetNull);
-        child.foreign_keys = vec![fk.clone()];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-
-        // Making the column nullable satisfies set_null.
-        child.columns.get_mut("a_id").unwrap().nullable = true;
-        assert!(!cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-
-        // set_default requires a declared default.
-        let mut fk = foreign_key(&["a_id"], "a", &["id"]);
-        fk.on_delete = Some(Action::SetDefault);
-        child.foreign_keys = vec![fk];
-        assert!(cross(vec![parent(), child.clone()]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-
-        child.columns.get_mut("a_id").unwrap().default = Some(json!("fallback"));
-        assert!(!cross(vec![parent(), child]).contains(&"SCHEMA_FK_ACTION_INVALID".into()));
-    }
-
-    /// Section 11: a cycle in which every edge cascades has no defined
-    /// termination, and is rejected for delete and update edges independently.
-    #[test]
-    fn test1012_all_cascade_cycles_are_rejected_per_action() {
-        let cyclic = |action: Action| {
-            let mut a = schema(
-                "a",
-                &[
-                    ("id", ColumnType::String, false),
-                    ("b_id", ColumnType::String, true),
-                ],
-                &["id"],
-            );
-            let mut b = schema(
-                "b",
-                &[
-                    ("id", ColumnType::String, false),
-                    ("a_id", ColumnType::String, true),
-                ],
-                &["id"],
-            );
-            let mut to_b = foreign_key(&["b_id"], "b", &["id"]);
-            let mut to_a = foreign_key(&["a_id"], "a", &["id"]);
-            to_b.on_delete = Some(action);
-            to_b.on_update = Some(action);
-            to_a.on_delete = Some(action);
-            to_a.on_update = Some(action);
-            a.foreign_keys = vec![to_b];
-            b.foreign_keys = vec![to_a];
-            cross(vec![a, b])
-        };
-        assert!(cyclic(Action::Cascade).contains(&"SCHEMA_FK_CYCLE".into()));
-        // A cycle whose edges restrict instead terminates and is allowed.
-        assert!(!cyclic(Action::Restrict).contains(&"SCHEMA_FK_CYCLE".into()));
-
-        // A self-referencing cascade is a cycle of length one.
-        let mut self_ref = schema(
-            "a",
-            &[
-                ("id", ColumnType::String, false),
-                ("parent", ColumnType::String, true),
-            ],
-            &["id"],
-        );
-        let mut fk = foreign_key(&["parent"], "a", &["id"]);
-        fk.on_delete = Some(Action::Cascade);
-        fk.on_update = Some(Action::Cascade);
-        self_ref.foreign_keys = vec![fk];
-        assert!(cross(vec![self_ref]).contains(&"SCHEMA_FK_CYCLE".into()));
-    }
-
-    /// Type identity is structural: two columns agree only when their nested
-    /// shapes agree, so a foreign key cannot bridge differently shaped values.
-    #[test]
-    fn test1013_column_type_identity_is_structural() {
-        let plain = column(ColumnType::String, false);
-        assert!(same_column_type(&plain, &plain, true));
-        assert!(!same_column_type(
-            &plain,
-            &column(ColumnType::Int, false),
-            true
-        ));
-
-        // Enum membership is part of the type.
-        let mut left = column(ColumnType::Enum, false);
-        left.values = Some(vec!["a".into(), "b".into()]);
-        let mut right = column(ColumnType::Enum, false);
-        right.values = Some(vec!["a".into()]);
-        assert!(!same_column_type(&left, &right, false));
-        right.values = Some(vec!["a".into(), "b".into()]);
-        assert!(same_column_type(&left, &right, false));
-
-        // Array element types must agree.
-        let mut left = column(ColumnType::Array, false);
-        left.items = Some(Box::new(column(ColumnType::Int, false)));
-        let mut right = column(ColumnType::Array, false);
-        right.items = Some(Box::new(column(ColumnType::String, false)));
-        assert!(!same_column_type(&left, &right, false));
-        right.items = Some(Box::new(column(ColumnType::Int, false)));
-        assert!(same_column_type(&left, &right, false));
-
-        // Object property sets must agree in both name and shape.
-        let mut properties = IndexMap::new();
-        properties.insert("n".to_string(), column(ColumnType::Int, false));
-        let mut left = column(ColumnType::Object, false);
-        left.properties = Some(properties.clone());
-        let mut right = column(ColumnType::Object, false);
-        properties.insert("extra".to_string(), column(ColumnType::Int, false));
-        right.properties = Some(properties);
-        assert!(!same_column_type(&left, &right, false));
-
-        // Nullability participates only when the caller asks for it, because a
-        // foreign key may point from a nullable column at a NOT NULL key.
-        let nullable = column(ColumnType::String, true);
-        assert!(same_column_type(&plain, &nullable, false));
-        assert!(!same_column_type(&plain, &nullable, true));
-    }
-
-    /// A schema with no storage override names files by its primary key, which
-    /// the observer relies on to map a row to its path.
-    #[test]
-    fn test1014_filename_columns_track_the_storage_declaration() {
-        let mut s = schema(
-            "t",
-            &[
-                ("id", ColumnType::String, false),
-                ("slug", ColumnType::String, false),
-            ],
-            &["id"],
-        );
-        assert_eq!(s.filename_columns(), ["id".to_string()]);
-        s.storage = Some(Storage {
-            filename: vec!["slug".into()],
-        });
-        assert_eq!(s.filename_columns(), ["slug".to_string()]);
-    }
+/// A relative path with `/` separators, as the mirror and provenance name it.
+pub fn slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
