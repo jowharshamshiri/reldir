@@ -402,7 +402,7 @@ pub fn safe_relative(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::{Fault, Sim};
+    use crate::fs::{Fault, Sim, Source};
     use std::collections::BTreeMap;
 
     const ROOT: &str = "/db";

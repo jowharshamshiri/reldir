@@ -521,21 +521,28 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         transaction::journaled(&Disk, &self.root, &id, request.origin, &changes)?;
         self.reobserve()?;
-        let record = metadata::record(&self.catalog, self.history.head(), request.origin, Some(&id), None)
-            .map_err(|error| {
-                error.with_help(
-                    "the change was written, but its revision could not be recorded; the next writing \
-                     command records the state as an external change",
-                )
-            })?;
-        let revision = record.revision;
-        self.history = History::Head(Box::new(record));
+        // A change that leaves the state history already has -- restoring what
+        // an outside edit removed -- is not a new revision.
+        let revision = if metadata::pending_changes(&self.catalog)?.is_empty() {
+            self.history.head().map(|head| head.revision)
+        } else {
+            let record = metadata::record(&self.catalog, self.history.head(), request.origin, Some(&id), None)
+                .map_err(|error| {
+                    error.with_help(
+                        "the change was written, but its revision could not be recorded; the next writing \
+                         command records the state as an external change",
+                    )
+                })?;
+            let revision = record.revision;
+            self.history = History::Head(Box::new(record));
+            Some(revision)
+        };
         drop(lock);
         Ok(Outcome {
             rows,
             induced,
             changes,
-            revision: Some(revision),
+            revision,
             warnings: self.verdict.warnings.clone(),
             dry_run: false,
         })

@@ -647,6 +647,30 @@ impl Mirror {
         revision: Option<u64>,
         root: Option<&str>,
     ) -> Result<()> {
+        self.atomically("reldir_recorded", || self.replace_recorded_inner(entries, revision, root))
+    }
+
+    /// Run `work` as one unit: all of it lands, with one flush, or none does.
+    fn atomically<T>(&self, name: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.savepoint(name)?;
+        match work() {
+            Ok(value) => {
+                self.release(name)?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.rollback_to(name)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn replace_recorded_inner(
+        &self,
+        entries: &std::collections::BTreeMap<String, crate::metadata::Entry>,
+        revision: Option<u64>,
+        root: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute("DELETE FROM _reldir_recorded", []).map_err(corrupt)?;
         for (path, entry) in entries {
             self.conn
@@ -675,6 +699,15 @@ impl Mirror {
 
     /// Apply one recorded revision's changes to the recorded head.
     pub fn apply_recorded(
+        &self,
+        changes: &std::collections::BTreeMap<String, Option<crate::metadata::Entry>>,
+        revision: u64,
+        root: &str,
+    ) -> Result<()> {
+        self.atomically("reldir_recorded", || self.apply_recorded_inner(changes, revision, root))
+    }
+
+    fn apply_recorded_inner(
         &self,
         changes: &std::collections::BTreeMap<String, Option<crate::metadata::Entry>>,
         revision: u64,
@@ -803,8 +836,7 @@ impl Mirror {
         let (doc, row_hash, trow) = match ingest.row {
             Some(row) => {
                 let canonical_row = canonical::canonical_row(row, schema);
-                let bytes = serde_json::to_vec(&canonical_row).map_err(corrupt)?;
-                let hash = canonical::hash_bytes(&bytes);
+                let hash = canonical::row_hash(&canonical_row);
                 let names: Vec<&String> = schema.columns().keys().collect();
                 let values: Vec<SqlValue> = schema
                     .columns()
@@ -1515,9 +1547,12 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2, "typed rows are queryable");
 
-        // Removing a file removes everything it contributed.
+        // Removing a file removes everything it contributed: its dangling
+        // reference goes with it, and the reference to it now dangles.
         mirror.remove("people/b.json").unwrap();
-        assert!(mirror.dangling(&fk_rule("people", "fk_refs"), PRIMARY, &["people".into()]).unwrap().is_empty());
+        let dangling = mirror.dangling(&fk_rule("people", "fk_refs"), PRIMARY, &["people".into()]).unwrap();
+        assert_eq!(dangling.len(), 1);
+        assert_eq!((dangling[0].path.as_str(), dangling[0].target.as_str()), ("people/a.json", "[\"b\"]"));
         assert_eq!(mirror.count("people").unwrap(), 1);
     }
 

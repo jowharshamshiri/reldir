@@ -275,12 +275,12 @@ fn resolve(
                         let mut diagnostic = Diagnostic::error(
                             "FOREIGN_KEY_VIOLATION",
                             format!(
-                                "{} {} is still referenced by {}{pointer} ({} {})",
-                                if vacated.replacement.is_some() { "changing the key of" } else { "removing" },
+                                "{} {} refused: {} still references it at {pointer} ({constraint}, {} {})",
+                                if vacated.replacement.is_some() { "changing the key of" } else { "deleting" },
                                 vacated.holder.display(),
                                 path.display(),
                                 if vacated.replacement.is_some() { "onUpdate" } else { "onDelete" },
-                                action.name()
+                                action.name(),
                             ),
                         )
                         .at(path.clone())
@@ -289,6 +289,9 @@ fn resolve(
                         .observed(vacated.key.clone())
                         .help("change or remove the references first, or declare an action that resolves them");
                         diagnostic.constraint = Some(constraint.clone());
+                        if let Ok(raw) = std::fs::read(catalog.root.join(&path)) {
+                            diagnostic = diagnostic.locate_in(&raw, &crate::locate::Spans::of(&raw));
+                        }
                         refusals.push(diagnostic);
                     }
                     continue;

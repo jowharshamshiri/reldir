@@ -146,6 +146,33 @@ impl Fs for Disk {
     }
 }
 
+/// Make every file written under `directory`, and the directory's entries,
+/// durable at once. On Linux one `syncfs` flushes the whole filesystem, which
+/// costs one flush however many files were written; elsewhere each file and
+/// then the directory is synced.
+pub fn flush_everything_under(directory: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let handle = std::fs::File::open(directory)?;
+        // SAFETY: `handle` is an open descriptor for the duration of the call.
+        if unsafe { libc::syncfs(handle.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_file() {
+                Disk.sync_file(&path)?;
+            }
+        }
+        Disk.sync_dir(directory)
+    }
+}
+
 /// A tree seen through a set of planned changes.
 ///
 /// Planned writes appear as files with fresh metadata, so no cache can mistake

@@ -61,17 +61,36 @@ pub enum StatementKind {
 /// Parse and classify one statement, refusing anything outside the supported
 /// surface with the reason and where it lies.
 pub fn classify(text: &str) -> Result<StatementKind> {
-    let statements = Parser::parse_sql(&SQLiteDialect {}, text).map_err(|error| {
-        let message = error.to_string();
+    let dialect = SQLiteDialect {};
+    let failed = |message: String, location: Option<crate::diagnostic::Location>| {
         let mut diagnostic = Diagnostic::error("QUERY_UNSUPPORTED", format!("SQL does not parse: {message}"));
-        diagnostic.location = sql_error_location(&message);
-        diagnostic.source_line = diagnostic
-            .location
+        diagnostic.source_line = location
             .as_ref()
             .and_then(|location| text.lines().nth(location.line.saturating_sub(1)))
             .map(String::from);
+        diagnostic.location = location;
         DbError::from_diag(diagnostic, 4)
-    })?;
+    };
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(text)
+        .map_err(|error| failed(error.to_string(), sql_error_location(&error.to_string())))?;
+    let statements = match parser.parse_statements() {
+        Ok(statements) => statements,
+        Err(error) => {
+            // The parser stops at the token it could not accept; that is
+            // where the fault is.
+            let mut start = parser.get_current_token().span.start;
+            if start.line == 0 {
+                start = parser.get_previous_token().span.start;
+            }
+            let location = (start.line > 0).then(|| crate::diagnostic::Location {
+                line: start.line as usize,
+                column: start.column as usize,
+            });
+            let message = error.to_string();
+            return Err(failed(message.clone(), sql_error_location(&message).or(location)));
+        }
+    };
     let [statement] = statements.as_slice() else {
         return Err(DbError::new(
             "QUERY_UNSUPPORTED",
@@ -369,11 +388,11 @@ pub fn mutate(
             connection
                 .execute_batch(&format!(
                     "CREATE TEMP TRIGGER \"_reldir_capture_{table}_i\" AFTER INSERT ON main.{quoted} BEGIN \
-                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'insert', NULL, NEW.rowid); END; \
+                       INSERT INTO _reldir_changes VALUES ('{literal}', 'insert', NULL, NEW.rowid); END; \
                      CREATE TEMP TRIGGER \"_reldir_capture_{table}_u\" AFTER UPDATE ON main.{quoted} BEGIN \
-                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'update', OLD.rowid, NEW.rowid); END; \
+                       INSERT INTO _reldir_changes VALUES ('{literal}', 'update', OLD.rowid, NEW.rowid); END; \
                      CREATE TEMP TRIGGER \"_reldir_capture_{table}_d\" AFTER DELETE ON main.{quoted} BEGIN \
-                       INSERT INTO temp._reldir_changes VALUES ('{literal}', 'delete', OLD.rowid, NULL); END;"
+                       INSERT INTO _reldir_changes VALUES ('{literal}', 'delete', OLD.rowid, NULL); END;"
                 ))
                 .map_err(query_err)?;
         }
@@ -912,6 +931,55 @@ mod tests {
         assert!(classify("SELECT 1; SELECT 2").is_err(), "one statement at a time");
         let located = classify("SELECT\n  FROM").unwrap_err();
         assert!(located.diagnostic.location.is_some(), "a parse error points at the fault");
+    }
+
+    fn catalog(rows: &[(&str, &str)]) -> (tempfile::TempDir, crate::catalog::Catalog) {
+        let directory = tempfile::tempdir().unwrap();
+        let schema = format!(
+            r#"{{"$schema":"{}","type":"object","properties":{{"id":{{"type":"string"}},"n":{{"type":"integer","x-reldir-type":"int"}}}},"required":["id"],"additionalProperties":false,"x-reldir":{{"table":"t","primaryKey":["id"]}}}}"#,
+            crate::schema::meta::DIALECT_URI
+        );
+        std::fs::create_dir_all(directory.path().join(".db/schema")).unwrap();
+        std::fs::create_dir_all(directory.path().join("t")).unwrap();
+        std::fs::write(directory.path().join(".db/schema/t.json"), schema).unwrap();
+        for (name, body) in rows {
+            std::fs::write(directory.path().join("t").join(name), body).unwrap();
+        }
+        let catalog = crate::catalog::Catalog::observe(
+            directory.path(),
+            &crate::config::Config::default(),
+            &crate::fs::Disk,
+            std::rc::Rc::new(Mirror::open_memory().unwrap()),
+            false,
+        )
+        .unwrap();
+        (directory, catalog)
+    }
+
+    const LIMITS: QueryLimits = QueryLimits { timeout: None, max_rows: 1000, max_memory: 1 << 28 };
+
+    /// Every kind of row change a statement makes is captured, and the mirror
+    /// is left exactly as it was.
+    #[test]
+    fn test2103_mutations_are_captured_and_never_applied_to_the_mirror() {
+        let (_directory, catalog) = catalog(&[("a.json", r#"{"id":"a","n":1}"#), ("b.json", r#"{"id":"b","n":2}"#)]);
+        let deleted = mutate(&catalog, "DELETE FROM t WHERE id = 'a'", &[], LIMITS).unwrap();
+        assert_eq!(deleted.rows.len(), 1);
+        assert!(deleted.rows[0].after.is_none());
+        let updated = mutate(&catalog, "UPDATE t SET n = n + 10 RETURNING id, n", &[], LIMITS).unwrap();
+        assert_eq!(updated.rows.len(), 2);
+        assert_eq!(updated.returning.len(), 2);
+        assert!(updated.rows.iter().all(|change| change.after.as_ref().unwrap()["n"].as_i64().unwrap() > 10));
+        let inserted = mutate(&catalog, "INSERT INTO t (id, n) VALUES ('c', 3)", &[], LIMITS).unwrap();
+        assert_eq!(inserted.rows.len(), 1);
+        assert!(inserted.rows[0].before.is_none());
+        let mut left = 0;
+        query(&catalog.mirror, &catalog.schemas, "SELECT id FROM t", &[], LIMITS, |_| {
+            left += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(left, 2, "the mirror still holds exactly the files");
     }
 
     #[test]

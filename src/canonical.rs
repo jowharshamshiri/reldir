@@ -2,7 +2,7 @@
 //! on how a value happened to be written.
 
 use crate::{
-    schema::{AdditionalFields, ColumnType, Schema},
+    schema::{ColumnType, Schema},
     value,
 };
 use serde::Serialize;
@@ -38,36 +38,47 @@ pub fn normalize(value: &Value) -> Value {
     }
 }
 
-/// A row as reldir writes it: schema columns in schema order, each present
-/// (absent ones as their default, else null), timestamps in UTC, values
-/// normalized; then undeclared members, when the schema admits them, in name
-/// order.
+/// Strings and member names in NFC and negative zero collapsed, with every
+/// member left where it was: the form reldir writes a value in.
+pub fn normalize_in_place_order(value: &Value) -> Value {
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(key, value)| (key.nfc().collect(), normalize_in_place_order(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(normalize_in_place_order).collect()),
+        other => normalize(other),
+    }
+}
+
+/// A row as reldir writes and records it: exactly the members it has -- an
+/// omitted member stays omitted, and reads as its default only where the row
+/// is read -- in the order it has them, values normalized and timestamp
+/// columns in UTC. Member order is the author's: a row reldir rewrites keeps
+/// its members where they were, and one it creates takes them in the order it
+/// was given them. Order is never part of identity; see [`row_hash`].
 pub fn canonical_row(row: &Map<String, Value>, schema: &Schema) -> Value {
     let mut out = Map::new();
-    for (name, column) in schema.columns() {
-        let mut value = row
-            .get(name)
-            .cloned()
-            .or_else(|| column.default().cloned())
-            .unwrap_or(Value::Null);
-        if column.kind() == &ColumnType::Timestamp
+    for (name, value) in row {
+        let mut value = value.clone();
+        if let Some(column) = schema.column(name)
+            && column.kind() == &ColumnType::Timestamp
             && let Some(text) = value::textual(&value, column.kind())
         {
             value = Value::String(text);
         }
-        out.insert(name.nfc().collect(), normalize(&value));
-    }
-    if schema.additional_fields() == AdditionalFields::Allow {
-        let mut extra: Vec<_> = row
-            .keys()
-            .filter(|key| !schema.columns().contains_key(*key))
-            .collect();
-        extra.sort();
-        for key in extra {
-            out.insert(key.clone(), normalize(&row[key]));
-        }
+        out.insert(name.nfc().collect(), normalize_in_place_order(&value));
     }
     Value::Object(out)
+}
+
+/// A row's identity in the state hash and in recorded history: the SHA-256 of
+/// its compact rendering with members sorted, so neither formatting nor member
+/// order is a change.
+pub fn row_hash(row: &Value) -> String {
+    hash_bytes(compact(row).as_bytes())
 }
 
 /// The comparison rendering of a value: compact JSON of its normalized form.
@@ -238,18 +249,6 @@ mod tests {
     }
 
     #[test]
-    fn test1003_canonical_rows_follow_schema_then_lexicographic_order() {
-        let s = schema(&[("zeta", "string"), ("alpha", "string"), ("nested", "json")], &["alpha"], json!({}));
-        let value = canonical_row(
-            &row(&[("nested", json!({"b": 1, "a": 2})), ("alpha", json!("A")), ("zeta", json!("Z"))]),
-            &s,
-        );
-        let text = String::from_utf8(pretty_with_indent(&value, 2)).unwrap();
-        assert!(text.find("zeta").unwrap() < text.find("alpha").unwrap(), "schema order wins: {text}");
-        assert!(text.find("\"a\"").unwrap() < text.find("\"b\"").unwrap(), "nested keys sort: {text}");
-    }
-
-    #[test]
     fn test1004_normalisation_collapses_incidental_representations() {
         assert_eq!(compact(&json!(-0.0)), "0");
         assert_eq!(compact(&Value::String("e\u{0301}".into())), compact(&Value::String("\u{e9}".into())));
@@ -257,13 +256,19 @@ mod tests {
     }
 
     #[test]
-    fn test1006_defaults_participate_in_the_canonical_value() {
-        let mut s = schema(&[("id", "string"), ("tag", "string")], &["id"], json!({})).edit();
+    fn test1006_the_canonical_row_holds_exactly_the_members_the_row_has() {
+        let mut s = schema(&[("id", "string"), ("tag", "string"), ("note", "string")], &["id"], json!({})).edit();
         s.set_default("tag", Some(json!("fallback")));
         let s = s.finish().unwrap();
         let omitted = canonical_row(&row(&[("id", json!("a"))]), &s);
-        let explicit = canonical_row(&row(&[("id", json!("a")), ("tag", json!("fallback"))]), &s);
-        assert_eq!(compact(&omitted), compact(&explicit));
+        assert_eq!(omitted, json!({"id": "a"}), "no default and no null is written for an omitted member");
+        let explicit = canonical_row(&row(&[("note", json!(null)), ("id", json!("a"))]), &s);
+        assert_eq!(compact(&explicit), r#"{"id":"a","note":null}"#);
+        let authored = canonical_row(&row(&[("note", json!("n")), ("tag", json!({"z": 1, "a": 2})), ("id", json!("a"))]), &s);
+        assert_eq!(authored.as_object().unwrap().keys().collect::<Vec<_>>(), ["note", "tag", "id"], "in the author's order");
+        assert_eq!(serde_json::to_string(&authored["tag"]).unwrap(), r#"{"z":1,"a":2}"#, "nested members too");
+        let reordered = canonical_row(&row(&[("id", json!("a")), ("tag", json!({"a": 2, "z": 1})), ("note", json!("n"))]), &s);
+        assert_eq!(row_hash(&authored), row_hash(&reordered), "order is not identity");
     }
 
     #[test]

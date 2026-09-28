@@ -368,7 +368,7 @@ pub fn check_document(document: &Value, source: Option<&[u8]>) -> Result<Vec<Dia
     let mut out = vec![];
     for error in validator.iter_errors(document) {
         let pointer = error.instance_path().to_string();
-        let mut diagnostic = describe(&error, &pointer);
+        let mut diagnostic = describe(&error, &pointer, document);
         diagnostic.pointer = Some(pointer.clone());
         if let Some(spans) = &spans {
             diagnostic.location = spans.location(&pointer);
@@ -420,21 +420,33 @@ fn nested_extension(value: &Value, pointer: &str, root: bool, out: &mut Vec<Diag
     }
 }
 
+/// The member name a `propertyNames` failure is about, however the evaluation
+/// reached it: reported either as the wrapping `propertyNames` error or as the
+/// inner failure whose instance is the name itself.
+fn unknown_member(error: &jsonschema::ValidationError<'_>, pointer: &str, document: &Value) -> Option<String> {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let named = |name: &str| {
+        document.pointer(pointer).and_then(Value::as_object).is_some_and(|object| object.contains_key(name))
+    };
+    match error.kind() {
+        Kind::PropertyNames { error: inner } => inner.instance().as_str().filter(|name| named(name)).map(String::from),
+        Kind::AnyOf { .. } => error.instance().as_str().filter(|name| named(name)).map(String::from),
+        _ => None,
+    }
+}
+
 /// One validation error against the dialect, stated for a schema author.
-fn describe(error: &jsonschema::ValidationError<'_>, pointer: &str) -> Diagnostic {
+fn describe(error: &jsonschema::ValidationError<'_>, pointer: &str, document: &Value) -> Diagnostic {
     use jsonschema::error::ValidationErrorKind as Kind;
     let at = if pointer.is_empty() { "/" } else { pointer };
     match error.kind() {
         // The closure: a member name that is no keyword. Name the nearest one,
         // because nearly every such error is a typo.
-        Kind::AnyOf { .. }
-            if error.schema_path().to_string().contains("propertyNames") =>
-        {
-            let name = error
-                .instance()
-                .as_str()
-                .map(String::from)
-                .unwrap_or_default();
+        // `propertyNames` reports the member name itself as the instance, at
+        // the pointer of the object holding it; however the evaluation got
+        // there, that shape is an unknown keyword.
+        _ if unknown_member(error, pointer, document).is_some() => {
+            let name = unknown_member(error, pointer, document).unwrap_or_default();
             let nearest = known_keywords()
                 .min_by_key(|candidate| strsim::levenshtein(&name, candidate))
                 .filter(|candidate| strsim::levenshtein(&name, candidate) <= 3);
@@ -534,7 +546,7 @@ mod tests {
         let hit = found
             .iter()
             .find(|d| d.code == "SCHEMA_UNKNOWN_KEY")
-            .expect("a typo deep in a composition is caught");
+            .unwrap_or_else(|| panic!("a typo deep in a composition is caught: {found:?}"));
         assert!(hit.message.contains("\"required\""), "{}", hit.message);
         assert_eq!(hit.pointer.as_deref(), Some("/properties/rules/items/oneOf/0"));
 

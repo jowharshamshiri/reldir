@@ -105,24 +105,31 @@ impl Catalog {
         crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut catalog = Self::empty(root, config, mirror, rebuilt_mirror);
             catalog.load_schemas(config, source)?;
+            crate::integrity::validate_schemas(&mut catalog);
             catalog.refresh(config, source)?;
             Ok(catalog)
         })
     }
 
-    /// Observe using schemas that were never written -- inferred in memory for a
-    /// folder that carries no database. Rows are read and judged exactly as for
-    /// a governed database, so there is one interpretation of validity
-    /// regardless of where the schemas came from.
+    /// Observe a folder that carries no database: its pins are read as usual,
+    /// and tables nobody pinned are governed by schemas inferred in memory and
+    /// never written. Rows are read and judged exactly as for a governed
+    /// database, so there is one interpretation of validity regardless of where
+    /// the schemas came from.
     pub fn observe_with_schemas(
         root: &Path,
         config: &Config,
         source: &dyn Source,
-        schemas: BTreeMap<String, Schema>,
+        inferred: BTreeMap<String, Schema>,
     ) -> Result<Self> {
         crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut catalog = Self::empty(root, config, Rc::new(Mirror::open_memory()?), false);
-            catalog.schemas = schemas;
+            catalog.load_schemas(config, source)?;
+            for (table, schema) in inferred {
+                if !catalog.schema_files.contains_key(&table) {
+                    catalog.schemas.insert(table, schema);
+                }
+            }
             crate::integrity::validate_schemas(&mut catalog);
             catalog.refresh(config, source)?;
             Ok(catalog)
@@ -138,6 +145,7 @@ impl Catalog {
         let outcome = crate::json::with_depth_limit(config.max_nesting_depth, || {
             let mut future = Self::empty(&self.root, config, Rc::clone(&self.mirror), false);
             future.load_schemas(config, source)?;
+            crate::integrity::validate_schemas(&mut future);
             future.refresh(config, source)?;
             crate::integrity::validate_through(&future, source)
         });
@@ -314,7 +322,6 @@ impl Catalog {
                 },
             );
         }
-        crate::integrity::validate_schemas(self);
         Ok(())
     }
 

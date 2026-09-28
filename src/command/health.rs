@@ -14,7 +14,11 @@ use std::collections::BTreeMap;
 fn state_name(database: &Database) -> &'static str {
     if !database.is_valid() {
         "INVALID"
-    } else if database.events.iter().any(|event| matches!(event, crate::db::Event::Recorded { .. })) {
+    } else if database
+        .events
+        .iter()
+        .any(|event| matches!(event, crate::db::Event::Recorded { origin, .. } if origin == "external" || origin == "recovery"))
+    {
         "VALID_CHANGED_EXTERNALLY"
     } else if !database.unrecorded.is_empty() {
         "VALID_UNRECORDED"

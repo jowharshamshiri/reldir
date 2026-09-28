@@ -407,9 +407,7 @@ pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Res
         .collect();
     transitions.push(Transition::Bootstrapped { inferred: inferred.clone() });
     if may_write {
-        let only_inferred: BTreeMap<String, Schema> =
-            schemas.into_iter().filter(|(table, _)| inferred.contains(table)).collect();
-        let database = Database::create(root.to_path_buf(), &only_inferred, false, overrides)?;
+        let database = Database::create(root.to_path_buf(), &schemas, false, overrides)?;
         Ok(Opened::Database { database: Box::new(database), transitions, planned: false })
     } else {
         let database = Database::ephemeral(root.to_path_buf(), schemas, overrides)?;
@@ -417,21 +415,19 @@ pub fn open(root: &Path, opening: Opening, overrides: &ResourceOverrides) -> Res
     }
 }
 
-/// The schemas a folder without metadata has: its pins, and schemas inferred
-/// for tables nobody pinned.
+/// Schemas inferred for the tables of a folder without metadata that nobody
+/// pinned. Pins are read by the catalog itself, so a fault in one is reported
+/// like any other schema fault.
 fn schemas_for(observation: &Observation, overrides: &ResourceOverrides) -> Result<BTreeMap<String, Schema>> {
     let mut config = Config::default();
     config.apply_overrides(overrides);
     config.validate().map_err(|message| DbError::new("RESOURCE_LIMIT", message, 1))?;
     let mut out = BTreeMap::new();
-    for table in &observation.topology.pinned {
-        out.insert(table.clone(), crate::schema_store::load(&crate::schema_store::pin_path(&observation.root, table))?);
-    }
     let missing: Vec<String> = observation
         .topology
         .table_candidates
         .iter()
-        .filter(|table| !out.contains_key(*table))
+        .filter(|table| !observation.topology.pinned.contains(table))
         .cloned()
         .collect();
     if !missing.is_empty() {
@@ -536,7 +532,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let handwritten = format!(
-            "{{\n    \"$schema\": \"{}\",\n    \"type\": \"object\",\n    \"properties\": {{\"id\": {{\"type\": \"string\"}}}},\n    \"required\": [\"id\"],\n    \"x-reldir\": {{\"table\": \"users\", \"primaryKey\": [\"id\"]}}\n}}\n",
+            "{{\n    \"$schema\": \"{}\",\n    \"type\": \"object\",\n    \"properties\": {{\"id\": {{\"type\": \"string\"}}}},\n    \"required\": [\"id\"],\n    \"additionalProperties\": false,\n    \"x-reldir\": {{\"table\": \"users\", \"primaryKey\": [\"id\"]}}\n}}\n",
             crate::schema::meta::DIALECT_URI
         );
         write(&root.join("schema/users.json"), &handwritten);

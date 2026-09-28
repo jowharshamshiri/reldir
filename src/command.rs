@@ -237,7 +237,7 @@ pub fn committed(sink: &mut dyn Sink, outcome: &crate::db::Outcome, verb: &str) 
     }
     let files = outcome.changes.len();
     let summary = match (outcome.dry_run, outcome.revision) {
-        (true, _) => format!("would {verb}: {files} file(s); nothing was written"),
+        (true, _) => format!("dry run: {files} file(s) would change; nothing was written"),
         (false, Some(revision)) => format!("{verb}: {files} file(s), revision {revision}"),
         (false, None) => "no change".to_string(),
     };

@@ -288,12 +288,11 @@ impl ForeignKey {
     /// A human spelling of the key, as `constraint` in diagnostics.
     pub fn describe(&self, table: &str) -> String {
         let from: Vec<String> = self.from.iter().map(ToString::to_string).collect();
-        format!(
-            "{table}.{} -> {}({})",
-            from.join(","),
-            self.to.describe(),
-            self.columns.join(",")
-        )
+        if self.columns.is_empty() {
+            format!("{table}.{} -> {}", from.join(","), self.to.describe())
+        } else {
+            format!("{table}.{} -> {}({})", from.join(","), self.to.describe(), self.columns.join(","))
+        }
     }
 }
 

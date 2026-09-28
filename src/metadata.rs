@@ -421,7 +421,7 @@ pub fn object_hash(kind: &str, value: &Value) -> Result<String> {
             format!("{}\n", value.as_str().ok_or_else(|| corrupt("a format object is a string"))?.trim()).as_bytes(),
         ),
         "schema" => crate::schema::identity::identity(value),
-        "row" => canonical::hash_bytes(&serde_json::to_vec(value).map_err(internal)?),
+        "row" => canonical::row_hash(value),
         _ => canonical::hash_bytes(&serde_json::to_vec(&canonical::normalize(value)).map_err(internal)?),
     })
 }
@@ -552,18 +552,32 @@ pub fn record(
 ) -> Result<Provenance> {
     let root = &catalog.root;
     let changes = pending_changes(catalog)?;
-    ensure_real_directory(&root.join(".db/objects"), true, "object store")?;
+    let objects = root.join(".db/objects");
+    ensure_real_directory(&objects, true, "object store")?;
+    // Objects are written without a flush each and made durable together
+    // before the record that names them is written: a crash in between leaves
+    // objects no record references, which `reldir gc` collects. An object is
+    // content-addressed, so one found damaged -- torn by such a crash -- is
+    // simply written again.
+    let mut written = false;
     for (path, entry) in changes.iter().filter_map(|(p, e)| e.as_ref().map(|e| (p, e))) {
         let target = object_path(root, &entry.hash);
-        if target.exists() {
-            verify_object(root, path, entry)?;
+        if target.exists() && verify_object(root, path, entry).is_ok() {
             continue;
         }
         let value = object_value(catalog, path, entry)?;
         if object_hash(&entry.kind, &value)? != entry.hash {
             return Err(corrupt(format!("the object for {path} does not hash to its entry")));
         }
-        write_json_atomic(&target, &value)?;
+        let mut bytes = serde_json::to_vec_pretty(&value).map_err(internal)?;
+        bytes.push(b'\n');
+        let temp = target.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temp, &bytes).map_err(|error| DbError::io(&temp, error))?;
+        fs::rename(&temp, &target).map_err(|error| DbError::io(&target, error))?;
+        written = true;
+    }
+    if written {
+        crate::fs::flush_everything_under(&objects).map_err(|error| DbError::io(&objects, error))?;
     }
     let record = Provenance {
         revision: head.map_or(1, |h| h.revision + 1),

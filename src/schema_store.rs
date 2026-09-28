@@ -20,7 +20,6 @@
 
 use crate::{
     catalog::Catalog,
-    diagnostic::{DbError, Diagnostic, Result},
     schema::{Schema, SchemaFileKind},
 };
 use std::path::{Path, PathBuf};
@@ -77,26 +76,6 @@ pub fn schema_table(path: &Path) -> Option<&str> {
     path.file_stem().and_then(|stem| stem.to_str())
 }
 
-/// Read a schema file that is expected to exist, reporting its first fault as
-/// an error at its path.
-pub fn load(path: &Path) -> Result<Schema> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| DbError::io(path, error))?;
-    if !metadata.file_type().is_file() || crate::catalog::has_multiple_links(&metadata) {
-        return Err(DbError::from_diag(
-            Diagnostic::error("NON_REGULAR_FILE", "schema files must be private regular files").at(path),
-            2,
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|error| DbError::io(path, error))?;
-    Schema::from_bytes(&bytes).map_err(|problems| {
-        let first = problems
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Diagnostic::error("SCHEMA_INVALID", "the schema could not be read"));
-        DbError::from_diag(first.at(path), 2)
-    })
-}
-
 /// Whether two schemas impose the same rules. Formatting, member order and
 /// annotations are not rules.
 pub fn equivalent(left: &Schema, right: &Schema) -> bool {
@@ -150,11 +129,4 @@ mod tests {
         assert!(equivalent(&plain, &wide), "formatting is not a rule");
     }
 
-    #[test]
-    fn test1124_a_schema_file_that_is_not_a_regular_file_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(directory.path().join("schema/users.json")).unwrap();
-        let error = load(&directory.path().join("schema/users.json")).unwrap_err();
-        assert_eq!(error.diagnostic.code, "NON_REGULAR_FILE");
-    }
 }

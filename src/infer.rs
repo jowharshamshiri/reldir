@@ -285,11 +285,12 @@ fn infer_table(
     config: &Config,
     requested_key: Option<&[String]>,
 ) -> Result<(TableBuilder, Vec<String>, ColumnType)> {
-    let mut names = BTreeSet::new();
+    // Columns in the order the rows first present them.
+    let mut names = indexmap::IndexSet::new();
     for row in rows {
         names.extend(row.obj.keys().cloned());
     }
-    let mut columns: BTreeMap<String, (Inferred, bool)> = BTreeMap::new();
+    let mut columns: indexmap::IndexMap<String, (Inferred, bool)> = indexmap::IndexMap::new();
     for name in &names {
         let present: Vec<&Value> = rows.iter().filter_map(|row| row.obj.get(name)).collect();
         let nullable = present.len() != rows.len() || present.iter().any(|value| value.is_null());
@@ -345,7 +346,7 @@ fn infer_table(
 fn validate_requested_key(
     table: &str,
     rows: &[Sample],
-    columns: &BTreeMap<String, (Inferred, bool)>,
+    columns: &indexmap::IndexMap<String, (Inferred, bool)>,
     requested: &[String],
 ) -> Result<()> {
     let mut seen_names = BTreeSet::new();
@@ -461,7 +462,7 @@ fn infer_value(
             Inferred { kind: ColumnType::Array, subschema: schema }
         }
         Value::Object(_) => {
-            let mut keys = BTreeSet::new();
+            let mut keys = indexmap::IndexSet::new();
             for value in values {
                 keys.extend(value.as_object().into_iter().flat_map(|object| object.keys().cloned()));
             }
@@ -498,7 +499,7 @@ fn infer_value(
 fn infer_primary_key(
     table: &str,
     rows: &[Sample],
-    columns: &BTreeMap<String, (Inferred, bool)>,
+    columns: &indexmap::IndexMap<String, (Inferred, bool)>,
 ) -> Result<Vec<String>> {
     let mut candidates = vec![];
     let mut rejected = vec![];

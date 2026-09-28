@@ -262,11 +262,23 @@ fn io_error(error: impl std::fmt::Display) -> DbError {
     DbError::new("IO_ERROR", format!("cannot write output: {error}"), 6)
 }
 
+/// A reader that stopped reading -- `reldir ... | head` -- has what it asked
+/// for. That is the end of the output, not a failure to report.
+fn write_failed(error: std::io::Error) -> DbError {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    io_error(error)
+}
+
 fn write_line(value: &Value) -> Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    serde_json::to_writer(&mut lock, value).map_err(io_error)?;
-    lock.write_all(b"\n").map_err(io_error)
+    serde_json::to_writer(&mut lock, value).map_err(|error| match error.io_error_kind() {
+        Some(kind) => write_failed(std::io::Error::from(kind)),
+        None => io_error(error),
+    })?;
+    lock.write_all(b"\n").map_err(write_failed)
 }
 
 /// A sink that writes to the terminal in one format.
@@ -344,8 +356,23 @@ impl Terminal {
                     lock.write_all(b"\n").map_err(io_error)?;
                 }
                 Format::Table => {
-                    if !self.table.is_empty() {
-                        table(&self.table);
+                    // One table per kind of record, in the order the kinds
+                    // first appear: a fix and a file change have nothing in
+                    // common to align.
+                    let mut kinds: Vec<Option<&Value>> = vec![];
+                    for record in &self.table {
+                        let kind = record.get("kind");
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                    for (index, kind) in kinds.iter().enumerate() {
+                        let group: Vec<Map<String, Value>> =
+                            self.table.iter().filter(|record| record.get("kind") == *kind).cloned().collect();
+                        if index > 0 {
+                            println!();
+                        }
+                        table(&group);
                     }
                     match &outcome {
                         Ok(finish) => {

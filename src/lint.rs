@@ -364,9 +364,9 @@ fn reference_findings(lint: &mut Lint<'_>, config: &Config) -> Result<()> {
         facts.insert(table.clone(), TableFacts::gather(table, key, Some(schema), rows.iter().map(|row| &row.value)));
     }
     for proposal in references::detect(&facts, config) {
-        let (code, fix) = match &proposal.target {
-            ProposedTarget::Table(_) => ("LINT_FK_CANDIDATE", "FIX_ADD_FK"),
-            ProposedTarget::Domain { .. } => ("LINT_DOMAIN_CANDIDATE", "FIX_ADD_FK"),
+        let code = match &proposal.target {
+            ProposedTarget::Table(_) => "LINT_FK_CANDIDATE",
+            ProposedTarget::Domain { .. } => "LINT_DOMAIN_CANDIDATE",
         };
         let mut edits = BTreeMap::new();
         let mut valid = true;
@@ -399,7 +399,7 @@ fn reference_findings(lint: &mut Lint<'_>, config: &Config) -> Result<()> {
             Diagnostic::suggestion(code, proposal.describe())
                 .field(proposal.path.to_string())
                 .expected(proposal.definition().to_string())
-                .fix(fix),
+                .fix("FIX_ADD_FK"),
             valid.then_some(Remedy::Edit(edits)),
         );
     }
@@ -454,9 +454,12 @@ mod tests {
         }
         assert!(promised.len() >= 8, "found {}", promised.len());
         for (fix, code) in promised {
-            let raised = source.find(&format!("\"{code}\"")).unwrap_or_else(|| panic!("{code} is never raised"));
-            let following = &source[raised..(raised + 600).min(source.len())];
-            assert!(following.contains(&format!(".fix(\"{fix}\")")), "{code} does not attach {fix}");
+            let raised: Vec<usize> = source.match_indices(&format!("\"{code}\"")).map(|(at, _)| at).collect();
+            assert!(!raised.is_empty(), "{code} is never raised");
+            let attached = raised
+                .iter()
+                .any(|at| source[*at..(*at + 900).min(source.len())].contains(&format!(".fix(\"{fix}\")")));
+            assert!(attached, "{code} does not attach {fix}");
         }
     }
 

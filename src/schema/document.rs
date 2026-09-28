@@ -560,13 +560,11 @@ fn validate_local(schema: &Schema) -> Problems {
             }
         }
     }
-    let filename = schema.filename_columns();
-    let keyed = filename == schema.primary_key.as_slice()
-        || schema.unique.iter().any(|unique| unique.as_slice() == filename);
-    if !keyed
-        || filename
-            .iter()
-            .any(|column| schema.columns.get(column).is_some_and(|c| c.nullable))
+    // Only a declared filename can fail this: the default is the primary key,
+    // whose own faults are reported against the key.
+    if let Some(filename) = &schema.filename
+        && (!(filename == &schema.primary_key || schema.unique.contains(filename))
+            || filename.iter().any(|column| schema.columns.get(column).is_some_and(|c| c.nullable)))
     {
         out.push(column_error(
             "SCHEMA_FILENAME_NOT_UNIQUE",
