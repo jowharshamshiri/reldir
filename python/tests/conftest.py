@@ -22,13 +22,15 @@ import reldir
 def _binary() -> str:
     """The binary under test.
 
-    Prefers a local debug build so the suite exercises the working tree rather
-    than whatever is installed, and says so clearly when neither exists.
+    Prefers the working tree's debug build -- wherever cargo puts it, which a
+    `CARGO_TARGET_DIR` or `build.target-dir` may move -- so the suite exercises
+    this source rather than whatever is installed, and says so clearly when
+    neither exists.
     """
     override = os.environ.get("RELDIR_BINARY")
     if override:
         return override
-    local = Path(__file__).resolve().parents[2] / "target" / "debug" / "reldir"
+    local = _target_directory() / "debug" / ("reldir.exe" if os.name == "nt" else "reldir")
     if local.exists():
         return str(local)
     found = shutil.which("reldir")
@@ -38,6 +40,21 @@ def _binary() -> str:
         "no reldir binary: build one with `cargo build` or set RELDIR_BINARY",
         allow_module_level=True,
     )
+
+
+def _target_directory() -> Path:
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return repository / "target"
+    return Path(json.loads(metadata.stdout)["target_directory"])
 
 
 @pytest.fixture(scope="session")

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 ACCOUNTS = {
-    "$schema": "https://reldir.dev/schema/reldir-1",
+    "$schema": "https://reldir.dev/schema/reldir-2",
     "type": "object",
     "properties": {
         "id": {"type": "string", "pattern": "^acct-[0-9]{4}$"},
@@ -29,7 +29,6 @@ ACCOUNTS = {
         "table": "accounts",
         "schemaVersion": 1,
         "primaryKey": ["id"],
-        "columnOrder": ["id", "email", "balance", "status", "opened"],
         "unique": [["email"]],
         "checks": [{"name": "balance_not_negative", "expr": "balance >= 0"}],
         "generated": {"opened": "now"},
@@ -37,7 +36,7 @@ ACCOUNTS = {
 }
 
 ORDERS = {
-    "$schema": "https://reldir.dev/schema/reldir-1",
+    "$schema": "https://reldir.dev/schema/reldir-2",
     "type": "object",
     "properties": {
         "id": {"type": "string", "format": "uuid"},
@@ -52,12 +51,10 @@ ORDERS = {
         "table": "orders",
         "schemaVersion": 1,
         "primaryKey": ["id"],
-        "columnOrder": ["id", "account_id", "amount", "note", "placed"],
-        "indexes": [["account_id"]],
         "foreignKeys": [
             {
-                "columns": ["account_id"],
-                "references": {"table": "accounts", "columns": ["id"]},
+                "from": ["account_id"],
+                "to": {"table": "accounts"},
                 "onDelete": "restrict",
                 "onUpdate": "restrict",
             }
@@ -67,7 +64,7 @@ ORDERS = {
 }
 
 AUDIT = {
-    "$schema": "https://reldir.dev/schema/reldir-1",
+    "$schema": "https://reldir.dev/schema/reldir-2",
     "type": "object",
     "properties": {
         "id": {"type": "string", "format": "uuid"},
@@ -82,7 +79,6 @@ AUDIT = {
         "table": "audit",
         "schemaVersion": 1,
         "primaryKey": ["id"],
-        "columnOrder": ["id", "account_id", "delta", "reason", "at"],
         "indexes": [["account_id"]],
         "generated": {"id": "uuid", "at": "now"},
     },

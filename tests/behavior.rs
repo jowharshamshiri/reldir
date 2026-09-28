@@ -1031,7 +1031,7 @@ fn test3043_parameters_are_values_never_sql() {
             "sql",
             "SELECT id FROM users WHERE name = ?",
             "--param",
-            "Ada",
+            "\"Ada\"",
         ],
     );
     assert_eq!(found["records"][0]["id"], "ada");
@@ -1041,7 +1041,7 @@ fn test3043_parameters_are_values_never_sql() {
             "sql",
             "SELECT id FROM users WHERE name = :who",
             "--param",
-            "who=Bob",
+            "who=\"Bob\"",
         ],
     );
     assert_eq!(named["records"][0]["id"], "bob");
@@ -1051,10 +1051,35 @@ fn test3043_parameters_are_values_never_sql() {
             "sql",
             "SELECT count(*) AS n FROM users WHERE name = ?",
             "--param",
-            "x' OR '1'='1",
+            "\"x' OR '1'='1\"",
         ],
     );
     assert_eq!(hostile["records"][0]["n"], 0);
+    // A value is JSON, never guessed: `7` is a number and `"7"` text, and
+    // text left unquoted is refused rather than read as whichever it looks like.
+    let typed = ok(
+        root,
+        &[
+            "sql",
+            "SELECT typeof(?) AS a, typeof(?) AS b",
+            "--param",
+            "7",
+            "--param",
+            "\"7\"",
+        ],
+    );
+    assert_eq!(typed["records"][0]["a"], "integer");
+    assert_eq!(typed["records"][0]["b"], "text");
+    let (refused, exit) = run(root, &["sql", "SELECT ?", "--param", "Ada"]);
+    assert_eq!(exit, 1);
+    assert_eq!(refused["error"]["code"], "USAGE");
+    assert!(
+        refused["error"]["help"]
+            .as_str()
+            .unwrap()
+            .contains("'\"Ada\"'"),
+        "{refused:#}"
+    );
 }
 
 #[test]

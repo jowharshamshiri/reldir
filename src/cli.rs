@@ -239,12 +239,12 @@ pub enum Command {
     },
     /// Run one SQL statement: a query, or an INSERT, UPDATE or DELETE.
     #[command(
-        after_help = "Examples:\n  reldir sql 'SELECT * FROM users WHERE id = ?' --param u1\n  echo 'SELECT count(*) FROM users' | reldir sql -"
+        after_help = "Examples:\n  reldir sql 'SELECT * FROM users WHERE id = ?' --param '\"u1\"'\n  echo 'SELECT count(*) FROM users' | reldir sql -"
     )]
     Sql {
         /// The statement; `-` reads it from stdin.
         statement: String,
-        /// A parameter: `value` for the next `?`, or `name=value` for `:name`. Values are JSON, or text.
+        /// A parameter, as JSON: `value` for the next `?`, or `name=value` for `:name`. Text is quoted: '"Ada"'.
         #[arg(long = "param", value_name = "VALUE")]
         params: Vec<String>,
     },

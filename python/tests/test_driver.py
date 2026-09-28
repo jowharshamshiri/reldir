@@ -89,49 +89,51 @@ def test_a_write_lands_on_disk_as_readable_json(
 # -------------------------------------------------------------------- binding
 
 
-def test_parameters_are_quoted_not_interpolated(db: reldir.Connection) -> None:
+def test_parameters_are_values_not_sql(db: reldir.Connection) -> None:
     # The injection this prevents: a value containing a quote must land as data.
     db.execute("INSERT INTO users (id, name) VALUES (?, ?)", ["u5", "O'Brien"])
-    assert db.one("SELECT name FROM users WHERE id = 'u5'")["name"] == "O'Brien"
+    assert db.one("SELECT name FROM users WHERE id = ?", ["u5"])["name"] == "O'Brien"
+    hostile = "x' OR '1'='1"
+    assert db.scalar("SELECT count(*) FROM users WHERE name = ?", [hostile]) == 0
 
 
-def test_a_placeholder_inside_a_literal_is_not_a_placeholder() -> None:
-    from reldir import _bind
-
+def test_a_placeholder_inside_a_literal_is_not_a_placeholder(
+    db: reldir.Connection,
+) -> None:
     # Counting `?` characters would bind the one inside the string and shift
-    # every later parameter, which is why the scan tracks quoting.
-    assert _bind("SELECT '?' , ?", [1]) == "SELECT '?' , 1"
-    assert _bind("SELECT 'it''s ?', ?", ["x"]) == "SELECT 'it''s ?', 'x'"
+    # every later parameter.
+    row = db.one("SELECT '?' AS q, ? AS p", [1])
+    assert row == {"q": "?", "p": 1}
 
 
-def test_placeholder_and_parameter_counts_must_agree() -> None:
-    from reldir import _bind
+def test_parameters_keep_their_type(db: reldir.Connection) -> None:
+    # 7 and "7" are different values; a driver that sent both as the same text
+    # would make a text key compare equal to a number, or never match at all.
+    row = db.one(
+        "SELECT typeof(?) AS a, typeof(?) AS b, typeof(?) AS c, typeof(?) AS d",
+        [7, "7", None, 1.5],
+    )
+    assert row == {"a": "integer", "b": "text", "c": "null", "d": "real"}
+    assert db.scalar("SELECT json_extract(?, '$.k[1]')", [{"k": [1, 2]}]) == 2
 
-    with pytest.raises(ValueError, match="more placeholders"):
-        _bind("SELECT ?, ?", [1])
-    with pytest.raises(ValueError, match="2 parameters"):
-        _bind("SELECT ?", [1, 2])
-    with pytest.raises(ValueError, match="unterminated"):
-        _bind("SELECT 'open", [])
+
+def test_placeholder_and_parameter_counts_must_agree(db: reldir.Connection) -> None:
+    with pytest.raises(reldir.QueryError, match="2 parameter"):
+        db.query("SELECT ?, ?", [1])
+    with pytest.raises(reldir.QueryError, match="1 parameter"):
+        db.query("SELECT ?", [1, 2])
 
 
-def test_literals_cover_reldir_types_and_refuse_others() -> None:
-    from reldir import _literal
-
-    assert _literal(None) == "NULL"
-    assert _literal(True) == "true"
-    assert _literal(False) == "false"
-    assert _literal(3) == "3"
-    assert _literal("a'b") == "'a''b'"
-    assert json.loads(_literal({"k": 1})[1:-1]) == {"k": 1}
-
+def test_a_value_without_a_reldir_type_is_refused_before_running(
+    db: reldir.Connection,
+) -> None:
     import datetime
 
     # Coercing this through str() is how a datetime becomes an unparseable row.
-    with pytest.raises(TypeError):
-        _literal(datetime.datetime(2026, 1, 1))
-    with pytest.raises(ValueError):
-        _literal(float("nan"))
+    with pytest.raises(TypeError, match="datetime"):
+        db.query("SELECT ?", [datetime.datetime(2026, 1, 1)])
+    with pytest.raises(ValueError, match="JSON"):
+        db.query("SELECT ?", [float("nan")])
 
 
 # ------------------------------------------------------------------ diagnostics
@@ -327,7 +329,6 @@ def test_a_genuinely_interrupted_transaction_still_surfaces(
         json.dumps(
             {
                 "id": "55555555-5555-4555-8555-555555555555",
-                "start_root": "x",
                 "origin": "internal",
                 "changes": [{"path": "users/u1.json", "stage": "00000000"}],
             }
@@ -358,7 +359,6 @@ def test_a_staged_transaction_does_not_refuse_a_reader(
         json.dumps(
             {
                 "id": "11111111-1111-4111-8111-111111111111",
-                "start_root": "x",
                 "origin": "internal",
                 "changes": [{"path": "users/u1.json", "stage": "00000000"}],
             }
@@ -508,7 +508,46 @@ def test_check_raises_on_an_invalid_database(
     db: reldir.Connection, database: Path
 ) -> None:
     # An externally written row that violates the schema must surface as a
-    # typed failure, not as a silently ignored file.
-    (database / "users" / "bad.json").write_text(json.dumps({"id": 42}) + "\n")
-    with pytest.raises(reldir.ReldirError):
+    # typed failure carrying every violation, not a bare exit status.
+    (database / "users" / "bad.json").write_text(json.dumps({"id": "bad"}) + "\n")
+    (database / "users" / "worse.json").write_text(json.dumps({"id": "worse"}) + "\n")
+    with pytest.raises(reldir.DatabaseInvalid) as caught:
         db.check()
+    error = caught.value
+    assert error.exit_code == 2
+    assert error.path in ("users/bad.json", "users/worse.json")
+    violations = [d for d in error.diagnostics if d.get("severity") == "error"]
+    assert {d["path"] for d in violations} == {"users/bad.json", "users/worse.json"}
+    assert "1 more violation" in error.message
+    # status reports the same state without raising: it is an observation.
+    status = db.status()
+    assert status["valid"] is False
+    assert status["violations"] == 2
+
+
+def test_a_folder_that_cannot_be_adopted_says_why(
+    tmp_path: Path, binary: str
+) -> None:
+    # The first command on a bare folder infers its schemas; data no schema can
+    # describe is refused with the file named, not adopted half-understood.
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "n1.json").write_text("[1, 2, 3]\n")
+    with reldir.connect(tmp_path, binary=binary) as bare:
+        with pytest.raises(reldir.InferenceFailed) as caught:
+            bare.tables()
+    assert caught.value.exit_code == 8
+    assert caught.value.code.startswith("INFER_")
+    assert caught.value.path == "notes/n1.json"
+
+
+def test_an_unsupported_format_is_refused_by_name(
+    db: reldir.Connection, database: Path
+) -> None:
+    (database / ".db" / "format").write_text("format_version = 1\n")
+    with pytest.raises(reldir.FormatUnsupported) as caught:
+        db.query("SELECT 1")
+    assert caught.value.exit_code == 6
+
+
+def test_tables_lists_the_governed_tables(db: reldir.Connection) -> None:
+    assert sorted(db.tables()) == ["counters", "users"]

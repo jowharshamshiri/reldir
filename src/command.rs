@@ -219,8 +219,16 @@ pub fn parse_params(texts: &[String]) -> Result<Vec<crate::sql::SqlParam>> {
                 }
                 _ => (None, text.as_str()),
             };
-            let value =
-                crate::json::parse_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+            // Always JSON: reading `7` as a number but `007` as text, or `a=b`
+            // as a named parameter when text was meant, would bind a value
+            // other than the one intended and the statement would quietly
+            // match nothing. No JSON value begins `identifier=`, so the name
+            // split cannot misread one.
+            let value = crate::json::parse_str(raw).map_err(|error| {
+                DbError::usage(format!("--param {text:?} is not a JSON value ({error})")).with_help(format!(
+                    "a parameter is JSON: text is quoted, as in --param '\"{raw}\"'; a number, true, false or null is bare"
+                ))
+            })?;
             Ok(crate::sql::SqlParam { name, value })
         })
         .collect()

@@ -48,10 +48,12 @@ and a bare `reldir` with SQL on its standard input read the statement from stdin
 ## Parameters
 
 Values are bound, never spliced into the text. `--param` gives the next `?`, or
-a named `:name` with `name=value`; a value is JSON, or text when it is not JSON:
+a named `:name` with `name=value`. A value is always JSON -- text is quoted,
+numbers, `true`, `false` and `null` are bare -- so `7` and `"7"` can never be
+confused:
 
 ```console
-$ reldir sql 'SELECT id FROM users WHERE name = ?' --param Grace
+$ reldir sql 'SELECT id FROM users WHERE name = ?' --param '"Grace"'
 id
 -----
 grace

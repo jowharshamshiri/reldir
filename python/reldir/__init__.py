@@ -19,12 +19,16 @@ lock held waits for it. When the wait expires the binary reports
 `Connection.execute` retries that for you, with the same bounded, jittered
 backoff the binary uses internally.
 
-What it does *not* silently retry is ``CONCURRENT_MODIFICATION``: nothing was
-written there either, but the state the statement was planned against has moved,
-so a blind retry would re-plan against different data. For a bare statement that
-is usually what you want and `retry_on_conflict` (default true) does it; for a
-read-modify-write it is a lost update, so use `Connection.transaction` which
-re-reads and hands you the fresh state.
+A statement is planned by the binary under its writer lock, against the state
+it commits to, so ``UPDATE t SET n = n + 1`` from many threads never loses an
+increment. What the binary cannot see is a value *you* read in Python and wrote
+back later; `Connection.transaction` re-runs such a read-modify-write when the
+state moved underneath it.
+
+Every invocation speaks reldir's machine contract: one ``command_result``
+envelope (``--format json``) whose ``error`` carries the diagnostic that stopped
+the command. Parameters are bound by the binary (``--param``), never spliced
+into the SQL text.
 """
 
 from __future__ import annotations
@@ -60,7 +64,9 @@ __all__ = [
     "FormatUnsupported",
     "MetadataCorrupt",
     "Uninitialized",
-    "ConfirmationRequired",
+    "InferenceFailed",
+    "DecisionRequired",
+    "UnsafeFilesystem",
     "UsageError",
     "Stale",
     "Result",
@@ -86,6 +92,7 @@ class ReldirError(Exception):
         *,
         exit_code: int,
         diagnostic: Mapping[str, Any] | None = None,
+        diagnostics: Sequence[Mapping[str, Any]] = (),
         stderr: str = "",
     ) -> None:
         super().__init__(f"{code}: {message}" if code else message)
@@ -93,6 +100,9 @@ class ReldirError(Exception):
         self.message = message
         self.exit_code = exit_code
         self.diagnostic: Mapping[str, Any] = diagnostic or {}
+        # Every diagnostic the command reported -- for `DatabaseInvalid`, each
+        # violation, of which `diagnostic` is the first.
+        self.diagnostics: list[Mapping[str, Any]] = list(diagnostics)
         self.stderr = stderr
 
     @property
@@ -123,11 +133,11 @@ class LockContended(ReldirError):
 
 
 class ConcurrentModification(ReldirError):
-    """Authoritative files changed underneath the statement.
+    """Authoritative files changed while the statement was committing.
 
-    Nothing was written, but the state the statement was planned against has
-    moved. A retry re-plans against the new data, which is correct for a bare
-    statement and wrong for a read-modify-write.
+    Nothing was written. A retry plans again against the new data, which is
+    correct for a bare statement and wrong for a read-modify-write whose values
+    came from an earlier read.
     """
 
 
@@ -152,11 +162,15 @@ class ResourceLimit(ReldirError):
 
 
 class TransactionIncomplete(ReldirError):
-    """An interrupted transaction materialised a state needing recovery."""
+    """An interrupted transaction cannot be rolled forward safely."""
 
 
 class RecoveryRequired(TransactionIncomplete):
-    """Kept as a distinct name for callers that catch recovery specifically."""
+    """A read met a transaction partway through its renames.
+
+    Momentary while a writer is committing; lasting only if a writer died
+    mid-commit, which any writing command recovers.
+    """
 
 
 class FormatUnsupported(ReldirError):
@@ -171,8 +185,20 @@ class Uninitialized(ReldirError):
     """The directory is not a database and was not permitted to become one."""
 
 
-class ConfirmationRequired(ReldirError):
-    """The operation needs confirmation, which the driver always supplies."""
+class InferenceFailed(ReldirError):
+    """A folder being adopted holds data no schema can be inferred for -- a
+    file that is not JSON, a row that is not an object, a table with no
+    primary key. Its code (``INFER_*``) names which, and its path where."""
+
+
+class DecisionRequired(ReldirError):
+    """The operation needs a decision: a confirmation the driver supplies with
+    ``--yes``, or a policy or authorisation the caller must choose."""
+
+
+class UnsafeFilesystem(ReldirError):
+    """A write on a network or FUSE filesystem the database is not configured
+    to trust (``allow_remote_filesystem``)."""
 
 
 class UsageError(ReldirError):
@@ -199,9 +225,10 @@ _EXIT_CLASSES: dict[int, type[ReldirError]] = {
     4: QueryError,
     5: TransactionIncomplete,
     6: MetadataCorrupt,
-    8: DatabaseInvalid,
-    9: ConfirmationRequired,
+    8: InferenceFailed,
+    9: DecisionRequired,
     10: Uninitialized,
+    11: UnsafeFilesystem,
 }
 
 # The code is more specific than the exit status, so it wins where both apply.
@@ -209,7 +236,8 @@ _CODE_CLASSES: dict[str, type[ReldirError]] = {
     "LOCK_CONTENDED": LockContended,
     "CONCURRENT_MODIFICATION": ConcurrentModification,
     "PATH_INTERFERENCE": PathInterference,
-    "TRANSACTION_INCOMPLETE": RecoveryRequired,
+    "TRANSACTION_INCOMPLETE": TransactionIncomplete,
+    "RECOVERY_REQUIRED": RecoveryRequired,
     "QUERY_UNSUPPORTED": QueryError,
     "QUERY_TYPE_ERROR": QueryError,
     "UNKNOWN_TABLE": UnknownName,
@@ -219,7 +247,8 @@ _CODE_CLASSES: dict[str, type[ReldirError]] = {
     "FORMAT_UNSUPPORTED": FormatUnsupported,
     "INTERNAL_METADATA_CORRUPT": MetadataCorrupt,
     "UNINITIALIZED": Uninitialized,
-    "CONFIRMATION_REQUIRED": ConfirmationRequired,
+    "DECISION_REQUIRED": DecisionRequired,
+    "UNSAFE_FILESYSTEM": UnsafeFilesystem,
     "USAGE": UsageError,
 }
 
@@ -238,9 +267,9 @@ class Row(dict):
 class Result(list):
     """What a statement produced.
 
-    A `list` of `Row`, so it iterates and indexes like a query result, plus
-    `changed`: how many files the statement rewrote. The count is what makes a
-    compare-and-set usable -- an `UPDATE` whose `WHERE` no longer matches
+    A `list` of `Row` -- a query's rows, or a change's ``RETURNING`` rows --
+    plus `changed`: how many files the statement wrote or removed. The count is
+    what makes a compare-and-set usable -- an `UPDATE` whose `WHERE` no longer matches
     changes nothing and succeeds, and only the count distinguishes that from a
     write that landed.
     """
@@ -292,7 +321,11 @@ class _Invocation:
     stdout: str
     stderr: str
     returncode: int
-    records: list[dict] = field(default_factory=list)
+    envelope: dict = field(default_factory=dict)
+
+    @property
+    def records(self) -> list[dict]:
+        return list(self.envelope.get("records", []))
 
 
 class Connection:
@@ -339,7 +372,7 @@ class Connection:
     def _run(self, args: Sequence[str], *, readonly: bool) -> _Invocation:
         if self._closed:
             raise ValueError("this connection is closed")
-        argv = [self.binary, "--db", str(self.path), "--format", "jsonl"]
+        argv = [self.binary, "--db", str(self.path), "--format", "json"]
         if readonly:
             # A read that takes no lock cannot contend and cannot be refused by
             # a concurrent writer, which is the whole reason to distinguish it.
@@ -365,30 +398,39 @@ class Connection:
             stderr=completed.stderr,
             returncode=completed.returncode,
         )
-        for line in completed.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError as cause:
-                # The binary promises JSONL on stdout under `--format jsonl`.
-                # Anything else means a version mismatch or a crash mid-write,
-                # and guessing at half a record would invent data.
-                raise ReldirError(
-                    "DRIVER_PROTOCOL",
-                    f"reldir emitted a line that is not JSON: {line[:200]!r}",
-                    exit_code=completed.returncode,
-                    stderr=completed.stderr,
-                ) from cause
-            if isinstance(parsed, dict):
-                invocation.records.append(parsed)
+        try:
+            envelope = json.loads(completed.stdout)
+        except json.JSONDecodeError as cause:
+            # The binary promises one envelope on stdout under `--format json`.
+            # Anything else means a version mismatch or a crash mid-write, and
+            # guessing at half a document would invent data.
+            raise ReldirError(
+                "DRIVER_PROTOCOL",
+                f"reldir did not print a command_result envelope: {completed.stdout[:200]!r}",
+                exit_code=completed.returncode,
+                stderr=completed.stderr,
+            ) from cause
+        if not isinstance(envelope, dict) or envelope.get("kind") != "command_result":
+            raise ReldirError(
+                "DRIVER_PROTOCOL",
+                "reldir printed JSON that is not a command_result envelope",
+                exit_code=completed.returncode,
+                stderr=completed.stderr,
+            )
+        invocation.envelope = envelope
         return invocation
 
     def _raise(self, invocation: _Invocation) -> None:
-        diagnostic = _last_diagnostic(invocation)
-        code = str(diagnostic.get("code", "")) if diagnostic else ""
-        message = str(diagnostic.get("message", "")) if diagnostic else ""
+        reported = list(invocation.envelope.get("diagnostics", []))
+        errors = [d for d in reported if d.get("severity") == "error"]
+        # A command that stopped carries `error`; one that ran to completion
+        # and found the database invalid (`check`) carries its violations as
+        # diagnostics instead, and the first of them is the account.
+        diagnostic = dict(invocation.envelope.get("error") or (errors[0] if errors else {}))
+        code = str(diagnostic.get("code", ""))
+        message = str(diagnostic.get("message", ""))
+        if len(errors) > 1 and not invocation.envelope.get("error"):
+            message += f" (and {len(errors) - 1} more violation(s))"
         if not message:
             # No structured diagnostic: the binary failed before it could emit
             # one. stderr is then the only account of what happened, and
@@ -404,6 +446,7 @@ class Connection:
             message,
             exit_code=invocation.returncode,
             diagnostic=diagnostic,
+            diagnostics=reported,
             stderr=invocation.stderr,
         )
 
@@ -459,7 +502,7 @@ class Connection:
         revision: a read is an observation, not a transition.
         """
         invocation = self._attempt(
-            ["sql", _bind(sql, params)], readonly=True, retry_on_conflict=False
+            ["sql", sql, *_params(params)], readonly=True, retry_on_conflict=False
         )
         if invocation.returncode != 0:
             self._raise(invocation)
@@ -508,19 +551,19 @@ class Connection:
     ) -> Result:
         """Run a statement that may write.
 
-        Returns a `Result` carrying any rows and `changed`, the number of files
-        the statement rewrote. `changed == 0` is how a compare-and-set reports
+        Returns a `Result` carrying any ``RETURNING`` rows and `changed`, the
+        number of files the statement wrote or removed. `changed == 0` is how a compare-and-set reports
         that its predicate did not match -- see `Connection.transaction`.
 
         Retries `LOCK_CONTENDED` always, and `CONCURRENT_MODIFICATION` when
-        `retry_on_conflict` is set. Pass `retry_on_conflict=False` when the
-        statement was computed from data you read earlier: a retry re-plans
-        against state that has since moved, which for a read-modify-write is a
-        lost update. `Connection.transaction` handles that case properly.
+        `retry_on_conflict` is set. The binary plans a statement under its lock,
+        so the statement itself never races; pass `retry_on_conflict=False`
+        when its *values* were computed from data you read earlier, and use
+        `Connection.transaction` for that read-modify-write.
         """
         with self._write_lock:
             invocation = self._attempt(
-                ["sql", _bind(sql, params)],
+                ["sql", sql, *_params(params)],
                 readonly=False,
                 retry_on_conflict=retry_on_conflict,
             )
@@ -596,12 +639,10 @@ class Connection:
         Because the function may run more than once it must be safe to repeat:
         no external side effects that cannot be replayed.
 
-        **Carry what you read into the write.** reldir raises
-        `CONCURRENT_MODIFICATION` when the files move *while a statement is in
-        flight*, not when they moved between your read and your write -- each
-        statement is complete and valid on its own, so nothing detects a stale
-        read for you. Make the predicate carry the value you read, and retry
-        when nothing changed:
+        **Carry what you read into the write.** Each statement is planned
+        against the current state and is valid on its own, so nothing detects
+        that a value moved between your read and your write for you. Make the
+        predicate carry the value you read, and retry when nothing changed:
 
             def increment(tx):
                 row = tx.one("SELECT n FROM counters WHERE id = 'c1'")
@@ -638,14 +679,20 @@ class Connection:
     # ------------------------------------------------------------------- state
 
     def status(self) -> dict:
-        """Report validity, revision, and any external changes."""
+        """Report validity, state and revision.
+
+        The envelope's summary fields: ``valid``, ``state``, ``tables``,
+        ``rows``, ``violations`` and, once something is recorded,
+        ``revision`` and ``root``.
+        """
         invocation = self._attempt(["status"], readonly=True, retry_on_conflict=False)
-        if invocation.returncode not in (0, 2):
+        if invocation.returncode != 0:
             self._raise(invocation)
-        for record in invocation.records:
-            if record.get("kind") in ("status", "check_summary"):
-                return dict(record)
-        return {"valid": invocation.returncode == 0}
+        return {
+            key: value
+            for key, value in invocation.envelope.items()
+            if key not in ("kind", "command", "records", "diagnostics", "events")
+        }
 
     def check(self) -> None:
         """Validate the whole database, raising `DatabaseInvalid` if it is not."""
@@ -654,34 +701,15 @@ class Connection:
             self._raise(invocation)
 
     def tables(self) -> list[str]:
-        """List governed table names.
-
-        The binary exposes these through the shell's `.tables`, which prints
-        them space-separated on stdout. There is no JSONL listing to parse, so
-        this reads that line rather than inventing a subcommand: a driver that
-        called one the binary does not have would fail for every caller.
-        """
-        if self._closed:
-            raise ValueError("this connection is closed")
-        completed = subprocess.run(
-            [self.binary, "--db", str(self.path), "--readonly", "shell"],
-            input=".tables\n",
-            capture_output=True,
-            text=True,
-            timeout=self.timeout,
-            env=self._env,
-            check=False,
-        )
-        if completed.returncode != 0:
-            self._raise(
-                _Invocation(
-                    args=["shell", ".tables"],
-                    stdout=completed.stdout,
-                    stderr=completed.stderr,
-                    returncode=completed.returncode,
-                )
-            )
-        return completed.stdout.split()
+        """List governed table names."""
+        invocation = self._attempt(["tables"], readonly=True, retry_on_conflict=False)
+        if invocation.returncode != 0:
+            self._raise(invocation)
+        return [
+            record["table"]
+            for record in invocation.records
+            if record.get("kind") == "table"
+        ]
 
     def close(self) -> None:
         """Release the connection.
@@ -725,135 +753,37 @@ def connect(
 def _result(invocation: _Invocation) -> Result:
     """Turn an invocation's records into rows plus a change count.
 
-    The binary emits one `change` record per file it rewrote, and a single
-    `no_change` record when a statement matched nothing. Counting the former is
-    what lets a caller tell a compare-and-set that missed from one that landed.
+    The binary emits one `change` record per file it writes or removes, and
+    none when a statement matched nothing. Counting them is what lets a caller
+    tell a compare-and-set that missed from one that landed.
     """
     rows = [
         Row((k, v) for k, v in record.items() if k != "kind")
         for record in invocation.records
-        if record.get("kind") == "row"
+        if record.get("kind") in ("row", "returning")
     ]
     changed = sum(1 for record in invocation.records if record.get("kind") == "change")
     return Result(rows, changed)
 
 
-def _last_diagnostic(invocation: _Invocation) -> dict:
-    """The diagnostic that explains a failure.
+def _params(params: Sequence[Any] | None) -> list[str]:
+    """`--param` arguments binding each value, as JSON, to the next `?`.
 
-    stderr carries warnings alongside the error that ended the run -- a stale
-    index and stale metadata are reported on a read that still answers -- so
-    position does not identify the failure. Severity does: the error is the
-    reason the command failed, and a warning riding beside it is not.
-
-    Taking the last parseable line instead reported a corrupt row as
-    METADATA_STALE_READONLY, which named a warning as the cause and would send
-    a caller branching on `code` to the wrong handler entirely.
+    The binary binds them as values: SQL text never contains a parameter, so
+    no value can change what a statement says. Only the types reldir's type
+    system has are accepted; anything else is refused rather than stringified,
+    because a silent `str()` is how a datetime becomes an unparseable row.
     """
-    records: list[dict] = []
-    for line in invocation.stderr.strip().splitlines():
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict) and "code" in parsed:
-            records.append(parsed)
-    records.extend(
-        record
-        for record in invocation.records
-        if record.get("kind") == "diagnostic" and "code" in record
-    )
-
-    for record in reversed(records):
-        if record.get("severity") == "error":
-            return record
-    # No error was reported, so the command failed without explaining itself in
-    # a diagnostic. The last record is still better than nothing, and `_raise`
-    # falls back to raw stderr when there is none.
-    return records[-1] if records else {}
-
-
-def _bind(sql: str, params: Sequence[Any] | None) -> str:
-    """Substitute `?` placeholders, quoting each value as a SQL literal.
-
-    reldir's CLI takes one SQL string, so parameters are bound here. They are
-    bound by this driver rather than by string formatting in the caller, which
-    is the difference between a quoted literal and an injection.
-
-    A placeholder inside a string literal is not a placeholder, so the scan
-    tracks quoting rather than counting `?` characters.
-    """
-    if params is None:
-        return sql
-    params = list(params)
-    out = []
-    index = 0
-    in_string = False
-    i = 0
-    while i < len(sql):
-        char = sql[i]
-        if in_string:
-            out.append(char)
-            if char == "'":
-                # A doubled quote is an escaped quote, not the end of the
-                # literal: 'it''s' is one string.
-                if i + 1 < len(sql) and sql[i + 1] == "'":
-                    out.append(sql[i + 1])
-                    i += 2
-                    continue
-                in_string = False
-            i += 1
-            continue
-        if char == "'":
-            in_string = True
-            out.append(char)
-            i += 1
-            continue
-        if char == "?":
-            if index >= len(params):
-                raise ValueError(
-                    f"SQL has more placeholders than the {len(params)} parameters given"
-                )
-            out.append(_literal(params[index]))
-            index += 1
-            i += 1
-            continue
-        out.append(char)
-        i += 1
-    if in_string:
-        raise ValueError("SQL ends inside an unterminated string literal")
-    if index != len(params):
-        raise ValueError(
-            f"SQL has {index} placeholders but {len(params)} parameters were given"
-        )
-    return "".join(out)
-
-
-def _literal(value: Any) -> str:
-    """Render one Python value as a SQL literal.
-
-    Only the types reldir's type system has. Anything else is refused rather
-    than coerced through `str()`, because a silent stringification is how a
-    datetime becomes an unparseable row.
-    """
-    if value is None:
-        return "NULL"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            raise ValueError(f"{value!r} has no SQL literal")
-        return repr(value)
-    if isinstance(value, str):
-        return "'" + value.replace("'", "''") + "'"
-    if isinstance(value, (Mapping, list)):
-        # A JSON column takes a JSON document, quoted as a string literal.
-        return "'" + json.dumps(value).replace("'", "''") + "'"
-    raise TypeError(
-        f"{type(value).__name__} has no reldir literal; "
-        "pass a str, int, float, bool, None, list, or dict"
-    )
+    out: list[str] = []
+    for value in params or ():
+        if isinstance(value, float) and not _finite(value):
+            raise ValueError(f"{value!r} has no JSON representation")
+        if value is not None and not isinstance(
+            value, (bool, int, float, str, list, Mapping)
+        ):
+            raise TypeError(
+                f"{type(value).__name__} has no reldir value; "
+                "pass a str, int, float, bool, None, list, or dict"
+            )
+        out += ["--param", json.dumps(value)]
+    return out

@@ -59,7 +59,7 @@ way to come out wrong:
 | 3 | `SIGKILL` mid-commit, then recover | recovery fails, or leaves an invalid database |
 | 4 | external corruption of a row | reldir absorbs bad JSON or a missing field instead of reporting it |
 | 5 | injection through parameters | a hostile value executes as SQL instead of landing as data |
-| 6 | schema and metadata tampering | an unknown format version or loosened pin is accepted |
+| 6 | schema and metadata tampering | an unknown format version is accepted, or a damaged mirror is believed or fatal |
 | 7 | readers during sustained writes | a read is refused for contention, or sees an impossible total |
 | 8 | resource limits | a limit truncates silently instead of failing |
 

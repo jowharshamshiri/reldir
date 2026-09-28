@@ -35,14 +35,26 @@ from ledger import InsufficientFunds, Ledger  # noqa: E402
 def _binary() -> str:
     """The reldir under test.
 
-    Prefers a local debug build so the suite exercises the working tree rather
-    than whatever happens to be installed, and says so plainly when neither
-    exists -- a stress run against an unknown binary proves nothing.
+    Prefers the working tree's debug build -- wherever cargo's target directory
+    is -- so the suite exercises this source rather than whatever happens to be
+    installed, and says so plainly when neither exists: a stress run against an
+    unknown binary proves nothing.
     """
     override = os.environ.get("RELDIR_BINARY")
     if override:
         return override
-    local = Path(__file__).resolve().parents[3] / "target" / "debug" / "reldir"
+    try:
+        metadata = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=Path(__file__).resolve().parents[3],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        target = Path(json.loads(metadata.stdout)["target_directory"])
+    except (OSError, subprocess.CalledProcessError):
+        target = Path(__file__).resolve().parents[3] / "target"
+    local = target / "debug" / ("reldir.exe" if os.name == "nt" else "reldir")
     if local.exists():
         return str(local)
     found = shutil.which("reldir")
@@ -95,21 +107,22 @@ def fresh(accounts: int = 8, balance: int = 1000) -> Path:
     return root
 
 
-def integrity(root: Path, report: Report, scenario: str) -> dict:
+def envelope(args: list[str]) -> tuple[dict, subprocess.CompletedProcess]:
+    """Run the binary and read its `command_result` envelope."""
     out = subprocess.run(
-        [BIN, "--db", str(root), "--readonly", "--format", "jsonl", "check"],
+        [BIN, *args[:2], "--format", "json", *args[2:]],
         capture_output=True,
         text=True,
         check=False,
     )
-    summary = {}
-    for line in out.stdout.splitlines():
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("kind") == "check_summary":
-            summary = record
+    try:
+        return json.loads(out.stdout), out
+    except json.JSONDecodeError:
+        return {}, out
+
+
+def integrity(root: Path, report: Report, scenario: str) -> dict:
+    summary, out = envelope(["--db", str(root), "--readonly", "check"])
     if not summary.get("valid"):
         report.defect(
             scenario,
@@ -263,12 +276,7 @@ def kill_mid_commit(report: Report) -> None:
             killed += 1
         proc.wait()
 
-        repair = subprocess.run(
-            [BIN, "--db", str(root), "--format", "jsonl", "recover"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        _, repair = envelope(["--db", str(root), "recover"])
         if repair.returncode != 0:
             report.defect(
                 "kill-mid-commit",
@@ -325,25 +333,31 @@ def injection_attempts(report: Report) -> None:
         "a'||'b",
         "\\'; DELETE FROM accounts; --",
     ]
-    for value in hostile:
+    stored_count = 0
+    for payload in hostile:
+        # The email pattern needs an `@`; without one every value would be
+        # refused by the schema and never reach the database, which proves
+        # nothing about binding.
+        value = f"{payload}@example.test"
         try:
             ledger.db.execute(
                 "UPDATE accounts SET email = ? WHERE id = 'acct-0000'", [value]
             )
         except reldir.ReldirError as error:
-            report.note(f"refused {value!r} as {error.code}")
+            report.defect("injection", f"{value!r} was refused as {error.code}")
             continue
-        stored = ledger.db.one("SELECT email FROM accounts WHERE id='acct-0000'")
+        stored = ledger.db.one("SELECT email FROM accounts WHERE id = ?", ["acct-0000"])
         if stored is None or stored["email"] != value:
             report.defect(
                 "injection",
                 f"{value!r} did not round-trip as data (got {stored and stored['email']!r})",
             )
+        else:
+            stored_count += 1
     remaining = ledger.db.scalar("SELECT count(*) FROM accounts")
     if remaining != 2:
         report.defect("injection", f"account count changed to {remaining}: SQL executed")
-    else:
-        report.note(f"all {len(hostile)} hostile values stored as data; rows intact")
+    report.note(f"{stored_count} of {len(hostile)} hostile values stored as data; {remaining} rows")
     integrity(root, report, "injection")
     ledger.close()
 
@@ -360,19 +374,35 @@ def schema_tampering(report: Report) -> None:
     tampered["properties"]["balance"]["minimum"] = -10**9
     tampered["x-reldir"]["checks"] = []
     pin.write_text(json.dumps(tampered, indent=2) + "\n")
+    # A schema edited by hand is an external change like any other: the data
+    # still satisfies the looser schema, so it is adopted and recorded.
     try:
         ledger.check()
-        report.note("a loosened pin was accepted (it disagrees with the working schema)")
+        report.note("a loosened schema was adopted as an external change")
     except reldir.ReldirError as error:
-        report.note(f"loosened pin reported as {error.code}")
+        report.defect("tampering", f"a loosened schema the data satisfies was refused: {error.code}")
+    # Tightening it past the data must be reported, never adopted silently.
+    tight = json.loads(original)
+    tight["properties"]["balance"]["maximum"] = 1
+    pin.write_text(json.dumps(tight, indent=2) + "\n")
+    try:
+        ledger.check()
+        report.defect("tampering", "a schema the data violates was accepted")
+    except reldir.DatabaseInvalid as error:
+        report.note(f"a schema the data violates reported as {error.code}")
     pin.write_text(original)
 
-    (root / ".db" / "manifest.json").write_text("{}\n")
+    # The mirror is derived state: damage to it must be rebuilt from the
+    # files, never believed and never fatal.
+    (root / ".db" / "mirror.sqlite").write_bytes(b"not a database at all")
     try:
         ledger.check()
-        report.note("an emptied manifest was rebuilt rather than fataled")
+        if ledger.db.scalar("SELECT count(*) FROM accounts") != 2:
+            report.defect("tampering", "a rebuilt mirror disagrees with the files")
+        else:
+            report.note("a damaged mirror was rebuilt from the files")
     except reldir.ReldirError as error:
-        report.note(f"emptied manifest reported as {error.code}")
+        report.defect("tampering", f"a damaged mirror was fatal: {error.code}")
 
     (root / ".db" / "format").write_text("format_version = 99\n")
     try:
@@ -436,12 +466,9 @@ def resource_limits(report: Report) -> None:
     """Limits must be enforced explicitly, never silently truncated."""
     say("\n[8] resource limits")
     root = fresh(accounts=3, balance=100)
-    tight = Ledger(root, BIN)
-    tight.db._env = {**os.environ}
-    out = subprocess.run(
-        [BIN, "--db", str(root), "--readonly", "--max-result-rows", "1",
-         "--format", "jsonl", "sql", "SELECT id FROM accounts"],
-        capture_output=True, text=True, check=False,
+    _, out = envelope(
+        ["--db", str(root), "--readonly", "--max-result-rows", "1",
+         "sql", "SELECT id FROM accounts"]
     )
     if out.returncode == 0:
         report.defect("limits", "a 1-row limit returned a 3-row result without failing")
@@ -453,15 +480,13 @@ def resource_limits(report: Report) -> None:
     for _ in range(200):
         node["note"] = {}
         node = node["note"]
-    out = subprocess.run(
-        [BIN, "--db", str(root), "--max-nesting-depth", "16", "--format", "jsonl",
-         "insert", "accounts", json.dumps(deep)],
-        capture_output=True, text=True, check=False,
+    _, out = envelope(
+        ["--db", str(root), "--max-nesting-depth", "16",
+         "insert", "accounts", json.dumps(deep)]
     )
     report.note(f"deep document: exit {out.returncode}")
     if out.returncode == 0:
         report.defect("limits", "a 200-deep document was accepted under a depth limit of 16")
-    tight.close()
 
 
 def main() -> int:
