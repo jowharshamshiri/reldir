@@ -2246,7 +2246,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reldir"
-version = "0.106.29"
+version = "0.107.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "reldir-bowtie"
-version = "0.106.29"
+version = "0.107.0"
 dependencies = [
  "indexmap",
  "reldir-core",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "reldir-core"
-version = "0.106.29"
+version = "0.107.0"
 dependencies = [
  "base64 0.22.1",
  "boon",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "reldir-node"
-version = "0.106.29"
+version = "0.107.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "reldir-py"
-version = "0.106.29"
+version = "0.107.0"
 dependencies = [
  "pyo3",
  "reldir",

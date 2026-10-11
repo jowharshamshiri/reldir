@@ -4707,12 +4707,16 @@ fn test3157_a_table_directory_changing_is_no_reason_to_examine_the_folder_whole(
     assert_eq!(ok(root, &["status"])["data"]["monitored"], true);
 
     // Windows reports a table's directory as changed beside every row that
-    // changes in it; Linux reports it when the directory's own times change.
-    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-    fs::File::open(root.join("users"))
-        .unwrap()
-        .set_modified(later)
-        .unwrap();
+    // changes in it; elsewhere it is reported when the directory's own times
+    // change. (Windows opens no directory as a file to change them.)
+    #[cfg(unix)]
+    {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::open(root.join("users"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
     write_json(root, "users/cy.json", json!({"id": "cy", "name": "Cy"}));
     let after = ok(root, &["status"]);
     assert_eq!(after["data"]["monitored"], true, "{after:#}");
