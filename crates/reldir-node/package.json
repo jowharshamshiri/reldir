@@ -1,6 +1,6 @@
 {
   "name": "@reldir/reldir",
-  "version": "0.108.11",
+  "version": "0.109.22",
   "description": "A folder of JSON files as a relational database: the reldir engine in-process for Node.js",
   "license": "MIT",
   "repository": "https://github.com/jowharshamshiri/reldir",
