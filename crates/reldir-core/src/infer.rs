@@ -586,7 +586,7 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
                 "move it out of the table directory, or leave it ungoverned with an ignore pattern: \
                  `reldir init --adopt --ignore {}` for a folder not yet adopted, `ignore` in \
                  .db/config for a database",
-                relative.display()
+                crate::catalog::slash(&relative)
             ))
         };
         if md.is_dir() {

@@ -3023,7 +3023,12 @@ fn test3098_format_2_history_that_does_not_verify_is_never_converted() {
     let unlocked = |files: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
         files
             .into_iter()
-            .filter(|(path, _)| !path.to_string_lossy().starts_with(".db/lock"))
+            .filter(|(path, _)| {
+                !path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .starts_with(".db/lock")
+            })
             .collect()
     };
     assert_eq!(

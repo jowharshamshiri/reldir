@@ -747,6 +747,17 @@ impl Catalog {
             return Ok(false);
         }
         for relative in paths {
+            // Windows reports a table's directory as modified whenever a row
+            // in it changes. The rows are reported themselves; the
+            // directory's own metadata holds nothing to read.
+            if self.schemas.contains_key(relative.as_str())
+                && scan
+                    .source
+                    .metadata(&self.root.join(relative))
+                    .is_ok_and(|meta| meta.kind == Kind::Dir)
+            {
+                continue;
+            }
             let Some((table, name)) = self.row_file(Path::new(relative)) else {
                 return Ok(false);
             };

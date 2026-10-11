@@ -2,7 +2,9 @@
 //! built for this platform.
 //!
 //! The release workflow attaches, for every target, `reldir-v<version>-<target>.tar.gz`
-//! and beside it `<archive>.sha256`. An update reads the release, downloads the
+//! and `reldir-v<version>-<target>.sha256`, which lists the checksum of each
+//! archive for that target (`sha256sum` lines; on Windows the `.zip` is listed
+//! too). An update reads the release, downloads the
 //! archive for the target this binary was built for, checks it against its
 //! checksum, runs the binary it holds to see that it is reldir at the version
 //! the release names, and only then puts it in place of the running one.
@@ -88,12 +90,15 @@ pub fn update(context: &Context, sink: &mut dyn Sink, version: Option<&str>) -> 
             Code::RELEASE_NOT_FOUND,
             format!("release {tag} holds no build for {TARGET} ({archive_name})"),
         )
-        .with_help("build from source: `cargo install reldir`")
+        .with_help(
+            "build from source: `cargo install --locked --git https://github.com/jowharshamshiri/reldir reldir`",
+        )
     })?;
-    let checksum_url = asset_url(&release, &format!("{archive_name}.sha256")).ok_or_else(|| {
+    let checksums_name = format!("reldir-{tag}-{TARGET}.sha256");
+    let checksum_url = asset_url(&release, &checksums_name).ok_or_else(|| {
         DbError::new(
             Code::RELEASE_UNVERIFIED,
-            format!("release {tag} publishes no checksum for {archive_name}"),
+            format!("release {tag} publishes no checksum for {archive_name} ({checksums_name})"),
         )
     })?;
     let destination = std::env::current_exe().map_err(|error| {
@@ -117,11 +122,14 @@ pub fn update(context: &Context, sink: &mut dyn Sink, version: Option<&str>) -> 
     }
 
     sink.note(&format!("downloading {archive_name}"));
-    let published = String::from_utf8_lossy(&download(&agent, &checksum_url, 4096)?)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let checksums = download(&agent, &checksum_url, 64 * 1024)?;
+    let published = published_checksum(&String::from_utf8_lossy(&checksums), &archive_name)
+        .ok_or_else(|| {
+            DbError::new(
+                Code::RELEASE_UNVERIFIED,
+                format!("{checksums_name} lists no checksum for {archive_name}"),
+            )
+        })?;
     let archive = download(&agent, &archive_url, ARCHIVE_LIMIT)?;
     let actual = hex::encode(Sha256::digest(&archive));
     if published != actual {
@@ -323,6 +331,15 @@ fn verify_runs(binary: &Path, version: &str) -> Result<()> {
     Ok(())
 }
 
+/// The checksum a `sha256sum` listing gives `name`: lines of the hash, a
+/// space, and the name, marked `*` when hashed in binary mode.
+fn published_checksum(listing: &str, name: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let (hash, listed) = line.trim_end().split_once(char::is_whitespace)?;
+        (listed.trim_start().trim_start_matches('*') == name).then(|| hash.to_ascii_lowercase())
+    })
+}
+
 /// Whether `candidate` is a later version than `current`: dotted numbers
 /// compared as numbers, so 0.103.1678 follows 0.99.2000.
 fn newer(candidate: &str, current: &str) -> bool {
@@ -340,7 +357,7 @@ fn newer(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{newer, published_checksum};
 
     #[test]
     fn test2600_a_release_is_newer_by_number_not_by_text() {
@@ -350,5 +367,24 @@ mod tests {
         assert!(!newer("0.103.1678", "0.103.1678"));
         assert!(!newer("0.9.0", "0.10.0"));
         assert!(!newer("0.103.1678", "0.103.1678-dev"));
+    }
+
+    #[test]
+    fn test2611_a_checksum_is_read_by_the_name_it_lists() {
+        let unix = "abc123  reldir-v1.2.3-x86_64-unknown-linux-gnu.tar.gz\n";
+        assert_eq!(
+            published_checksum(unix, "reldir-v1.2.3-x86_64-unknown-linux-gnu.tar.gz").as_deref(),
+            Some("abc123")
+        );
+        let windows = "AAA *reldir-v1.2.3-x86_64-pc-windows-msvc.tar.gz\r\nBBB *reldir-v1.2.3-x86_64-pc-windows-msvc.zip\r\n";
+        assert_eq!(
+            published_checksum(windows, "reldir-v1.2.3-x86_64-pc-windows-msvc.tar.gz").as_deref(),
+            Some("aaa")
+        );
+        assert_eq!(
+            published_checksum(windows, "reldir-v1.2.3-x86_64-pc-windows-msvc.zip").as_deref(),
+            Some("bbb")
+        );
+        assert_eq!(published_checksum(unix, "another.tar.gz"), None);
     }
 }

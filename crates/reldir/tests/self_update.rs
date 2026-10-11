@@ -72,16 +72,18 @@ struct Release {
     version: &'static str,
     target: &'static str,
     archive: Vec<u8>,
-    checksum: Option<String>,
+    /// The listing published as `reldir-v<version>-<target>.sha256`.
+    checksums: Option<String>,
 }
 
 impl Release {
     fn of(version: &'static str) -> Self {
         let archive = archive(version);
+        let checksums = listing(&archive, &format!("reldir-v{version}-{TARGET}.tar.gz"));
         Release {
             version,
             target: TARGET,
-            checksum: Some(hex::encode(Sha256::digest(&archive))),
+            checksums: Some(checksums),
             archive,
         }
     }
@@ -91,26 +93,43 @@ impl Release {
         serve(|base| {
             let tag = format!("v{}", self.version);
             let name = format!("reldir-{tag}-{}.tar.gz", self.target);
+            let sums = format!("reldir-{tag}-{}.sha256", self.target);
             let mut assets = vec![
                 json!({"name": name, "browser_download_url": format!("{base}/download/{name}")}),
             ];
-            if self.checksum.is_some() {
-                assets.push(json!({"name": format!("{name}.sha256"), "browser_download_url": format!("{base}/download/{name}.sha256")}));
+            if self.checksums.is_some() {
+                assets.push(json!({"name": sums, "browser_download_url": format!("{base}/download/{sums}")}));
             }
             let release = serde_json::to_vec(&json!({"tag_name": tag, "assets": assets})).unwrap();
             let mut files = HashMap::new();
             files.insert("/releases/latest".to_string(), release.clone());
             files.insert(format!("/releases/tags/{tag}"), release);
-            if let Some(checksum) = self.checksum {
-                files.insert(
-                    format!("/download/{name}.sha256"),
-                    format!("{checksum}  {name}\n").into_bytes(),
-                );
+            if let Some(checksums) = self.checksums {
+                files.insert(format!("/download/{sums}"), checksums.into_bytes());
             }
             files.insert(format!("/download/{name}"), self.archive);
             files
         })
     }
+}
+
+/// A `sha256sum` line for `bytes` under `name`.
+fn listing(bytes: &[u8], name: &str) -> String {
+    format!("{}  {name}\n", hex::encode(Sha256::digest(bytes)))
+}
+
+/// Run a binary just written. Another test's child, forked while the file
+/// was open for writing, can hold it a moment longer (`ETXTBSY`).
+fn output(command: &mut Command) -> std::process::Output {
+    for _ in 0..100 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    panic!("{command:?} stayed busy")
 }
 
 /// A copy of the binary under test, in a directory of its own.
@@ -122,12 +141,12 @@ fn copy_of_reldir() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn update(binary: &Path, base: &str, args: &[&str]) -> (Value, i32) {
-    let output = Command::new(binary)
-        .args(["--json", "self", "update"])
-        .args(args)
-        .env("RELDIR_RELEASES_URL", format!("{base}/releases"))
-        .output()
-        .unwrap();
+    let output = output(
+        Command::new(binary)
+            .args(["--json", "self", "update"])
+            .args(args)
+            .env("RELDIR_RELEASES_URL", format!("{base}/releases")),
+    );
     let envelope = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
         panic!(
             "not JSON: {}\n{}",
@@ -139,7 +158,7 @@ fn update(binary: &Path, base: &str, args: &[&str]) -> (Value, i32) {
 }
 
 fn version_of(binary: &Path) -> String {
-    let output = Command::new(binary).arg("--version").output().unwrap();
+    let output = output(Command::new(binary).arg("--version"));
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -187,7 +206,10 @@ fn test2603_a_named_version_is_installed_even_when_older() {
 fn test2604_an_archive_that_fails_its_checksum_is_never_installed() {
     let (_directory, binary) = copy_of_reldir();
     let mut release = Release::of("999.0.0");
-    release.checksum = Some("0".repeat(64));
+    release.checksums = Some(format!(
+        "{}  reldir-v999.0.0-{TARGET}.tar.gz\n",
+        "0".repeat(64)
+    ));
     let (envelope, exit) = update(&binary, &release.serve(), &[]);
     assert_eq!(exit, 6, "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "RELEASE_UNVERIFIED");
@@ -198,7 +220,7 @@ fn test2604_an_archive_that_fails_its_checksum_is_never_installed() {
 fn test2605_a_release_without_a_checksum_is_never_installed() {
     let (_directory, binary) = copy_of_reldir();
     let mut release = Release::of("999.0.0");
-    release.checksum = None;
+    release.checksums = None;
     let (envelope, exit) = update(&binary, &release.serve(), &[]);
     assert_eq!(exit, 6, "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "RELEASE_UNVERIFIED");
@@ -210,7 +232,10 @@ fn test2606_a_binary_that_is_not_the_release_it_claims_is_refused() {
     let (_directory, binary) = copy_of_reldir();
     let mut release = Release::of("999.0.0");
     release.archive = archive("998.0.0");
-    release.checksum = Some(hex::encode(Sha256::digest(&release.archive)));
+    release.checksums = Some(listing(
+        &release.archive,
+        &format!("reldir-v999.0.0-{TARGET}.tar.gz"),
+    ));
     let (envelope, exit) = update(&binary, &release.serve(), &[]);
     assert_eq!(exit, 6, "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "RELEASE_UNVERIFIED");
@@ -260,4 +285,17 @@ fn test2610_an_unreachable_release_server_is_reported() {
     let (envelope, exit) = update(&binary, &base, &[]);
     assert_eq!(exit, 6, "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "RELEASE_UNREACHABLE");
+}
+
+#[test]
+fn test2612_a_checksum_listing_without_the_archive_is_never_trusted() {
+    let (_directory, binary) = copy_of_reldir();
+    let mut release = Release::of("999.0.0");
+    // Windows' listing names the .zip as well; one naming only another
+    // archive vouches for nothing downloaded here.
+    release.checksums = Some(listing(&release.archive, "reldir-v999.0.0-other.zip"));
+    let (envelope, exit) = update(&binary, &release.serve(), &[]);
+    assert_eq!(exit, 6, "{envelope:#}");
+    assert_eq!(envelope["error"]["code"], "RELEASE_UNVERIFIED");
+    assert_eq!(version_of(&binary), current());
 }

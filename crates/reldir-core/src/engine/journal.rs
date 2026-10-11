@@ -188,7 +188,7 @@ fn unresolvable(error: DbError, root: &Path, dir: &Path) -> DbError {
         "move {} out of .db/transactions/ to let reldir run again. A journal in it lists every \
          file the change wrote, with the bytes committed for each: compare them with the files, \
          and make what is missing as an ordinary change",
-        relative.display()
+        crate::catalog::slash(&relative)
     ))
 }
 

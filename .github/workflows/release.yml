@@ -3,7 +3,8 @@ name: Release
 # A tag `vX.Y.Z` releases version X.Y.Z on GitHub: the reldir binary for each
 # platform, archived, with its SHA-256 checksum beside it. `reldir self update`
 # installs from these assets, so their names are part of its contract:
-# `reldir-vX.Y.Z-<target>.tar.gz` and `<archive>.sha256`, for every target.
+# `reldir-vX.Y.Z-<target>.tar.gz`, and `reldir-vX.Y.Z-<target>.sha256` listing
+# the checksum of each archive for that target, for every target.
 #
 # The version is wsb's, rendered into version.txt and Cargo.toml by the
 # pre-commit hook; the tag must name the version of the commit it tags. Tag
@@ -83,8 +84,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          # The oldest runners: a binary needs the glibc it was linked
+          # against (2.35 here) or later.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
           - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
@@ -130,7 +133,7 @@ jobs:
           assets=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
           missing=0
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
-            for name in "reldir-$GITHUB_REF_NAME-$target.tar.gz" "reldir-$GITHUB_REF_NAME-$target.tar.gz.sha256"; do
+            for name in "reldir-$GITHUB_REF_NAME-$target.tar.gz" "reldir-$GITHUB_REF_NAME-$target.sha256"; do
               grep -qxF "$name" <<< "$assets" || { echo "missing $name" >&2; missing=1; }
             done
           done

@@ -8,7 +8,7 @@ describes: format 3, protocol 1, the error-code registry and the
 
 ## [Unreleased]
 
-## [0.104.1719] - 2026-10-11
+## [0.105.0] - 2026-10-11
 
 The first release published on GitHub: a new on-disk format, a versioned
 machine protocol, libraries for Python, Node and Rust, an engine whose cost
@@ -30,6 +30,12 @@ included, by `reldir upgrade`.
   document or schema is judged the same on Windows as on Linux.
 - On macOS, `reldir serve` sees the folder's changes: events reported under
   the folder's resolved path (`/private/var` for `/var`) were dropped.
+- On Windows, every path the protocol carries -- a diagnostic's `path`, its
+  help, a table's `schema_file` -- is separated by `/`, as on every other
+  platform; and `reldir serve` no longer mistakes a table directory's own
+  change, which Windows reports beside each row's, for a reason to examine
+  the folder whole.
+- Linux builds need glibc 2.35, not the 2.39 of the runner they were built on.
 
 ### The observed contract
 

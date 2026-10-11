@@ -14,11 +14,13 @@ PyPI or npm.
 ## The command, from a release
 
 Each release carries `reldir-v<version>-<target>.tar.gz` for Linux (x86-64 and
-ARM64), macOS (Intel and Apple silicon) and Windows (x86-64, also as a `.zip`),
-each beside its `.sha256` checksum. Download the one for your platform, unpack
-it, and put `reldir` on your `PATH`:
+ARM64, glibc 2.35 or later), macOS (Intel and Apple silicon) and Windows
+(x86-64, also as a `.zip`), and beside each `reldir-v<version>-<target>.sha256`,
+its checksum. Download the two for your platform, check the one against the
+other, unpack the archive, and put `reldir` on your `PATH`:
 
 ```sh
+sha256sum -c reldir-v*-x86_64-unknown-linux-gnu.sha256
 tar -xzf reldir-v*-x86_64-unknown-linux-gnu.tar.gz
 install -m 755 reldir ~/.local/bin/
 reldir --version
