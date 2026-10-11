@@ -4696,3 +4696,32 @@ fn test3156_a_transaction_recovery_cannot_resolve_is_named_with_what_to_do() {
     fs::remove_dir_all(root.join("stranded-transaction")).unwrap();
     ok(root, &["insert", "users", r#"{"id":"cy","name":"Cy"}"#]);
 }
+
+#[test]
+fn test3157_a_table_directory_changing_is_no_reason_to_examine_the_folder_whole() {
+    let directory = blog();
+    let root = directory.path();
+    ok(root, &["status"]);
+    let _monitor = monitor(root);
+    ok(root, &["status"]);
+    assert_eq!(ok(root, &["status"])["data"]["monitored"], true);
+
+    // Windows reports a table's directory as changed beside every row that
+    // changes in it; Linux reports it when the directory's own times change.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    fs::File::open(root.join("users"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    write_json(root, "users/cy.json", json!({"id": "cy", "name": "Cy"}));
+    let after = ok(root, &["status"]);
+    assert_eq!(after["data"]["monitored"], true, "{after:#}");
+    assert_eq!(
+        ok(root, &["sql", "SELECT count(*) AS n FROM users"])["records"][0]["row"]["n"],
+        3
+    );
+
+    // A directory that is no table is still examined the slow way.
+    fs::create_dir(root.join("drafts")).unwrap();
+    assert_eq!(ok(root, &["status"])["data"]["monitored"], false);
+}

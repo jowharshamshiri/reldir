@@ -51,18 +51,43 @@ fn serve(make: impl FnOnce(&str) -> HashMap<String, Vec<u8>>) -> String {
 
 /// A gzipped tar holding a `reldir` that answers `--version` as `version`.
 fn archive(version: &str) -> Vec<u8> {
-    let script = format!("#!/bin/sh\necho 'reldir {version}'\n");
-    let mut header = tar::Header::new_gnu();
-    header.set_size(script.len() as u64);
-    header.set_mode(0o755);
-    header.set_cksum();
+    archive_with(version, &[])
+}
+
+/// The same, after `others`: (name, contents), a directory when contents is
+/// `None`.
+fn archive_with(version: &str, others: &[(&str, Option<&str>)]) -> Vec<u8> {
     let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
         vec![],
         flate2::Compression::default(),
     ));
-    builder
-        .append_data(&mut header, "reldir", script.as_bytes())
-        .unwrap();
+    let mut append = |name: &str, contents: Option<&str>, mode: u32| {
+        let mut header = tar::Header::new_gnu();
+        match contents {
+            Some(text) => {
+                header.set_size(text.len() as u64);
+                header.set_mode(mode);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, text.as_bytes())
+                    .unwrap();
+            }
+            None => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::empty())
+                    .unwrap();
+            }
+        }
+    };
+    for (name, contents) in others {
+        append(name, *contents, 0o644);
+    }
+    let script = format!("#!/bin/sh\necho 'reldir {version}'\n");
+    append("reldir", Some(&script), 0o755);
     builder.into_inner().unwrap().finish().unwrap()
 }
 
@@ -298,4 +323,25 @@ fn test2612_a_checksum_listing_without_the_archive_is_never_trusted() {
     assert_eq!(exit, 6, "{envelope:#}");
     assert_eq!(envelope["error"]["code"], "RELEASE_UNVERIFIED");
     assert_eq!(version_of(&binary), current());
+}
+
+#[test]
+fn test2614_only_the_binary_is_taken_from_an_archive_that_holds_more() {
+    let (_directory, binary) = copy_of_reldir();
+    let mut release = Release::of("999.0.0");
+    release.archive = archive_with(
+        "999.0.0",
+        &[
+            ("README.md", Some("# reldir\n")),
+            ("docs/", None),
+            ("docs/reldir", Some("not the binary\n")),
+        ],
+    );
+    release.checksums = Some(listing(
+        &release.archive,
+        &format!("reldir-v999.0.0-{TARGET}.tar.gz"),
+    ));
+    let (envelope, exit) = update(&binary, &release.serve(), &[]);
+    assert_eq!(exit, 0, "{envelope:#}");
+    assert_eq!(version_of(&binary), "reldir 999.0.0");
 }

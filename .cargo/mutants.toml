@@ -1,0 +1,4 @@
+# The engine is exercised mostly through the command: its behavior, docs and
+# MCP suites. A mutant in reldir-core is caught there as often as by the
+# engine's own tests, so both packages' tests run for every mutant.
+test_package = ["reldir-core", "reldir"]

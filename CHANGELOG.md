@@ -8,7 +8,7 @@ describes: format 3, protocol 1, the error-code registry and the
 
 ## [Unreleased]
 
-## [0.105.0] - 2026-10-11
+## [0.106.29] - 2026-10-11
 
 The first release published on GitHub: a new on-disk format, a versioned
 machine protocol, libraries for Python, Node and Rust, an engine whose cost

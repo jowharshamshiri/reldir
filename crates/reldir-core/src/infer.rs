@@ -567,7 +567,7 @@ fn load_samples_bounded(root: &Path, table: &str, config: &Config) -> Result<Vec
     let mut rows = vec![];
     for path in paths {
         progress.advance();
-        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        let relative = crate::catalog::relative(root, &path);
         let name = path
             .file_name()
             .and_then(|name| name.to_str())

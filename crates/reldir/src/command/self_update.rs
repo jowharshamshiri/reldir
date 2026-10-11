@@ -30,8 +30,12 @@ use std::{
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// The target triple it was built for; release archives are named by it.
 const TARGET: &str = env!("RELDIR_TARGET");
-/// The largest archive accepted: a release binary is tens of megabytes.
-const ARCHIVE_LIMIT: u64 = 512 * 1024 * 1024;
+/// The largest archive accepted, 512 MiB: a release binary is tens of megabytes.
+const ARCHIVE_LIMIT: u64 = 536_870_912;
+/// The largest checksum listing accepted, 64 KiB: it holds a line or two.
+const CHECKSUMS_LIMIT: u64 = 65_536;
+/// The largest release description accepted, 16 MiB.
+const RELEASE_LIMIT: u64 = 16_777_216;
 /// Where the releases are read from, unless `RELDIR_RELEASES_URL` says otherwise.
 fn releases_url() -> String {
     if let Ok(url) = std::env::var("RELDIR_RELEASES_URL") {
@@ -122,7 +126,7 @@ pub fn update(context: &Context, sink: &mut dyn Sink, version: Option<&str>) -> 
     }
 
     sink.note(&format!("downloading {archive_name}"));
-    let checksums = download(&agent, &checksum_url, 64 * 1024)?;
+    let checksums = download(&agent, &checksum_url, CHECKSUMS_LIMIT)?;
     let published = published_checksum(&String::from_utf8_lossy(&checksums), &archive_name)
         .ok_or_else(|| {
             DbError::new(
@@ -203,7 +207,7 @@ fn fetch_release(agent: &ureq::Agent, url: &str) -> std::result::Result<Value, F
     if url.starts_with("https://api.github.com/")
         && let Some(token) = ["GITHUB_TOKEN", "GH_TOKEN"]
             .iter()
-            .find_map(|name| std::env::var(name).ok().filter(|token| !token.is_empty()))
+            .find_map(|name| usable_token(std::env::var(name).ok()))
     {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
@@ -214,11 +218,16 @@ fn fetch_release(agent: &ureq::Agent, url: &str) -> std::result::Result<Value, F
     let body = response
         .body_mut()
         .with_config()
-        .limit(16 * 1024 * 1024)
+        .limit(RELEASE_LIMIT)
         .read_to_vec()
         .map_err(|error| FetchError::Other(format!("cannot read {url}: {error}")))?;
     serde_json::from_slice(&body)
         .map_err(|error| FetchError::Other(format!("{url} is not a release: {error}")))
+}
+
+/// A token worth sending: set, and not blank.
+fn usable_token(token: Option<String>) -> Option<String> {
+    token.filter(|token| !token.trim().is_empty())
 }
 
 enum FetchError {
@@ -274,9 +283,9 @@ fn unpack(archive: &[u8], directory: &Path, name: &str) -> Result<PathBuf> {
         let path = entry
             .path()
             .map_err(|error| unverified(format!("{name} holds an unreadable name: {error}")))?;
-        if !entry.header().entry_type().is_file()
-            || path.file_name().and_then(|name| name.to_str()) != Some(BINARY)
-        {
+        // The release puts the binary at the archive's root; a file of the
+        // same name deeper in is something else.
+        if !entry.header().entry_type().is_file() || path != Path::new(BINARY) {
             continue;
         }
         let mut bytes = vec![];
@@ -357,7 +366,15 @@ fn newer(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{newer, published_checksum};
+    use super::{newer, published_checksum, usable_token};
+
+    #[test]
+    fn test2613_a_blank_token_is_not_sent() {
+        assert_eq!(usable_token(None), None);
+        assert_eq!(usable_token(Some(String::new())), None);
+        assert_eq!(usable_token(Some("  ".into())), None);
+        assert_eq!(usable_token(Some("ghp_x".into())).as_deref(), Some("ghp_x"));
+    }
 
     #[test]
     fn test2600_a_release_is_newer_by_number_not_by_text() {
