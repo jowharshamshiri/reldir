@@ -2353,6 +2353,14 @@ fn test3086_a_lost_contract_comes_back_from_history_and_a_moved_one_stays_moved(
 fn test3087_names_one_filesystem_folds_together_are_two_rows_here_and_a_warning() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
+    // Two names that fold together can only both exist where the filesystem
+    // keeps case apart, as Linux's do and macOS's and Windows' do not by default.
+    write(root, "probe/case", "");
+    if root.join("probe/CASE").exists() {
+        eprintln!("skipped: {} folds case", root.display());
+        return;
+    }
+    fs::remove_dir_all(root.join("probe")).unwrap();
     write_json(root, "notes/Readme.json", json!({"text": "upper"}));
     write_json(root, "notes/readme.json", json!({"text": "lower"}));
     let status = ok(root, &["status"]);

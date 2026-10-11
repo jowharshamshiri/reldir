@@ -424,6 +424,7 @@ reldir mcp                                          # serve the database over MC
 reldir docs [TOPIC]                                 # this documentation; needs no database
 reldir protocol schema                              # the machine protocol's JSON Schema
 reldir completions bash|zsh|fish|elvish|powershell
+reldir self update [VERSION]                        # replace this binary with a release's
 ```
 
 `init` on a folder that already holds data needs `--adopt`; `--ignore` adds a
@@ -433,6 +434,15 @@ patterns; `--track-provenance` keeps history under version control with the rows
 [Git integration]({{ site.baseurl }}/git#what-git-versions)). See
 [MCP]({{ site.baseurl }}/mcp) for `mcp` and
 [Machine protocol]({{ site.baseurl }}/protocol) for `protocol schema`.
+
+`self update` installs the latest GitHub release's build for this platform
+when it is newer than the running binary, or the release `VERSION` names,
+newer or older. The archive is checked against the checksum the release
+publishes, and the binary in it must run and report the release's version
+before it replaces the running one; `--dry-run` names the release and the path
+and writes nothing. `HTTPS_PROXY` is honoured, and `GITHUB_TOKEN` raises
+GitHub's limit on unauthenticated reads. A `reldir` installed with the Python
+package has no `self` command: pip updates it.
 
 ## Output and exit statuses
 

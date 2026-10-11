@@ -25,6 +25,8 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 reldir-core.workspace = true
-reldir = { path = "../reldir" }
+# Without `self-update`: here the command runs inside Python, and the binary
+# it would replace is the interpreter.
+reldir = { path = "../reldir", default-features = false, features = ["parquet"] }
 pyo3 = { version = "0.29.2", features = ["abi3-py310"] }
 serde_json.workspace = true

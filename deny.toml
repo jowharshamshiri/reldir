@@ -22,6 +22,8 @@ allow = [
     # inotify, notify's Linux backend: ISC is MIT's equivalent.
     "ISC",
     "BSD-2-Clause",
+    # snap, parquet's Snappy codec: BSD-3 adds only a no-endorsement clause.
+    "BSD-3-Clause",
     "BSL-1.0",
     "Unicode-3.0",
     "Unlicense",
@@ -29,9 +31,19 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# The Mozilla root certificates, as data. rustls-platform-verifier links them
+# only on wasm32, which reldir is never built for; every release target uses
+# the operating system's store.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A path dependency without a version is a wildcard; it is allowed only in a
+# crate that is never published (the Python and Node bindings, the harnesses).
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

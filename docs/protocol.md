@@ -24,7 +24,7 @@ $ reldir --format json sql 'SELECT id, name FROM users ORDER BY id'
 {
   "type": "result",
   "protocol": 1,
-  "reldir": "1.0.0",
+  "reldir": "[..]",
   "command": "sql",
   "ok": true,
   "exit": 0,
@@ -82,7 +82,7 @@ $ reldir --format jsonl sql 'SELECT 1 AS a; SELECT 2 AS b'
 {"type":"statement","index":1,"statement":"SELECT 1 AS a","rows":1}
 {"type":"row","row":{"b":2}}
 {"type":"statement","index":2,"statement":"SELECT 2 AS b","rows":1}
-{"type":"result","protocol":1,"reldir":"1.0.0","command":"sql","ok":true,"exit":0,"summary":"2 statement(s), 2 row(s)","data":{"statements":2,"rows":2,"database_valid":true}}
+{"type":"result","protocol":1,"reldir":"[..]","command":"sql","ok":true,"exit":0,"summary":"2 statement(s), 2 row(s)","data":{"statements":2,"rows":2,"database_valid":true}}
 ```
 
 A failure prints its diagnostics, then the result with `error`:
@@ -90,7 +90,7 @@ A failure prints its diagnostics, then the result with `error`:
 ```console
 $ reldir --format jsonl get users nobody
 {"type":"diagnostic","severity":"error","code":"UNKNOWN_ROW","message":"users has no row with key nobody"}
-{"type":"result","protocol":1,"reldir":"1.0.0","command":"get","ok":false,"exit":4,"summary":"users has no row with key nobody","data":{},"error":{"type":"diagnostic","severity":"error","code":"UNKNOWN_ROW","message":"users has no row with key nobody"}}
+{"type":"result","protocol":1,"reldir":"[..]","command":"get","ok":false,"exit":4,"summary":"users has no row with key nobody","data":{},"error":{"type":"diagnostic","severity":"error","code":"UNKNOWN_ROW","message":"users has no row with key nobody"}}
 ```
 
 A reader that stops reading -- `reldir ... | head` -- stops only the printing:
@@ -143,7 +143,7 @@ $ reldir --format jsonl --dry-run sql "DELETE FROM tags WHERE id = 'history'"
 {"type":"event","event":"referential_action","path":"posts/p1.json","action":"remove","constraint":"posts.tags[] -> tags","key":"[\"history\"]","because":"tags/history.json"}
 {"type":"change","action":"delete","path":"tags/history.json","planned":true}
 {"type":"change","action":"write","path":"posts/p1.json","planned":true}
-{"type":"result","protocol":1,"reldir":"1.0.0","command":"sql","ok":true,"exit":0,"summary":"dry run: 2 file(s) would change; nothing was written","data":{"files":2,"dry_run":true,"replayed":false,"state":"[..]"}}
+{"type":"result","protocol":1,"reldir":"[..]","command":"sql","ok":true,"exit":0,"summary":"dry run: 2 file(s) would change; nothing was written","data":{"files":2,"dry_run":true,"replayed":false,"state":"[..]"}}
 ```
 
 **Diagnostics.** A fault, finding or notice has `type: "diagnostic"`,
@@ -282,6 +282,7 @@ generate types from it. The result document is `#`, one line of
             "revision",
             "revision_change",
             "schema",
+            "self_update",
             "snapshot",
             "statement",
             "table",
@@ -488,6 +489,9 @@ generate types from it. The result document is `#`, one line of
             "LINT_ADDITIONAL_FIELDS_ALLOWED",
             "LINT_NON_CANONICAL_FORMATTING",
             "LINT_NO_DESCRIPTION",
+            "RELEASE_UNREACHABLE",
+            "RELEASE_NOT_FOUND",
+            "RELEASE_UNVERIFIED",
             "INTERNAL_ERROR"
           ]
         },
