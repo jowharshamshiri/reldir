@@ -1,0 +1,43 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "reldir"
+description = "A folder of JSON files as a relational database: the engine in-process, a DB-API 2.0 driver, and the reldir command"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["database", "json", "sql", "filesystem", "dbapi"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+  "Topic :: Database :: Front-Ends",
+  "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://jowharshamshiri.github.io/reldir/"
+Documentation = "https://jowharshamshiri.github.io/reldir/python"
+Repository = "https://github.com/jowharshamshiri/reldir"
+
+[project.scripts]
+reldir = "reldir.__main__:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pandas>=2"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "reldir._reldir"
+features = ["extension-module"]
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]

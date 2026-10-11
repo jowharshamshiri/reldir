@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Weekly: time-boxed fuzzing and the full mutation run.
+    # Weekly: time-boxed fuzzing, the full mutation run, and the scale run.
     - cron: "17 3 * * 1"
   workflow_dispatch:
 
@@ -22,7 +22,7 @@ env:
 
 jobs:
   lint:
-    name: fmt and clippy
+    name: fmt, clippy, docs
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -30,9 +30,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      # Every crate, the bindings included, under every feature.
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --locked -p reldir-core --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: fuzz targets build
         run: cargo check --manifest-path fuzz/Cargo.toml
 
@@ -44,7 +51,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         # stable, and the minimum supported version declared in Cargo.toml.
-        rust: [stable, "1.88"]
+        rust: [stable, "1.89"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -54,23 +61,60 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust }}
-      # Unit, behavior, conformance, property, MCP and executed-docs suites.
+      # Unit, behavior, contract, conformance, property, MCP and executed-docs
+      # suites; the benches compile.
       - run: cargo test --locked
+      - run: cargo bench --locked -p reldir-core --no-run
 
   python:
-    name: python driver
+    name: python ${{ matrix.python }} (${{ matrix.os }})
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.10"
-      - run: cargo build --locked
-      - run: pip install -e 'python[test]'
-      - run: pytest -q python/tests
+          python-version: ${{ matrix.python }}
+      - name: build and install the wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release -m crates/reldir-py/Cargo.toml --out dist
+          wheel=$(ls dist/*.whl)
+          python -m pip install "${wheel}[test]"
+      - run: python -m pytest -q crates/reldir-py/tests
+
+  node:
+    name: node ${{ matrix.node }} (${{ matrix.os }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["22", "24"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: build the addon
+        shell: bash
+        working-directory: crates/reldir-node
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+      - run: node --test test/*.test.js
+        working-directory: crates/reldir-node
 
   deny:
     name: dependencies
@@ -79,6 +123,40 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  coverage:
+    name: coverage
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --locked --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: lcov.info
+
+  semver:
+    name: public API compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      # reldir-core's API against the branch it merges into.
+      - run: cargo semver-checks --package reldir-core --baseline-rev "origin/${{ github.base_ref }}"
 
   mutants-diff:
     name: mutants in the change
@@ -93,7 +171,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
-      - run: git diff origin/${{ github.base_ref }}... -- src > change.diff
+      - run: git diff origin/${{ github.base_ref }}... -- crates > change.diff
       # Every mutant of a changed line must be caught by a test.
       - run: cargo mutants --in-diff change.diff --in-place --timeout 300
       - if: always()
@@ -108,7 +186,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [json_and_locator, schema_decode, reference_path, sql_front_end, file_name]
+        target:
+          - json_and_locator
+          - json_edit
+          - schema_decode
+          - reference_path
+          - sql_front_end
+          - file_name
+          - merge
+          - config
+          - migration
+          - history_formats
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -116,6 +204,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The corpus each target has grown, kept between runs.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=600
       - if: failure()
         uses: actions/upload-artifact@v4
@@ -141,3 +235,20 @@ jobs:
         with:
           name: mutants
           path: mutants.out
+
+  scale:
+    name: scale (100k rows)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release -p reldir
+      # Fails when an operation misses its target; the report is kept.
+      - run: cargo xtask scale --rows 100000 --binary target/release/reldir --dir "$RUNNER_TEMP/scale" | tee scale.txt
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scale
+          path: scale.txt

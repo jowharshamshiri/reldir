@@ -1,0 +1,29 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "name"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "users",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "id"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    }
+  }
+}

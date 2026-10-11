@@ -2,5 +2,5 @@
 //! resolves to a position inside the input.
 #![no_main]
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    reldir::fuzzing::json_and_locator(data);
+    reldir_core::fuzzing::json_and_locator(data);
 });

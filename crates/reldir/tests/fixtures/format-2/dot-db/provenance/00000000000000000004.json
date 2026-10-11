@@ -1,0 +1,14 @@
+{
+  "revision": 4,
+  "timestamp": "2026-10-11T01:43:49.312181231+00:00",
+  "previous_revision": 3,
+  "previous_root_hash": "971a75800a6cb4a899306b063c6e7d4dbbef65ef787d800e174a32e78337112d",
+  "new_root_hash": "bd390a8a0f77e99218dc00a05302e907ffc3856214ed8faa343dd3445cc0a39f",
+  "origin": "internal",
+  "changes": {
+    "posts/p2.json": null
+  },
+  "binary_version": "0.92.820",
+  "format_version": 2,
+  "transaction_id": "fe852963-4001-4e12-9fe3-e5ba51facd3f"
+}

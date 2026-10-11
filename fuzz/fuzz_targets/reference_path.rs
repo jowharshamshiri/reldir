@@ -2,5 +2,5 @@
 //! to itself.
 #![no_main]
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    reldir::fuzzing::reference_path(data);
+    reldir_core::fuzzing::reference_path(data);
 });

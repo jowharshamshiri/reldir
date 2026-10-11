@@ -1,0 +1,37 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "age": {
+      "type": "integer",
+      "x-reldir-type": "int"
+    },
+    "big": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "age"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "users",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "id"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    }
+  }
+}

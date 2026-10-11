@@ -1,94 +1,52 @@
-[[bin]]
-name = "reldir"
-path = "src/main.rs"
+[workspace]
+resolver = "3"
+members = ["crates/reldir-core", "crates/reldir", "crates/reldir-py", "crates/reldir-node", "xtask", "bowtie"]
+# The Python and Node extensions are built by maturin and napi, which link
+# them against the runtime that loads them; plain cargo commands build the
+# engine and the CLI.
+default-members = ["crates/reldir-core", "crates/reldir"]
 
-[dependencies]
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/jowharshamshiri/reldir"
+homepage = "https://jowharshamshiri.github.io/reldir/"
+documentation = "https://jowharshamshiri.github.io/reldir/"
+keywords = ["database", "json", "sql", "filesystem", "schema"]
+
+[workspace.dependencies]
+reldir-core = { path = "crates/reldir-core", version = "=1.0.0" }
 base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 csv = "1.3"
-fs2 = "0.4"
 globset = "0.4"
 hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+jsonschema = { version = "0.49.9", default-features = false, features = ["arbitrary-precision"] }
+libc = "0.2"
 regex = "1"
+rmcp = { version = "3.5", features = ["server", "transport-io", "macros", "elicitation"] }
+rusqlite = { version = "0.37", features = ["bundled", "backup", "hooks", "collation", "column_decltype", "functions", "vtab"] }
 rustyline = "17"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.152", features = ["preserve_order", "unbounded_depth", "arbitrary_precision"] }
 sha2 = "0.10"
-sqlparser = "0.58"
+sqlparser = { version = "0.58", features = ["visitor"] }
 strsim = "0.11"
 tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "io-std", "macros"] }
 ulid = "1"
 unicode-normalization = "0.1"
-
-[dependencies.chrono]
-features = ["serde"]
-version = "0.4"
-
-[dependencies.clap]
-features = ["derive", "env"]
-version = "4.5"
-
-[dependencies.indexmap]
-features = ["serde"]
-version = "2"
-
-[dependencies.jsonschema]
-default-features = false
-version = "0.49.9"
-
-[dependencies.rusqlite]
-features = ["bundled", "backup", "hooks", "collation", "column_decltype"]
-version = "0.37"
-
-[dependencies.serde]
-features = ["derive"]
-version = "1"
-
-[dependencies.serde_json]
-features = ["preserve_order", "unbounded_depth"]
-version = "1"
-
-[dependencies.rmcp]
-features = ["server", "transport-io", "macros"]
-version = "3.5"
-
-[dependencies.tokio]
-features = ["rt", "io-std", "macros"]
-version = "1"
-
-[dependencies.uuid]
-features = ["v4", "serde"]
-version = "1"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies.windows-sys]
-features = ["Win32_Storage_FileSystem"]
-version = "0.61"
-
-[dev-dependencies]
+uuid = { version = "1", features = ["v4", "serde"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_WindowsProgramming"] }
 assert_cmd = "2"
 predicates = "3"
 proptest = "1.11"
 
-[dev-dependencies.rmcp]
-features = ["client", "transport-child-process"]
-version = "3.5"
-
-[dev-dependencies.tokio]
-features = ["rt", "io-std", "io-util", "macros", "process"]
-version = "1"
-
-[package]
-categories = ["command-line-utilities", "database-implementations"]
-description = "A filesystem-native relational JSON database"
-documentation = "https://jowharshamshiri.github.io/reldir/"
-edition = "2024"
-rust-version = "1.88"
-homepage = "https://jowharshamshiri.github.io/reldir/"
-keywords = ["database", "json", "sql", "filesystem", "schema"]
-license = "MIT"
-name = "reldir"
-readme = "README.md"
-repository = "https://github.com/jowharshamshiri/reldir"
-version = "0.92.820"
+[profile.release]
+debug = "line-tables-only"

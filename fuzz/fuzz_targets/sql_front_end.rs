@@ -2,5 +2,5 @@
 //! panic, and nothing refused reaches the mirror.
 #![no_main]
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    reldir::fuzzing::sql_front_end(data);
+    reldir_core::fuzzing::sql_front_end(data);
 });
