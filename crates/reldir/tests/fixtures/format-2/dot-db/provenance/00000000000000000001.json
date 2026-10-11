@@ -1,0 +1,44 @@
+{
+  "revision": 1,
+  "timestamp": "2026-10-11T01:43:48.672909917+00:00",
+  "previous_revision": null,
+  "previous_root_hash": null,
+  "new_root_hash": "31f64e2311f79324cc40f9c8906db3e465efe7449bec509099e2c70f6e86e78d",
+  "origin": "import",
+  "changes": {
+    ".db/config": {
+      "kind": "config",
+      "hash": "e197e6b073d43264b8d2dec965cd4af2eba70959335849656808cb52e34d57e9"
+    },
+    ".db/format": {
+      "kind": "format",
+      "hash": "129e348bbcd8fa5179224e6ad066aa89a5866cc48e0ebd768620e9cff45d4d4a"
+    },
+    "posts/p1.json": {
+      "kind": "row",
+      "hash": "4dfab1c6b711d080de10b965bc41df6d1ae279f3001b1e6e19304be5575574f3"
+    },
+    "posts/p2.json": {
+      "kind": "row",
+      "hash": "6c05af885457cd7619aa845d1fde442b2a0d28b2e74ac7a42fa72c68c47f18a2"
+    },
+    "schema/posts.json": {
+      "kind": "schema",
+      "hash": "e926ed818a05da2c995949482d2391cec7e4772075b3c0cd23431b994359f6c1"
+    },
+    "schema/users.json": {
+      "kind": "schema",
+      "hash": "37fdf0cb8332423bb01ae186edf3f45f35e28335b120720312ae66fdf6eb5993"
+    },
+    "users/ada.json": {
+      "kind": "row",
+      "hash": "9307e50e8d1abe8c90a585ae43e043e48aa7336751684c137fb95192e4a7aced"
+    },
+    "users/bob.json": {
+      "kind": "row",
+      "hash": "0a257cfe8a5c18032a242283c51d626d9936b6cbcf874edbf2891ef526a78770"
+    }
+  },
+  "binary_version": "0.92.820",
+  "format_version": 2
+}

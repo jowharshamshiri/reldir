@@ -1,0 +1,33 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "n": {
+      "type": "integer",
+      "x-reldir-type": "int"
+    },
+    "what": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "n",
+    "what"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "tickets",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "n"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    },
+    "generated": {
+      "n": "sequence"
+    }
+  }
+}

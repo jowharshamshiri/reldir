@@ -17,6 +17,10 @@ allow = [
     "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    # notify (the folder monitor's watcher) is dedicated to the public domain.
+    "CC0-1.0",
+    # inotify, notify's Linux backend: ISC is MIT's equivalent.
+    "ISC",
     "BSD-2-Clause",
     "BSL-1.0",
     "Unicode-3.0",

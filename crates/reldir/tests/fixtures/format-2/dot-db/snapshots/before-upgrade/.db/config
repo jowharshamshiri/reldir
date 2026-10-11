@@ -1,0 +1,31 @@
+{
+  "indentation_width": 2,
+  "enum_max_values": 10,
+  "unique_min_rows": 20,
+  "max_json_file_size": 67108864,
+  "max_nesting_depth": 128,
+  "max_result_rows": 1000000,
+  "max_query_memory": 268435456,
+  "max_transaction_size": 1073741824,
+  "timeout_seconds": null,
+  "wait_seconds": 5.0,
+  "ignore": [
+    ".DS_Store",
+    "*~",
+    "*.swp",
+    ".gitkeep"
+  ],
+  "allow_remote_filesystem": false,
+  "reference_naming": [
+    "{singular}_id",
+    "{table}_id",
+    "{singular}_ids",
+    "{singular}_ref",
+    "{singular}_refs",
+    "{table}_ref",
+    "{table}_refs",
+    "{singular}",
+    "{table}"
+  ],
+  "reference_min_values": 1
+}

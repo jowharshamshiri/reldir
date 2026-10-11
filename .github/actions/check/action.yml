@@ -1,0 +1,59 @@
+name: reldir check
+description: >-
+  Validate a reldir database -- every row against its schema, every key and
+  reference -- and report each fault on the line it is on, as code scanning
+  results.
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  path:
+    description: The database's root folder, relative to the repository.
+    default: "."
+  strict:
+    description: Count lint findings as failures too.
+    default: "false"
+  upload:
+    description: Upload the results as code scanning alerts (needs `security-events write`).
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # The reldir this action runs is built from the action's own source, at
+    # the ref the workflow names it by: `@v1.2.3` or a commit runs exactly
+    # that reldir, and nothing depends on a published release.
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install reldir
+      shell: bash
+      env:
+        SOURCE: ${{ github.action_path }}/../../../crates/reldir
+        INSTALL: ${{ runner.temp }}/reldir
+      run: |
+        cargo install --locked --no-default-features --root "$INSTALL" --path "$SOURCE"
+        echo "$INSTALL/bin" >> "$GITHUB_PATH"
+    - name: Check
+      id: check
+      shell: bash
+      env:
+        ROOT: ${{ inputs.path }}
+        STRICT: ${{ inputs.strict }}
+      run: |
+        flags=()
+        if [ "$STRICT" = "true" ]; then flags+=(--strict); fi
+        set +e
+        reldir --db "$ROOT" --readonly --format sarif check "${flags[@]}" > reldir.sarif
+        status=$?
+        set -e
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        reldir --db "$ROOT" --readonly --format table check "${flags[@]}" || true
+    - name: Upload
+      if: ${{ inputs.upload == 'true' }}
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: reldir.sarif
+        category: reldir
+    - name: Fail on faults
+      shell: bash
+      run: exit ${{ steps.check.outputs.status }}

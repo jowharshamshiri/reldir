@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-reldir = { path = ".." }
+reldir-core = { path = "../crates/reldir-core", features = ["testing"] }
 
 [workspace]
 members = ["."]
@@ -45,6 +45,41 @@ bench = false
 [[bin]]
 name = "file_name"
 path = "fuzz_targets/file_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_edit"
+path = "fuzz_targets/json_edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merge"
+path = "fuzz_targets/merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "migration"
+path = "fuzz_targets/migration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history_formats"
+path = "fuzz_targets/history_formats.rs"
 test = false
 doc = false
 bench = false

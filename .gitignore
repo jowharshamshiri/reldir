@@ -13,3 +13,7 @@ __pycache__/
 /fuzz/target/
 /fuzz/corpus/
 /fuzz/artifacts/
+
+# The Python extension, built into the package directory by maturin
+/crates/reldir-py/python/reldir/*.so
+/crates/reldir-py/python/reldir/*.pyd

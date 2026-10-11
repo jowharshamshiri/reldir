@@ -1,0 +1,17 @@
+{
+  "revision": 5,
+  "timestamp": "2026-10-11T01:43:49.512875081+00:00",
+  "previous_revision": 4,
+  "previous_root_hash": "bd390a8a0f77e99218dc00a05302e907ffc3856214ed8faa343dd3445cc0a39f",
+  "new_root_hash": "7bac663880ae003456a609afbdef83094e5836d5fe2e84865530c79347ddc784",
+  "origin": "migration",
+  "changes": {
+    "schema/posts.json": {
+      "kind": "schema",
+      "hash": "f77a7992b784d3ae78f0c1adddceb182bb811865a3ead71dcc1d33f9e2fde4e2"
+    }
+  },
+  "binary_version": "0.92.820",
+  "format_version": 2,
+  "transaction_id": "ebbf3661-e3e5-449c-b6e9-e6e9c2672b96"
+}

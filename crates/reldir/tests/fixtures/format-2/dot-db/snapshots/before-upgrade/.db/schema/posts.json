@@ -1,0 +1,44 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-2",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "user_id",
+    "title",
+    "tags"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "posts",
+    "primaryKey": [
+      "id"
+    ],
+    "foreignKeys": [
+      {
+        "from": [
+          "user_id"
+        ],
+        "to": {
+          "table": "users"
+        }
+      }
+    ]
+  }
+}

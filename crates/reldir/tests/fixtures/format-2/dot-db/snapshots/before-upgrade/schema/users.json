@@ -1,0 +1,12 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-2",
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"},
+    "name": {"type": "string", "description": "what they are called"},
+    "since": {"type": "string", "format": "date-time"}
+  },
+  "required": ["id", "name"],
+  "additionalProperties": false,
+  "x-reldir": {"table": "users", "primaryKey": ["id"]}
+}

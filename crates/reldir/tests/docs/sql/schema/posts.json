@@ -1,0 +1,61 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "id",
+    "user_id",
+    "title"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "posts",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "id"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    },
+    "foreignKeys": [
+      {
+        "from": [
+          "user_id"
+        ],
+        "to": {
+          "table": "users"
+        },
+        "onDelete": "restrict",
+        "onUpdate": "cascade"
+      },
+      {
+        "from": [
+          "tags[]"
+        ],
+        "to": {
+          "table": "tags"
+        },
+        "onDelete": "remove"
+      }
+    ]
+  }
+}

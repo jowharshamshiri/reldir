@@ -1,0 +1,36 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "balance": {
+      "type": "integer",
+      "x-reldir-type": "int"
+    }
+  },
+  "required": [
+    "id",
+    "balance"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "accounts",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "id"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    },
+    "checks": [
+      {
+        "name": "solvent",
+        "expr": "balance >= 0"
+      }
+    ]
+  }
+}

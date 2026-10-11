@@ -1,0 +1,60 @@
+{
+  "$schema": "https://reldir.dev/schema/reldir-3",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer",
+      "x-reldir-type": "int"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "total": {
+      "type": "string",
+      "x-reldir-type": "decimal"
+    },
+    "placed": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "user_id",
+    "total",
+    "placed"
+  ],
+  "additionalProperties": false,
+  "x-reldir": {
+    "table": "orders",
+    "identity": {
+      "source": "body",
+      "columns": [
+        "id"
+      ],
+      "naming": {
+        "rule": "reldir"
+      }
+    },
+    "generated": {
+      "id": "sequence"
+    },
+    "foreignKeys": [
+      {
+        "from": [
+          "user_id"
+        ],
+        "to": {
+          "table": "users"
+        },
+        "onDelete": "cascade"
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "revision": 2,
+  "timestamp": "2026-10-11T01:43:48.910712742+00:00",
+  "previous_revision": 1,
+  "previous_root_hash": "31f64e2311f79324cc40f9c8906db3e465efe7449bec509099e2c70f6e86e78d",
+  "new_root_hash": "be028ae3f5efa48d45e0ad63e3f5d0dd1963ab547be5a33365065d7d29fb9c66",
+  "origin": "internal",
+  "changes": {
+    "users/cy.json": {
+      "kind": "row",
+      "hash": "1c71b47682f050bec7da5f458497771bd59922798a18c4d5f04ae937227d3d20"
+    }
+  },
+  "binary_version": "0.92.820",
+  "format_version": 2,
+  "transaction_id": "983d374f-76b3-4976-b7da-0f0b1207391f"
+}

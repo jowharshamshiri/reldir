@@ -1,0 +1,44 @@
+{
+  "name": "@reldir/reldir",
+  "version": "1.0.0",
+  "description": "A folder of JSON files as a relational database: the reldir engine in-process for Node.js",
+  "license": "MIT",
+  "repository": "https://github.com/jowharshamshiri/reldir",
+  "homepage": "https://jowharshamshiri.github.io/reldir/node",
+  "keywords": [
+    "database",
+    "json",
+    "sql",
+    "filesystem"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "native.js",
+    "native.d.ts",
+    "reldir.*.node"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "napi": {
+    "binaryName": "reldir",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release --js native.js --dts native.d.ts",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.10.4"
+  }
+}

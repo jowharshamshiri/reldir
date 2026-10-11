@@ -1,0 +1,27 @@
+[package]
+name = "reldir-node"
+description = "Node.js bindings for reldir: the engine in-process, behind a promise API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+# Tested from its own language (pytest, node --test): a Rust test harness
+# would need the interpreter's symbols at link time.
+test = false
+doctest = false
+
+[dependencies]
+reldir-core.workspace = true
+napi = { version = "3.12.6", default-features = false, features = ["napi8"] }
+napi-derive = "3.6.7"
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build = "2.4.3"

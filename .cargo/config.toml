@@ -1,0 +1,3 @@
+[alias]
+# `cargo xtask scale --rows 100000`: see xtask/src/main.rs.
+xtask = "run --quiet --package xtask --"
