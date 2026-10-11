@@ -12,6 +12,8 @@ pub mod history;
 pub mod query;
 pub mod rows;
 pub mod schema;
+#[cfg(feature = "self-update")]
+pub mod self_update;
 pub mod setup;
 pub mod transfer;
 

@@ -95,7 +95,13 @@ pub fn row_path(schema: &Schema, row: &Map<String, Value>) -> Result<PathBuf> {
         .row_identity()
         .stem(row)
         .map_err(|error| DbError::from_diag(naming_diagnostic(schema, &error)))?;
-    Ok(Path::new(schema.table()).join(format!("{stem}{}", crate::naming::EXTENSION)))
+    // Separated by `/` on every platform: a row's path is its name in the
+    // mirror, in history and in the protocol, which must not differ by OS.
+    Ok(PathBuf::from(format!(
+        "{}/{stem}{}",
+        schema.table(),
+        crate::naming::EXTENSION
+    )))
 }
 
 /// A row's body: what its file holds, without the column a table keyed by

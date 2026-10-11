@@ -1,0 +1,199 @@
+name: Publish
+
+# Publishes a release that release.yml has already made to the package
+# registries: the crates to crates.io, the wheels to PyPI, the Node packages to
+# npm. Run by hand, for a tag, once each registry is set up: the `release`
+# environment, CARGO_REGISTRY_TOKEN and NPM_TOKEN as its secrets, and this
+# repository as a trusted publisher on PyPI. Note that the `reldir` crate name
+# on crates.io is held by a different, incompatible package.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The release tag to publish, e.g. v0.103.1678"
+        required: true
+        type: string
+      crates:
+        description: "Publish reldir-core and reldir to crates.io"
+        type: boolean
+        default: false
+      pypi:
+        description: "Publish the Python wheels and sdist to PyPI"
+        type: boolean
+        default: false
+      npm:
+        description: "Publish the Node packages to npm"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates:
+    name: crates.io
+    if: inputs.crates
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      # The engine first: the command depends on that exact version.
+      - run: cargo publish --locked -p reldir-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - run: cargo publish --locked -p reldir
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  wheels:
+    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
+    if: inputs.pypi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: ubuntu-latest, target: aarch64, manylinux: auto }
+          - { os: macos-15-intel, target: x86_64 }
+          - { os: macos-latest, target: aarch64 }
+          - { os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # abi3: one wheel per platform serves Python 3.10 and later.
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -m crates/reldir-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    name: source distribution
+    if: inputs.pypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: PyO3/maturin-action@v1.51.0
+        with:
+          command: sdist
+          args: --out dist -m crates/reldir-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  pypi:
+    name: PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      # Trusted publishing: no stored token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  addons:
+    name: node addon (${{ matrix.target }})
+    if: inputs.npm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: crates/reldir-node
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - run: npm ci --ignore-scripts
+      - run: npx napi build --platform --release --target ${{ matrix.target }} --js native.js --dts native.d.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addon-${{ matrix.target }}
+          path: crates/reldir-node/reldir.*.node
+      # The loader napi generates is the same on every platform: one copy
+      # goes into the main package.
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: loader
+          path: |
+            crates/reldir-node/native.js
+            crates/reldir-node/native.d.ts
+
+  npm:
+    name: npm
+    needs: addons
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: crates/reldir-node
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/reldir-node/artifacts
+          pattern: addon-*
+      - uses: actions/download-artifact@v4
+        with:
+          name: loader
+          path: crates/reldir-node
+      # One package per platform, holding its addon; the main package lists
+      # them as optional dependencies, and its loader finds the one installed.
+      - run: npx napi create-npm-dirs
+      - run: npx napi artifacts --output-dir artifacts
+      - run: npx napi pre-publish -t npm --no-gh-release
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

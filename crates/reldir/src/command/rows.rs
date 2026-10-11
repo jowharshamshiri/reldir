@@ -70,7 +70,7 @@ pub fn describe(context: &Context, sink: &mut dyn Sink, table: &str) -> Result<F
         "table_description",
         json!({
             "table": table,
-            "schema_file": database.catalog.schema_files.get(table).map(|file| &file.relative),
+            "schema_file": database.catalog.schema_files.get(table).map(|file| reldir_core::catalog::slash(&file.relative)),
             "pinned": database.catalog.pinned.contains(table),
             "rows": database.catalog.mirror.count(table)?,
             "primary_key": schema.primary_key(),

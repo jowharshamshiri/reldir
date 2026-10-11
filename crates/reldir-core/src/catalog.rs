@@ -747,6 +747,17 @@ impl Catalog {
             return Ok(false);
         }
         for relative in paths {
+            // Windows reports a table's directory as modified whenever a row
+            // in it changes. The rows are reported themselves; the
+            // directory's own metadata holds nothing to read.
+            if self.schemas.contains_key(relative.as_str())
+                && scan
+                    .source
+                    .metadata(&self.root.join(relative))
+                    .is_ok_and(|meta| meta.kind == Kind::Dir)
+            {
+                continue;
+            }
             let Some((table, name)) = self.row_file(Path::new(relative)) else {
                 return Ok(false);
             };
@@ -1496,8 +1507,11 @@ fn now_ns() -> i64 {
         .map_or(0, |elapsed| elapsed.as_nanos() as i64)
 }
 
-fn relative(root: &Path, path: &Path) -> PathBuf {
-    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+/// A path relative to the root, separated by `/` on every platform: it names
+/// the file in the mirror, in history and in the protocol, which must not
+/// differ by operating system. Windows accepts `/` wherever a path is opened.
+pub fn relative(root: &Path, path: &Path) -> PathBuf {
+    PathBuf::from(slash(path.strip_prefix(root).unwrap_or(path)))
 }
 
 /// Whether a file has other names. A hard-linked metadata or row file could be
