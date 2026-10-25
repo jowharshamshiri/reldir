@@ -7,7 +7,7 @@ members = ["crates/reldir-core", "crates/reldir", "crates/reldir-py", "crates/re
 default-members = ["crates/reldir-core", "crates/reldir"]
 
 [workspace.package]
-version = "0.109.22"
+version = "0.110.34"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -17,7 +17,7 @@ documentation = "https://jowharshamshiri.github.io/reldir/"
 keywords = ["database", "json", "sql", "filesystem", "schema"]
 
 [workspace.dependencies]
-reldir-core = { path = "crates/reldir-core", version = "=0.109.22" }
+reldir-core = { path = "crates/reldir-core", version = "=0.110.34" }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
