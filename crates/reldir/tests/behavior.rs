@@ -2353,6 +2353,14 @@ fn test3086_a_lost_contract_comes_back_from_history_and_a_moved_one_stays_moved(
 fn test3087_names_one_filesystem_folds_together_are_two_rows_here_and_a_warning() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
+    // Two names that fold together can only both exist where the filesystem
+    // keeps case apart, as Linux's do and macOS's and Windows' do not by default.
+    write(root, "probe/case", "");
+    if root.join("probe/CASE").exists() {
+        eprintln!("skipped: {} folds case", root.display());
+        return;
+    }
+    fs::remove_dir_all(root.join("probe")).unwrap();
     write_json(root, "notes/Readme.json", json!({"text": "upper"}));
     write_json(root, "notes/readme.json", json!({"text": "lower"}));
     let status = ok(root, &["status"]);
@@ -3015,7 +3023,12 @@ fn test3098_format_2_history_that_does_not_verify_is_never_converted() {
     let unlocked = |files: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
         files
             .into_iter()
-            .filter(|(path, _)| !path.to_string_lossy().starts_with(".db/lock"))
+            .filter(|(path, _)| {
+                !path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .starts_with(".db/lock")
+            })
             .collect()
     };
     assert_eq!(
@@ -4682,4 +4695,37 @@ fn test3156_a_transaction_recovery_cannot_resolve_is_named_with_what_to_do() {
     fs::rename(&stranded, root.join("stranded-transaction")).unwrap();
     fs::remove_dir_all(root.join("stranded-transaction")).unwrap();
     ok(root, &["insert", "users", r#"{"id":"cy","name":"Cy"}"#]);
+}
+
+#[test]
+fn test3157_a_table_directory_changing_is_no_reason_to_examine_the_folder_whole() {
+    let directory = blog();
+    let root = directory.path();
+    ok(root, &["status"]);
+    let _monitor = monitor(root);
+    ok(root, &["status"]);
+    assert_eq!(ok(root, &["status"])["data"]["monitored"], true);
+
+    // Windows reports a table's directory as changed beside every row that
+    // changes in it; elsewhere it is reported when the directory's own times
+    // change. (Windows opens no directory as a file to change them.)
+    #[cfg(unix)]
+    {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::open(root.join("users"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+    write_json(root, "users/cy.json", json!({"id": "cy", "name": "Cy"}));
+    let after = ok(root, &["status"]);
+    assert_eq!(after["data"]["monitored"], true, "{after:#}");
+    assert_eq!(
+        ok(root, &["sql", "SELECT count(*) AS n FROM users"])["records"][0]["row"]["n"],
+        3
+    );
+
+    // A directory that is no table is still examined the slow way.
+    fs::create_dir(root.join("drafts")).unwrap();
+    assert_eq!(ok(root, &["status"])["data"]["monitored"], false);
 }
