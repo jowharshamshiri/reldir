@@ -181,14 +181,14 @@ fn unresolvable(error: DbError, root: &Path, dir: &Path) -> DbError {
     if error.code() != Code::TRANSACTION_INCOMPLETE {
         return error;
     }
-    let relative = dir.strip_prefix(root).unwrap_or(dir).to_path_buf();
+    let relative = crate::catalog::relative(root, dir);
     let mut diagnostic = *error.diagnostic;
     diagnostic.path = Some(relative.clone());
     DbError::from_diag(diagnostic).with_help(format!(
         "move {} out of .db/transactions/ to let reldir run again. A journal in it lists every \
          file the change wrote, with the bytes committed for each: compare them with the files, \
          and make what is missing as an ordinary change",
-        relative.display()
+        crate::catalog::slash(&relative)
     ))
 }
 

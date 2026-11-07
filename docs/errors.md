@@ -234,6 +234,14 @@ every change an `--idempotency-key`, which makes a retry safe whatever happened.
 | <a id="lint_non_canonical_formatting"></a>`LINT_NON_CANONICAL_FORMATTING` | `7` | rows not in their table's recorded style |
 | <a id="lint_no_description"></a>`LINT_NO_DESCRIPTION` | `7` | a table or column without a description |
 
+### Updating reldir
+
+| Code | Exit | Meaning |
+|---|---|---|
+| <a id="release_unreachable"></a>`RELEASE_UNREACHABLE` | `6` | the releases could not be read or downloaded: the network, a proxy or GitHub refused |
+| <a id="release_not_found"></a>`RELEASE_NOT_FOUND` | `4` | no release has that version, or the release holds no build for this platform |
+| <a id="release_unverified"></a>`RELEASE_UNVERIFIED` | `6` | a downloaded release does not match its published checksum, or does not run as reldir |
+
 ### reldir itself
 
 | Code | Exit | Meaning |

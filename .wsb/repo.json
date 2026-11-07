@@ -1,0 +1,10 @@
+{
+  "name": "reldir",
+  "alias": "reldir",
+  "templates_root": ".",
+  "version": {
+    "major": 0,
+    "file": "version.txt",
+    "detect_manifests": true
+  }
+}

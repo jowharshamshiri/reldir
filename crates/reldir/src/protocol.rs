@@ -39,6 +39,7 @@ pub const RECORD_KINDS: &[&str] = &[
     "revision",
     "revision_change",
     "schema",
+    "self_update",
     "snapshot",
     "statement",
     "table",

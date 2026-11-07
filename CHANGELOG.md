@@ -1,19 +1,41 @@
 # Changelog
 
 Every release of reldir, newest first. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-the [stability policy](https://jowharshamshiri.github.io/reldir/stability):
-format 3, protocol 1, the error-code registry and the `reldir-core` API are
-governed by semantic versioning.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
+numbered as the [stability policy](https://jowharshamshiri.github.io/reldir/stability)
+describes: format 3, protocol 1, the error-code registry and the
+`reldir-core` API change incompatibly only with the major version.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-11
+## [0.106.29] - 2026-10-11
 
-The first stable release: a new on-disk format, a versioned machine
-protocol, libraries for Python, Node and Rust, and an engine whose cost
-follows the change rather than the folder. Databases in format 2 are
-converted, history included, by `reldir upgrade`.
+The first release published on GitHub: a new on-disk format, a versioned
+machine protocol, libraries for Python, Node and Rust, an engine whose cost
+follows the change rather than the folder, and a binary for every major
+platform that updates itself. Databases in format 2 are converted, history
+included, by `reldir upgrade`.
+
+### Releases
+
+- Every release carries `reldir-v<version>-<target>.tar.gz` for Linux
+  (x86-64, ARM64), macOS (Intel, Apple silicon) and Windows (x86-64, also as
+  a `.zip`), each with its `.sha256`.
+- `reldir self update [VERSION]` installs the latest release's build for the
+  running platform, or the release named, after checking the download
+  against its checksum and that the binary in it runs as that version;
+  `--dry-run` names it and writes nothing. New codes `RELEASE_UNREACHABLE`,
+  `RELEASE_NOT_FOUND` and `RELEASE_UNVERIFIED`.
+- Every command runs on a 64 MiB stack on every platform, so a deep
+  document or schema is judged the same on Windows as on Linux.
+- On macOS, `reldir serve` sees the folder's changes: events reported under
+  the folder's resolved path (`/private/var` for `/var`) were dropped.
+- On Windows, every path the protocol carries -- a diagnostic's `path`, its
+  help, a table's `schema_file` -- is separated by `/`, as on every other
+  platform; and `reldir serve` no longer mistakes a table directory's own
+  change, which Windows reports beside each row's, for a reason to examine
+  the folder whole.
+- Linux builds need glibc 2.35, not the 2.39 of the runner they were built on.
 
 ### The observed contract
 

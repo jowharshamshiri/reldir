@@ -15,5 +15,8 @@ fn main() {
     };
     let docs = docs.canonicalize().expect("the documentation is present");
     println!("cargo:rustc-env=RELDIR_DOCS={}", docs.display());
+    // The target triple names the release archive `self update` installs.
+    let target = std::env::var("TARGET").expect("set by cargo");
+    println!("cargo:rustc-env=RELDIR_TARGET={target}");
     println!("cargo:rerun-if-changed={}", docs.display());
 }

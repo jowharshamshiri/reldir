@@ -125,6 +125,7 @@ pub enum Group {
     History,
     Inference,
     Lint,
+    Update,
     Internal,
 }
 
@@ -143,6 +144,7 @@ impl Group {
             Group::History => "History and snapshots",
             Group::Inference => "Inference",
             Group::Lint => "Lint",
+            Group::Update => "Updating reldir",
             Group::Internal => "reldir itself",
         }
     }
@@ -336,6 +338,11 @@ codes! {
     LINT_ADDITIONAL_FIELDS_ALLOWED => Lint, Findings, "the schema accepts members it does not declare";
     LINT_NON_CANONICAL_FORMATTING => Lint, Findings, "rows not in their table's recorded style";
     LINT_NO_DESCRIPTION => Lint, Findings, "a table or column without a description";
+
+    // Updating reldir.
+    RELEASE_UNREACHABLE => Update, Untrusted, "the releases could not be read or downloaded: the network, a proxy or GitHub refused";
+    RELEASE_NOT_FOUND => Update, Unresolved, "no release has that version, or the release holds no build for this platform";
+    RELEASE_UNVERIFIED => Update, Untrusted, "a downloaded release does not match its published checksum, or does not run as reldir";
 
     // reldir itself.
     INTERNAL_ERROR => Internal, Internal, "reldir failed; the message says what it was doing";
