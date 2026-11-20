@@ -8,7 +8,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 
@@ -20,7 +19,6 @@ testing = []
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
-csv.workspace = true
 globset.workspace = true
 hex.workspace = true
 indexmap.workspace = true

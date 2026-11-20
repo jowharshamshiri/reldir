@@ -12,7 +12,6 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/jowharshamshiri/reldir"
-homepage = "https://jowharshamshiri.github.io/reldir/"
 documentation = "https://jowharshamshiri.github.io/reldir/"
 keywords = ["database", "json", "sql", "filesystem", "schema"]
 
