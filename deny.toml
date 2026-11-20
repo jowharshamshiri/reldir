@@ -8,7 +8,12 @@ all-features = true
 # is judged not to apply is ignored here by id, with the reason.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono is unmaintained, and no release replaces it. Arrow and Parquet
+    # (the export format) and rmcp (the MCP server) each require it in their
+    # latest releases, so it stays in the graph whatever reldir itself uses.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is required by arrow-array, parquet and rmcp in their latest releases; no maintained release exists to upgrade to" },
+]
 
 [licenses]
 # Permissive licenses only: reldir is MIT and must stay distributable as such.

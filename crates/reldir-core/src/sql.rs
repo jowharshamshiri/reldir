@@ -426,86 +426,139 @@ const RULE_FUNCTIONS: &[&str] = &[
     "nfc",
 ];
 
-fn install(connection: &Connection, policy: &Policy) {
-    let policy = policy.clone();
-    connection.authorizer(Some(move |context: AuthContext<'_>| {
-        if context
-            .accessor
-            .is_some_and(|name| name.starts_with("_reldir_capture_"))
-        {
-            return Authorization::Allow;
-        }
-        let decision = match context.action {
-            AuthAction::Select | AuthAction::Recursive => Ok(()),
-            AuthAction::Read { table_name, .. } => {
-                if policy.readable.contains(table_name)
-                    || matches!(table_name, "json_each" | "json_tree")
-                {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "reading {table_name:?}, which is not a governed table"
-                    ))
-                }
-            }
-            AuthAction::Function { function_name } => {
-                if function_name.eq_ignore_ascii_case("load_extension") {
-                    Err("load_extension(): a statement never loads code into the engine".into())
-                } else if policy.deterministic
-                    && !RULE_FUNCTIONS.contains(&function_name.to_ascii_lowercase().as_str())
-                {
-                    Err(format!(
-                        "{function_name}() is not a function a rule may call: validity depends on \
-                         the rows alone, never on the clock or on chance"
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            AuthAction::Insert { table_name }
-            | AuthAction::Delete { table_name }
-            | AuthAction::Update { table_name, .. } => {
-                if policy.writable.contains(table_name) {
-                    Ok(())
-                } else {
-                    Err(format!("writing {table_name:?}"))
-                }
-            }
-            AuthAction::Pragma { pragma_name, .. } => Err(format!("PRAGMA {pragma_name}")),
-            AuthAction::Attach { .. } => Err("ATTACH".into()),
-            AuthAction::Detach { .. } => Err("DETACH".into()),
-            AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
-                Err("transaction control; every statement is its own transaction".into())
-            }
-            other => Err(format!("{other:?}")),
-        };
-        match decision {
-            Ok(()) => Authorization::Allow,
-            Err(reason) => {
-                let mut refused = policy.refused.lock().unwrap_or_else(|p| p.into_inner());
-                if refused.is_none() {
-                    *refused = Some(reason);
-                }
-                Authorization::Deny
-            }
-        }
-    }));
+/// How many virtual-machine instructions SQLite runs between two looks at a
+/// statement's limits.
+const PROGRESS_INTERVAL: std::ffi::c_int = 1000;
+
+/// What a mirror's connection holds the statement in hand to: its policy
+/// while it is compiled, its limits while it runs. The authorizer and the
+/// progress handler that enforce them are registered once, when the
+/// connection opens -- SQLite's hooks may change only while no statement
+/// borrows the connection -- and each statement sets what they read for as
+/// long as it needs it. With nothing set, reldir's own statements run
+/// unhindered.
+#[derive(Clone, Default)]
+pub(crate) struct Guard(Arc<Mutex<Guarding>>);
+
+#[derive(Default)]
+struct Guarding {
+    policy: Option<Policy>,
+    limit: Option<Limit>,
 }
 
-fn uninstall(connection: &Connection) {
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+/// When the statement in hand is to stop.
+struct Limit {
+    started: std::time::Instant,
+    timeout: Option<std::time::Duration>,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Limit {
+    fn reached(&self) -> bool {
+        self.timeout
+            .is_some_and(|timeout| self.started.elapsed() >= timeout)
+            || cancelled(self.cancel.as_deref())
+    }
+}
+
+impl Guard {
+    /// Register the authorizer and the progress handler on a connection that
+    /// no statement borrows, both reading the guard returned.
+    pub(crate) fn register(connection: &mut Connection) -> rusqlite::Result<Self> {
+        let guard = Self::default();
+        let held = guard.clone();
+        connection.authorizer(Some(move |context: AuthContext<'_>| {
+            match &held.lock().policy {
+                Some(policy) => authorize(policy, context),
+                None => Authorization::Allow,
+            }
+        }))?;
+        let held = guard.clone();
+        connection.progress_handler(
+            PROGRESS_INTERVAL,
+            Some(move || held.lock().limit.as_ref().is_some_and(Limit::reached)),
+        )?;
+        Ok(guard)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Guarding> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Whether a policy admits what a statement being compiled would do. The
+/// first action refused is recorded in the policy, to name in the error.
+fn authorize(policy: &Policy, context: AuthContext<'_>) -> Authorization {
+    if context
+        .accessor
+        .is_some_and(|name| name.starts_with("_reldir_capture_"))
+    {
+        return Authorization::Allow;
+    }
+    let decision = match context.action {
+        AuthAction::Select | AuthAction::Recursive => Ok(()),
+        AuthAction::Read { table_name, .. } => {
+            if policy.readable.contains(table_name)
+                || matches!(table_name, "json_each" | "json_tree")
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "reading {table_name:?}, which is not a governed table"
+                ))
+            }
+        }
+        AuthAction::Function { function_name } => {
+            if function_name.eq_ignore_ascii_case("load_extension") {
+                Err("load_extension(): a statement never loads code into the engine".into())
+            } else if policy.deterministic
+                && !RULE_FUNCTIONS.contains(&function_name.to_ascii_lowercase().as_str())
+            {
+                Err(format!(
+                    "{function_name}() is not a function a rule may call: validity depends on \
+                     the rows alone, never on the clock or on chance"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        AuthAction::Insert { table_name }
+        | AuthAction::Delete { table_name }
+        | AuthAction::Update { table_name, .. } => {
+            if policy.writable.contains(table_name) {
+                Ok(())
+            } else {
+                Err(format!("writing {table_name:?}"))
+            }
+        }
+        AuthAction::Pragma { pragma_name, .. } => Err(format!("PRAGMA {pragma_name}")),
+        AuthAction::Attach { .. } => Err("ATTACH".into()),
+        AuthAction::Detach { .. } => Err("DETACH".into()),
+        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+            Err("transaction control; every statement is its own transaction".into())
+        }
+        other => Err(format!("{other:?}")),
+    };
+    match decision {
+        Ok(()) => Authorization::Allow,
+        Err(reason) => {
+            let mut refused = policy.refused.lock().unwrap_or_else(|p| p.into_inner());
+            if refused.is_none() {
+                *refused = Some(reason);
+            }
+            Authorization::Deny
+        }
+    }
 }
 
 /// Prepare a statement under a policy, turning a refusal into a diagnostic that
 /// names what was refused.
-fn prepare<'c>(
-    connection: &'c Connection,
-    text: &str,
-    policy: &Policy,
-) -> Result<rusqlite::Statement<'c>> {
-    install(connection, policy);
-    let prepared = connection.prepare(text);
-    uninstall(connection);
+fn prepare<'c>(mirror: &'c Mirror, text: &str, policy: &Policy) -> Result<rusqlite::Statement<'c>> {
+    mirror.guard().lock().policy = Some(policy.clone());
+    let prepared = mirror.connection().prepare(text);
+    mirror.guard().lock().policy = None;
     prepared.map_err(|error| {
         let refused = policy
             .refused
@@ -536,26 +589,20 @@ fn policy(schemas: &BTreeMap<String, Schema>, mutation: bool, deterministic: boo
     }
 }
 
-/// Apply the resource limits to a connection for the duration of a statement.
-fn limit(connection: &Connection, limits: &QueryLimits) -> Result<()> {
-    connection
+/// Apply the resource limits to the mirror for the duration of a statement.
+fn limit(mirror: &Mirror, limits: &QueryLimits) -> Result<()> {
+    mirror
+        .connection()
         .execute_batch(&format!(
             "PRAGMA temp_store=MEMORY; PRAGMA hard_heap_limit={};",
             limits.max_memory
         ))
         .map_err(query_err)?;
-    let started = std::time::Instant::now();
-    let timeout = limits.timeout;
-    let cancel = limits.cancel.clone();
-    if timeout.is_some() || cancel.is_some() {
-        connection.progress_handler(
-            1000,
-            Some(move || {
-                timeout.is_some_and(|timeout| started.elapsed() >= timeout)
-                    || cancelled(cancel.as_deref())
-            }),
-        );
-    }
+    mirror.guard().lock().limit = Some(Limit {
+        started: std::time::Instant::now(),
+        timeout: limits.timeout,
+        cancel: limits.cancel.clone(),
+    });
     Ok(())
 }
 
@@ -575,9 +622,11 @@ fn interrupted(error: DbError, limits: &QueryLimits) -> DbError {
     error
 }
 
-fn unlimit(connection: &Connection) {
-    let _ = connection.execute_batch("PRAGMA hard_heap_limit=0;");
-    connection.progress_handler(0, None::<fn() -> bool>);
+fn unlimit(mirror: &Mirror) {
+    mirror.guard().lock().limit = None;
+    let _ = mirror
+        .connection()
+        .execute_batch("PRAGMA hard_heap_limit=0;");
 }
 
 /// Which of a query's rows to hand over: the first `skip` are passed over,
@@ -633,20 +682,14 @@ pub fn query_window(
             "a query must not change rows; run the mutation as its own statement",
         ));
     }
-    let connection = mirror.connection();
     let policy = policy(schemas, false, false);
-    let mut statement = prepare(connection, text, &policy)?;
+    let mut statement = prepare(mirror, text, &policy)?;
     bind(&mut statement, params)?;
-    limit(connection, &limits)?;
+    limit(mirror, &limits)?;
     let outcome = (|| -> Result<Answered> {
-        let names: Vec<String> = statement
-            .column_names()
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let names: Vec<String> = statement.column_names().map(String::from).collect();
         let declared: Vec<Option<String>> = statement
             .columns()
-            .into_iter()
             .map(|column| {
                 column
                     .decl_type()
@@ -694,7 +737,7 @@ pub fn query_window(
         })
     })();
     drop(statement);
-    unlimit(connection);
+    unlimit(mirror);
     outcome.map_err(|error| interrupted(error, &limits))
 }
 
@@ -711,12 +754,8 @@ pub fn columns(
         ));
     }
     let policy = policy(schemas, false, false);
-    let statement = prepare(mirror.connection(), text, &policy)?;
-    Ok(statement
-        .column_names()
-        .into_iter()
-        .map(String::from)
-        .collect())
+    let statement = prepare(mirror, text, &policy)?;
+    Ok(statement.column_names().map(String::from).collect())
 }
 
 /// A read statement's plan, as SQLite states it.
@@ -727,11 +766,10 @@ pub fn plan(
     params: &[SqlParam],
 ) -> Result<Vec<Map<String, Value>>> {
     classify(text)?;
-    let connection = mirror.connection();
     let policy = policy(schemas, true, false);
     // The plan of a statement is taken without running it, so preparing it
     // under the mutation policy is safe: nothing is stepped.
-    let mut statement = prepare(connection, &format!("EXPLAIN QUERY PLAN {text}"), &policy)?;
+    let mut statement = prepare(mirror, &format!("EXPLAIN QUERY PLAN {text}"), &policy)?;
     bind(&mut statement, params)?;
     let mut rows = statement.raw_query();
     let mut out = vec![];
@@ -875,17 +913,12 @@ pub fn mutate(
             }
         }
         let policy = policy(&catalog.schemas, true, false);
-        let mut statement = prepare(connection, text, &policy)?;
+        let mut statement = prepare(mirror, text, &policy)?;
         bind(&mut statement, params)?;
-        limit(connection, &limits)?;
-        let names: Vec<String> = statement
-            .column_names()
-            .into_iter()
-            .map(String::from)
-            .collect();
+        limit(mirror, &limits)?;
+        let names: Vec<String> = statement.column_names().map(String::from).collect();
         let declared: Vec<Option<String>> = statement
             .columns()
-            .into_iter()
             .map(|column| {
                 column
                     .decl_type()
@@ -909,11 +942,11 @@ pub fn mutate(
             }
         }
         drop(statement);
-        unlimit(connection);
+        unlimit(mirror);
         let rows = captured(catalog, inserted.as_ref())?;
         Ok(Mutation { rows, returning })
     })();
-    unlimit(connection);
+    unlimit(mirror);
     mirror.sequences().clear();
     mirror.rollback_to("reldir_mutation")?;
     outcome
@@ -1161,7 +1194,6 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
         out.push(*error.diagnostic);
         return out;
     }
-    let connection = scratch.connection();
     for (table, schema) in schemas {
         for (index, check) in schema.checks().iter().enumerate() {
             let only_this: BTreeMap<String, Schema> =
@@ -1183,7 +1215,7 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
                 }
             };
             let text = format!("SELECT ({expression}) FROM {}", mirror::quote(table));
-            if let Err(error) = prepare(connection, &text, &rule) {
+            if let Err(error) = prepare(&scratch, &text, &rule) {
                 out.push(
                     Diagnostic::error(
                         Code::SCHEMA_CHECK_INVALID,
@@ -1215,7 +1247,7 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
                 }
             };
             let rule = policy(schemas, false, true);
-            match prepare(connection, &query, &rule) {
+            match prepare(&scratch, &query, &rule) {
                 Err(error) => out.push(
                     Diagnostic::error(
                         Code::SCHEMA_ASSERTION_INVALID,
@@ -1229,11 +1261,7 @@ pub fn compile_rules(schemas: &BTreeMap<String, Schema>) -> Vec<Diagnostic> {
                     .pointer(at),
                 ),
                 Ok(statement) => {
-                    let columns: Vec<String> = statement
-                        .column_names()
-                        .into_iter()
-                        .map(String::from)
-                        .collect();
+                    let columns: Vec<String> = statement.column_names().map(String::from).collect();
                     if columns != schema.primary_key() {
                         out.push(
                             Diagnostic::error(
@@ -1419,7 +1447,6 @@ pub fn check_violations_in(
     if rowids.is_some_and(<[i64]>::is_empty) {
         return Ok(vec![]);
     }
-    let connection = mirror.connection();
     let expression = rule_expression(check.expr()).map_err(|reason| {
         DbError::new(
             Code::SCHEMA_CHECK_INVALID,
@@ -1444,7 +1471,7 @@ pub fn check_violations_in(
         "SELECT rowid FROM {} WHERE NOT ({expression}){among}",
         mirror::quote(&table)
     );
-    let mut statement = prepare(connection, &text, &rule)?;
+    let mut statement = prepare(mirror, &text, &rule)?;
     let rowids = statement
         .query_map([], |row| row.get::<_, i64>(0))
         .map_err(query_err)?
@@ -1467,7 +1494,6 @@ pub fn assertion_violations(
     schema: &Schema,
     assertion: &Assertion,
 ) -> Result<Vec<String>> {
-    let connection = mirror.connection();
     let query = rule_query(assertion.query()).map_err(|reason| {
         DbError::new(
             Code::SCHEMA_ASSERTION_INVALID,
@@ -1475,7 +1501,7 @@ pub fn assertion_violations(
         )
     })?;
     let rule = policy(schemas, false, true);
-    let mut statement = prepare(connection, &query, &rule)?;
+    let mut statement = prepare(mirror, &query, &rule)?;
     let count = statement.column_count();
     let mut rows = statement.query([]).map_err(query_err)?;
     let mut keys = BTreeSet::new();
@@ -1992,6 +2018,98 @@ mod tests {
             error.diagnostic.message
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A statement's policy holds while that statement is compiled, and only
+    /// then: the next statement is judged by its own policy, and reldir's
+    /// own statements by none.
+    #[test]
+    fn test2108_a_policy_holds_for_its_own_statement_alone() {
+        let (_directory, catalog) = catalog(&[("a.json", r#"{"id":"a","n":1}"#)]);
+        let rows = |text: &str| {
+            let mut answered = vec![];
+            query(
+                &catalog.mirror,
+                &catalog.schemas,
+                text,
+                &[],
+                LIMITS,
+                |row| {
+                    answered.push(row);
+                    Ok(())
+                },
+            )
+            .map(|_| answered)
+        };
+        let refused = rows("SELECT value FROM _reldir_meta").expect_err("bookkeeping is private");
+        assert_eq!(refused.diagnostic.code, Code::QUERY_UNSUPPORTED);
+        assert!(
+            refused
+                .diagnostic
+                .message
+                .contains("reading \"_reldir_meta\", which is not a governed table"),
+            "{}",
+            refused.diagnostic.message
+        );
+        let answered = rows("SELECT id, n FROM t").expect("a governed table is readable");
+        assert_eq!(answered.len(), 1);
+        assert_eq!(answered[0]["id"], "a");
+        let named = columns(&catalog.mirror, &catalog.schemas, "SELECT random() AS r")
+            .expect("a query may call any function");
+        assert_eq!(named, ["r"]);
+        let layout: String = catalog
+            .mirror
+            .connection()
+            .query_row(
+                "SELECT value FROM _reldir_meta WHERE key = 'layout'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reldir reads its own bookkeeping under no policy");
+        assert!(!layout.is_empty());
+    }
+
+    /// A statement's limits stop it, and are lifted when it ends: neither the
+    /// next query nor reldir's own statements are held to them.
+    #[test]
+    fn test2109_limits_hold_for_their_own_statement_alone() {
+        let (_directory, catalog) = catalog(&[("a.json", r#"{"id":"a"}"#)]);
+        let counted = "WITH RECURSIVE c(x) AS \
+                       (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) \
+                       SELECT max(x) AS m FROM c";
+        let stopped = query(
+            &catalog.mirror,
+            &catalog.schemas,
+            counted,
+            &[],
+            QueryLimits {
+                timeout: Some(std::time::Duration::ZERO),
+                ..LIMITS
+            },
+            |_| Ok(()),
+        )
+        .expect_err("a statement past its time is stopped");
+        assert_eq!(stopped.diagnostic.code, Code::RESOURCE_LIMIT);
+        let own: i64 = catalog
+            .mirror
+            .connection()
+            .query_row(counted, [], |row| row.get(0))
+            .expect("reldir's own statement runs without the last query's timeout");
+        assert_eq!(own, 200000);
+        let mut most = None;
+        query(
+            &catalog.mirror,
+            &catalog.schemas,
+            counted,
+            &[],
+            LIMITS,
+            |row| {
+                most = Some(row["m"].clone());
+                Ok(())
+            },
+        )
+        .expect("the next statement runs without the last one's timeout");
+        assert_eq!(most, Some(Value::from(200000)));
     }
 
     #[test]

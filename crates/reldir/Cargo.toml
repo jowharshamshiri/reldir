@@ -46,7 +46,7 @@ notify = "8.2.0"
 flate2 = { version = "1.1", optional = true }
 hex = { workspace = true, optional = true }
 # The ring provider: aws-lc-rs would need cmake and nasm to build on Windows.
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 self-replace = { version = "1.5", optional = true }
 sha2 = { workspace = true, optional = true }
 tar = { version = "0.4", optional = true, default-features = false }

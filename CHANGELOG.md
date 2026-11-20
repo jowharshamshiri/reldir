@@ -8,6 +8,17 @@ describes: format 3, protocol 1, the error-code registry and the
 
 ## [Unreleased]
 
+### Security
+
+- The bundled SQLite is 3.54.1 (rusqlite 0.43), which fixes CVE-2026-119375:
+  opening a database with a crafted `-wal` file of another page size could
+  return uninitialized memory.
+- `reldir self update` connects with rustls 0.23.46, which fixes four TLS
+  client advisories, and rustls-webpki 0.103.17, which refuses certificate
+  paths through the distrusted emSign intermediates.
+- The MCP server is built on rmcp 3.11 and tokio 1.54.1, past their
+  advisories.
+
 ## [0.106.29] - 2026-10-11
 
 The first release published on GitHub: a new on-disk format, a versioned

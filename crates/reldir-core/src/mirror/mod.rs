@@ -135,6 +135,8 @@ pub struct Mirror {
     conn: Connection,
     /// The sequences generated columns hand out while a statement is planned.
     sequences: crate::index::types::Sequences,
+    /// What the statement in hand may touch and how long it may run.
+    guard: crate::sql::Guard,
     /// Whether changes are written to `.db/mirror.sqlite` rather than held in
     /// memory for this process only.
     persistent: bool,
@@ -151,12 +153,6 @@ fn corrupt(error: impl std::fmt::Display) -> DbError {
         Code::INTERNAL_METADATA_CORRUPT,
         format!("derived mirror: {error}"),
     )
-}
-
-fn register(conn: &Connection) -> Result<crate::index::types::Sequences> {
-    let sequences = crate::index::types::Sequences::default();
-    crate::index::types::register(conn, &sequences)?;
-    Ok(sequences)
 }
 
 const INTERNAL: &str = "
@@ -289,6 +285,20 @@ impl Mirror {
         }
     }
 
+    /// A mirror over an open connection, with reldir's functions and the
+    /// statement guard registered while no statement borrows it.
+    fn assemble(mut conn: Connection, persistent: bool) -> Result<Self> {
+        let sequences = crate::index::types::Sequences::default();
+        crate::index::types::register(&conn, &sequences)?;
+        let guard = crate::sql::Guard::register(&mut conn).map_err(corrupt)?;
+        Ok(Self {
+            conn,
+            sequences,
+            guard,
+            persistent,
+        })
+    }
+
     fn try_open_file(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).map_err(corrupt)?;
         // Write-ahead logging lets a reader keep answering from the last
@@ -302,12 +312,7 @@ impl Mirror {
              PRAGMA foreign_keys=OFF;",
         )
         .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: true,
-        };
+        let mirror = Self::assemble(conn, true)?;
         mirror.initialize()?;
         Ok(mirror)
     }
@@ -328,12 +333,7 @@ impl Mirror {
         };
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
             .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: true,
-        };
+        let mirror = Self::assemble(conn, true)?;
         mirror.hold_snapshot()?;
         let layout: Option<String> = mirror
             .conn
@@ -364,12 +364,7 @@ impl Mirror {
         let conn = Connection::open_in_memory().map_err(corrupt)?;
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
             .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: false,
-        };
+        let mirror = Self::assemble(conn, false)?;
         mirror.initialize()?;
         Ok(mirror)
     }
@@ -385,21 +380,10 @@ impl Mirror {
         };
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
             .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mut mirror = Self {
-            conn,
-            sequences,
-            persistent: false,
-        };
+        let mut mirror = Self::assemble(conn, false)?;
         if mirror.initialize().is_err() {
             // A copy of a mirror from another layout is no base to build on.
-            let conn = Connection::open_in_memory().map_err(corrupt)?;
-            let sequences = register(&conn)?;
-            mirror = Self {
-                conn,
-                sequences,
-                persistent: false,
-            };
+            mirror = Self::assemble(Connection::open_in_memory().map_err(corrupt)?, false)?;
             mirror.initialize()?;
         }
         Ok(mirror)
@@ -502,6 +486,11 @@ impl Mirror {
     /// The sequences generated columns hand out while a statement is planned.
     pub fn sequences(&self) -> &crate::index::types::Sequences {
         &self.sequences
+    }
+
+    /// What the statement in hand may touch and how long it may run.
+    pub(crate) fn guard(&self) -> &crate::sql::Guard {
+        &self.guard
     }
 
     /// Begin a unit of mirror maintenance. Everything until [`Mirror::commit`]
