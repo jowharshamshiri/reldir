@@ -23,6 +23,7 @@
 //! list can rot.
 
 use indexmap::IndexMap;
+use reldir_core::catalog::slash;
 use reldir_core::code::Code;
 use reldir_core::schema::row::RowValidator;
 use serde_json::Value;
@@ -143,11 +144,8 @@ fn test6001_rows_are_judged_exactly_as_json_schema_2020_12_judges_them() {
     let mut refused_remote = 0;
     let mut refused_as_listed = vec![];
     for path in &paths {
-        let name = path
-            .strip_prefix("tests/conformance/draft2020-12")
-            .unwrap()
-            .display()
-            .to_string();
+        // The listed cases name a file as the suite does, with `/`, on every platform.
+        let name = slash(path.strip_prefix("tests/conformance/draft2020-12").unwrap());
         let cases: Vec<Value> = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         for case in cases {
             let description = case["description"].as_str().unwrap_or_default();
