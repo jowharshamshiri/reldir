@@ -1819,14 +1819,39 @@ mod tests {
     }
 
     fn catalog(rows: &[(&str, &str)]) -> (tempfile::TempDir, crate::catalog::Catalog) {
+        catalog_with(serde_json::json!({}), rows)
+    }
+
+    /// A catalog of table `t`, its `x-reldir` extended by `rules`.
+    fn catalog_with(
+        rules: Value,
+        rows: &[(&str, &str)],
+    ) -> (tempfile::TempDir, crate::catalog::Catalog) {
         let directory = tempfile::tempdir().unwrap();
-        let schema = format!(
-            r#"{{"$schema":"{}","type":"object","properties":{{"id":{{"type":"string"}},"n":{{"type":"integer","x-reldir-type":"int"}}}},"required":["id"],"additionalProperties":false,"x-reldir":{{"table":"t","identity":{{"source":"body","columns":["id"],"naming":{{"rule":"reldir"}}}}}}}}"#,
-            crate::schema::meta::DIALECT_URI
-        );
+        let mut schema = serde_json::json!({
+            "$schema": crate::schema::meta::DIALECT_URI,
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "n": {"type": "integer", "x-reldir-type": "int"}},
+            "required": ["id"],
+            "additionalProperties": false,
+            "x-reldir": {
+                "table": "t",
+                "identity": {"source": "body", "columns": ["id"], "naming": {"rule": "reldir"}}
+            }
+        });
+        let Value::Object(rules) = rules else {
+            panic!("rules are an object of x-reldir members");
+        };
+        for (key, value) in rules {
+            schema["x-reldir"][key] = value;
+        }
         std::fs::create_dir_all(directory.path().join(".db/schema")).unwrap();
         std::fs::create_dir_all(directory.path().join("t")).unwrap();
-        std::fs::write(directory.path().join(".db/schema/t.json"), schema).unwrap();
+        std::fs::write(
+            directory.path().join(".db/schema/t.json"),
+            schema.to_string(),
+        )
+        .unwrap();
         for (name, body) in rows {
             std::fs::write(directory.path().join("t").join(name), body).unwrap();
         }
@@ -1984,6 +2009,10 @@ mod tests {
         assert!(query.is_err(), "an assertion is held to the same rule");
     }
 
+    /// A query cancelled while it runs stops at its next progress check. The
+    /// query would end on its own after ten million rows -- seconds, not the
+    /// tenth of one before it is cancelled -- so a cancellation that fails is
+    /// a failing test, never one that hangs.
     #[test]
     fn test2106_a_cancelled_query_stops() {
         let (_directory, catalog) = catalog(&[("a.json", r#"{"id":"a"}"#)]);
@@ -2000,17 +2029,13 @@ mod tests {
             })
         };
         let started = std::time::Instant::now();
-        let endless = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
-                       SELECT max(x) AS m FROM c";
-        let error = query(
-            &catalog.mirror,
-            &catalog.schemas,
-            endless,
-            &[],
-            limits,
-            |_| Ok(()),
-        )
-        .expect_err("an endless query ends only by being stopped");
+        let long = "WITH RECURSIVE c(x) AS \
+                    (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10000000) \
+                    SELECT max(x) AS m FROM c";
+        let error = query(&catalog.mirror, &catalog.schemas, long, &[], limits, |_| {
+            Ok(())
+        })
+        .expect_err("the query is stopped before it ends");
         setter.join().unwrap();
         assert!(
             error.diagnostic.message.contains("cancelled"),
@@ -2067,6 +2092,50 @@ mod tests {
             )
             .expect("reldir reads its own bookkeeping under no policy");
         assert!(!layout.is_empty());
+    }
+
+    /// A rule that parses is still compiled under the rule policy, and each
+    /// one that does not compile is reported against its table and place:
+    /// a check that calls a function no rule may call, and an assertion
+    /// that does not name rows by the primary key. A sound rule is not.
+    #[test]
+    fn test2112_rules_are_compiled_under_the_rule_policy() {
+        let (_directory, catalog) = catalog_with(
+            serde_json::json!({
+                "checks": [
+                    {"name": "positive", "expr": "n > 0"},
+                    {"name": "lucky", "expr": "random() > 0"}
+                ],
+                "assertions": [
+                    {"name": "named", "query": "SELECT id FROM t WHERE n > 10"},
+                    {"name": "counted", "query": "SELECT count(*) AS c FROM t"}
+                ]
+            }),
+            &[],
+        );
+        let reported: Vec<(Code, String, String)> = compile_rules(&catalog.schemas)
+            .into_iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.code,
+                    diagnostic.pointer.unwrap_or_default(),
+                    diagnostic.message,
+                )
+            })
+            .collect();
+        assert_eq!(reported.len(), 2, "{reported:#?}");
+        assert_eq!(reported[0].0, Code::SCHEMA_CHECK_INVALID);
+        assert_eq!(reported[0].1, "/x-reldir/checks/1/expr");
+        assert!(
+            reported[0]
+                .2
+                .contains("random() is not a function a rule may call"),
+            "{}",
+            reported[0].2
+        );
+        assert_eq!(reported[1].0, Code::SCHEMA_ASSERTION_INVALID);
+        assert_eq!(reported[1].1, "/x-reldir/assertions/1/query");
+        assert!(reported[1].2.contains("returns (c)"), "{}", reported[1].2);
     }
 
     /// A statement's limits stop it, and are lifted when it ends: neither the
