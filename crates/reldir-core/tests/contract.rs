@@ -11,7 +11,7 @@
 //! styles and spellings chosen here; the shape they establish is read here;
 //! and the schema reldir adopted is checked by an independent validator.
 
-use proptest::prelude::*;
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
 use reldir_core::{Connection, Options};
 use serde_json::{Map, Value, json};
 use std::{
@@ -363,17 +363,66 @@ fn files(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 /// How a file is written, read back: what a change must keep.
-fn written_style(bytes: &[u8]) -> (bool, bool, bool, Option<String>) {
+#[derive(Debug, PartialEq, Eq)]
+struct Written {
+    bom: bool,
+    /// Whether its line breaks are CRLF; `None` in a file with no line
+    /// break, which shows no line ending.
+    crlf: Option<bool>,
+    final_newline: bool,
+    /// The indentation of its second line; `None` in a file with no second
+    /// line, which shows no indentation.
+    indent: Option<String>,
+}
+
+fn written_style(bytes: &[u8]) -> Written {
     let bom = bytes.starts_with(b"\xEF\xBB\xBF");
     let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
-    let crlf = text.contains("\r\n");
-    let final_newline = text.ends_with('\n');
-    let indent = text.lines().nth(1).map(|line| {
-        line.chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect::<String>()
-    });
-    (bom, crlf, final_newline, indent)
+    Written {
+        bom,
+        crlf: text.contains('\n').then(|| text.contains("\r\n")),
+        final_newline: text.ends_with('\n'),
+        indent: text.lines().nth(1).map(|line| {
+            line.chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect::<String>()
+        }),
+    }
+}
+
+/// Whether a file a change rewrote kept how it is written: its mark and
+/// final newline always, and its line endings and indentation wherever the
+/// new file still shows them. Only an object left with no members, written
+/// `{}`, may stop showing them: it has no line of its own to show them on.
+fn kept_style(previous: &[u8], now: &[u8]) -> Result<(), String> {
+    let (was, is) = (written_style(previous), written_style(now));
+    let emptied = parse(now) == json!({});
+    let shows = |name: &str, was_shown: bool, is_shown: bool| {
+        if was_shown && !is_shown && !emptied {
+            Err(format!(
+                "no longer shows its {name}, though it still has members"
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    if (was.bom, was.final_newline) != (is.bom, is.final_newline) {
+        return Err(format!(
+            "changed its mark or final newline: {was:?} became {is:?}"
+        ));
+    }
+    if let (Some(old), Some(new)) = (was.crlf, is.crlf)
+        && old != new
+    {
+        return Err(format!("changed its line endings: {was:?} became {is:?}"));
+    }
+    shows("line endings", was.crlf.is_some(), is.crlf.is_some())?;
+    if let (Some(old), Some(new)) = (&was.indent, &is.indent)
+        && old != new
+    {
+        return Err(format!("changed its indentation: {was:?} became {is:?}"));
+    }
+    shows("indentation", was.indent.is_some(), is.indent.is_some())
 }
 
 #[derive(Debug, Clone)]
@@ -523,8 +572,22 @@ fn validator(root: &Path) -> (boon::Schemas, boon::SchemaIndex) {
     (schemas, index)
 }
 
+/// A property's run: every failing case kept in the `.proptest-regressions`
+/// file beside this one, then `cases` generated ones; a new failing case is
+/// kept there too. proptest's default finds where to keep them from the
+/// crate's `lib.rs`, and no folder above an integration test holds one.
+fn config(cases: u32) -> ProptestConfig {
+    ProptestConfig {
+        cases,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+    #![proptest_config(config(48))]
 
     #[test]
     fn test7201_changes_keep_every_file_within_the_observed_contract(
@@ -584,12 +647,8 @@ proptest! {
                         // A file the change rewrote keeps its style, and every
                         // member the change did not target keeps its exact
                         // spelling.
-                        let (was, now) = (written_style(previous), written_style(bytes));
-                        prop_assert_eq!((was.0, was.1, was.2), (now.0, now.1, now.2), "{} changed its mark or line endings", name);
-                        // An object left with no members has no line to show
-                        // its indentation on.
-                        if let (Some(was), Some(now)) = (&was.3, &now.3) {
-                            prop_assert_eq!(was, now, "{} changed its indentation", name);
+                        if let Err(why) = kept_style(previous, bytes) {
+                            prop_assert!(false, "after {:?}, {} {}", operation, name, why);
                         }
                         let (old, new) = (parse(previous), value);
                         for (member, old_value) in old.as_object().unwrap() {
@@ -697,4 +756,84 @@ fn test7202_the_operations_the_property_runs_are_made_not_merely_refused() {
     let (old, new) = (parse(&before), parse(&after));
     assert_eq!(old["m1"], new["m1"], "the big integer keeps its digits");
     assert_eq!(old["m2"], new["m2"], "the timestamp keeps its offset");
+}
+
+/// Setting a member that is optional and never null to null removes it, and a
+/// file holding only that member is left an empty object, written `{}`. Such
+/// a file has no line break to show its line endings on, so it keeps CRLF
+/// line endings as surely as LF ones (seed cc 8e9b1004 of test7201).
+#[test]
+fn test7203_a_file_emptied_of_its_members_keeps_its_style() {
+    let style = |indent, crlf, final_newline| Style {
+        indent,
+        crlf,
+        bom: false,
+        final_newline,
+    };
+    let row = |members: Value| members.as_object().unwrap().clone();
+    let folder = Folder {
+        keyed_by_name: true,
+        members: vec![Member {
+            name: "m0".into(),
+            kind: Kind::Int,
+            optional: true,
+            nullable: false,
+        }],
+        rows: vec![
+            (row(json!({"m0": -10})), style(None, false, false)),
+            (row(json!({"m0": 10})), style(Some("\t"), true, false)),
+            (row(json!({})), style(Some("  "), false, true)),
+        ],
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::create_dir_all(root.join("items")).unwrap();
+    let keys: Vec<String> = (0..folder.rows.len()).map(|n| format!("r{n}")).collect();
+    for (key, (row, style)) in keys.iter().zip(&folder.rows) {
+        fs::write(
+            root.join(format!("items/{key}.json")),
+            render(&Value::Object(row.clone()), style),
+        )
+        .unwrap();
+    }
+    let db = Connection::open(root, Options::default()).unwrap();
+    let before = fs::read(root.join("items/r1.json")).unwrap();
+    assert_eq!(before, b"{\r\n\t\"m0\": 10\r\n}");
+
+    let (outcome, _) = perform(
+        &db,
+        &folder,
+        &keys,
+        &Operation::Null { row: 1, member: 0 },
+        0,
+    );
+    outcome.unwrap();
+
+    let after = fs::read(root.join("items/r1.json")).unwrap();
+    assert_eq!(after, b"{}", "{}", String::from_utf8_lossy(&after));
+    kept_style(&before, &after).unwrap();
+}
+
+/// The style a rewritten file must keep is not given up where a file still
+/// shows it: only an object emptied of its members may stop showing its line
+/// endings or indentation.
+#[test]
+fn test7204_a_file_with_members_left_shows_the_style_it_had() {
+    let crlf = b"{\r\n\t\"m0\": 10,\r\n\t\"m1\": 1\r\n}";
+    assert_eq!(kept_style(crlf, b"{\r\n\t\"m1\": 1\r\n}"), Ok(()));
+    assert_eq!(kept_style(crlf, b"{}"), Ok(()));
+    for (now, why) in [
+        (&b"{\n\t\"m1\": 1\n}"[..], "changed its line endings"),
+        (b"{\r\n  \"m1\": 1\r\n}", "changed its indentation"),
+        (b"{\"m1\": 1}", "no longer shows its line endings"),
+        (b"{}\r\n", "changed its mark or final newline"),
+        (b"\xEF\xBB\xBF{}", "changed its mark or final newline"),
+    ] {
+        let verdict = kept_style(crlf, now);
+        assert!(
+            verdict.as_ref().is_err_and(|error| error.starts_with(why)),
+            "{:?}: {verdict:?}",
+            String::from_utf8_lossy(now)
+        );
+    }
 }
