@@ -1,9 +1,19 @@
 name: Release
 
-# A tag `vX.Y.Z` releases version X.Y.Z everywhere at once: binaries and their
-# checksums on the GitHub release (which `cargo binstall reldir` and the
-# check action install from), the crates on crates.io, the wheels on PyPI and
-# the Node packages on npm. The tag must equal the workspace version.
+# A tag `vX.Y.Z` releases version X.Y.Z on GitHub: the reldir binary for each
+# platform, archived, with its SHA-256 checksum beside it. `reldir self update`
+# installs from these assets, so their names are part of its contract:
+# `reldir-vX.Y.Z-<target>.tar.gz`, and `reldir-vX.Y.Z-<target>.sha256` listing
+# the checksum of each archive for that target, for every target.
+#
+# The version is wsb's, rendered into version.txt and Cargo.toml by the
+# pre-commit hook; the tag must name the version of the commit it tags. Tag
+# only a commit CI has passed.
+#
+# The release is made as a draft and published once every binary is attached,
+# so no reader ever sees a latest release that is missing its platform.
+# Publishing to crates.io, PyPI and npm is a separate, manual workflow
+# (publish.yml).
 
 on:
   push:
@@ -26,23 +36,27 @@ jobs:
       - id: version
         shell: bash
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          version=$(tr -d '[:space:]' < version.txt)
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not name the workspace version $version" >&2
+            echo "tag $GITHUB_REF_NAME does not name the commit's version $version (version.txt)" >&2
             exit 1
           fi
-          grep -q "^## \[$version\]" CHANGELOG.md || { echo "CHANGELOG.md has no section for $version" >&2; exit 1; }
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml says $cargo_version but version.txt says $version: render Cargo.toml.wstemplate" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-  notes:
-    name: release notes
+  draft:
+    name: draft release
     needs: version
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
-      - name: create the release with its changelog section
+      - name: create the draft, with the changelog's section when it has one
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,20 +67,28 @@ jobs:
             keep && /^## \[/ { exit }
             keep { print }
           ' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" --title "reldir $VERSION" --notes-file notes.md
+          if [ -s notes.md ]; then
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "reldir $VERSION" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "reldir $VERSION" --generate-notes
+          fi
 
   binaries:
     name: binary (${{ matrix.target }})
-    needs: notes
+    needs: [version, draft]
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-13 }
+          # The oldest runners: a binary needs the glibc it was linked
+          # against (2.35 here) or later.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
@@ -76,161 +98,47 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1.30.2
         with:
           bin: reldir
+          package: reldir
           target: ${{ matrix.target }}
+          locked: true
           archive: reldir-$tag-$target
+          # A .tar.gz on every platform, which `reldir self update` unpacks;
+          # Windows also gets the .zip its users expect.
+          tar: all
+          zip: windows
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: the binary runs and is the tagged version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=".exe"
+          said=$("target/${{ matrix.target }}/release/reldir$ext" --version)
+          echo "$said"
+          [ "$said" = "reldir $VERSION" ]
 
-  crates:
-    name: crates.io
+  publish:
+    name: publish release
     needs: binaries
     runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      # The engine first: the command depends on that exact version.
-      - run: cargo publish --locked -p reldir-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      - run: cargo publish --locked -p reldir
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  wheels:
-    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { os: ubuntu-latest, target: aarch64, manylinux: auto }
-          - { os: macos-13, target: x86_64 }
-          - { os: macos-latest, target: aarch64 }
-          - { os: windows-latest, target: x64 }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      # abi3: one wheel per platform serves Python 3.10 and later.
-      - uses: PyO3/maturin-action@v1.51.0
-        with:
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
-          args: --release --locked --out dist -m crates/reldir-py/Cargo.toml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.os }}-${{ matrix.target }}
-          path: dist
-
-  sdist:
-    name: source distribution
-    needs: version
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: PyO3/maturin-action@v1.51.0
-        with:
-          command: sdist
-          args: --out dist -m crates/reldir-py/Cargo.toml
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: dist
-
-  pypi:
-    name: PyPI
-    needs: [wheels, sdist, binaries]
-    runs-on: ubuntu-latest
-    environment: release
     permissions:
-      # Trusted publishing: no stored token.
-      id-token: write
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
-
-  addons:
-    name: node addon (${{ matrix.target }})
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-13 }
-          - { target: aarch64-apple-darwin, os: macos-latest }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
-          - { target: aarch64-pc-windows-msvc, os: windows-latest }
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: crates/reldir-node
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-      - run: npm ci --ignore-scripts
-      - run: npx napi build --platform --release --target ${{ matrix.target }} --js native.js --dts native.d.ts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: addon-${{ matrix.target }}
-          path: crates/reldir-node/reldir.*.node
-      # The loader napi generates is the same on every platform: one copy
-      # goes into the main package.
-      - if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
-        with:
-          name: loader
-          path: |
-            crates/reldir-node/native.js
-            crates/reldir-node/native.d.ts
-
-  npm:
-    name: npm
-    needs: [addons, binaries]
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      id-token: write
-    defaults:
-      run:
-        working-directory: crates/reldir-node
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          registry-url: https://registry.npmjs.org
-      - run: npm ci --ignore-scripts
-      - uses: actions/download-artifact@v4
-        with:
-          path: crates/reldir-node/artifacts
-          pattern: addon-*
-      - uses: actions/download-artifact@v4
-        with:
-          name: loader
-          path: crates/reldir-node
-      # One package per platform, holding its addon; the main package lists
-      # them as optional dependencies, and its loader finds the one installed.
-      - run: npx napi create-npm-dirs
-      - run: npx napi artifacts --output-dir artifacts
-      - run: npx napi pre-publish -t npm --no-gh-release
+      - name: every platform is attached, with its checksum
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish --provenance --access public
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=0
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            for name in "reldir-$GITHUB_REF_NAME-$target.tar.gz" "reldir-$GITHUB_REF_NAME-$target.sha256"; do
+              grep -qxF "$name" <<< "$assets" || { echo "missing $name" >&2; missing=1; }
+            done
+          done
+          exit $missing
+      - name: publish it
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

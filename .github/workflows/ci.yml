@@ -27,8 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # rustfmt and clippy change their verdicts between releases, so this job
+      # runs one pinned toolchain: a new stable release can't fail it unseen,
+      # and moving it is a commit of its own, made with the code it reformats.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           components: rustfmt, clippy
       - uses: actions/setup-python@v6
         with:

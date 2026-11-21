@@ -105,7 +105,16 @@ impl Fs for StdFs {
             .sync_all()
     }
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
-        std::fs::File::open(path)?.sync_all()
+        // As the disk does: Windows opens no directory to sync, and NTFS
+        // journals directory entries itself.
+        #[cfg(unix)]
+        {
+            std::fs::File::open(path)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::metadata(path).map(|_| ())
+        }
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)

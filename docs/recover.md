@@ -96,8 +96,10 @@ error[TRANSACTION_INCOMPLETE]: the transaction holds left-behind, which no trans
 
 ## When the mirror is damaged
 
-`.db/mirror.sqlite` is derived from the files. A mirror that cannot be read is
-rebuilt by the next command, which says so. If `reldir check --deep` reports
+`.db/mirror.sqlite` is derived from the files. A mirror that is damaged is
+rebuilt by the next command, which says so. A mirror another process holds
+locked is not damaged: that is `MIRROR_LOCKED`, and a retry once the lock is
+free answers. If `reldir check --deep` reports
 `INTERNAL_METADATA_CORRUPT` at `.db/mirror.sqlite`, delete it and the files
 beside it:
 

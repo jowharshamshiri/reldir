@@ -101,7 +101,8 @@ pub struct Global {
     /// Seconds a query may run; fractions are allowed (0.5).
     #[arg(long, global = true, value_name = "SECONDS")]
     pub timeout: Option<f64>,
-    /// Seconds to wait for the writer lock; 0 tries once.
+    /// Seconds to wait for the writer lock, or for a lock another process holds
+    /// on the mirror; 0 tries once.
     #[arg(long, global = true, value_name = "SECONDS")]
     pub wait: Option<f64>,
     /// Largest JSON file read, in bytes.
@@ -472,6 +473,24 @@ pub enum Command {
     Completions {
         /// bash, zsh, fish, elvish or powershell.
         shell: clap_complete::Shell,
+    },
+    /// reldir itself: replace this binary with a release's. Needs no database.
+    #[cfg(feature = "self-update")]
+    #[command(name = "self", subcommand)]
+    SelfCommand(SelfCommand),
+}
+
+#[cfg(feature = "self-update")]
+#[derive(Subcommand, Debug, Clone)]
+pub enum SelfCommand {
+    /// Replace this binary with the latest GitHub release's build for this
+    /// platform, after checking it against its published checksum.
+    #[command(
+        after_help = "Examples:\n  reldir self update\n  reldir self update --dry-run\n  reldir self update 0.103.1678\n\nReleases are read from GitHub; HTTPS_PROXY is honoured, and GITHUB_TOKEN raises the API's rate limit. Without VERSION, only a newer release is installed."
+    )]
+    Update {
+        /// The release to install, newer or older; omit for the latest.
+        version: Option<String>,
     },
 }
 
@@ -951,6 +970,8 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Mcp => "mcp",
         Command::Serve => "serve",
         Command::Completions { .. } => "completions",
+        #[cfg(feature = "self-update")]
+        Command::SelfCommand(_) => "self",
     }
 }
 
@@ -1306,6 +1327,10 @@ pub fn dispatch(context: &Context, sink: &mut dyn Sink, command: Command) -> Res
         Command::Gc => history::gc(context, sink),
         Command::Serve => crate::serve::serve(context, sink),
         Command::Analyze => history::analyze(context, sink),
+        #[cfg(feature = "self-update")]
+        Command::SelfCommand(SelfCommand::Update { version }) => {
+            command::self_update::update(context, sink, version.as_deref())
+        }
         Command::Shell | Command::Mcp | Command::Completions { .. } => Err(DbError::usage(
             "this command runs interactively and has no result to report",
         )),

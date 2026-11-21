@@ -41,6 +41,10 @@ fn default_transaction_timeout() -> f64 {
     300.0
 }
 
+/// The longest wait: SQLite counts the wait for a lock on the mirror in
+/// milliseconds held in 32 bits, about 24.8 days.
+pub const MAX_WAIT_SECONDS: f64 = 2_147_483.0;
+
 /// Wait for the writer lock by default: five seconds absorbs any ordinary
 /// commit while still failing in bounded time when a writer is stuck.
 fn default_wait() -> f64 {
@@ -105,8 +109,9 @@ pub struct Config {
     pub max_transaction_size: u64,
     #[serde(default)]
     pub timeout_seconds: Option<f64>,
-    /// Seconds to wait for the writer lock before reporting contention. Zero
-    /// means try once. Every wait is bounded.
+    /// Seconds to wait for the writer lock, or for a lock another connection
+    /// holds on the mirror, before reporting contention. Zero means try once.
+    /// Every wait is bounded.
     #[serde(default = "default_wait")]
     pub wait_seconds: f64,
     /// Seconds a transaction may hold the writer lock, from its first
@@ -206,8 +211,9 @@ impl Config {
         }
     }
 
-    /// How long to wait for the writer lock. `validate` has refused a negative
-    /// or non-finite wait, so this cannot panic.
+    /// How long to wait for the writer lock, and for a lock another connection
+    /// holds on the mirror. `validate` has refused a negative, non-finite or
+    /// overlong wait, so this cannot panic, here or in SQLite's busy timeout.
     pub fn lock_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.wait_seconds)
     }
@@ -264,9 +270,12 @@ impl Config {
                 self.transaction_timeout_seconds
             ));
         }
-        if !self.wait_seconds.is_finite() || self.wait_seconds < 0.0 {
+        if !self.wait_seconds.is_finite()
+            || self.wait_seconds < 0.0
+            || self.wait_seconds > MAX_WAIT_SECONDS
+        {
             return Err(format!(
-                "wait_seconds must be a finite number of seconds, zero or greater, not {}",
+                "wait_seconds must be a number of seconds from 0 to {MAX_WAIT_SECONDS}, not {}",
                 self.wait_seconds
             ));
         }
@@ -357,7 +366,14 @@ mod tests {
 
     #[test]
     fn test1206_an_unusable_wait_is_rejected_before_it_reaches_a_duration() {
-        for unusable in [-1.0, -0.001, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for unusable in [
+            -1.0,
+            -0.001,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            MAX_WAIT_SECONDS + 1.0,
+        ] {
             let config = Config {
                 wait_seconds: unusable,
                 ..Default::default()
@@ -369,13 +385,18 @@ mod tests {
                     .contains("wait_seconds")
             );
         }
-        for usable in [0.0, 0.001, 5.0, 3600.0] {
+        for usable in [0.0, 0.001, 5.0, 3600.0, MAX_WAIT_SECONDS] {
             let config = Config {
                 wait_seconds: usable,
                 ..Default::default()
             };
             config.validate().unwrap();
             assert_eq!(config.lock_budget().as_secs_f64(), usable);
+            // The same budget bounds SQLite's wait for a lock on the mirror.
+            rusqlite::Connection::open_in_memory()
+                .unwrap()
+                .busy_timeout(config.lock_budget())
+                .unwrap();
         }
     }
 

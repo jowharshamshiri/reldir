@@ -20,7 +20,7 @@ impl Mirror {
                 "SELECT tbl, path FROM _reldir_keys WHERE key = ?1 AND cons = ?2 AND tbl IN ({placeholders}) \
                  ORDER BY path"
             ))
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut arguments: Vec<SqlValue> = vec![
             SqlValue::Text(key.into()),
             SqlValue::Text(constraint.into()),
@@ -30,9 +30,9 @@ impl Mirror {
             .query_map(rusqlite::params_from_iter(arguments), |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(found)
     }
 
@@ -48,7 +48,7 @@ impl Mirror {
                 "SELECT path, rule, ptr, target FROM _reldir_edges WHERE target = ?1 AND rule IN ({placeholders}) \
                  ORDER BY path, ptr"
             ))
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut arguments: Vec<SqlValue> = vec![SqlValue::Text(target.into())];
         arguments.extend(rules.iter().map(|r| SqlValue::Text(r.clone())));
         let found = statement
@@ -60,9 +60,9 @@ impl Mirror {
                     target: row.get(3)?,
                 })
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(found)
     }
 
@@ -71,7 +71,7 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT path, rule, ptr, target FROM _reldir_edges WHERE rule = ?1 ORDER BY path, ptr")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let found = statement
             .query_map([rule], |row| {
                 Ok(Edge {
@@ -81,9 +81,9 @@ impl Mirror {
                     target: row.get(3)?,
                 })
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(found)
     }
 
@@ -127,7 +127,7 @@ impl Mirror {
                  ORDER BY e.path, e.ptr"
             )
         };
-        let mut statement = self.conn.prepare(&text).map_err(corrupt)?;
+        let mut statement = self.conn.prepare(&text).map_err(sqlite)?;
         let mut arguments: Vec<SqlValue> = vec![
             SqlValue::Text(rule.into()),
             SqlValue::Text(constraint.into()),
@@ -142,9 +142,9 @@ impl Mirror {
                     target: row.get(3)?,
                 })
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(found)
     }
 
@@ -191,7 +191,7 @@ impl Mirror {
                   WHERE k.cons = ?1 AND k.tbl IN ({placeholders}) ORDER BY k.path) \
                  GROUP BY key HAVING {having} ORDER BY key"
             ))
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut arguments: Vec<SqlValue> = vec![SqlValue::Text(constraint.into())];
         arguments.extend(tables.iter().map(|t| SqlValue::Text(t.clone())));
         let found = statement
@@ -210,9 +210,9 @@ impl Mirror {
                         .collect(),
                 })
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(found)
     }
 
@@ -226,20 +226,20 @@ impl Mirror {
                  CREATE TEMP TABLE IF NOT EXISTS _reldir_scope_keys (key TEXT PRIMARY KEY) WITHOUT ROWID; \
                  DELETE FROM temp._reldir_scope_paths; DELETE FROM temp._reldir_scope_keys;",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut path = self
             .conn
             .prepare("INSERT INTO temp._reldir_scope_paths (path) VALUES (?1)")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for each in paths {
-            path.execute([each]).map_err(corrupt)?;
+            path.execute([each]).map_err(sqlite)?;
         }
         let mut key = self
             .conn
             .prepare("INSERT INTO temp._reldir_scope_keys (key) VALUES (?1)")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for each in keys {
-            key.execute([each]).map_err(corrupt)?;
+            key.execute([each]).map_err(sqlite)?;
         }
         Ok(())
     }
@@ -249,14 +249,14 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT key FROM _reldir_keys WHERE path = ?1")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut out = BTreeSet::new();
         for path in paths {
             let keys = statement
                 .query_map([path], |row| row.get::<_, String>(0))
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
             for key in keys {
-                out.insert(key.map_err(corrupt)?);
+                out.insert(key.map_err(sqlite)?);
             }
         }
         Ok(out)
@@ -269,13 +269,13 @@ impl Mirror {
             .prepare(
                 "SELECT trow FROM _reldir_files WHERE path = ?1 AND tbl = ?2 AND trow IS NOT NULL",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let mut out = vec![];
         for path in paths {
             if let Some(rowid) = statement
                 .query_row(params![path, table], |row| row.get::<_, i64>(0))
                 .optional()
-                .map_err(corrupt)?
+                .map_err(sqlite)?
             {
                 out.push(rowid);
             }

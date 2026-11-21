@@ -8,7 +8,12 @@ all-features = true
 # is judged not to apply is ignored here by id, with the reason.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono is unmaintained, and no release replaces it. Arrow and Parquet
+    # (the export format) and rmcp (the MCP server) each require it in their
+    # latest releases, so it stays in the graph whatever reldir itself uses.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is required by arrow-array, parquet and rmcp in their latest releases; no maintained release exists to upgrade to" },
+]
 
 [licenses]
 # Permissive licenses only: reldir is MIT and must stay distributable as such.
@@ -22,6 +27,8 @@ allow = [
     # inotify, notify's Linux backend: ISC is MIT's equivalent.
     "ISC",
     "BSD-2-Clause",
+    # snap, parquet's Snappy codec: BSD-3 adds only a no-endorsement clause.
+    "BSD-3-Clause",
     "BSL-1.0",
     "Unicode-3.0",
     "Unlicense",
@@ -29,9 +36,19 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# The Mozilla root certificates, as data. rustls-platform-verifier links them
+# only on wasm32, which reldir is never built for; every release target uses
+# the operating system's store.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A path dependency without a version is a wildcard; it is allowed only in a
+# crate that is never published (the Python and Node bindings, the harnesses).
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

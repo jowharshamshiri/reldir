@@ -21,6 +21,18 @@ fn diagnostic_kind() -> String {
     "diagnostic".into()
 }
 
+/// A path in the protocol is relative to the root and separated by `/` on
+/// every platform, as a row's path is named everywhere else.
+fn slash_path<S: serde::Serializer>(
+    path: &Option<PathBuf>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match path {
+        Some(path) => serializer.serialize_some(&crate::catalog::slash(path)),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Diagnostic {
@@ -32,7 +44,7 @@ pub struct Diagnostic {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "slash_path")]
     pub path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,

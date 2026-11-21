@@ -159,18 +159,13 @@ fn numeric_argument(context: &Context<'_>, index: usize) -> rusqlite::Result<Opt
 /// Register the collations and functions every connection over the mirror
 /// needs: the orderings above, and exact arithmetic for decimals.
 pub fn register(connection: &Connection, sequences: &Sequences) -> Result<()> {
-    let corrupt = |error: rusqlite::Error| {
-        DbError::new(
-            Code::INTERNAL_METADATA_CORRUPT,
-            format!("derived mirror: {error}"),
-        )
-    };
+    let sqlite = crate::mirror::sqlite;
     connection
         .create_collation("RELDIR_NUMERIC", crate::value::collate_numeric)
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     connection
         .create_collation("RELDIR_INSTANT", crate::value::collate_instant)
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     let flags = FunctionFlags::SQLITE_UTF8
         | FunctionFlags::SQLITE_DETERMINISTIC
         | FunctionFlags::SQLITE_INNOCUOUS;
@@ -191,7 +186,7 @@ pub fn register(connection: &Connection, sequences: &Sequences) -> Result<()> {
                     _ => Ok(SqlValue::Null),
                 }
             })
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
     }
     connection
         .create_scalar_function("dec_cmp", 2, flags, |context| {
@@ -202,13 +197,13 @@ pub fn register(connection: &Connection, sequences: &Sequences) -> Result<()> {
                 _ => Ok(SqlValue::Null),
             }
         })
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     connection
         .create_aggregate_function("dec_sum", 1, flags, DecimalSum)
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     connection
         .create_scalar_function("absent", 0, flags, |_| Ok(SqlValue::Blob(ABSENT.to_vec())))
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     // Strings are compared exactly as written; these compare them as people
     // read them, whichever Unicode form a program wrote.
     connection
@@ -222,13 +217,13 @@ pub fn register(connection: &Connection, sequences: &Sequences) -> Result<()> {
                 _ => return Err(function_error("nfc() normalizes text")),
             })
         })
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     connection
         .create_collation("RELDIR_NFC", |left: &str, right: &str| {
             use unicode_normalization::UnicodeNormalization;
             left.nfc().cmp(right.nfc())
         })
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     let sequences = sequences.clone();
     connection
         .create_scalar_function(
@@ -255,7 +250,7 @@ pub fn register(connection: &Connection, sequences: &Sequences) -> Result<()> {
                 Ok(to_sql_generic(&crate::value::generate(kind, sequence)))
             },
         )
-        .map_err(corrupt)?;
+        .map_err(sqlite)?;
     Ok(())
 }
 

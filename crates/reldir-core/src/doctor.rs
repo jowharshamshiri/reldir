@@ -356,7 +356,11 @@ fn fixes_for(database: &Database, diagnostic: &Diagnostic) -> Result<Vec<Fix>> {
     match diagnostic.code {
         Code::IDENTITY_MISMATCH if offered("FIX_RENAME_TO_IDENTITY") => {
             if let Some(expected) = &diagnostic.expected {
-                let to = path.parent().unwrap_or(Path::new("")).join(expected);
+                // Beside the file it renames, separated by `/` as every row
+                // path is.
+                let to = PathBuf::from(crate::catalog::slash(
+                    &path.parent().unwrap_or(Path::new("")).join(expected),
+                ));
                 if catalog.mirror.file(&crate::catalog::slash(&to))?.is_none() {
                     out.push(base(
                         "FIX_RENAME_TO_IDENTITY",

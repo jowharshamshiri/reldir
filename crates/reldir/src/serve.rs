@@ -232,7 +232,13 @@ pub fn serve(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
         cookies: HashSet::new(),
     }));
     let seen = Arc::new(Condvar::new());
-    let watch_root = root.clone();
+    // Events name paths as the operating system resolves them: on macOS a
+    // temporary folder under `/var` is reported under `/private/var`, and an
+    // event whose path is not under the root is dropped, cookies included.
+    // Watching the resolved path, and matching events against it, keeps the
+    // two in the same spelling on every platform.
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let watch_root = resolved.clone();
     let events_log = Arc::clone(&log);
     let events_seen = Arc::clone(&seen);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -273,7 +279,7 @@ pub fn serve(context: &Context, sink: &mut dyn Sink) -> Result<Finish> {
     })
     .map_err(|error| DbError::new(Code::IO_ERROR, format!("cannot watch the folder: {error}")))?;
     watcher
-        .watch(&root, RecursiveMode::Recursive)
+        .watch(&resolved, RecursiveMode::Recursive)
         .map_err(|error| {
             DbError::new(
                 Code::IO_ERROR,

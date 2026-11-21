@@ -1,19 +1,66 @@
 # Changelog
 
 Every release of reldir, newest first. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-the [stability policy](https://jowharshamshiri.github.io/reldir/stability):
-format 3, protocol 1, the error-code registry and the `reldir-core` API are
-governed by semantic versioning.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
+numbered as the [stability policy](https://jowharshamshiri.github.io/reldir/stability)
+describes: format 3, protocol 1, the error-code registry and the
+`reldir-core` API change incompatibly only with the major version.
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-11
+### Fixed
 
-The first stable release: a new on-disk format, a versioned machine
-protocol, libraries for Python, Node and Rust, and an engine whose cost
-follows the change rather than the folder. Databases in format 2 are
-converted, history included, by `reldir upgrade`.
+- A lock another process held on the mirror was reported as
+  `INTERNAL_METADATA_CORRUPT` ("derived mirror: database is locked"), and a
+  writer that met it while opening the mirror deleted the mirror and rebuilt
+  it from under that process. Every command now waits for that lock for up to
+  `wait_seconds` and then fails with the new code `MIRROR_LOCKED` (exit `3`,
+  safe to retry), naming `.db/mirror.sqlite`. A failed read or write of the
+  mirror is `IO_ERROR`; only a mirror that fails verification is
+  `INTERNAL_METADATA_CORRUPT`, and only that is rebuilt.
+- `wait_seconds` and `--wait` accept at most `2147483` seconds, the longest
+  wait SQLite can count; a longer one is refused as invalid instead of
+  stopping the command.
+
+### Security
+
+- The bundled SQLite is 3.54.1 (rusqlite 0.43), which fixes CVE-2026-119375:
+  opening a database with a crafted `-wal` file of another page size could
+  return uninitialized memory.
+- `reldir self update` connects with rustls 0.23.46, which fixes four TLS
+  client advisories, and rustls-webpki 0.103.17, which refuses certificate
+  paths through the distrusted emSign intermediates.
+- The MCP server is built on rmcp 3.11 and tokio 1.54.1, past their
+  advisories.
+
+## [0.106.29] - 2026-10-11
+
+The first release published on GitHub: a new on-disk format, a versioned
+machine protocol, libraries for Python, Node and Rust, an engine whose cost
+follows the change rather than the folder, and a binary for every major
+platform that updates itself. Databases in format 2 are converted, history
+included, by `reldir upgrade`.
+
+### Releases
+
+- Every release carries `reldir-v<version>-<target>.tar.gz` for Linux
+  (x86-64, ARM64), macOS (Intel, Apple silicon) and Windows (x86-64, also as
+  a `.zip`), each with its `.sha256`.
+- `reldir self update [VERSION]` installs the latest release's build for the
+  running platform, or the release named, after checking the download
+  against its checksum and that the binary in it runs as that version;
+  `--dry-run` names it and writes nothing. New codes `RELEASE_UNREACHABLE`,
+  `RELEASE_NOT_FOUND` and `RELEASE_UNVERIFIED`.
+- Every command runs on a 64 MiB stack on every platform, so a deep
+  document or schema is judged the same on Windows as on Linux.
+- On macOS, `reldir serve` sees the folder's changes: events reported under
+  the folder's resolved path (`/private/var` for `/var`) were dropped.
+- On Windows, every path the protocol carries -- a diagnostic's `path`, its
+  help, a table's `schema_file` -- is separated by `/`, as on every other
+  platform; and `reldir serve` no longer mistakes a table directory's own
+  change, which Windows reports beside each row's, for a reason to examine
+  the folder whole.
+- Linux builds need glibc 2.35, not the 2.39 of the runner they were built on.
 
 ### The observed contract
 

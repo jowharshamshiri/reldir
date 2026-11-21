@@ -125,6 +125,7 @@ pub enum Group {
     History,
     Inference,
     Lint,
+    Update,
     Internal,
 }
 
@@ -143,6 +144,7 @@ impl Group {
             Group::History => "History and snapshots",
             Group::Inference => "Inference",
             Group::Lint => "Lint",
+            Group::Update => "Updating reldir",
             Group::Internal => "reldir itself",
         }
     }
@@ -293,6 +295,7 @@ codes! {
 
     // Transactions and concurrency.
     LOCK_CONTENDED => Transaction, Contention, "another writer held the lock past the wait";
+    MIRROR_LOCKED => Transaction, Contention, "another connection held SQLite's lock on the derived mirror, `.db/mirror.sqlite`, past the wait, or wrote it while this one was reading it";
     CONCURRENT_MODIFICATION => Transaction, Contention, "a file a change was planned against moved before it was written";
     PATH_INTERFERENCE => Transaction, Contention, "a path a change needs is not what it must be (a directory where a file goes, a symlink ancestor)";
     PLAN_CHANGED => Transaction, Contention, "a planned change no longer matches the state it would be committed to";
@@ -336,6 +339,11 @@ codes! {
     LINT_ADDITIONAL_FIELDS_ALLOWED => Lint, Findings, "the schema accepts members it does not declare";
     LINT_NON_CANONICAL_FORMATTING => Lint, Findings, "rows not in their table's recorded style";
     LINT_NO_DESCRIPTION => Lint, Findings, "a table or column without a description";
+
+    // Updating reldir.
+    RELEASE_UNREACHABLE => Update, Untrusted, "the releases could not be read or downloaded: the network, a proxy or GitHub refused";
+    RELEASE_NOT_FOUND => Update, Unresolved, "no release has that version, or the release holds no build for this platform";
+    RELEASE_UNVERIFIED => Update, Untrusted, "a downloaded release does not match its published checksum, or does not run as reldir";
 
     // reldir itself.
     INTERNAL_ERROR => Internal, Internal, "reldir failed; the message says what it was doing";

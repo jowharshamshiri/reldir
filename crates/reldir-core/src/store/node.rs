@@ -495,11 +495,17 @@ macro_rules! typed_loader {
 
 typed_loader!(
     /// Read a root node.
-    load_root, Root, Root, "root"
+    load_root,
+    Root,
+    Root,
+    "root"
 );
 typed_loader!(
     /// Read an extras node.
-    load_extras, Extras, Extras, "extras"
+    load_extras,
+    Extras,
+    Extras,
+    "extras"
 );
 typed_loader!(load_table_node, Table, TableNode, "table");
 typed_loader!(load_mid_node, Mid, Mid, "mid");

@@ -181,6 +181,7 @@ every change an `--idempotency-key`, which makes a retry safe whatever happened.
 | Code | Exit | Meaning |
 |---|---|---|
 | <a id="lock_contended"></a>`LOCK_CONTENDED` | `3` | another writer held the lock past the wait |
+| <a id="mirror_locked"></a>`MIRROR_LOCKED` | `3` | another connection held SQLite's lock on the derived mirror, `.db/mirror.sqlite`, past the wait, or wrote it while this one was reading it |
 | <a id="concurrent_modification"></a>`CONCURRENT_MODIFICATION` | `3` | a file a change was planned against moved before it was written |
 | <a id="path_interference"></a>`PATH_INTERFERENCE` | `3` | a path a change needs is not what it must be (a directory where a file goes, a symlink ancestor) |
 | <a id="plan_changed"></a>`PLAN_CHANGED` | `3` | a planned change no longer matches the state it would be committed to |
@@ -233,6 +234,14 @@ every change an `--idempotency-key`, which makes a retry safe whatever happened.
 | <a id="lint_additional_fields_allowed"></a>`LINT_ADDITIONAL_FIELDS_ALLOWED` | `7` | the schema accepts members it does not declare |
 | <a id="lint_non_canonical_formatting"></a>`LINT_NON_CANONICAL_FORMATTING` | `7` | rows not in their table's recorded style |
 | <a id="lint_no_description"></a>`LINT_NO_DESCRIPTION` | `7` | a table or column without a description |
+
+### Updating reldir
+
+| Code | Exit | Meaning |
+|---|---|---|
+| <a id="release_unreachable"></a>`RELEASE_UNREACHABLE` | `6` | the releases could not be read or downloaded: the network, a proxy or GitHub refused |
+| <a id="release_not_found"></a>`RELEASE_NOT_FOUND` | `4` | no release has that version, or the release holds no build for this platform |
+| <a id="release_unverified"></a>`RELEASE_UNVERIFIED` | `6` | a downloaded release does not match its published checksum, or does not run as reldir |
 
 ### reldir itself
 

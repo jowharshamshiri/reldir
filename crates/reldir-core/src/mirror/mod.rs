@@ -18,9 +18,11 @@
 //! invalid state in order to describe it. Validity is decided by
 //! [`crate::integrity`], which reads the mirror.
 //!
-//! A mirror that is missing, from another layout, or unreadable is discarded
-//! and rebuilt from the files, and the command says so. Nothing is lost,
-//! because nothing here is authoritative.
+//! A mirror that is missing, from another layout, or damaged is discarded and
+//! rebuilt from the files, and the command says so. Nothing is lost, because
+//! nothing here is authoritative. A mirror another connection holds locked is
+//! not damaged: it is waited on, as long as a writer waits for the writer
+//! lock, and then reported as `MIRROR_LOCKED`.
 
 use crate::code::Code;
 use crate::{
@@ -33,6 +35,7 @@ use serde_json::{Map, Value};
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 mod ddl;
@@ -135,9 +138,21 @@ pub struct Mirror {
     conn: Connection,
     /// The sequences generated columns hand out while a statement is planned.
     sequences: crate::index::types::Sequences,
+    /// What the statement in hand may touch and how long it may run.
+    guard: crate::sql::Guard,
     /// Whether changes are written to `.db/mirror.sqlite` rather than held in
     /// memory for this process only.
     persistent: bool,
+    /// The savepoints open on the connection, outermost first.
+    savepoints: std::cell::RefCell<Savepoints>,
+}
+
+#[derive(Default)]
+struct Savepoints {
+    names: Vec<String>,
+    /// Whether the outermost began the transaction they are in, which ends
+    /// when the outermost is released or rolled back.
+    began: bool,
 }
 
 /// The `_reldir_meta` key recording how many rows a table had when its
@@ -146,17 +161,111 @@ fn analyzed_key(table: &str) -> String {
     format!("analyzed_rows:{table}")
 }
 
-fn corrupt(error: impl std::fmt::Display) -> DbError {
+/// The mirror's file, as a diagnostic names it: relative to the root.
+const FILE: &str = ".db/mirror.sqlite";
+
+/// The mirror holds something reldir never wrote there, or SQLite found its
+/// file damaged. Only a failure of verification is corruption: a SQLite
+/// error goes through [`sqlite`], which tells a lock or a failed read apart.
+fn corrupt(message: impl Into<String>) -> DbError {
     DbError::new(
         Code::INTERNAL_METADATA_CORRUPT,
-        format!("derived mirror: {error}"),
+        format!("derived mirror: {}", message.into()),
     )
 }
 
-fn register(conn: &Connection) -> Result<crate::index::types::Sequences> {
-    let sequences = crate::index::types::Sequences::default();
-    crate::index::types::register(conn, &sequences)?;
-    Ok(sequences)
+/// What a SQLite failure on the mirror means. A lock another connection held
+/// past the wait is contention, and a retry is safe; a failed read or write of
+/// the file is I/O; neither says anything about what the mirror holds. The
+/// rest -- SQLite found the file malformed, or the mirror does not hold what
+/// reldir wrote to it -- is corruption, and a writer rebuilds the mirror.
+pub(crate) fn sqlite(error: rusqlite::Error) -> DbError {
+    condition(&error).unwrap_or_else(|| corrupt(error.to_string()))
+}
+
+/// The SQLite failures that are conditions of the moment -- a lock, the
+/// disk, memory -- rather than faults in the mirror or in a statement: the
+/// same on every connection over the mirror, whatever it was running.
+pub(crate) fn condition(error: &rusqlite::Error) -> Option<DbError> {
+    use rusqlite::ffi::ErrorCode;
+    let rusqlite::Error::SqliteFailure(failure, _) = error else {
+        return None;
+    };
+    let diagnostic = match failure.code {
+        // SQLITE_BUSY_SNAPSHOT: a read cannot become a write, because another
+        // connection wrote the mirror after the read began.
+        ErrorCode::DatabaseBusy if failure.extended_code == rusqlite::ffi::SQLITE_BUSY_SNAPSHOT => {
+            Diagnostic::error(
+                Code::MIRROR_LOCKED,
+                format!(
+                    "another connection wrote the derived mirror {FILE} after this one began \
+                     reading it, so this one cannot write it: {error}"
+                ),
+            )
+            .help("nothing was written, and a retry is safe")
+            .at(FILE)
+        }
+        // SQLITE_BUSY: another connection holds the lock this one needs, and
+        // held it past the busy timeout. SQLITE_PROTOCOL: in write-ahead mode,
+        // the log's locks kept changing hands under every attempt to take one.
+        ErrorCode::DatabaseBusy | ErrorCode::FileLockingProtocolFailed => Diagnostic::error(
+            Code::MIRROR_LOCKED,
+            format!(
+                "another connection held SQLite's lock on the derived mirror {FILE} past the \
+                 wait: {error}"
+            ),
+        )
+        .help(
+            "nothing was written, and a retry is safe; to wait longer, pass `--wait SECONDS` or \
+             set `wait_seconds`",
+        )
+        .at(FILE),
+        // SQLITE_LOCKED: without a shared cache, only a statement on this
+        // same connection can hold what this one needs. No wait ends that.
+        ErrorCode::DatabaseLocked => Diagnostic::error(
+            Code::INTERNAL_ERROR,
+            format!(
+                "a statement on the derived mirror conflicted with another on reldir's own \
+                 connection: {error}"
+            ),
+        ),
+        ErrorCode::SystemIoFailure
+        | ErrorCode::DiskFull
+        | ErrorCode::CannotOpen
+        | ErrorCode::ReadOnly
+        | ErrorCode::PermissionDenied
+        | ErrorCode::NoLargeFileSupport => Diagnostic::error(
+            Code::IO_ERROR,
+            format!("the derived mirror could not be read or written: {error}"),
+        )
+        .at(FILE),
+        ErrorCode::OutOfMemory => Diagnostic::error(
+            Code::RESOURCE_LIMIT,
+            format!("SQLite ran out of memory working on the derived mirror: {error}"),
+        ),
+        _ => return None,
+    };
+    Some(DbError::from_diag(diagnostic))
+}
+
+/// Have SQLite wait up to `wait` for a lock another connection holds, as
+/// reldir waits for its writer lock: a commit finishing, or the last
+/// connection to close checkpointing the log, holds the mirror only briefly.
+fn wait_for_locks(conn: &Connection, wait: Duration) -> Result<()> {
+    conn.busy_timeout(wait).map_err(sqlite)
+}
+
+/// A mirror not yet labelled with its layout -- one being built, or an empty
+/// file -- holds no `_reldir_meta` to read: it has no layout yet.
+fn no_such_table(error: rusqlite::Error) -> rusqlite::Result<Option<String>> {
+    match error {
+        rusqlite::Error::SqliteFailure(_, Some(ref message))
+            if message.contains("no such table") =>
+        {
+            Ok(None)
+        }
+        other => Err(other),
+    }
 }
 
 const INTERNAL: &str = "
@@ -260,13 +369,16 @@ END;
 
 impl Mirror {
     /// Open the persistent mirror for writing. The caller holds the writer
-    /// lock. A mirror that cannot be read, or has another layout, is replaced
-    /// by an empty one; the returned flag says so, so the command can report it.
-    pub fn open_persistent(root: &Path, verify: bool) -> Result<(Self, bool)> {
+    /// lock. A mirror that is damaged, or has another layout, is replaced by
+    /// an empty one; the returned flag says so, so the command can report it.
+    /// One that another connection holds locked is waited on for up to
+    /// `wait`, and past that reported as `MIRROR_LOCKED`, never rebuilt: the
+    /// connection holding it may be finishing a commit.
+    pub fn open_persistent(root: &Path, verify: bool, wait: Duration) -> Result<(Self, bool)> {
         let file = path(root);
         // After an interrupted commit the mirror may hold a torn page; it is
         // derived, so one that fails SQLite's own check is rebuilt, never used.
-        let opened = Self::try_open_file(&file).and_then(|mirror| match verify {
+        let opened = Self::try_open_file(&file, wait).and_then(|mirror| match verify {
             true => match mirror.integrity_check()? {
                 None => Ok(mirror),
                 Some(problem) => Err(corrupt(problem)),
@@ -275,6 +387,7 @@ impl Mirror {
         });
         match opened {
             Ok(mirror) => Ok((mirror, false)),
+            Err(error) if error.code() != Code::INTERNAL_METADATA_CORRUPT => Err(error),
             Err(_) => {
                 for suffix in ["", "-journal", "-wal", "-shm"] {
                     let stale = PathBuf::from(format!("{}{suffix}", file.display()));
@@ -284,13 +397,29 @@ impl Mirror {
                         Err(error) => return Err(DbError::io(&stale, error)),
                     }
                 }
-                Ok((Self::try_open_file(&file)?, true))
+                Ok((Self::try_open_file(&file, wait)?, true))
             }
         }
     }
 
-    fn try_open_file(file: &Path) -> Result<Self> {
-        let conn = Connection::open(file).map_err(corrupt)?;
+    /// A mirror over an open connection, with reldir's functions and the
+    /// statement guard registered while no statement borrows it.
+    fn assemble(mut conn: Connection, persistent: bool) -> Result<Self> {
+        let sequences = crate::index::types::Sequences::default();
+        crate::index::types::register(&conn, &sequences)?;
+        let guard = crate::sql::Guard::register(&mut conn).map_err(sqlite)?;
+        Ok(Self {
+            conn,
+            sequences,
+            guard,
+            persistent,
+            savepoints: Default::default(),
+        })
+    }
+
+    fn try_open_file(file: &Path, wait: Duration) -> Result<Self> {
+        let conn = Connection::open(file).map_err(sqlite)?;
+        wait_for_locks(&conn, wait)?;
         // Write-ahead logging lets a reader keep answering from the last
         // committed state while a writer changes it. The mirror is derived,
         // so NORMAL synchronisation -- durable up to the last checkpoint --
@@ -301,13 +430,8 @@ impl Mirror {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; \
              PRAGMA foreign_keys=OFF;",
         )
-        .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: true,
-        };
+        .map_err(sqlite)?;
+        let mirror = Self::assemble(conn, true)?;
         mirror.initialize()?;
         Ok(mirror)
     }
@@ -315,8 +439,9 @@ impl Mirror {
     /// The persistent mirror opened to answer from its last committed state
     /// while a writer holds the lock: one read transaction, begun now, so
     /// every question is asked of one state. `None` when there is no mirror
-    /// in this layout to read.
-    pub fn open_snapshot(root: &Path) -> Result<Option<Self>> {
+    /// in this layout to read. A lock another connection holds is waited on
+    /// for up to `wait`, as when opening for writing.
+    pub fn open_snapshot(root: &Path, wait: Duration) -> Result<Option<Self>> {
         let file = path(root);
         let conn = match Connection::open_with_flags(
             &file,
@@ -324,16 +449,12 @@ impl Mirror {
         ) {
             Ok(conn) => conn,
             Err(_) if !file.exists() => return Ok(None),
-            Err(error) => return Err(corrupt(error)),
+            Err(error) => return Err(sqlite(error)),
         };
+        wait_for_locks(&conn, wait)?;
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
-            .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: true,
-        };
+            .map_err(sqlite)?;
+        let mirror = Self::assemble(conn, true)?;
         mirror.hold_snapshot()?;
         let layout: Option<String> = mirror
             .conn
@@ -343,7 +464,8 @@ impl Mirror {
                 |row| row.get(0),
             )
             .optional()
-            .unwrap_or(None);
+            .or_else(no_such_table)
+            .map_err(sqlite)?;
         if layout.as_deref() != Some(LAYOUT) {
             return Ok(None);
         }
@@ -356,20 +478,15 @@ impl Mirror {
     pub fn hold_snapshot(&self) -> Result<()> {
         self.conn
             .execute_batch("BEGIN DEFERRED; SELECT count(*) FROM sqlite_master;")
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 
     /// An empty mirror held in memory, for folders that carry no database.
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(corrupt)?;
+        let conn = Connection::open_in_memory().map_err(sqlite)?;
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
-            .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mirror = Self {
-            conn,
-            sequences,
-            persistent: false,
-        };
+            .map_err(sqlite)?;
+        let mirror = Self::assemble(conn, false)?;
         mirror.initialize()?;
         Ok(mirror)
     }
@@ -381,25 +498,14 @@ impl Mirror {
     pub fn open_ephemeral(root: &Path) -> Result<Self> {
         let conn = match Self::copy_persistent(root)? {
             Some(conn) => conn,
-            None => Connection::open_in_memory().map_err(corrupt)?,
+            None => Connection::open_in_memory().map_err(sqlite)?,
         };
         conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA foreign_keys=OFF;")
-            .map_err(corrupt)?;
-        let sequences = register(&conn)?;
-        let mut mirror = Self {
-            conn,
-            sequences,
-            persistent: false,
-        };
+            .map_err(sqlite)?;
+        let mut mirror = Self::assemble(conn, false)?;
         if mirror.initialize().is_err() {
             // A copy of a mirror from another layout is no base to build on.
-            let conn = Connection::open_in_memory().map_err(corrupt)?;
-            let sequences = register(&conn)?;
-            mirror = Self {
-                conn,
-                sequences,
-                persistent: false,
-            };
+            mirror = Self::assemble(Connection::open_in_memory().map_err(sqlite)?, false)?;
             mirror.initialize()?;
         }
         Ok(mirror)
@@ -439,7 +545,7 @@ impl Mirror {
         let Ok(source) = Connection::open(&copy) else {
             return Ok(None);
         };
-        let mut conn = Connection::open_in_memory().map_err(corrupt)?;
+        let mut conn = Connection::open_in_memory().map_err(sqlite)?;
         let copied = rusqlite::backup::Backup::new(&source, &mut conn)
             .and_then(|backup| backup.run_to_completion(256, std::time::Duration::ZERO, None));
         Ok(copied.ok().map(|()| conn))
@@ -454,15 +560,8 @@ impl Mirror {
                 |row| row.get(0),
             )
             .optional()
-            .or_else(|error| match error {
-                rusqlite::Error::SqliteFailure(_, Some(ref message))
-                    if message.contains("no such table") =>
-                {
-                    Ok(None)
-                }
-                other => Err(other),
-            })
-            .map_err(corrupt)?;
+            .or_else(no_such_table)
+            .map_err(sqlite)?;
         match layout.as_deref() {
             Some(LAYOUT) => {}
             Some(other) => return Err(corrupt(format!("layout {other} is not {LAYOUT}"))),
@@ -470,17 +569,17 @@ impl Mirror {
                 let empty: i64 = self
                     .conn
                     .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
-                    .map_err(corrupt)?;
+                    .map_err(sqlite)?;
                 if empty != 0 {
                     return Err(corrupt("an unlabelled database is not a mirror"));
                 }
-                self.conn.execute_batch(INTERNAL).map_err(corrupt)?;
+                self.conn.execute_batch(INTERNAL).map_err(sqlite)?;
                 self.conn
                     .execute(
                         "INSERT INTO _reldir_meta (key, value) VALUES ('layout', ?1)",
                         [LAYOUT],
                     )
-                    .map_err(corrupt)?;
+                    .map_err(sqlite)?;
             }
         }
         Ok(())
@@ -504,38 +603,96 @@ impl Mirror {
         &self.sequences
     }
 
+    /// What the statement in hand may touch and how long it may run.
+    pub(crate) fn guard(&self) -> &crate::sql::Guard {
+        &self.guard
+    }
+
     /// Begin a unit of mirror maintenance. Everything until [`Mirror::commit`]
     /// or [`Mirror::rollback`] lands together or not at all.
     pub fn begin(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(corrupt)
+        self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite)
     }
 
     pub fn commit(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT").map_err(corrupt)
+        self.conn.execute_batch("COMMIT").map_err(sqlite)
     }
 
     pub fn rollback(&self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK").map_err(corrupt)
+        self.conn.execute_batch("ROLLBACK").map_err(sqlite)
     }
 
     /// A named point inside the current unit that can be undone to, used to try
     /// a prospective state and discard it.
+    ///
+    /// Outside a transaction, a savepoint on the mirror's file begins one
+    /// that holds SQLite's write lock from the start. `SAVEPOINT` alone would
+    /// begin a deferred one, which reads under a shared lock and asks for the
+    /// write lock at its first write; SQLite refuses an upgrade it cannot make
+    /// at once without waiting, since two readers upgrading would wait on each
+    /// other forever. Asking for the write lock first, where SQLite does wait,
+    /// makes a lock another connection holds a wait rather than a refusal.
     pub fn savepoint(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute_batch(&format!("SAVEPOINT {name}"))
-            .map_err(corrupt)
+        let mut open = self.savepoints.borrow_mut();
+        if open.names.is_empty() && self.persistent && self.conn.is_autocommit() {
+            self.conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite)?;
+            open.began = true;
+        }
+        if let Err(error) = self.conn.execute_batch(&format!("SAVEPOINT {name}")) {
+            if open.names.is_empty() && open.began {
+                open.began = false;
+                self.abandon();
+            }
+            return Err(sqlite(error));
+        }
+        open.names.push(name.to_string());
+        Ok(())
     }
 
     pub fn rollback_to(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))
-            .map_err(corrupt)
+        self.end(name, &format!("ROLLBACK TO {name}; RELEASE {name}"))
     }
 
     pub fn release(&self, name: &str) -> Result<()> {
-        self.conn
-            .execute_batch(&format!("RELEASE {name}"))
-            .map_err(corrupt)
+        self.end(name, &format!("RELEASE {name}"))
+    }
+
+    /// End the savepoint `name`, and those opened inside it, with `sql`; the
+    /// outermost commits the transaction it began.
+    fn end(&self, name: &str, sql: &str) -> Result<()> {
+        let mut open = self.savepoints.borrow_mut();
+        if let Err(error) = self.conn.execute_batch(sql) {
+            if self.conn.is_autocommit() {
+                // A failure SQLite answers by rolling back the whole
+                // transaction ended every savepoint in it.
+                *open = Savepoints::default();
+            }
+            return Err(sqlite(error));
+        }
+        if let Some(at) = open.names.iter().rposition(|open| open == name) {
+            open.names.truncate(at);
+        }
+        if open.names.is_empty() && open.began {
+            open.began = false;
+            if let Err(error) = self.conn.execute_batch("COMMIT") {
+                self.abandon();
+                return Err(sqlite(error));
+            }
+        }
+        Ok(())
+    }
+
+    /// Roll back a transaction a savepoint began, after the failure that is
+    /// reported in its place. SQLite has rolled back already when that
+    /// failure ended the transaction; otherwise this does, so the connection
+    /// is never left inside a transaction nothing will end.
+    fn abandon(&self) {
+        if !self.conn.is_autocommit() {
+            // The failure being reported is what went wrong; a rollback that
+            // fails too leaves the connection to report its own state at the
+            // next statement.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -546,14 +703,14 @@ impl Mirror {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 
     pub fn clear_meta(&self, key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM _reldir_meta WHERE key = ?1", [key])
             .map(|_| ())
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -565,7 +722,7 @@ impl Mirror {
                 params![key, value],
             )
             .map(|_| ())
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 }
 
@@ -986,5 +1143,59 @@ mod tests {
             ),
             "a changed size is a change"
         );
+    }
+
+    /// A mirror another connection holds -- as the last connection to close
+    /// holds it while it checkpoints the log -- is waited on, and past the
+    /// wait reported as locked: never taken for damaged and rebuilt from
+    /// under the connection holding it. A damaged mirror is still rebuilt.
+    #[test]
+    fn test2082_a_locked_mirror_is_waited_on_and_never_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir_all(root.join(".db")).unwrap();
+        let (mirror, rebuilt) = Mirror::open_persistent(root, false, Duration::ZERO).unwrap();
+        assert!(!rebuilt);
+        mirror.set_meta("kept", "yes").unwrap();
+        drop(mirror);
+
+        let holder = Connection::open(path(root)).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; \
+                 SELECT count(*) FROM _reldir_meta;",
+            )
+            .unwrap();
+        let wait = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let Err(error) = Mirror::open_persistent(root, false, wait) else {
+            panic!("a mirror held exclusively cannot be opened");
+        };
+        let waited = started.elapsed();
+        assert_eq!(error.code(), Code::MIRROR_LOCKED, "{error}");
+        assert!(
+            waited >= wait,
+            "must wait the whole budget: waited {waited:?}"
+        );
+
+        let held = Duration::from_millis(300);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(held);
+            drop(holder);
+        });
+        let started = std::time::Instant::now();
+        let (mirror, rebuilt) =
+            Mirror::open_persistent(root, false, Duration::from_secs(30)).unwrap();
+        let waited = started.elapsed();
+        releaser.join().unwrap();
+        assert!(waited >= held, "must wait for the lock: waited {waited:?}");
+        assert!(!rebuilt, "a mirror that was only locked is kept");
+        assert_eq!(mirror.meta("kept").unwrap().as_deref(), Some("yes"));
+        drop(mirror);
+
+        std::fs::write(path(root), vec![0xab; 4096]).unwrap();
+        let (mirror, rebuilt) = Mirror::open_persistent(root, false, Duration::ZERO).unwrap();
+        assert!(rebuilt, "a damaged mirror is rebuilt");
+        assert_eq!(mirror.meta("kept").unwrap(), None);
     }
 }

@@ -14,12 +14,12 @@ impl Mirror {
             let mut statement = self
                 .conn
                 .prepare("SELECT tbl, identity FROM _reldir_tables")
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
             statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(corrupt)?
+                .map_err(sqlite)?
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(corrupt)?
+                .map_err(sqlite)?
         };
         let mut rebuilt = vec![];
         for (table, identity) in &known {
@@ -43,21 +43,21 @@ impl Mirror {
     pub(super) fn drop_table(&self, table: &str) -> Result<()> {
         self.conn
             .execute_batch(&format!("DROP TABLE IF EXISTS {}", quote(table)))
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for statement in [
             "DELETE FROM _reldir_edges WHERE path IN (SELECT path FROM _reldir_files WHERE tbl = ?1)",
             "DELETE FROM _reldir_keys WHERE tbl = ?1",
             "DELETE FROM _reldir_files WHERE tbl = ?1",
             "DELETE FROM _reldir_tables WHERE tbl = ?1",
         ] {
-            self.conn.execute(statement, [table]).map_err(corrupt)?;
+            self.conn.execute(statement, [table]).map_err(sqlite)?;
         }
         self.conn
             .execute(
                 "DELETE FROM _reldir_meta WHERE key = ?1",
                 [analyzed_key(table)],
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(())
     }
 
@@ -85,7 +85,7 @@ impl Mirror {
                 quote(table),
                 columns.join(", ")
             ))
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         // A sequence's next value is read from the largest it holds, which an
         // index finds without a scan.
         let sequences = schema
@@ -127,14 +127,14 @@ impl Mirror {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
         }
         self.conn
             .execute(
                 "INSERT INTO _reldir_tables (tbl, identity, enforced) VALUES (?1, ?2, 1)",
                 params![table, signature(schema)],
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         self.key_indexes(schema, true)?;
         Ok(())
     }
@@ -159,14 +159,14 @@ impl Mirror {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
         }
         self.conn
             .execute(
                 "UPDATE _reldir_tables SET enforced = ?2 WHERE tbl = ?1",
                 params![table, i64::from(unique)],
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(())
     }
 
@@ -176,12 +176,12 @@ impl Mirror {
             let mut statement = self
                 .conn
                 .prepare("SELECT tbl FROM _reldir_tables WHERE enforced = 0")
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
             statement
                 .query_map([], |row| row.get(0))
-                .map_err(corrupt)?
+                .map_err(sqlite)?
                 .collect::<std::result::Result<Vec<String>, _>>()
-                .map_err(corrupt)?
+                .map_err(sqlite)?
         };
         for table in relaxed {
             let Some(schema) = schemas.get(&table) else {

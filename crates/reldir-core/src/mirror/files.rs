@@ -13,7 +13,7 @@ impl Mirror {
                 file_entry,
             )
             .optional()
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .transpose()
     }
 
@@ -27,7 +27,7 @@ impl Mirror {
                 "SELECT path, size, mtime_ns, ctime_ns, inode, device, raw_hash, seen_ns \
                  FROM _reldir_files WHERE tbl = ?1",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let stamps = statement
             .query_map([table], |row| {
                 Ok((
@@ -45,9 +45,9 @@ impl Mirror {
                     },
                 ))
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(stamps)
     }
 
@@ -57,12 +57,12 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT path FROM _reldir_files WHERE tbl = ?1 AND folded = ?2 AND path <> ?3 ORDER BY path")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let paths = statement
             .query_map(params![table, folded, except], |row| row.get(0))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<String>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(paths)
     }
 
@@ -73,12 +73,12 @@ impl Mirror {
             .prepare(
                 "SELECT path FROM _reldir_files WHERE tbl = ?1 AND style IS NOT ?2 ORDER BY path",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let paths = statement
             .query_map(params![table, style], |row| row.get(0))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<String>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(paths)
     }
 
@@ -86,12 +86,12 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT path FROM _reldir_files WHERE tbl = ?1 ORDER BY path")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let paths = statement
             .query_map([table], |row| row.get(0))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<String>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(paths)
     }
 
@@ -107,10 +107,10 @@ impl Mirror {
                 "SELECT path, tbl, size, mtime_ns, ctime_ns, inode, device, raw_hash, seen_ns, \
                  row_hash, doc, diagnostics FROM _reldir_files WHERE tbl = ?1 ORDER BY path",
             )
-            .map_err(corrupt)?;
-        let mut rows = statement.query([table]).map_err(corrupt)?;
-        while let Some(row) = rows.next().map_err(corrupt)? {
-            visit(file_entry(row).map_err(corrupt)??)?;
+            .map_err(sqlite)?;
+        let mut rows = statement.query([table]).map_err(sqlite)?;
+        while let Some(row) = rows.next().map_err(sqlite)? {
+            visit(file_entry(row).map_err(sqlite)??)?;
         }
         Ok(())
     }
@@ -132,7 +132,7 @@ impl Mirror {
                 ],
             )
             .map(|_| ())
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 
     /// Forget a file.
@@ -145,21 +145,21 @@ impl Mirror {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         if let Some((table, Some(rowid))) = &trow {
             self.conn
                 .execute(
                     &format!("DELETE FROM {} WHERE rowid = ?1", quote(table)),
                     [rowid],
                 )
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
         }
         for statement in [
             "DELETE FROM _reldir_edges WHERE path = ?1",
             "DELETE FROM _reldir_keys WHERE path = ?1",
             "DELETE FROM _reldir_files WHERE path = ?1",
         ] {
-            self.conn.execute(statement, [path]).map_err(corrupt)?;
+            self.conn.execute(statement, [path]).map_err(sqlite)?;
         }
         Ok(())
     }
@@ -207,9 +207,9 @@ impl Mirror {
                         self.key_indexes(schema, false)?;
                         self.conn
                             .execute(&insert, rusqlite::params_from_iter(values))
-                            .map_err(corrupt)?;
+                            .map_err(sqlite)?;
                     }
-                    Err(error) => return Err(corrupt(error)),
+                    Err(error) => return Err(sqlite(error)),
                 }
                 let trow = self.conn.last_insert_rowid();
                 for (constraint, columns) in constraints(schema) {
@@ -219,7 +219,7 @@ impl Mirror {
                                 "INSERT INTO _reldir_keys (tbl, cons, key, path) VALUES (?1, ?2, ?3, ?4)",
                                 params![ingest.table, constraint, key, ingest.path],
                             )
-                            .map_err(corrupt)?;
+                            .map_err(sqlite)?;
                     }
                 }
                 for edge in edges(row, schema) {
@@ -229,17 +229,18 @@ impl Mirror {
                              VALUES (?1, ?2, ?3, ?4)",
                             params![ingest.path, edge.rule, edge.pointer, edge.target],
                         )
-                        .map_err(corrupt)?;
+                        .map_err(sqlite)?;
                 }
                 (
-                    Some(serde_json::to_string(row).map_err(corrupt)?),
+                    Some(serde_json::to_string(row).map_err(|error| corrupt(error.to_string()))?),
                     Some(hash),
                     Some(trow),
                 )
             }
             None => (None, None, None),
         };
-        let diagnostics = serde_json::to_string(&ingest.diagnostics).map_err(corrupt)?;
+        let diagnostics = serde_json::to_string(&ingest.diagnostics)
+            .map_err(|error| corrupt(error.to_string()))?;
         self.conn
             .execute(
                 "INSERT INTO _reldir_files (path, tbl, size, mtime_ns, ctime_ns, inode, device, \
@@ -263,7 +264,7 @@ impl Mirror {
                     crate::catalog::fold(ingest.path.rsplit('/').next().unwrap_or(ingest.path)),
                 ],
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(())
     }
 
@@ -276,15 +277,16 @@ impl Mirror {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 }
 
 pub(super) fn decode_diagnostics(text: &str) -> Result<Vec<Diagnostic>> {
-    let values: Vec<Value> = serde_json::from_str(text).map_err(corrupt)?;
+    let values: Vec<Value> =
+        serde_json::from_str(text).map_err(|error| corrupt(error.to_string()))?;
     values
         .into_iter()
-        .map(|value| Diagnostic::from_json(&value).map_err(corrupt))
+        .map(|value| Diagnostic::from_json(&value).map_err(|error| corrupt(error.to_string())))
         .collect()
 }
 
@@ -293,22 +295,22 @@ pub(super) fn file_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Fil
     let diagnostics: String = row.get(11)?;
     Ok((|| -> Result<FileEntry> {
         Ok(FileEntry {
-            path: row.get(0).map_err(corrupt)?,
-            table: row.get(1).map_err(corrupt)?,
+            path: row.get(0).map_err(sqlite)?,
+            table: row.get(1).map_err(sqlite)?,
             stat: Stat {
-                size: row.get::<_, i64>(2).map_err(corrupt)? as u64,
-                mtime_ns: row.get(3).map_err(corrupt)?,
-                ctime_ns: row.get(4).map_err(corrupt)?,
-                inode: row.get::<_, i64>(5).map_err(corrupt)? as u64,
-                device: row.get::<_, i64>(6).map_err(corrupt)? as u64,
+                size: row.get::<_, i64>(2).map_err(sqlite)? as u64,
+                mtime_ns: row.get(3).map_err(sqlite)?,
+                ctime_ns: row.get(4).map_err(sqlite)?,
+                inode: row.get::<_, i64>(5).map_err(sqlite)? as u64,
+                device: row.get::<_, i64>(6).map_err(sqlite)? as u64,
             },
-            raw_hash: row.get(7).map_err(corrupt)?,
-            seen_ns: row.get(8).map_err(corrupt)?,
-            row_hash: row.get(9).map_err(corrupt)?,
+            raw_hash: row.get(7).map_err(sqlite)?,
+            seen_ns: row.get(8).map_err(sqlite)?,
+            row_hash: row.get(9).map_err(sqlite)?,
             doc: doc
                 .map(|text| {
                     serde_json::from_str::<Value>(&text)
-                        .map_err(corrupt)
+                        .map_err(|error| corrupt(error.to_string()))
                         .and_then(|value| match value {
                             Value::Object(map) => Ok(map),
                             _ => Err(corrupt("a mirrored row is not an object")),

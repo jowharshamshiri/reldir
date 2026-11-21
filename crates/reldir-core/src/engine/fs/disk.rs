@@ -69,7 +69,7 @@ impl Source for Disk {
         // mixture of two moments, and the caller is the one that knows whether
         // to retry.
         let listed = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
-        let describe = |entry: &std::fs::DirEntry| -> io::Result<(Vec<u8>, Entry)> {
+        let describe = |entry: &std::fs::DirEntry| -> io::Result<(SortKey, Entry)> {
             let name = entry.file_name();
             #[cfg(unix)]
             let meta = {
@@ -99,7 +99,7 @@ impl Source for Disk {
             .get_or_init(|| std::thread::available_parallelism().map_or(1, |count| count.get())))
         .min(16)
         .min(listed.len().div_ceil(PER_THREAD));
-        let mut entries: Vec<(Vec<u8>, Entry)> = if threads <= 1 {
+        let mut entries: Vec<(SortKey, Entry)> = if threads <= 1 {
             listed.iter().map(describe).collect::<io::Result<_>>()?
         } else {
             let chunk = listed.len().div_ceil(threads);
@@ -442,13 +442,18 @@ fn meta_of(metadata: &std::fs::Metadata) -> io::Result<Meta> {
 /// is UTF-16 code units, which order supplementary characters differently from
 /// the WTF-8 bytes Rust keeps an `OsStr` in.
 #[cfg(unix)]
-fn sort_key(name: &std::ffi::OsStr) -> Vec<u8> {
+type SortKey = Vec<u8>;
+#[cfg(windows)]
+type SortKey = Vec<u16>;
+
+#[cfg(unix)]
+fn sort_key(name: &std::ffi::OsStr) -> SortKey {
     use std::os::unix::ffi::OsStrExt;
     name.as_bytes().to_vec()
 }
 
 #[cfg(windows)]
-fn sort_key(name: &std::ffi::OsStr) -> Vec<u16> {
+fn sort_key(name: &std::ffi::OsStr) -> SortKey {
     use std::os::windows::ffi::OsStrExt;
     name.encode_wide().collect()
 }

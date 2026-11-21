@@ -181,6 +181,15 @@ state while a writer works. `--readonly` goes further: it takes no lock and
 writes nothing at all, and sees a change that is committed but not yet
 finished on disk as made.
 
+The mirror has a lock of its own, SQLite's, which a process holds only
+briefly: while it writes what it observed, or while the last connection to
+close folds the write-ahead log back into the mirror. A command that meets
+that lock waits for it, as a writer waits for the writer lock, for up to
+`wait_seconds`, and then fails with `MIRROR_LOCKED`, naming
+`.db/mirror.sqlite`. Nothing was written, so a retry is safe. A lock is never
+taken for damage: only a mirror that fails verification is reported as
+`INTERNAL_METADATA_CORRUPT`, and rebuilt from the files.
+
 A change planned before the lock is taken -- a repair, a migration, a plan
 an agent reviews -- carries the bytes each file held when it was planned. If
 any of them moved by the time it commits, it is refused

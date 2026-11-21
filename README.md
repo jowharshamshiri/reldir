@@ -110,6 +110,10 @@ maturin develop -m crates/reldir-py/Cargo.toml && pytest crates/reldir-py/tests
 cargo xtask scale --rows 100000                            # the performance targets
 ```
 
+CI's `fmt, clippy, docs` job runs the toolchain that `.github/workflows/ci.yml`
+pins, not the latest stable. Run `cargo fmt` and `cargo clippy` with that
+version (`cargo +<version> fmt --all --check`) to get the verdicts CI gets.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

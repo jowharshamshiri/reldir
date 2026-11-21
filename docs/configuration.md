@@ -71,7 +71,7 @@ never a shortened answer.
 | Key | Default | Meaning |
 |---|---|---|
 | `timeout_seconds` | `null` | The seconds a query may run. `null` means no limit; otherwise it is a finite number greater than zero. |
-| `wait_seconds` | `5.0` | The seconds a writer waits for the writer lock before it reports `LOCK_CONTENDED`. `0` tries once. It must be finite and not negative. |
+| `wait_seconds` | `5.0` | The seconds a writer waits for the writer lock before it reports `LOCK_CONTENDED`, and any command waits for a lock another process holds on the mirror before it reports `MIRROR_LOCKED`. `0` tries once. It must be from `0` to `2147483` (about 24.8 days, the longest wait SQLite can count). |
 | `transaction_timeout_seconds` | `300.0` | The seconds a transaction may hold the writer lock, from its first statement to its commit. After that it is rolled back, so a session left open cannot hold every other writer off. It must be finite and greater than zero. |
 
 See [transactions]({{ site.baseurl }}/transactions) for the lock and for what a

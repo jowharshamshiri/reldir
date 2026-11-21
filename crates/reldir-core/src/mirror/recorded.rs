@@ -19,7 +19,7 @@ impl Mirror {
                  WHERE f.row_hash IS NOT NULL AND (r.hash IS NULL OR r.hash <> f.row_hash) \
                  ORDER BY f.path",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for row in changed
             .query_map([], |row| {
                 Ok(RowChangeSince {
@@ -28,9 +28,9 @@ impl Mirror {
                     recorded: row.get(3)?,
                 })
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
         {
-            out.push(row.map_err(corrupt)?);
+            out.push(row.map_err(sqlite)?);
         }
         let mut removed = self
             .conn
@@ -40,13 +40,13 @@ impl Mirror {
                  (SELECT 1 FROM _reldir_files f WHERE f.path = r.path AND f.row_hash IS NOT NULL) \
                  ORDER BY r.path",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for row in removed
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
         {
             out.push(RowChangeSince {
-                path: row.map_err(corrupt)?,
+                path: row.map_err(sqlite)?,
                 after: None,
                 recorded: true,
             });
@@ -63,12 +63,12 @@ impl Mirror {
                 "SELECT path, row_hash, raw_hash FROM _reldir_files \
                  WHERE tbl = ?1 AND row_hash IS NOT NULL ORDER BY path",
             )
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let rows = statement
             .query_map([table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(rows)
     }
 
@@ -79,7 +79,7 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT path, kind, hash FROM _reldir_recorded WHERE kind <> 'row'")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -90,9 +90,9 @@ impl Mirror {
                     },
                 ))
             })
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(rows)
     }
 
@@ -101,12 +101,12 @@ impl Mirror {
         let mut statement = self
             .conn
             .prepare("SELECT path FROM _reldir_recorded")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let paths = statement
             .query_map([], |row| row.get(0))
-            .map_err(corrupt)?
+            .map_err(sqlite)?
             .collect::<std::result::Result<_, _>>()
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         Ok(paths)
     }
 
@@ -143,14 +143,14 @@ impl Mirror {
     ) -> Result<()> {
         self.conn
             .execute("DELETE FROM _reldir_recorded", [])
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for (path, entry) in entries {
             self.conn
                 .execute(
                     "INSERT INTO _reldir_recorded (path, kind, hash) VALUES (?1, ?2, ?3)",
                     params![path, entry.kind, entry.hash],
                 )
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
         }
         self.settle()?;
         match head {
@@ -164,7 +164,7 @@ impl Mirror {
                         "DELETE FROM _reldir_meta WHERE key IN ('recorded_head', 'recorded_tree')",
                         [],
                     )
-                    .map_err(corrupt)?;
+                    .map_err(sqlite)?;
             }
         }
         Ok(())
@@ -197,12 +197,12 @@ impl Mirror {
                              ON CONFLICT (path) DO UPDATE SET kind = excluded.kind, hash = excluded.hash",
                             params![path, entry.kind, entry.hash],
                         )
-                        .map_err(corrupt)?;
+                        .map_err(sqlite)?;
                 }
                 None => {
                     self.conn
                         .execute("DELETE FROM _reldir_recorded WHERE path = ?1", [path])
-                        .map_err(corrupt)?;
+                        .map_err(sqlite)?;
                 }
             }
         }
@@ -223,6 +223,6 @@ impl Mirror {
                 [],
             )
             .map(|_| ())
-            .map_err(corrupt)
+            .map_err(sqlite)
     }
 }

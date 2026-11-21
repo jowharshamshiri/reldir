@@ -1,6 +1,6 @@
 //! Properties that must hold for every input, checked on generated ones.
 
-use proptest::prelude::*;
+use proptest::{prelude::*, test_runner::FileFailurePersistence};
 use reldir_core::{
     canonical,
     catalog::Catalog,
@@ -63,8 +63,22 @@ fn table(extra: Value) -> Value {
     document
 }
 
+/// A property's run: every failing case kept in the `.proptest-regressions`
+/// file beside this one, then `cases` generated ones; a new failing case is
+/// kept there too. proptest's default finds where to keep them from the
+/// crate's `lib.rs`, and no folder above an integration test holds one.
+fn config(cases: u32) -> ProptestConfig {
+    ProptestConfig {
+        cases,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+    #![proptest_config(config(128))]
 
     /// A row's hash is what it says, not how it is written: member order
     /// never matters, and normalizing is idempotent.
@@ -201,7 +215,7 @@ fn verdict(root: &Path, mirror: Rc<Mirror>) -> (BTreeSet<String>, usize) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, .. ProptestConfig::default() })]
+    #![proptest_config(config(48))]
 
     /// Judging a directory incrementally -- re-reading only what changed since
     /// the last observation -- always reaches the verdict a judgment from
@@ -264,7 +278,7 @@ fn forest() -> impl Strategy<Value = (Vec<Node>, usize)> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 24, .. ProptestConfig::default() })]
+    #![proptest_config(config(24))]
 
     /// Deleting a row carries out exactly what the foreign keys declare -- a
     /// cascade removes every descendant, `remove` takes every link to a
