@@ -8,6 +8,20 @@ describes: format 3, protocol 1, the error-code registry and the
 
 ## [Unreleased]
 
+### Fixed
+
+- A lock another process held on the mirror was reported as
+  `INTERNAL_METADATA_CORRUPT` ("derived mirror: database is locked"), and a
+  writer that met it while opening the mirror deleted the mirror and rebuilt
+  it from under that process. Every command now waits for that lock for up to
+  `wait_seconds` and then fails with the new code `MIRROR_LOCKED` (exit `3`,
+  safe to retry), naming `.db/mirror.sqlite`. A failed read or write of the
+  mirror is `IO_ERROR`; only a mirror that fails verification is
+  `INTERNAL_METADATA_CORRUPT`, and only that is rebuilt.
+- `wait_seconds` and `--wait` accept at most `2147483` seconds, the longest
+  wait SQLite can count; a longer one is refused as invalid instead of
+  stopping the command.
+
 ### Security
 
 - The bundled SQLite is 3.54.1 (rusqlite 0.43), which fixes CVE-2026-119375:

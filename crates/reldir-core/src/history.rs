@@ -633,24 +633,19 @@ pub type PackFiles = (Vec<u8>, Vec<u8>, PackName);
 
 pub fn number(catalog: &Catalog, history: &History, persist: bool) -> Result<BTreeMap<Id, u64>> {
     let connection = catalog.mirror.connection();
-    let corrupt = |error: rusqlite::Error| {
-        DbError::new(
-            Code::INTERNAL_METADATA_CORRUPT,
-            format!("derived mirror: {error}"),
-        )
-    };
+    let sqlite = crate::mirror::sqlite;
     let mut known: BTreeMap<Id, u64> = BTreeMap::new();
     {
         let mut statement = connection
             .prepare("SELECT id, seq FROM _reldir_revisions")
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
-            .map_err(corrupt)?;
+            .map_err(sqlite)?;
         for row in rows {
-            let (text, seq) = row.map_err(corrupt)?;
+            let (text, seq) = row.map_err(sqlite)?;
             let id = Id::from_hex(&text).ok_or_else(|| {
                 DbError::new(
                     Code::INTERNAL_METADATA_CORRUPT,
@@ -693,7 +688,7 @@ pub fn number(catalog: &Catalog, history: &History, persist: bool) -> Result<BTr
                     "INSERT INTO _reldir_revisions (id, seq) VALUES (?1, ?2)",
                     rusqlite::params![id.to_hex(), next as i64],
                 )
-                .map_err(corrupt)?;
+                .map_err(sqlite)?;
         }
         known.insert(id, next);
     }

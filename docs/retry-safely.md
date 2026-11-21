@@ -69,6 +69,7 @@ The codes behind exit `3`, each of which leaves nothing written:
 | Code | A retry |
 |---|---|
 | `LOCK_CONTENDED` | waits for the lock again; to wait longer each time, pass `--wait SECONDS` |
+| `MIRROR_LOCKED` | waits for SQLite's lock on the mirror again; to wait longer each time, pass `--wait SECONDS` |
 | `CONCURRENT_MODIFICATION` | plans the change again against the files as they now are |
 | `PLAN_CHANGED` | plans the change again; review it first if it was reviewed before |
 | `TRANSACTION_EXPIRED` | starts the transaction over |

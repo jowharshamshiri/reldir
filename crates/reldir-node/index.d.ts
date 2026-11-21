@@ -7,7 +7,7 @@ export interface OpenOptions {
   readonly?: boolean;
   /** Adopt a folder of JSON files the first time (default true). */
   establish?: boolean;
-  /** Seconds to wait for another writer. */
+  /** Seconds to wait for another writer, or for a lock another process holds on the mirror. */
   wait?: number;
   /** Seconds a query may run. */
   timeout?: number;

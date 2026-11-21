@@ -213,7 +213,7 @@ The class follows the code:
 |---|---|
 | `DataError` | `TYPE_MISMATCH`, `INPUT_INVALID`, `NOT_NULL_VIOLATION` |
 | `NotSupportedError` | `TRANSACTION_STATEMENT` |
-| `OperationalError` | `READ_ONLY`; contention (`LOCK_CONTENDED`, `CONCURRENT_MODIFICATION`, `TRANSACTION_EXPIRED`), recovery, untrusted metadata and I/O, decisions required, unsafe filesystems, commit outcomes |
+| `OperationalError` | `READ_ONLY`; contention (`LOCK_CONTENDED`, `MIRROR_LOCKED`, `CONCURRENT_MODIFICATION`, `TRANSACTION_EXPIRED`), recovery, untrusted metadata and I/O, decisions required, unsafe filesystems, commit outcomes |
 | `IntegrityError` | every other fault that leaves the database invalid: keys, references, checks, assertions, schema rules, `CONTRACT_WIDENING_REQUIRED` |
 | `ProgrammingError` | usage errors and names that do not resolve: unknown tables and columns, statements outside the SQL surface |
 | `InternalError` | a defect in reldir |

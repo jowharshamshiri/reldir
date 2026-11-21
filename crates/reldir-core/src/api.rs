@@ -47,7 +47,8 @@ pub struct Options {
     /// Refuse to establish a database where none is yet: the folder must
     /// already have been adopted or initialised.
     pub no_establish: bool,
-    /// Seconds to wait for another writer's lock before refusing.
+    /// Seconds to wait for another writer's lock, or for a lock another
+    /// process holds on the mirror, before refusing.
     pub wait_seconds: Option<f64>,
     /// Seconds a query may run.
     pub timeout_seconds: Option<f64>,

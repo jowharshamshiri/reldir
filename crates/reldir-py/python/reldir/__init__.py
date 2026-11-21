@@ -96,8 +96,8 @@ def connect(
     first time unless ``establish`` is false.
 
     ``readonly`` writes nothing at all, not even derived state; ``wait`` is
-    how long to wait for another writer; ``timeout`` how long a query may
-    run; ``max_rows`` how many rows a query may return.
+    how long to wait for another writer, or for a lock another process holds
+    on the mirror; ``timeout`` how long a query may run; ``max_rows`` how many rows a query may return.
     """
     database = _Database(
         path,

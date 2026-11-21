@@ -310,3 +310,133 @@ fn test9105_a_readonly_connection_writes_nothing() {
     let refused = Connection::open(empty.path().join("missing"), Options::default()).unwrap_err();
     assert_eq!(refused.code(), Code::PATH_NOT_FOUND, "{refused}");
 }
+
+/// Another connection to the mirror that holds SQLite's write lock, as a
+/// process finishing a commit does. The connection is returned holding it,
+/// with a marker written inside its transaction: once it commits, the marker
+/// is in the mirror unless the mirror was discarded meanwhile.
+fn hold_mirror(root: &Path) -> rusqlite::Connection {
+    let holder = rusqlite::Connection::open(root.join(".db/mirror.sqlite")).unwrap();
+    holder
+        .execute_batch(
+            "BEGIN IMMEDIATE; \
+             INSERT INTO _reldir_meta (key, value) VALUES ('held_by_another', 'yes');",
+        )
+        .unwrap();
+    holder
+}
+
+/// Whether the marker [`hold_mirror`] wrote is in the mirror.
+fn marker_survived(root: &Path) -> bool {
+    rusqlite::Connection::open(root.join(".db/mirror.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM _reldir_meta WHERE key = 'held_by_another'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+        == 1
+}
+
+/// A lock another connection holds on the mirror holds a read up only while
+/// it is held: the read waits for it, then answers, from the files as they
+/// are, and the mirror the other connection wrote is kept.
+#[test]
+fn test9106_a_read_waits_for_a_lock_another_connection_holds_on_the_mirror() {
+    let directory = folder();
+    let root = directory.path();
+    let db = Connection::open(
+        root,
+        Options {
+            wait_seconds: Some(30.0),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    // An outside edit, so the read has what it observes to write to the mirror.
+    write(
+        root,
+        "users/ada.json",
+        json!({"id": "ada", "name": "Ada L", "age": 36}),
+    );
+    let holder = hold_mirror(root);
+    let held = std::time::Duration::from_millis(500);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        holder.execute_batch("COMMIT").unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let answer = db
+        .query("SELECT name FROM users WHERE id = 'ada'", &[])
+        .unwrap();
+    let waited = started.elapsed();
+    releaser.join().unwrap();
+
+    assert_eq!(answer.rows[0]["name"], "Ada L");
+    assert!(
+        waited >= held,
+        "the read must wait for the lock, not answer past it: waited {waited:?}"
+    );
+    assert!(
+        marker_survived(root),
+        "the locked mirror must not be rebuilt"
+    );
+}
+
+/// A lock held past the wait is reported as what it is -- the mirror locked,
+/// contention a retry may outlast -- never as corruption, and the mirror is
+/// not discarded from under the connection that holds it.
+#[test]
+fn test9107_a_lock_held_past_the_wait_is_reported_as_the_mirror_locked() {
+    let directory = folder();
+    let root = directory.path();
+    let wait = 0.3;
+    let db = Connection::open(
+        root,
+        Options {
+            wait_seconds: Some(wait),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    write(
+        root,
+        "users/ada.json",
+        json!({"id": "ada", "name": "Ada L", "age": 36}),
+    );
+    let holder = hold_mirror(root);
+
+    let started = std::time::Instant::now();
+    let error = db
+        .query("SELECT name FROM users WHERE id = 'ada'", &[])
+        .unwrap_err();
+    let waited = started.elapsed();
+
+    assert_eq!(error.code(), Code::MIRROR_LOCKED, "{error}");
+    assert_eq!(error.exit(), reldir_core::code::Exit::Contention);
+    assert_eq!(
+        error.diagnostic.path.as_deref(),
+        Some(Path::new(".db/mirror.sqlite")),
+        "the error names the database whose lock it is: {error}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_secs_f64(wait),
+        "the read must wait the whole budget before refusing: waited {waited:?}"
+    );
+
+    holder.execute_batch("COMMIT").unwrap();
+    drop(holder);
+    assert!(
+        marker_survived(root),
+        "the locked mirror must not be rebuilt"
+    );
+    let answer = db
+        .query("SELECT name FROM users WHERE id = 'ada'", &[])
+        .unwrap();
+    assert_eq!(
+        answer.rows[0]["name"], "Ada L",
+        "a retry once it is free answers"
+    );
+}

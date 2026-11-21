@@ -56,7 +56,7 @@ directory beside its tables is reported (`UNGOVERNED_DIRECTORY`), not adopted;
 | `--idempotency-key <KEY>` | name the change, so a retry is reported (`replayed`) rather than made twice |
 | `--widen` | widen a table's contract, in the same change, to admit what the change writes |
 | `--expect-state <STATE>` | commit only if the database still holds the state a dry run reported as `data.state`; otherwise `PLAN_CHANGED` |
-| `--wait <S>` | seconds to wait for another writer's lock; `0` tries once; fractions allowed |
+| `--wait <S>` | seconds to wait for another writer's lock, or for a lock another process holds on the mirror; `0` tries once; fractions allowed |
 | `--timeout <S>` | seconds a query may run; fractions allowed |
 | `--max-json-file-size`, `--max-nesting-depth`, `--max-query-memory`, `--max-result-rows`, `--max-transaction-size` | override a [limit]({{ site.baseurl }}/configuration) for one command |
 

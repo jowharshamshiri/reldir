@@ -295,6 +295,7 @@ codes! {
 
     // Transactions and concurrency.
     LOCK_CONTENDED => Transaction, Contention, "another writer held the lock past the wait";
+    MIRROR_LOCKED => Transaction, Contention, "another connection held SQLite's lock on the derived mirror, `.db/mirror.sqlite`, past the wait, or wrote it while this one was reading it";
     CONCURRENT_MODIFICATION => Transaction, Contention, "a file a change was planned against moved before it was written";
     PATH_INTERFERENCE => Transaction, Contention, "a path a change needs is not what it must be (a directory where a file goes, a symlink ancestor)";
     PLAN_CHANGED => Transaction, Contention, "a planned change no longer matches the state it would be committed to";

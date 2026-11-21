@@ -181,6 +181,7 @@ every change an `--idempotency-key`, which makes a retry safe whatever happened.
 | Code | Exit | Meaning |
 |---|---|---|
 | <a id="lock_contended"></a>`LOCK_CONTENDED` | `3` | another writer held the lock past the wait |
+| <a id="mirror_locked"></a>`MIRROR_LOCKED` | `3` | another connection held SQLite's lock on the derived mirror, `.db/mirror.sqlite`, past the wait, or wrote it while this one was reading it |
 | <a id="concurrent_modification"></a>`CONCURRENT_MODIFICATION` | `3` | a file a change was planned against moved before it was written |
 | <a id="path_interference"></a>`PATH_INTERFERENCE` | `3` | a path a change needs is not what it must be (a directory where a file goes, a symlink ancestor) |
 | <a id="plan_changed"></a>`PLAN_CHANGED` | `3` | a planned change no longer matches the state it would be committed to |

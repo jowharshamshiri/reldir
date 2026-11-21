@@ -101,7 +101,8 @@ pub struct Global {
     /// Seconds a query may run; fractions are allowed (0.5).
     #[arg(long, global = true, value_name = "SECONDS")]
     pub timeout: Option<f64>,
-    /// Seconds to wait for the writer lock; 0 tries once.
+    /// Seconds to wait for the writer lock, or for a lock another process holds
+    /// on the mirror; 0 tries once.
     #[arg(long, global = true, value_name = "SECONDS")]
     pub wait: Option<f64>,
     /// Largest JSON file read, in bytes.

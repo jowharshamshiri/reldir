@@ -439,7 +439,8 @@ impl Database {
                 let recovered = recover(&root)?;
                 let interrupted = recovered.is_some();
                 events.extend(recovered);
-                let (mirror, rebuilt) = Mirror::open_persistent(&root, interrupted)?;
+                let (mirror, rebuilt) =
+                    Mirror::open_persistent(&root, interrupted, waiting.lock_budget())?;
                 if rebuilt {
                     events.push(Event::MirrorRebuilt);
                 }
@@ -529,7 +530,8 @@ impl Database {
     /// observation to answer from.
     fn open_snapshot(root: &Path, overrides: &ResourceOverrides) -> Result<Option<Self>> {
         let started = std::time::Instant::now();
-        let Some(mirror) = Mirror::open_snapshot(root)? else {
+        let config = configured(root, overrides)?;
+        let Some(mirror) = Mirror::open_snapshot(root, config.lock_budget())? else {
             return Ok(None);
         };
         let mirror = Rc::new(mirror);
@@ -538,7 +540,6 @@ impl Database {
             Err(error) if error.code() == Code::INTERNAL_METADATA_CORRUPT => return Ok(None),
             Err(error) => return Err(error),
         };
-        let config = configured(root, overrides)?;
         let verdict = integrity::validate(&catalog)?;
         let history = History::open(root).ok();
         let head = match (&history, mirror.meta("recorded_head")?) {

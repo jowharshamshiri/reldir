@@ -452,6 +452,7 @@ generate types from it. The result document is `#`, one line of
             "UNKNOWN_RESOURCE",
             "CURSOR_STALE",
             "LOCK_CONTENDED",
+            "MIRROR_LOCKED",
             "CONCURRENT_MODIFICATION",
             "PATH_INTERFERENCE",
             "PLAN_CHANGED",

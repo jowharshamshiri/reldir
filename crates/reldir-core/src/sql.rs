@@ -1708,8 +1708,10 @@ fn bind(statement: &mut rusqlite::Statement<'_>, params: &[SqlParam]) -> Result<
 }
 
 /// Classify a SQLite error: a constraint failure is a relational violation of
-/// the database; running out of an allowance is a resource limit; the rest is
-/// a fault in the statement.
+/// the database; running out of an allowance is a resource limit; a lock
+/// another connection held past the wait, or a failed read or write, is the
+/// mirror's condition, not the statement's; the rest is a fault in the
+/// statement.
 pub fn query_err(error: rusqlite::Error) -> DbError {
     let message = error.to_string();
     if let rusqlite::Error::SqliteFailure(failure, _) = &error {
@@ -1740,6 +1742,9 @@ pub fn query_err(error: rusqlite::Error) -> DbError {
             };
             return DbError::new(code, message);
         }
+    }
+    if let Some(condition) = crate::mirror::condition(&error) {
+        return condition;
     }
     let code = if message.contains("no such table") {
         Code::UNKNOWN_TABLE
